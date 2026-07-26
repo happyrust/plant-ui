@@ -58,19 +58,21 @@ async fn main() -> anyhow::Result<()> {
             .iter()
             .filter(|a| !matches!(a.kind, AttrKind::Unset | AttrKind::Opaque))
             .count();
+        // 值格空白是「空值有明确显示」的反例：既看不出是空值还是没查到。
+        // 空数组曾从这里漏出去（每个 EQUI / NOZZ 都带一行空 DESP）。
+        let blank = props.iter().filter(|a| a.value.trim().is_empty()).count();
         println!(
-            "element_props({}) -> {} 项（UDA {} / unset {} / 可编辑 {}）",
+            "element_props({}) -> {} 项（UDA {} / unset {} / 可编辑 {} / 空值格 {}）",
             target.refno(),
             props.len(),
             udas,
             unset,
-            editable
+            editable,
+            blank
         );
-        for a in props
-            .iter()
-            .filter(|a| !matches!(a.kind, AttrKind::Unset | AttrKind::Opaque))
-            .take(12)
-        {
+        // 有值的行全列出来，只读的也列：可编辑字段被错判成只读时，光看可编辑那一批
+        // 是看不出来的——ISOH / LOOS 当初就是这么漏过去的。
+        for a in props.iter().filter(|a| a.value != "unset") {
             println!("  {:<12} {:<28} {:?}", a.name, a.value, a.kind);
         }
     }

@@ -74,7 +74,13 @@ pub struct Attr {
 /// 就会把引用错当文本放开。原始版带 `#[cached]`，第二次查同一元素不再打库。
 pub async fn element_props(refno: RefnoEnum) -> Result<Vec<Attr>> {
     let attmap = aios_core::get_ui_named_attmap(refno).await?;
-    let raw = aios_core::get_named_attmap_with_uda(refno).await.ok();
+    let mut raw = aios_core::get_named_attmap_with_uda(refno).await.ok();
+    // UI 版取类型之前先补了一轮字典默认值，这里不补两张表的键集就对不上：凡是取自
+    // 默认值的属性在 raw 里查不到，`map_or` 会把它们一律当成 Opaque 锁成只读。
+    // 实测一个 BRAN 有 32 个键走这条路，其中 9 个是本该可编辑的标量。
+    if let Some(raw) = &mut raw {
+        raw.fill_explicit_default_values();
+    }
     Ok(attmap
         .map
         .iter()
@@ -124,19 +130,13 @@ fn fmt_attr(v: &aios_core::NamedAttrValue) -> String {
             format!("{x}")
         }
     }
-    match v {
+    let s = match v {
         V::InvalidType => "unset".into(),
         V::IntegerType(i) => i.to_string(),
         V::LongType(i) => i.to_string(),
         V::F32Type(x) => f32s(*x),
         V::BoolType(b) => if *b { "true" } else { "false" }.into(),
-        V::StringType(s) | V::ElementType(s) | V::WordType(s) => {
-            if s.is_empty() {
-                "unset".into()
-            } else {
-                s.clone()
-            }
-        }
+        V::StringType(s) | V::ElementType(s) | V::WordType(s) => s.clone(),
         V::Vec3Type(p) => format!("{} {} {}", f32s(p.x), f32s(p.y), f32s(p.z)),
         V::F32VecType(xs) => xs.iter().map(|x| f32s(*x)).collect::<Vec<_>>().join(" "),
         V::StringArrayType(xs) => xs.join(" "),
@@ -153,5 +153,12 @@ fn fmt_attr(v: &aios_core::NamedAttrValue) -> String {
             .map(|r| r.refno().to_string())
             .collect::<Vec<_>>()
             .join(" "),
+    };
+    // 空数组与空串一并归到 unset。一个什么都没有的值格看不出是「空值」还是「没查到」，
+    // 而 unset 在面板上是弱化色的明确一行。实测每个 EQUI / NOZZ 都带一行空 DESP。
+    if s.trim().is_empty() {
+        "unset".into()
+    } else {
+        s
     }
 }
