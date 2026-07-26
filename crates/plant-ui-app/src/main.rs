@@ -1,14 +1,17 @@
 //! plant-ui-app：独立可执行外壳（eframe + plant-ui + plant-ui-data）。
-//! M0 阶段内容是组件画廊；M1 换成主工作台 S1。
+//! 默认进入主工作台 S1；`--gallery` 进入 M0 组件画廊。
 
 mod fonts;
+mod gallery;
 
 use eframe::egui;
 use plant_ui::style::theme_tokens::{self, set_weight_families_ready};
-use plant_ui::style::tokens::{Density, Status, Tokens};
-use plant_ui::style::widgets::{self, RowIcon, RowTag, TreeRow};
+use plant_ui::style::tokens::{Density, Tokens};
+use plant_ui::vm::WorkbenchVm;
+use plant_ui::workbench::{self, WorkbenchState};
 
 fn main() -> eframe::Result {
+    let gallery = std::env::args().any(|a| a == "--gallery");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1600.0, 1000.0])
@@ -18,33 +21,40 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "plant-ui",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             let defs = fonts::definitions();
             let weights_ready = defs.font_data.contains_key(fonts::MEDIUM);
             cc.egui_ctx.set_fonts(defs);
             set_weight_families_ready(weights_ready);
             theme_tokens::apply(&cc.egui_ctx, &Tokens::dark(), Density::Standard);
-            Ok(Box::new(App::default()))
+            if gallery {
+                Ok(Box::new(gallery::GalleryApp::default()))
+            } else {
+                Ok(Box::new(App::default()))
+            }
         }),
     )
 }
 
 struct App {
-    vm: plant_ui::vm::WorkbenchVm,
-    chip_on: bool,
-    toggle_on: bool,
+    vm: WorkbenchVm,
+    state: WorkbenchState,
 }
 
 impl Default for App {
     fn default() -> Self {
         Self {
-            vm: plant_ui::vm::WorkbenchVm {
+            // M1-1 外壳阶段的真实状态：还没连库，所以数据源「未连接」、元素 0。
+            // M1-2 接 plant-ui-data 后这些字段来自真实查询。
+            vm: WorkbenchVm {
                 project: "AvevaMarineSample".into(),
+                db: "ns 1516 / db 7997".into(),
+                user: std::env::var("USERNAME").unwrap_or_else(|_| "user".into()),
+                data_source_ok: false,
                 element_count: 0,
                 selected: None,
             },
-            chip_on: true,
-            toggle_on: true,
+            state: WorkbenchState::default(),
         }
     }
 }
@@ -53,60 +63,10 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let t = theme_tokens::current();
         let d = Density::Standard;
-        egui::CentralPanel::default().show(ui, |ui| {
-            widgets::section_header(
-                ui,
-                &t,
-                d,
-                "plant-ui · M0 组件画廊",
-                "egui 0.35 · 组件层迁自 ui/redesign",
-            );
-            ui.add_space(12.0);
-
-            ui.horizontal(|ui| {
-                let _ = ui.add(widgets::button(&t, d, "主要动作").primary());
-                let _ = ui.add(widgets::button(&t, d, "次要动作"));
-                if ui.add(widgets::chip(&t, d, "ERROR 12", self.chip_on)).clicked() {
-                    self.chip_on = !self.chip_on;
-                }
-                let _ = ui.add(widgets::status_tag(&t, d, "已连接", Status::Success));
-                let _ = ui.add(widgets::status_tag(&t, d, "3 个错误", Status::Error));
-                let _ = ui.add(widgets::toggle(&t, d, &mut self.toggle_on));
-            });
-
-            ui.add_space(12.0);
-            let rows: [(usize, &str, Option<bool>, bool); 3] = [
-                (0, "SITE /-RX-CSV", Some(true), false),
-                (1, "ZONE /-RX-CSV-S4009", Some(true), false),
-                (2, "STRU /-RX-CSV-S4009-V1 一段很长的中文名称用来验证截断", Some(false), true),
-            ];
-            for (depth, label, expandable, selected) in rows {
-                let _ = widgets::tree_row_ui(
-                    ui,
-                    &t,
-                    d,
-                    TreeRow {
-                        depth,
-                        icon: RowIcon::Glyph(egui_phosphor::regular::CUBE),
-                        label,
-                        meta: "24381/100060",
-                        selected,
-                        expandable,
-                        tone: Status::Neutral,
-                        tags: &[RowTag {
-                            icon: None,
-                            text: "DESI",
-                            tone: Status::Info,
-                        }],
-                    },
-                );
-            }
-
-            ui.add_space(12.0);
-            ui.label(format!(
-                "project: {}  elements: {}",
-                self.vm.project, self.vm.element_count
-            ));
-        });
+        let cmds = workbench::show(ui, &t, d, &self.vm, &mut self.state);
+        // M1-6 联动前，命令先落日志，验证 Vm 进 / Cmd 出的管道是通的。
+        for cmd in cmds {
+            eprintln!("[cmd] {cmd:?}");
+        }
     }
 }
