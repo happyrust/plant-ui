@@ -664,9 +664,15 @@ pub fn prop_row_edit<R>(
     }
     // 只有键名跟着层级缩进，值列固定不动——值列一旦跟着缩进，同一屏里的数字就
     // 对不成一列了。
+    let value_x = rect.left() + pad + prop_key_w(d);
     let kg = lay(ui, key, Font::meta(d));
-    draw_galley(
-        ui,
+    // 与只读行同样裁在值列前 4px：长 UDA 名（`:MechanicalRep` 一类）不裁就会顶进
+    // 输入框，而输入框有底色，压上去的键名比只读行顶穿值列更难看。
+    let key_clip = Rect::from_min_max(
+        pos2(rect.left() + pad, rect.top()),
+        pos2(value_x - d.px(4.0), rect.bottom()),
+    );
+    ui.painter().with_clip_rect(key_clip).galley(
         pos2(
             rect.left() + pad + depth as f32 * d.px(16.0),
             rect.center().y - kg.size().y / 2.0,
@@ -675,10 +681,7 @@ pub fn prop_row_edit<R>(
         t.text_muted,
     );
 
-    let value_rect = Rect::from_min_max(
-        pos2(rect.left() + pad + prop_key_w(d), rect.top()),
-        rect.right_bottom(),
-    );
+    let value_rect = Rect::from_min_max(pos2(value_x, rect.top()), rect.right_bottom());
     let mut child = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(value_rect)
