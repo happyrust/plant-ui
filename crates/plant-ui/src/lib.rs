@@ -9,4 +9,6 @@ pub mod workbench;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cmd {
     SelectElement(aios_core::RefU64),
+    /// 展开 / 折叠模型树节点；子层未加载时由 App 侧懒加载。
+    ToggleExpand(aios_core::RefU64),
 }

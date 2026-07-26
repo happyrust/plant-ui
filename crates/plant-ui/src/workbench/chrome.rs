@@ -32,13 +32,16 @@ pub fn title_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
                         .font(Font::strong(d))
                         .color(t.text_primary),
                 );
-                divider(ui, t, d);
-                ui.add(widgets::status_tag(t, d, &vm.project, Status::Info));
-                ui.label(
-                    RichText::new(&vm.db)
-                        .font(Font::mono_meta(d))
-                        .color(t.text_muted),
-                );
+                // 连接成功前没有工程标识，这一段整体不画（不摆空芯片）。
+                if !vm.project.is_empty() {
+                    divider(ui, t, d);
+                    ui.add(widgets::status_tag(t, d, &vm.project, Status::Info));
+                    ui.label(
+                        RichText::new(&vm.db)
+                            .font(Font::mono_meta(d))
+                            .color(t.text_muted),
+                    );
+                }
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(
@@ -116,18 +119,20 @@ pub fn status_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
                         .font(Font::micro(d))
                         .color(t.text_muted),
                 );
-                divider(ui, t, d);
-                meta_icon(ui, d, ph::DATABASE, t.accent);
-                ui.label(
-                    RichText::new(&vm.project)
-                        .font(Font::micro(d))
-                        .color(t.text_secondary),
-                );
-                ui.label(
-                    RichText::new(&vm.db)
-                        .font(Font::mono_micro(d))
-                        .color(t.text_muted),
-                );
+                if !vm.project.is_empty() {
+                    divider(ui, t, d);
+                    meta_icon(ui, d, ph::DATABASE, t.accent);
+                    ui.label(
+                        RichText::new(&vm.project)
+                            .font(Font::micro(d))
+                            .color(t.text_secondary),
+                    );
+                    ui.label(
+                        RichText::new(&vm.db)
+                            .font(Font::mono_micro(d))
+                            .color(t.text_muted),
+                    );
+                }
                 divider(ui, t, d);
                 meta_icon(ui, d, ph::CURSOR, t.text_secondary);
                 match &vm.selected {

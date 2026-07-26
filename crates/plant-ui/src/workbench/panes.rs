@@ -111,9 +111,11 @@ impl TabViewer for Viewer<'_> {
     }
 
     fn ui(&mut self, ui: &mut Ui, tab: &mut Self::Tab) {
-        // M1-1 只立外壳，四个视图都是占位；M1-2 起逐个换成真实内容。
-        let _ = (&self.vm, &mut self.cmds);
-        placeholder(ui, self.t, self.d, *tab);
+        match tab {
+            Pane::ModelTree => super::tree::show(ui, self.t, self.d, self.vm, self.cmds),
+            // 其余视图仍是占位，M1-3 起逐个换成真实内容。
+            _ => placeholder(ui, self.t, self.d, *tab),
+        }
     }
 
     fn closeable(&mut self, _tab: &mut Self::Tab) -> bool {

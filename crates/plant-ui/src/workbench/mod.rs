@@ -5,6 +5,7 @@
 
 pub mod chrome;
 pub mod panes;
+pub mod tree;
 
 pub use panes::Pane;
 
