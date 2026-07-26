@@ -1,5 +1,7 @@
 use aios_core::RefU64;
 
+use crate::style::tokens::Status;
+
 /// 主工作台视图模型（外壳字段随 M1 各视图逐步补齐）。
 ///
 /// 外壳原则：宁可少一格，也不摆一个永远是 0 的假数字。所以 gen-model 侧口径的
@@ -23,6 +25,86 @@ pub struct WorkbenchVm {
     pub tree: TreeVm,
     /// 属性视图（M1-3）。
     pub props: PropsVm,
+    /// 命令行视图（M1-4）。
+    pub console: ConsoleVm,
+}
+
+/// 命令行视图数据。
+///
+/// 旧壳的分级靠关键词猜（`PrintConsoleLine` 只带一个字符串），词表要照真实语料
+/// 校准还是会错判。新链路里发日志的就是 App 自己，级别在发的那一刻就定死，
+/// 不再有猜的环节。
+#[derive(Debug, Clone, Default)]
+pub struct ConsoleVm {
+    /// 按时间先后排列的日志行（App 侧限长，最早的先丢）。
+    pub lines: Vec<LogLineVm>,
+    /// 分级计数。筛选芯片每帧都要显示它，App 侧增量维护，绘制层不逐帧扫全表。
+    pub counts: LogCounts,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LogCounts {
+    pub info: usize,
+    pub warn: usize,
+    pub error: usize,
+}
+
+impl LogCounts {
+    pub fn total(self) -> usize {
+        self.info + self.warn + self.error
+    }
+
+    pub fn of(self, level: LogLevel) -> usize {
+        match level {
+            LogLevel::Info => self.info,
+            LogLevel::Warn => self.warn,
+            LogLevel::Error => self.error,
+        }
+    }
+}
+
+/// 命令行的一行（C/LogRow：高 24、时间等宽 + 52pt 分级标签 + 正文）。
+#[derive(Debug, Clone)]
+pub struct LogLineVm {
+    /// 稳定行号。处置入口拿它回指对应操作——缓冲限长会让 Vec 下标漂移。
+    pub id: u64,
+    /// 本地时钟 HH:MM:SS，等宽渲染。
+    pub time: String,
+    pub level: LogLevel,
+    /// 单行摘要，超出行宽截断。
+    pub message: String,
+    /// 完整信息（错误链等）；None = 摘要就是全部。
+    pub detail: Option<String>,
+    /// 该行对应的操作可以重来，行尾给「重试」。
+    pub retryable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    pub const ALL: [LogLevel; 3] = [LogLevel::Info, LogLevel::Warn, LogLevel::Error];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LogLevel::Info => "INFO",
+            LogLevel::Warn => "WARN",
+            LogLevel::Error => "ERROR",
+        }
+    }
+
+    /// 分级色沿用状态色，不另起一套。
+    pub fn status(self) -> Status {
+        match self {
+            LogLevel::Info => Status::Info,
+            LogLevel::Warn => Status::Warn,
+            LogLevel::Error => Status::Error,
+        }
+    }
 }
 
 /// 模型树数据状态。

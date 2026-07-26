@@ -18,4 +18,8 @@ pub enum Cmd {
         attr: String,
         value: String,
     },
+    /// 命令行错误行的处置入口：重做该行对应的操作（App 侧按行号找回原请求）。
+    RetryLog(u64),
+    /// 清空命令行缓冲。
+    ClearConsole,
 }

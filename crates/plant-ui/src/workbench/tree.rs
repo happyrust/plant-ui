@@ -31,12 +31,19 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                 })
                 .show(ui, |ui| {
                     ui.set_min_size(ui.available_size());
+                    // show_rows 是拿**外层** ui 的 item_spacing.y 去折算每行占位的，
+                    // 设在闭包里就晚了：行按 26 画、位子却按 26+6 留，滚动条会比
+                    // 内容长出近四分之一，能一路滚进底下的空白里。
+                    ui.spacing_mut().item_spacing.y = 0.0;
                     ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show_rows(ui, d.row_h(), rows.len(), |ui, range| {
-                            ui.spacing_mut().item_spacing.y = 0.0;
                             for row in &rows[range] {
-                                let meta = if row.loading { "加载中…" } else { row.noun.as_str() };
+                                let meta = if row.loading {
+                                    "加载中…"
+                                } else {
+                                    row.noun.as_str()
+                                };
                                 let out = widgets::tree_row_ui(
                                     ui,
                                     t,
@@ -64,8 +71,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                                     } else {
                                         cmds.push(Cmd::SelectElement(row.refno));
                                     }
-                                } else if out.response.double_clicked()
-                                    && row.expandable.is_some()
+                                } else if out.response.double_clicked() && row.expandable.is_some()
                                 {
                                     cmds.push(Cmd::ToggleExpand(row.refno));
                                 }

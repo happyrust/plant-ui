@@ -16,19 +16,25 @@ fn font_dir() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/fonts")
 }
 
-fn load(file: &str) -> Option<Vec<u8>> {
+fn load(file: &str, warnings: &mut Vec<String>) -> Option<Vec<u8>> {
     let path = font_dir().join(file);
     match std::fs::read(&path) {
         Ok(bytes) => Some(bytes),
         Err(err) => {
-            eprintln!("字体缺失，回退到 egui 默认字体：{} ({err})", path.display());
+            warnings.push(format!(
+                "字体缺失，回退到 egui 默认字体：{} ({err})",
+                path.display()
+            ));
             None
         }
     }
 }
 
-pub fn definitions() -> FontDefinitions {
+/// 返回字体定义与告警。告警交给 App 上命令行——字面看不出缺字体，
+/// 只会觉得「字有点丑」，不上屏就没人知道。
+pub fn definitions() -> (FontDefinitions, Vec<String>) {
     let mut fonts = FontDefinitions::default();
+    let mut warnings = Vec::new();
 
     let faces = [
         (REGULAR_KEY, "AlibabaPuHuiTi-2-55-Regular.ttf"),
@@ -38,7 +44,7 @@ pub fn definitions() -> FontDefinitions {
 
     let mut loaded = Vec::new();
     for (key, file) in faces {
-        if let Some(bytes) = load(file) {
+        if let Some(bytes) = load(file, &mut warnings) {
             fonts
                 .font_data
                 .insert(key.to_owned(), Arc::new(FontData::from_owned(bytes)));
@@ -81,7 +87,7 @@ pub fn definitions() -> FontDefinitions {
     }
 
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
-    fonts
+    (fonts, warnings)
 }
 
 fn dedup(chain: Vec<String>) -> Vec<String> {

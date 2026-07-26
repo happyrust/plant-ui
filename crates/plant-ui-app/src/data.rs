@@ -13,6 +13,8 @@ pub enum Req {
     Children(RefU64),
     /// 选中元素的 UI 属性表。
     Props(RefU64),
+    /// 重跑启动序列。连库失败后命令行上的「重试」走这条，结果仍走 `Evt::Ready`。
+    Reconnect,
 }
 
 /// 启动序列（连接 + 工程标识 + SITE 根层）的合并产物。
@@ -34,6 +36,19 @@ pub struct Bridge {
     pub evt: mpsc::Receiver<Evt>,
 }
 
+/// 启动序列：连库、抓工程标识、抓 SITE 根层。三步任一失败都算没连上。
+async fn ready() -> anyhow::Result<ReadyInfo> {
+    plant_ui_data::connect().await?;
+    let (project, ns, db_nums) = plant_ui_data::project_identity().await?;
+    let sites = plant_ui_data::site_nodes().await?;
+    Ok(ReadyInfo {
+        project,
+        ns,
+        db_nums,
+        sites,
+    })
+}
+
 /// 起数据线程：连库、抓工程标识与 SITE 根层，然后循环处理懒加载请求。
 pub fn spawn(ctx: egui::Context) -> Bridge {
     let (req_tx, req_rx) = mpsc::channel();
@@ -46,23 +61,15 @@ pub fn spawn(ctx: egui::Context) -> Bridge {
                 .build()
                 .expect("tokio runtime");
             rt.block_on(async move {
-                let ready = async {
-                    plant_ui_data::connect().await?;
-                    let (project, ns, db_nums) = plant_ui_data::project_identity().await?;
-                    let sites = plant_ui_data::site_nodes().await?;
-                    anyhow::Ok(ReadyInfo {
-                        project,
-                        ns,
-                        db_nums,
-                        sites,
-                    })
-                }
-                .await;
-                let _ = evt_tx.send(Evt::Ready(ready));
+                let _ = evt_tx.send(Evt::Ready(ready().await));
                 ctx.request_repaint();
 
                 while let Ok(req) = req_rx.recv() {
                     match req {
+                        Req::Reconnect => {
+                            let _ = evt_tx.send(Evt::Ready(ready().await));
+                            ctx.request_repaint();
+                        }
                         Req::Children(refno) => {
                             let r = plant_ui_data::child_nodes(refno.into()).await;
                             let _ = evt_tx.send(Evt::Children(refno, r));

@@ -1,3 +1,6 @@
 /target
 /vendor/registry
 /output
+# SUL_DB 客户端在工作目录里落的查询历史，跑一次应用就会重新生成
+/history.txt
+

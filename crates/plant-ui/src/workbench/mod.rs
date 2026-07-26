@@ -4,6 +4,7 @@
 //! 不认识数据库、不认识 Bevy。三维视口对本层只是一个 TextureId（M1-5 前用占位）。
 
 pub mod chrome;
+pub mod console;
 pub mod panes;
 pub mod props;
 pub mod tree;

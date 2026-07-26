@@ -100,7 +100,11 @@ impl Widget for Btn<'_> {
 
         let t = self.t;
         let (bg, fg, border) = if self.primary {
-            let bg = if resp.hovered() { t.accent_strong } else { t.accent };
+            let bg = if resp.hovered() {
+                t.accent_strong
+            } else {
+                t.accent
+            };
             (bg, t.accent_ink, None)
         } else if resp.hovered() {
             (t.bg_hover, t.text_primary, Some(t.border_strong))
@@ -178,8 +182,7 @@ pub fn nav_item<'a>(
 ) -> impl Widget + 'a {
     move |ui: &mut Ui| {
         let h = d.px(32.0);
-        let (rect, resp) =
-            ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
+        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
         if !ui.is_rect_visible(rect) {
             return resp;
         }
@@ -193,12 +196,23 @@ pub fn nav_item<'a>(
         fill_rect(ui, rect, radius::MD, bg, None);
 
         let pad = d.px(10.0);
-        let g = lay(ui, label, if active { Font::strong(d) } else { Font::label(d) });
+        let g = lay(
+            ui,
+            label,
+            if active {
+                Font::strong(d)
+            } else {
+                Font::label(d)
+            },
+        );
         let pos = pos2(rect.left() + pad, rect.center().y - g.size().y / 2.0);
         draw_galley(ui, pos, g, fg);
 
         let b = lay(ui, badge, Font::mono_micro(d));
-        let bpos = pos2(rect.right() - pad - b.size().x, rect.center().y - b.size().y / 2.0);
+        let bpos = pos2(
+            rect.right() - pad - b.size().x,
+            rect.center().y - b.size().y / 2.0,
+        );
         draw_galley(ui, bpos, b, t.text_muted);
 
         resp
@@ -217,7 +231,15 @@ pub fn tab<'a>(
     move |ui: &mut Ui| {
         let pad = d.px(12.0);
         let gap = d.px(8.0);
-        let g = lay(ui, label, if active { Font::strong(d) } else { Font::label(d) });
+        let g = lay(
+            ui,
+            label,
+            if active {
+                Font::strong(d)
+            } else {
+                Font::label(d)
+            },
+        );
         let ig = icon.map(|i| lay(ui, i, icon_font(d)));
         let mut w = pad * 2.0 + g.size().x;
         if let Some(x) = &ig {
@@ -246,7 +268,12 @@ pub fn tab<'a>(
         if let Some(i) = ig {
             let y = rect.center().y - i.size().y / 2.0;
             let sx = i.size().x;
-            draw_galley(ui, pos2(x, y), i, if active { t.accent } else { t.text_muted });
+            draw_galley(
+                ui,
+                pos2(x, y),
+                i,
+                if active { t.accent } else { t.text_muted },
+            );
             x += sx + gap;
         }
         let y = rect.center().y - g.size().y / 2.0;
@@ -521,9 +548,11 @@ pub fn tree_row_ui(ui: &mut Ui, t: &Tokens, d: Density, row: TreeRow<'_>) -> Tre
         t.text_primary
     };
     let label_clip = Rect::from_min_max(pos2(x, rect.top()), pos2(right.max(x), rect.bottom()));
-    ui.painter()
-        .with_clip_rect(label_clip)
-        .galley(pos2(x, rect.center().y - lg.size().y / 2.0), lg, fg);
+    ui.painter().with_clip_rect(label_clip).galley(
+        pos2(x, rect.center().y - lg.size().y / 2.0),
+        lg,
+        fg,
+    );
 
     TreeRowOut {
         response: resp,
@@ -572,7 +601,11 @@ pub fn prop_row_ui(ui: &mut Ui, t: &Tokens, d: Density, row: PropRow<'_>) -> Res
     let vg = lay(
         ui,
         row.value,
-        if row.mono { Font::mono(d) } else { Font::label(d) },
+        if row.mono {
+            Font::mono(d)
+        } else {
+            Font::label(d)
+        },
     );
     let value_clip = Rect::from_min_max(
         pos2(value_x, rect.top()),
@@ -622,10 +655,12 @@ pub fn prop_row_edit<R>(
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
 
     if zebra {
-        ui.painter().rect_filled(rect, CornerRadius::ZERO, t.bg_header);
+        ui.painter()
+            .rect_filled(rect, CornerRadius::ZERO, t.bg_header);
     }
     if resp.hovered() {
-        ui.painter().rect_filled(rect, CornerRadius::ZERO, t.bg_hover);
+        ui.painter()
+            .rect_filled(rect, CornerRadius::ZERO, t.bg_hover);
     }
     // 只有键名跟着层级缩进，值列固定不动——值列一旦跟着缩进，同一屏里的数字就
     // 对不成一列了。
@@ -652,58 +687,130 @@ pub fn prop_row_edit<R>(
     value_ui(&mut child)
 }
 
-pub fn log_row<'a>(
-    t: &'a Tokens,
+pub struct LogRow<'a> {
+    pub time: &'a str,
+    pub level: Status,
+    pub level_text: &'a str,
+    pub message: &'a str,
+}
+
+pub struct LogRowOut<R> {
+    pub response: Response,
+    /// 正文那一段的响应。正文被截断时，调用点拿它挂完整文本的 tooltip。
+    pub message: Response,
+    pub trailing: R,
+}
+
+/// 日志行（C/LogRow：高 24、时间等宽 `text-muted` + 52pt 分级标签 + 正文；
+/// ERROR 行整行 `danger-bg`）。
+///
+/// 时间 / 分级 / 正文都走 selectable 的 `Label`，不用 painter 直接落字：控制台的
+/// 头等需求是把出错的那几行原样抄出去。egui 的跨 Label 选中会把同一行的几段用空格
+/// 拼、跨行用换行拼（行距大于半个字高时多一个空行），拖选几行 Ctrl+C 就能贴走——
+/// 不必像旧壳那样为了可选中复制而整块退回 `TextEdit`，把分级配色一起弄丢。
+/// 想要单行不带空行的话走行尾的「复制」。
+///
+/// `trailing` 在行尾从右往左画处置入口（重试 / 复制），正文按剩下的宽度截断。
+pub fn log_row_ui<R>(
+    ui: &mut Ui,
+    t: &Tokens,
     d: Density,
-    time: &'a str,
-    level: Status,
-    level_text: &'a str,
-    message: &'a str,
-) -> impl Widget + 'a {
-    move |ui: &mut Ui| {
-        let h = d.px(24.0);
-        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
-        if !ui.is_rect_visible(rect) {
-            return resp;
-        }
-        let (fg, bg) = t.status(level);
-        if level == Status::Error {
-            ui.painter().rect_filled(rect, CornerRadius::ZERO, bg);
-        }
+    row: LogRow<'_>,
+    trailing: impl FnOnce(&mut Ui) -> R,
+) -> LogRowOut<R> {
+    let h = d.px(24.0);
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
+    let (fg, bg) = t.status(row.level);
 
-        let pad = d.px(14.0);
-        let gap = d.px(12.0);
-        let mut x = rect.left() + pad;
-
-        let tg = lay(ui, time, Font::mono_meta(d));
-        let tsx = tg.size().x;
-        draw_galley(
-            ui,
-            pos2(x, rect.center().y - tg.size().y / 2.0),
-            tg,
-            t.text_muted,
-        );
-        x += tsx + gap;
-
-        let tag_w = d.px(52.0);
-        let tag = Rect::from_min_size(
-            pos2(x, rect.center().y - d.px(16.0) / 2.0),
-            vec2(tag_w, d.px(16.0)),
-        );
-        fill_rect(ui, tag, radius::SM, bg, None);
-        let lg = lay(ui, level_text, Font::mono_micro(d));
-        draw_galley(ui, tag.center() - lg.size() / 2.0, lg, fg);
-        x += tag_w + gap;
-
-        let color = if level == Status::Info {
-            t.text_secondary
-        } else {
-            fg
-        };
-        let mg = lay(ui, message, Font::meta(d));
-        draw_galley(ui, pos2(x, rect.center().y - mg.size().y / 2.0), mg, color);
-        resp
+    // 行上盖着几个 Label，它们会挡掉整行 Response 的 hover；底色按几何命中判，
+    // 不看 `response.hovered()`。
+    if row.level == Status::Error {
+        ui.painter().rect_filled(rect, CornerRadius::ZERO, bg);
+    } else if ui.rect_contains_pointer(rect) {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::ZERO, t.bg_hover);
     }
+
+    let pad = d.px(14.0);
+    let gap = d.px(12.0);
+
+    // 行尾先摆：正文能写到哪由处置入口占了多少宽度决定，不先摆的话长消息会
+    // 直接压在按钮底下。
+    let mut tail = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(Rect::from_min_max(
+                pos2(rect.left() + pad, rect.top()),
+                pos2(rect.right() - pad, rect.bottom()),
+            ))
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+    );
+    let trailing = trailing(&mut tail);
+    let tail_w = tail.min_rect().width();
+    let right = rect.right() - pad - if tail_w > 0.0 { tail_w + gap } else { 0.0 };
+
+    let mut x = rect.left() + pad;
+    let time_w = lay(ui, row.time, Font::mono_meta(d)).size().x;
+    selectable_at(
+        ui,
+        Rect::from_min_max(pos2(x, rect.top()), pos2(x + time_w, rect.bottom())),
+        egui::RichText::new(row.time)
+            .font(Font::mono_meta(d))
+            .color(t.text_muted),
+        false,
+    );
+    x += time_w + gap;
+
+    let tag_w = d.px(52.0);
+    let tag = Rect::from_min_size(
+        pos2(x, rect.center().y - d.px(16.0) / 2.0),
+        vec2(tag_w, d.px(16.0)),
+    );
+    fill_rect(ui, tag, radius::SM, bg, None);
+    selectable_at(
+        ui,
+        tag,
+        egui::RichText::new(row.level_text)
+            .font(Font::mono_micro(d))
+            .color(fg),
+        false,
+    );
+    x += tag_w + gap;
+
+    // INFO 用次级色，让 WARN / ERROR 在一屏里跳出来。
+    let color = if row.level == Status::Info {
+        t.text_secondary
+    } else {
+        fg
+    };
+    let message = selectable_at(
+        ui,
+        Rect::from_min_max(pos2(x, rect.top()), pos2(right.max(x), rect.bottom())),
+        egui::RichText::new(row.message)
+            .font(Font::meta(d))
+            .color(color),
+        true,
+    );
+
+    LogRowOut {
+        response,
+        message,
+        trailing,
+    }
+}
+
+/// 在指定矩形里左对齐地放一段可选中文本。`truncate` 为真时按矩形宽度截断并加省略号
+/// ——整段被选中时 egui 复制的是未截断原文，所以截断不影响抄走完整内容。
+fn selectable_at(ui: &mut Ui, rect: Rect, text: egui::RichText, truncate: bool) -> Response {
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        |ui| {
+            let label = egui::Label::new(text).selectable(true);
+            ui.add(if truncate { label.truncate() } else { label })
+        },
+    )
+    .inner
 }
 
 // ---------------------------------------------------------------- 容器

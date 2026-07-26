@@ -24,6 +24,8 @@ egui_inspection = "0.35"
 
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 anyhow = "1"
+# 命令行视图的本地时钟时间戳。aios_core 链上已经带进来了，不新增下载
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # egui upstream advice: optimize deps for runtime smoothness, keep own code at 0 for fast incremental builds
 [profile.dev.package."*"]

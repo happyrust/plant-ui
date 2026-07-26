@@ -1,12 +1,14 @@
 //! plant-ui-app：独立可执行外壳（eframe + plant-ui + plant-ui-data）。
 //! 默认进入主工作台 S1；`--gallery` 进入 M0 组件画廊。
 
+mod console;
 mod data;
 mod fonts;
 mod gallery;
 
 use std::collections::{HashMap, HashSet};
 
+use console::Retry;
 use eframe::egui;
 use plant_ui::Cmd;
 use plant_ui::style::theme_tokens::{self, set_weight_families_ready};
@@ -27,7 +29,7 @@ fn main() -> eframe::Result {
         "plant-ui",
         options,
         Box::new(move |cc| {
-            let defs = fonts::definitions();
+            let (defs, warnings) = fonts::definitions();
             let weights_ready = defs.font_data.contains_key(fonts::MEDIUM);
             cc.egui_ctx.set_fonts(defs);
             set_weight_families_ready(weights_ready);
@@ -35,7 +37,7 @@ fn main() -> eframe::Result {
             if gallery {
                 Ok(Box::new(gallery::GalleryApp::default()))
             } else {
-                Ok(Box::new(App::new(cc.egui_ctx.clone())))
+                Ok(Box::new(App::new(cc.egui_ctx.clone(), warnings)))
             }
         }),
     )
@@ -83,6 +85,17 @@ impl TreeModel {
     fn element_count(&self) -> usize {
         self.roots.len() + self.children.values().map(Vec::len).sum::<usize>()
     }
+
+    /// 命令行里指认某个节点用的短名，形如 `EQUI /VESSEL-01`（name 自带前导斜杠）。
+    /// 缓存里找不到就退回 refno——它至少还能在树上定位。
+    fn label(&self, refno: RefU64) -> String {
+        self.roots
+            .iter()
+            .chain(self.children.values().flatten())
+            .find(|n| n.refno.refno() == refno)
+            .map(|n| format!("{} {}", n.noun, n.name))
+            .unwrap_or_else(|| refno.to_string())
+    }
 }
 
 struct App {
@@ -90,11 +103,12 @@ struct App {
     state: WorkbenchState,
     bridge: data::Bridge,
     tree: TreeModel,
+    console: console::Console,
 }
 
 impl App {
-    fn new(ctx: egui::Context) -> Self {
-        Self {
+    fn new(ctx: egui::Context, font_warnings: Vec<String>) -> Self {
+        let mut app = Self {
             // 连接前不摆任何工程数据：项目 / 库标识等 Ready 事件带真实值。
             vm: WorkbenchVm {
                 user: std::env::var("USERNAME").unwrap_or_else(|_| "user".into()),
@@ -103,7 +117,13 @@ impl App {
             state: WorkbenchState::default(),
             bridge: data::spawn(ctx),
             tree: TreeModel::default(),
+            console: console::Console::default(),
+        };
+        for w in font_warnings {
+            app.console.warn(&mut app.vm.console, w);
         }
+        app.console.info(&mut app.vm.console, "正在连接数据源…");
+        app
     }
 
     fn pump_events(&mut self) {
@@ -111,6 +131,13 @@ impl App {
         while let Ok(evt) = self.bridge.evt.try_recv() {
             match evt {
                 data::Evt::Ready(Ok(info)) => {
+                    let msg = format!(
+                        "已连接 {}（{}），根层 {} 个 SITE",
+                        info.project,
+                        db_label(&info.ns, &info.db_nums),
+                        info.sites.len()
+                    );
+                    self.console.info(&mut self.vm.console, msg);
                     self.vm.data_source_ok = true;
                     self.vm.project = info.project;
                     self.vm.db = db_label(&info.ns, &info.db_nums);
@@ -119,25 +146,43 @@ impl App {
                 }
                 data::Evt::Ready(Err(e)) => {
                     self.vm.tree = TreeVm::Failed(format!("数据源连接失败：{e:#}"));
+                    self.console.error(
+                        &mut self.vm.console,
+                        "数据源连接失败",
+                        &e,
+                        Some(Retry::Connect),
+                    );
                 }
                 data::Evt::Children(refno, Ok(kids)) => {
                     self.tree.loading.remove(&refno);
+                    let msg = format!("{} 展开：{} 个子元素", self.tree.label(refno), kids.len());
+                    self.console.info(&mut self.vm.console, msg);
                     self.tree.children.insert(refno, kids);
                     dirty = true;
                 }
                 data::Evt::Children(refno, Err(e)) => {
-                    // 展开失败就收回箭头，别让行卡在「加载中」；详情先落日志，
-                    // M1-4 命令行视图接上后再上屏。
+                    // 展开失败就收回箭头，别让行卡在「加载中」。
                     self.tree.loading.remove(&refno);
                     self.tree.expanded.remove(&refno);
-                    eprintln!("[data] 子层加载失败 {refno:?}: {e:#}");
+                    let msg = format!("{} 子层加载失败", self.tree.label(refno));
+                    self.console
+                        .error(&mut self.vm.console, msg, &e, Some(Retry::Children(refno)));
                     dirty = true;
                 }
                 // 晚到的旧选中结果直接丢弃，属性面板只认当前选中。
                 data::Evt::Props(refno, result) if self.vm.selected == Some(refno) => {
                     self.vm.props = match result {
                         Ok(kvs) => PropsVm::Ready(self.build_props(refno, kvs)),
-                        Err(e) => PropsVm::Failed(format!("属性查询失败：{e:#}")),
+                        Err(e) => {
+                            let msg = format!("{} 属性查询失败", self.tree.label(refno));
+                            self.console.error(
+                                &mut self.vm.console,
+                                msg,
+                                &e,
+                                Some(Retry::Props(refno)),
+                            );
+                            PropsVm::Failed(format!("属性查询失败：{e:#}"))
+                        }
                     };
                 }
                 data::Evt::Props(..) => {}
@@ -192,8 +237,33 @@ impl App {
                             data.name = value.clone();
                         }
                     }
-                    eprintln!("[edit] {refno:?} {attr} = {value}（未写回数据库）");
+                    let msg = format!(
+                        "{} {attr} = {value}（仅改内存，未写回数据库）",
+                        self.tree.label(refno)
+                    );
+                    self.console.warn(&mut self.vm.console, msg);
                 }
+                Cmd::RetryLog(id) => match self.console.retry_of(id) {
+                    Some(Retry::Connect) => {
+                        self.console.info(&mut self.vm.console, "正在重连数据源…");
+                        let _ = self.bridge.req.send(data::Req::Reconnect);
+                    }
+                    Some(Retry::Children(refno)) => {
+                        // 重试即重新展开：箭头上次失败时被收回了，这里一并推回展开态。
+                        self.tree.expanded.insert(refno);
+                        if self.tree.loading.insert(refno) {
+                            let _ = self.bridge.req.send(data::Req::Children(refno));
+                        }
+                        dirty = true;
+                    }
+                    Some(Retry::Props(refno)) if self.vm.selected == Some(refno) => {
+                        self.vm.props = PropsVm::Loading;
+                        let _ = self.bridge.req.send(data::Req::Props(refno));
+                    }
+                    // 选中早就挪走的话，属性重查回来也没地方摆，直接跳过。
+                    _ => {}
+                },
+                Cmd::ClearConsole => self.console.clear(&mut self.vm.console),
             }
         }
         if dirty {
@@ -227,17 +297,23 @@ impl App {
             match row.attr.as_str() {
                 "TYPE" => {
                     data.noun = row.value.clone();
-                    common.insert("TYPE".into(), PropRowVm {
-                        key: "类型".into(),
-                        ..row
-                    });
+                    common.insert(
+                        "TYPE".into(),
+                        PropRowVm {
+                            key: "类型".into(),
+                            ..row
+                        },
+                    );
                 }
                 "NAME" => {
                     data.name = row.value.clone();
-                    common.insert("NAME".into(), PropRowVm {
-                        key: "名称".into(),
-                        ..row
-                    });
+                    common.insert(
+                        "NAME".into(),
+                        PropRowVm {
+                            key: "名称".into(),
+                            ..row
+                        },
+                    );
                 }
                 "OWNER" => {
                     common.insert("OWNER".into(), row);

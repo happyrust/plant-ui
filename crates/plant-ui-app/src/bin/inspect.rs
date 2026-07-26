@@ -8,6 +8,8 @@
 //! 应用需带 `EGUI_INSPECTION=1` 启动。用法：
 //!   inspect tree [关键字]         列控件：角色 / 文本 / 逻辑坐标包围盒，给了关键字就只列匹配的
 //!   inspect click <x> <y>         在逻辑坐标点一下
+//!   inspect drag <x0> <y0> <x1> <y1>  按住左键从一点拖到另一点（选文本、拖分隔条）
+//!   inspect copy                  发一次复制事件，选中的文本进系统剪贴板
 //!   inspect scroll <x> <y> <dy>   在逻辑坐标滚一下（dy 正值内容下移）
 //!   inspect type <文本>           往当前焦点控件敲一段文本
 //!   inspect key <键>              敲一个键：enter / esc / tab / backspace / ctrl+a
@@ -15,7 +17,7 @@
 
 use std::net::TcpStream;
 
-use egui::{Key, Modifiers, MouseWheelUnit, PointerButton, TouchPhase, pos2, vec2};
+use egui::{Key, Modifiers, MouseWheelUnit, PointerButton, Pos2, TouchPhase, pos2, vec2};
 use egui_inspection::protocol::{Request, Response, read_handshake, read_message, write_message};
 
 const ADDR: &str = "127.0.0.1:5719";
@@ -43,6 +45,11 @@ fn main() -> anyhow::Result<()> {
                 },
             ])
         }
+        "drag" => drag(
+            pos2(num(&args, 1)?, num(&args, 2)?),
+            pos2(num(&args, 3)?, num(&args, 4)?),
+        ),
+        "copy" => apply(vec![egui::Event::Copy]),
         "scroll" => {
             let (x, y, dy) = (num(&args, 1)?, num(&args, 2)?, num(&args, 3)?);
             apply(vec![
@@ -79,7 +86,9 @@ fn main() -> anyhow::Result<()> {
         }
         "shot" => shot(args.get(1).map(String::as_str).unwrap_or("shot.png")),
         other => {
-            anyhow::bail!("未知命令 {other}；可用：tree / click / scroll / type / key / shot")
+            anyhow::bail!(
+                "未知命令 {other}；可用：tree / click / drag / copy / scroll / type / key / shot"
+            )
         }
     }
 }
@@ -124,6 +133,35 @@ fn request(req: &Request) -> anyhow::Result<Response> {
 
 fn apply(events: Vec<egui::Event>) -> anyhow::Result<()> {
     request(&Request::ApplyEvents { events })?;
+    println!("ok");
+    Ok(())
+}
+
+/// 按住左键从 `from` 拖到 `to`。拆成三次请求发：拖动在 egui 里是跨帧状态机，
+/// 按下 / 移动 / 松开挤进同一帧只会被当成一次点击，选不出文本。
+fn drag(from: Pos2, to: Pos2) -> anyhow::Result<()> {
+    request(&Request::ApplyEvents {
+        events: vec![
+            egui::Event::PointerMoved(from),
+            egui::Event::PointerButton {
+                pos: from,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+    })?;
+    request(&Request::ApplyEvents {
+        events: vec![egui::Event::PointerMoved(to)],
+    })?;
+    request(&Request::ApplyEvents {
+        events: vec![egui::Event::PointerButton {
+            pos: to,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }],
+    })?;
     println!("ok");
     Ok(())
 }

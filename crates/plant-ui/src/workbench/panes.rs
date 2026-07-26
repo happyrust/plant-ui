@@ -114,7 +114,8 @@ impl TabViewer for Viewer<'_> {
         match tab {
             Pane::ModelTree => super::tree::show(ui, self.t, self.d, self.vm, self.cmds),
             Pane::Properties => super::props::show(ui, self.t, self.d, self.vm, self.cmds),
-            // 命令行与三维视图仍是占位，M1-4 / M1-5 换成真实内容。
+            Pane::Console => super::console::show(ui, self.t, self.d, self.vm, self.cmds),
+            // 三维视图仍是占位，M1-5 换成真实内容。
             _ => placeholder(ui, self.t, self.d, *tab),
         }
     }
