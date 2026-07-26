@@ -30,7 +30,27 @@ M2-3 说「38 个 plugin 里 UI 与业务逻辑混在一起，删之前必须逐
 `search_plugin`、`ssc_setting_plugin`、`suspension_and_support_plugin`、
 `through_wall_construction_plugin`、`virtual_hole_plugin`。
 
-其中两处容易踩：
+### 删除前的核对（已做）
+
+「不参与编译所以删了没事」这句要经得起查，核过四项：
+
+1. 全仓库没有任何 `#[path = ...]` 指向这 21 个目录；`include!` / `include_bytes!`
+   只有四处，都指向 `assets/`，唯一落在待删目录里的那处在 `docs_plugin` 自己身上。
+2. `Cargo.toml` 里没有提到它们中的任何一个。
+3. 活代码里唯一提到的是 `virtual_hole_plugin`，出现在 `e3d_plugin` 的
+   `data_state/state.rs:19` 与 `asset_loader/virtual_hole_loader.rs:6`，**且没有被注释**。
+4. 但这两个文件本身也没参与编译——`data_state/mod.rs` 里是 `// pub mod state;`，
+   `asset_loader/mod.rs` 里是 `// pub(crate) mod virtual_hole_loader;`。
+
+第 3、4 两条合起来是这次核对最值得记的一点：**判据不能是「文件在不在」，得是
+「文件能不能从模块树走到」**。按文件存在与否去数，`e3d_plugin` 里这两个文件会被
+误判成活代码，进而把 `virtual_hole_plugin` 误判成还有人依赖。
+
+顺带得到一个附加结论：**死代码不只在那 21 个目录里，活插件内部也有**
+（`e3d_plugin/data_state/state.rs`、`asset_loader/` 下三个 loader 等）。
+这些不在 M2 的清单上，但清理它们的风险与那 21 个目录同级。
+
+### 两处容易踩的坑
 
 - **`metadata_plugin` 与 `meta_data_plugin` 是两个不同的目录**，只差一个下划线。
   前者已注释、是死的；后者在编译、注册着 `EditorTab::MetaDataTab`。别删错。
