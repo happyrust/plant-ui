@@ -60,9 +60,11 @@ pub fn current() -> Tokens {
 
 pub fn apply(ctx: &Context, t: &Tokens, d: Density) {
     DARK.store(t.dark, Ordering::Relaxed);
-    let mut style = Style::default();
-    style.visuals = visuals(t);
-    style.text_styles = text_styles(d);
+    let mut style = Style {
+        visuals: visuals(t),
+        text_styles: text_styles(d),
+        ..Default::default()
+    };
     style.spacing.item_spacing = Vec2::new(d.px(8.0), d.px(6.0));
     style.spacing.button_padding = Vec2::new(d.px(10.0), d.px(4.0));
     style.spacing.menu_margin = Margin::same(d.px(6.0) as i8);

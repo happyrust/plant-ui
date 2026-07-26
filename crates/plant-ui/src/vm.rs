@@ -27,6 +27,18 @@ pub struct WorkbenchVm {
     pub props: PropsVm,
     /// 命令行视图（M1-4）。
     pub console: ConsoleVm,
+    /// 三维视口的画面（M1-5 是占位纹理，M3 换成 Bevy 的渲染目标）。
+    /// `None` = 还没有可画的东西。
+    pub view3d: Option<View3dVm>,
+}
+
+/// 三维视口对绘制层就是一张纹理。M1-5 里它是磁盘上的占位图，M3 接回 Bevy 后
+/// 换成每帧更新的渲染目标，这一层不用改。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct View3dVm {
+    pub texture: egui::TextureId,
+    /// 纹理的像素尺寸。视口要按它等比裁切铺满，不然图会被拉变形。
+    pub size: egui::Vec2,
 }
 
 /// 命令行视图数据。

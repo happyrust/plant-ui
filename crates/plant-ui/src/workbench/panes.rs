@@ -6,13 +6,12 @@
 //! 已知与设计稿的偏差：egui_dock 的 Style 表达不了「激活页签顶部 2px 强调条」，
 //! 这里用「激活页签底色与面板底色合并」表达；自绘页签是后续单独的增强项。
 
-use egui::{Color32, CornerRadius, Margin, RichText, Stroke, Ui};
+use egui::{Color32, CornerRadius, Margin, Stroke, Ui};
 use egui_dock::{Style as DockStyle, TabViewer};
 use egui_phosphor::regular as ph;
 
 use crate::Cmd;
-use crate::style::theme_tokens::Font;
-use crate::style::tokens::{Density, Tokens, space};
+use crate::style::tokens::{Density, Tokens};
 use crate::vm::WorkbenchVm;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -30,16 +29,6 @@ impl Pane {
             Pane::View3d => (ph::CUBE, "三维视图"),
             Pane::Console => (ph::TERMINAL_WINDOW, "命令行"),
             Pane::Properties => (ph::SLIDERS_HORIZONTAL, "属性"),
-        }
-    }
-
-    /// 该视图由哪个里程碑接入真实内容（占位文案用）。
-    fn milestone(self) -> &'static str {
-        match self {
-            Pane::ModelTree => "M1-2",
-            Pane::Properties => "M1-3",
-            Pane::Console => "M1-4",
-            Pane::View3d => "M1-5",
         }
     }
 }
@@ -115,40 +104,11 @@ impl TabViewer for Viewer<'_> {
             Pane::ModelTree => super::tree::show(ui, self.t, self.d, self.vm, self.cmds),
             Pane::Properties => super::props::show(ui, self.t, self.d, self.vm, self.cmds),
             Pane::Console => super::console::show(ui, self.t, self.d, self.vm, self.cmds),
-            // 三维视图仍是占位，M1-5 换成真实内容。
-            _ => placeholder(ui, self.t, self.d, *tab),
+            Pane::View3d => super::view3d::show(ui, self.t, self.d, self.vm),
         }
     }
 
     fn closeable(&mut self, _tab: &mut Self::Tab) -> bool {
         false
     }
-}
-
-fn placeholder(ui: &mut Ui, t: &Tokens, d: Density, pane: Pane) {
-    egui::Frame::new().fill(t.bg_panel).show(ui, |ui| {
-        ui.set_min_size(ui.available_size());
-        ui.vertical_centered(|ui| {
-            ui.add_space(d.px(40.0));
-            ui.label(
-                RichText::new(ph::CUBE_TRANSPARENT)
-                    .font(egui::FontId::new(
-                        d.px(28.0),
-                        egui::FontFamily::Proportional,
-                    ))
-                    .color(t.text_muted),
-            );
-            ui.add_space(space::S2);
-            ui.label(
-                RichText::new(format!("{} 尚未接入", pane.title().1))
-                    .font(Font::label(d))
-                    .color(t.text_secondary),
-            );
-            ui.label(
-                RichText::new(format!("将在 {} 接入真实内容", pane.milestone()))
-                    .font(Font::meta(d))
-                    .color(t.text_muted),
-            );
-        });
-    });
 }

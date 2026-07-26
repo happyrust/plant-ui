@@ -26,6 +26,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 anyhow = "1"
 # 命令行视图的本地时钟时间戳。aios_core 链上已经带进来了，不新增下载
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# 三维视口的占位纹理。只开这两种编码，够读 assets/textures 下的图；
+# 包本身与两个解码器链上都已有，vendor 里不新增
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 # egui upstream advice: optimize deps for runtime smoothness, keep own code at 0 for fast incremental builds
 [profile.dev.package."*"]

@@ -8,6 +8,7 @@ pub mod console;
 pub mod panes;
 pub mod props;
 pub mod tree;
+pub mod view3d;
 
 pub use panes::Pane;
 

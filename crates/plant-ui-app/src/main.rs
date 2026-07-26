@@ -5,6 +5,7 @@ mod console;
 mod data;
 mod fonts;
 mod gallery;
+mod textures;
 
 use std::collections::{HashMap, HashSet};
 
@@ -13,7 +14,9 @@ use eframe::egui;
 use plant_ui::Cmd;
 use plant_ui::style::theme_tokens::{self, set_weight_families_ready};
 use plant_ui::style::tokens::{Density, Tokens};
-use plant_ui::vm::{PropKind, PropRowVm, PropsDataVm, PropsVm, TreeRowVm, TreeVm, WorkbenchVm};
+use plant_ui::vm::{
+    PropKind, PropRowVm, PropsDataVm, PropsVm, TreeRowVm, TreeVm, View3dVm, WorkbenchVm,
+};
 use plant_ui::workbench::{self, WorkbenchState};
 use plant_ui_data::{EleTreeNode, RefU64};
 
@@ -104,6 +107,8 @@ struct App {
     bridge: data::Bridge,
     tree: TreeModel,
     console: console::Console,
+    /// 占位纹理的所有者：句柄一丢纹理就被回收，Vm 里那个 id 会指向空。
+    _view3d_tex: Option<egui::TextureHandle>,
 }
 
 impl App {
@@ -115,12 +120,26 @@ impl App {
                 ..Default::default()
             },
             state: WorkbenchState::default(),
-            bridge: data::spawn(ctx),
+            bridge: data::spawn(ctx.clone()),
             tree: TreeModel::default(),
             console: console::Console::default(),
+            _view3d_tex: None,
         };
         for w in font_warnings {
             app.console.warn(&mut app.vm.console, w);
+        }
+        match textures::viewport_placeholder(&ctx) {
+            Ok(tex) => {
+                app.vm.view3d = Some(View3dVm {
+                    texture: tex.id(),
+                    size: tex.size_vec2(),
+                });
+                app._view3d_tex = Some(tex);
+            }
+            // 缺一张占位图不该拦住启动，但也不能悄悄少画一块——挂到命令行上。
+            Err(e) => app
+                .console
+                .error(&mut app.vm.console, "三维视口占位纹理载入失败", &e, None),
         }
         app.console.info(&mut app.vm.console, "正在连接数据源…");
         app

@@ -3956,6 +3956,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -5697,6 +5699,7 @@ dependencies = [
  "egui",
  "egui-phosphor",
  "egui_inspection",
+ "image",
  "plant-ui",
  "plant-ui-data",
  "tokio",
