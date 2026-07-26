@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["crates/plant-ui", "crates/plant-ui-data", "crates/plant-ui-app"]
+# vendor path deps must NOT be auto-absorbed as workspace members (would build with their own default features)
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,7 +15,7 @@ plant-ui-data = { path = "crates/plant-ui-data" }
 aios_core = { path = "vendor/rs-core", default-features = false }
 
 egui = "0.35.0"
-eframe = "0.35"
+eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts", "accesskit", "inspection"] }
 egui_extras = "0.35"
 egui_dock = "0.20.1"
 egui-phosphor = "0.13.0"
