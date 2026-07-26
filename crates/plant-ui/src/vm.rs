@@ -19,8 +19,11 @@ pub struct WorkbenchVm {
     pub data_source_ok: bool,
     /// 已加载元素计数（状态栏右侧）。
     pub element_count: usize,
-    /// 当前选中元素（状态栏；M1-6 起驱动属性视图跟随）。
+    /// 当前选中元素（状态栏 + 属性视图跟随）。
     pub selected: Option<RefU64>,
+    /// 一次性的「把这个元素滚进模型树视野」请求（M1-6：命令行定位过来时用）。
+    /// 绘制层只读，消费不掉自己，所以由 App 在每帧 `show` 之后清掉。
+    pub tree_reveal: Option<RefU64>,
     /// 模型树（M1-2）。
     pub tree: TreeVm,
     /// 属性视图（M1-3）。
@@ -83,12 +86,26 @@ pub struct LogLineVm {
     /// 本地时钟 HH:MM:SS，等宽渲染。
     pub time: String,
     pub level: LogLevel,
+    /// 这一行说的是哪个元素。Some 时正文前多一段可点的元素名，点它把模型树
+    /// 和属性视图一起带过去（M1-6）。
+    pub element: Option<LogElement>,
     /// 单行摘要，超出行宽截断。
     pub message: String,
     /// 完整信息（错误链等）；None = 摘要就是全部。
     pub detail: Option<String>,
     /// 该行对应的操作可以重来，行尾给「重试」。
     pub retryable: bool,
+}
+
+/// 日志行指向的元素。
+///
+/// 名字是**写这行日志那一刻**的名字，之后改名了也不回填——日志记的是当时发生了
+/// 什么。回指用的是 refno，名字改了照样定位得到。
+#[derive(Debug, Clone)]
+pub struct LogElement {
+    pub refno: RefU64,
+    /// 形如 `EQUI /VESSEL-01`；缓存里查不到名字时退回 refno。
+    pub label: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

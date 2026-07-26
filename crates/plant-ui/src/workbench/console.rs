@@ -132,6 +132,7 @@ fn row(ui: &mut Ui, t: &Tokens, d: Density, line: &LogLineVm, cmds: &mut Vec<Cmd
             time: &line.time,
             level: line.level.status(),
             level_text: line.level.label(),
+            element: line.element.as_ref().map(|e| e.label.as_str()),
             message: &line.message,
         },
         |ui| {
@@ -151,6 +152,12 @@ fn row(ui: &mut Ui, t: &Tokens, d: Density, line: &LogLineVm, cmds: &mut Vec<Cmd
     // 或者直接在行上拖选（时间 / 分级 / 正文都可选中）。
     if let Some(detail) = &line.detail {
         let _ = out.message.on_hover_text(detail);
+    }
+    if let (Some(resp), Some(el)) = (out.element, &line.element) {
+        if resp.clicked() {
+            cmds.push(Cmd::LocateElement(el.refno));
+        }
+        resp.on_hover_text(format!("定位到 {}", el.label));
     }
 }
 

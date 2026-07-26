@@ -9,6 +9,9 @@ pub mod workbench;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cmd {
     SelectElement(aios_core::RefU64),
+    /// 定位到元素：选中它、把树上挡着的祖先一路展开、再把行滚进视野。
+    /// 与 `SelectElement` 分开，是因为树上点行本来就看得见，不该跟着跳。
+    LocateElement(aios_core::RefU64),
     /// 展开 / 折叠模型树节点；子层未加载时由 App 侧懒加载。
     ToggleExpand(aios_core::RefU64),
     /// 属性面板提交了一次改值（回车或失焦）。`attr` 是真实属性名，

@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use plant_ui::vm::{ConsoleVm, LogCounts, LogLevel, LogLineVm};
+use plant_ui::vm::{ConsoleVm, LogCounts, LogElement, LogLevel, LogLineVm};
 use plant_ui_data::RefU64;
 
 /// 一条错误行对应的可重做操作。行尾「重试」按行号回指它。
@@ -28,11 +28,11 @@ pub struct Console {
 
 impl Console {
     pub fn info(&mut self, vm: &mut ConsoleVm, message: impl Into<String>) {
-        self.push(vm, LogLevel::Info, message.into(), None, None);
+        self.push(vm, LogLevel::Info, None, message.into(), None, None);
     }
 
     pub fn warn(&mut self, vm: &mut ConsoleVm, message: impl Into<String>) {
-        self.push(vm, LogLevel::Warn, message.into(), None, None);
+        self.push(vm, LogLevel::Warn, None, message.into(), None, None);
     }
 
     /// 错误行：摘要上屏、完整错误链进 detail（hover 看、行尾「复制」抄走）。
@@ -45,7 +45,43 @@ impl Console {
         retry: Option<Retry>,
     ) {
         let detail = format!("{err:#}");
-        self.push(vm, LogLevel::Error, message.into(), Some(detail), retry);
+        self.push(
+            vm,
+            LogLevel::Error,
+            None,
+            message.into(),
+            Some(detail),
+            retry,
+        );
+    }
+
+    /// 带元素的三种：正文前多一段可点的元素名，点它定位到树与属性（M1-6）。
+    /// 因此正文里不要再重复元素名。
+    pub fn info_of(&mut self, vm: &mut ConsoleVm, el: LogElement, message: impl Into<String>) {
+        self.push(vm, LogLevel::Info, Some(el), message.into(), None, None);
+    }
+
+    pub fn warn_of(&mut self, vm: &mut ConsoleVm, el: LogElement, message: impl Into<String>) {
+        self.push(vm, LogLevel::Warn, Some(el), message.into(), None, None);
+    }
+
+    pub fn error_of(
+        &mut self,
+        vm: &mut ConsoleVm,
+        el: LogElement,
+        message: impl Into<String>,
+        err: &anyhow::Error,
+        retry: Option<Retry>,
+    ) {
+        let detail = format!("{err:#}");
+        self.push(
+            vm,
+            LogLevel::Error,
+            Some(el),
+            message.into(),
+            Some(detail),
+            retry,
+        );
     }
 
     pub fn retry_of(&self, id: u64) -> Option<Retry> {
@@ -62,6 +98,7 @@ impl Console {
         &mut self,
         vm: &mut ConsoleVm,
         level: LogLevel,
+        element: Option<LogElement>,
         message: String,
         detail: Option<String>,
         retry: Option<Retry>,
@@ -75,6 +112,7 @@ impl Console {
             id,
             time: chrono::Local::now().format("%H:%M:%S").to_string(),
             level,
+            element,
             message,
             detail,
             retryable: retry.is_some(),

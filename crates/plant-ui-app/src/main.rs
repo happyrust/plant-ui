@@ -15,7 +15,7 @@ use plant_ui::Cmd;
 use plant_ui::style::theme_tokens::{self, set_weight_families_ready};
 use plant_ui::style::tokens::{Density, Tokens};
 use plant_ui::vm::{
-    PropKind, PropRowVm, PropsDataVm, PropsVm, TreeRowVm, TreeVm, View3dVm, WorkbenchVm,
+    LogElement, PropKind, PropRowVm, PropsDataVm, PropsVm, TreeRowVm, TreeVm, View3dVm, WorkbenchVm,
 };
 use plant_ui::workbench::{self, WorkbenchState};
 use plant_ui_data::{EleTreeNode, RefU64};
@@ -53,6 +53,8 @@ struct TreeModel {
     roots: Vec<EleTreeNode>,
     /// 已加载的子层，按父 refno 缓存。
     children: HashMap<RefU64, Vec<EleTreeNode>>,
+    /// 子 -> 父。命令行定位要顺着它把挡在目标前面的祖先一路展开。
+    parent: HashMap<RefU64, RefU64>,
     expanded: HashSet<RefU64>,
     /// 子层查询在途的节点。
     loading: HashSet<RefU64>,
@@ -98,6 +100,41 @@ impl TreeModel {
             .find(|n| n.refno.refno() == refno)
             .map(|n| format!("{} {}", n.noun, n.name))
             .unwrap_or_else(|| refno.to_string())
+    }
+
+    /// 日志行里的元素引用。名字按当下的缓存取一次，之后不再回填。
+    fn element(&self, refno: RefU64) -> LogElement {
+        LogElement {
+            refno,
+            label: self.label(refno),
+        }
+    }
+
+    fn is_root(&self, refno: RefU64) -> bool {
+        self.roots.iter().any(|n| n.refno.refno() == refno)
+    }
+
+    /// 从最近的父到 SITE 根的祖先链；不在已加载的树里就是 None。
+    ///
+    /// 不必为此发查询：能被日志提到的元素都是从某个父层查回来的，那一层连同它上面
+    /// 每一层都还在缓存里（缓存只增不减）。
+    fn ancestors(&self, refno: RefU64) -> Option<Vec<RefU64>> {
+        if self.is_root(refno) {
+            return Some(Vec::new());
+        }
+        let mut chain = Vec::new();
+        let mut cur = refno;
+        // 数据异常造出环的话这里会转不出去，按缓存规模封顶兜一下——挂住 UI 线程
+        // 比定位错了严重得多。
+        for _ in 0..=self.parent.len() {
+            let p = *self.parent.get(&cur)?;
+            chain.push(p);
+            if self.is_root(p) {
+                return Some(chain);
+            }
+            cur = p;
+        }
+        None
     }
 }
 
@@ -174,8 +211,12 @@ impl App {
                 }
                 data::Evt::Children(refno, Ok(kids)) => {
                     self.tree.loading.remove(&refno);
-                    let msg = format!("{} 展开：{} 个子元素", self.tree.label(refno), kids.len());
-                    self.console.info(&mut self.vm.console, msg);
+                    let el = self.tree.element(refno);
+                    let msg = format!("展开：{} 个子元素", kids.len());
+                    self.console.info_of(&mut self.vm.console, el, msg);
+                    for kid in &kids {
+                        self.tree.parent.insert(kid.refno.refno(), refno);
+                    }
                     self.tree.children.insert(refno, kids);
                     dirty = true;
                 }
@@ -183,9 +224,14 @@ impl App {
                     // 展开失败就收回箭头，别让行卡在「加载中」。
                     self.tree.loading.remove(&refno);
                     self.tree.expanded.remove(&refno);
-                    let msg = format!("{} 子层加载失败", self.tree.label(refno));
-                    self.console
-                        .error(&mut self.vm.console, msg, &e, Some(Retry::Children(refno)));
+                    let el = self.tree.element(refno);
+                    self.console.error_of(
+                        &mut self.vm.console,
+                        el,
+                        "子层加载失败",
+                        &e,
+                        Some(Retry::Children(refno)),
+                    );
                     dirty = true;
                 }
                 // 晚到的旧选中结果直接丢弃，属性面板只认当前选中。
@@ -193,10 +239,11 @@ impl App {
                     self.vm.props = match result {
                         Ok(kvs) => PropsVm::Ready(self.build_props(refno, kvs)),
                         Err(e) => {
-                            let msg = format!("{} 属性查询失败", self.tree.label(refno));
-                            self.console.error(
+                            let el = self.tree.element(refno);
+                            self.console.error_of(
                                 &mut self.vm.console,
-                                msg,
+                                el,
+                                "属性查询失败",
                                 &e,
                                 Some(Retry::Props(refno)),
                             );
@@ -216,12 +263,30 @@ impl App {
         let mut dirty = false;
         for cmd in cmds {
             match cmd {
-                Cmd::SelectElement(refno) => {
-                    if self.vm.selected != Some(refno) {
-                        self.vm.selected = Some(refno);
-                        self.vm.props = PropsVm::Loading;
-                        let _ = self.bridge.req.send(data::Req::Props(refno));
+                Cmd::SelectElement(refno) => self.select(refno),
+                // 命令行点元素名过来的：先把挡着的祖先展开、记下要滚到哪一行，
+                // 再走一遍与树上点选相同的选中路径，属性视图自然跟上。
+                Cmd::LocateElement(refno) => {
+                    match self.tree.ancestors(refno) {
+                        Some(chain) => {
+                            for ancestor in chain {
+                                self.tree.expanded.insert(ancestor);
+                            }
+                            self.vm.tree_reveal = Some(refno);
+                            dirty = true;
+                        }
+                        // 按缓存只增不减的前提到不了这里。真到了也得说一声，
+                        // 不能点了没动静。
+                        None => {
+                            let el = self.tree.element(refno);
+                            self.console.warn_of(
+                                &mut self.vm.console,
+                                el,
+                                "不在已加载的模型树里，只切了属性",
+                            );
+                        }
                     }
+                    self.select(refno);
                 }
                 Cmd::ToggleExpand(refno) => {
                     if !self.tree.expanded.remove(&refno) {
@@ -256,11 +321,9 @@ impl App {
                             data.name = value.clone();
                         }
                     }
-                    let msg = format!(
-                        "{} {attr} = {value}（仅改内存，未写回数据库）",
-                        self.tree.label(refno)
-                    );
-                    self.console.warn(&mut self.vm.console, msg);
+                    let el = self.tree.element(refno);
+                    let msg = format!("{attr} = {value}（仅改内存，未写回数据库）");
+                    self.console.warn_of(&mut self.vm.console, el, msg);
                 }
                 Cmd::RetryLog(id) => match self.console.retry_of(id) {
                     Some(Retry::Connect) => {
@@ -288,6 +351,16 @@ impl App {
         if dirty {
             self.rebuild_tree();
         }
+    }
+
+    /// 选中元素并让属性视图跟上。重复选同一个不再发查询。
+    fn select(&mut self, refno: RefU64) {
+        if self.vm.selected == Some(refno) {
+            return;
+        }
+        self.vm.selected = Some(refno);
+        self.vm.props = PropsVm::Loading;
+        let _ = self.bridge.req.send(data::Req::Props(refno));
     }
 
     fn rebuild_tree(&mut self) {
@@ -388,6 +461,12 @@ impl eframe::App for App {
         let t = theme_tokens::current();
         let d = Density::Standard;
         let cmds = workbench::show(ui, &t, d, &self.vm, &mut self.state);
+        // 定位请求只管一帧：树刚才已经滚过去了，绘制层只读、消费不掉自己。
+        self.vm.tree_reveal = None;
         self.handle_cmds(cmds);
+        // 这一帧才记下的定位要等下一帧才画得出来，别让界面停在这儿等下一次输入。
+        if self.vm.tree_reveal.is_some() {
+            ui.ctx().request_repaint();
+        }
     }
 }

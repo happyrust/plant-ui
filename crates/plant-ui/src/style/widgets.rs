@@ -691,11 +691,15 @@ pub struct LogRow<'a> {
     pub time: &'a str,
     pub level: Status,
     pub level_text: &'a str,
+    /// 该行指向的元素名。Some 时正文前多一段 accent 色的可点文字。
+    pub element: Option<&'a str>,
     pub message: &'a str,
 }
 
 pub struct LogRowOut<R> {
     pub response: Response,
+    /// 元素名那一段的响应；`LogRow::element` 为 None 时也是 None。
+    pub element: Option<Response>,
     /// 正文那一段的响应。正文被截断时，调用点拿它挂完整文本的 tooltip。
     pub message: Response,
     pub trailing: R,
@@ -711,6 +715,8 @@ pub struct LogRowOut<R> {
 /// 想要单行不带空行的话走行尾的「复制」。
 ///
 /// `trailing` 在行尾从右往左画处置入口（重试 / 复制），正文按剩下的宽度截断。
+/// `element` 给出时在分级标签与正文之间插一段 accent 色的元素名，调用点拿
+/// `LogRowOut::element` 的点击回指该元素（M1-6 的命令行定位）。
 pub fn log_row_ui<R>(
     ui: &mut Ui,
     t: &Tokens,
@@ -776,6 +782,26 @@ pub fn log_row_ui<R>(
     );
     x += tag_w + gap;
 
+    // 元素名：accent 色 + 悬停下划线，指认它是可点的。仍走 selectable 的 Label，
+    // 拖选整行时它跟着一起被抄走——egui 的可选中 Label 本身就 sense 点击，
+    // 不必为了可点而换成 Link 把这段从选区里挖掉。
+    let element = row.element.map(|name| {
+        // 长 PDMS 名不许把正文挤没，超过四成行宽就截断。
+        let want = lay(ui, name, Font::mono_meta(d)).size().x;
+        let w = want.min((right - x) * 0.4).max(0.0);
+        let elem_rect = Rect::from_min_max(pos2(x, rect.top()), pos2(x + w, rect.bottom()));
+        let hovered = ui.rect_contains_pointer(elem_rect);
+        let mut text = egui::RichText::new(name)
+            .font(Font::mono_meta(d))
+            .color(t.accent);
+        if hovered {
+            text = text.underline();
+        }
+        let out = selectable_at(ui, elem_rect, text, want > w);
+        x += w + gap;
+        out
+    });
+
     // INFO 用次级色，让 WARN / ERROR 在一屏里跳出来。
     let color = if row.level == Status::Info {
         t.text_secondary
@@ -793,6 +819,7 @@ pub fn log_row_ui<R>(
 
     LogRowOut {
         response,
+        element,
         message,
         trailing,
     }
