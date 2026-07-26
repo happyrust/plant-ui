@@ -201,7 +201,8 @@ impl App {
                     dirty = true;
                 }
                 data::Evt::Ready(Err(e)) => {
-                    self.vm.tree = TreeVm::Failed(format!("数据源连接失败：{e:#}"));
+                    self.vm.tree =
+                        TreeVm::Failed(format!("数据源连接失败：{}", console::error_chain(&e)));
                     self.console.error(
                         &mut self.vm.console,
                         "数据源连接失败",
@@ -247,7 +248,7 @@ impl App {
                                 &e,
                                 Some(Retry::Props(refno)),
                             );
-                            PropsVm::Failed(format!("属性查询失败：{e:#}"))
+                            PropsVm::Failed(format!("属性查询失败：{}", console::error_chain(&e)))
                         }
                     };
                 }

@@ -19,6 +19,32 @@ pub enum Retry {
 /// 缓冲上限。命令行是给人看的，留最近这些足够；再多只会拖慢筛选与滚动。
 const CAP: usize = 2000;
 
+/// 错误链的显示文本，同一句话只说一遍。
+///
+/// anyhow 的 `{:#}` 把整条链用 ": " 串起来，但外层错误的 Display 常常已经把 source
+/// 的原文抄了进去（thiserror 的 `#[error("...{0}")]` 就是这个形状），于是同一句话在
+/// 链上出现两遍。实测数据源连不上时那句 WS 错误正好重复一次，在模型树面板上占掉四行。
+///
+/// 不能改用 `{}` 了事：那样只留最外层，外层信息笼统而真因在 source 里的时候就把话
+/// 说没了。这里按「已经说过的不再说、说得更全的顶掉说得少的」压一遍，既去重也不丢。
+pub fn error_chain(err: &anyhow::Error) -> String {
+    let mut out = String::new();
+    for cause in err.chain() {
+        let text = cause.to_string();
+        if out.contains(&text) {
+            continue;
+        }
+        // 空串被任何串包含，所以第一轮天然走这条分支。
+        if text.contains(&out) {
+            out = text;
+        } else {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+    }
+    out
+}
+
 #[derive(Default)]
 pub struct Console {
     next_id: u64,
@@ -44,7 +70,7 @@ impl Console {
         err: &anyhow::Error,
         retry: Option<Retry>,
     ) {
-        let detail = format!("{err:#}");
+        let detail = error_chain(err);
         self.push(
             vm,
             LogLevel::Error,
@@ -73,7 +99,7 @@ impl Console {
         err: &anyhow::Error,
         retry: Option<Retry>,
     ) {
-        let detail = format!("{err:#}");
+        let detail = error_chain(err);
         self.push(
             vm,
             LogLevel::Error,
