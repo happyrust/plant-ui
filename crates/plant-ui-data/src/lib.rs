@@ -145,11 +145,7 @@ fn fmt_attr(v: &aios_core::NamedAttrValue) -> String {
             .map(|b| if *b { "true" } else { "false" })
             .collect::<Vec<_>>()
             .join(" "),
-        V::IntArrayType(xs) => xs
-            .iter()
-            .map(i32::to_string)
-            .collect::<Vec<_>>()
-            .join(" "),
+        V::IntArrayType(xs) => xs.iter().map(i32::to_string).collect::<Vec<_>>().join(" "),
         V::RefU64Type(r) => r.to_string(),
         V::RefnoEnumType(r) => r.refno().to_string(),
         V::RefU64Array(rs) => rs

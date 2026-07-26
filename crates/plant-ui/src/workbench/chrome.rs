@@ -4,9 +4,7 @@
 //! 设计稿上的已应用 sesno / 文件 sesno / 待更新批次 / 待重试单元属于 gen-model
 //! 侧，等 M4-4 定下数据边界后再补，宁可少一格。
 
-use egui::{
-    Align, Color32, CornerRadius, Layout, Margin, RichText, Sense, Stroke, Ui, pos2, vec2,
-};
+use egui::{Align, Color32, CornerRadius, Layout, Margin, RichText, Sense, Stroke, Ui, pos2, vec2};
 use egui_phosphor::regular as ph;
 
 use crate::style::theme_tokens::Font;
@@ -78,7 +76,11 @@ pub fn command_bar(ui: &mut Ui, t: &Tokens, d: Density, _vm: &WorkbenchVm) {
                 ui.add_space(space::S2);
                 divider(ui, t, d);
                 ui.add_space(space::S2);
-                for icon in [ph::ARROW_COUNTER_CLOCKWISE, ph::ARROW_CLOCKWISE, ph::FLOPPY_DISK] {
+                for icon in [
+                    ph::ARROW_COUNTER_CLOCKWISE,
+                    ph::ARROW_CLOCKWISE,
+                    ph::FLOPPY_DISK,
+                ] {
                     let _ = ui.add(widgets::tool_btn(t, d, icon, false));
                 }
 
@@ -183,10 +185,12 @@ fn logo(ui: &mut Ui, t: &Tokens, d: Density) {
 fn avatar(ui: &mut Ui, t: &Tokens, d: Density, name: &str) {
     let s = d.px(22.0);
     let (rect, _) = ui.allocate_exact_size(vec2(s, s), Sense::hover());
-    ui.painter().circle_filled(rect.center(), s / 2.0, t.accent_bg);
+    ui.painter()
+        .circle_filled(rect.center(), s / 2.0, t.accent_bg);
     let ch: String = name.chars().take(1).collect();
     let g = ui.painter().layout_no_wrap(ch, Font::micro(d), t.accent);
-    ui.painter().galley(rect.center() - g.size() / 2.0, g, t.accent);
+    ui.painter()
+        .galley(rect.center() - g.size() / 2.0, g, t.accent);
 }
 
 pub fn divider(ui: &mut Ui, t: &Tokens, d: Density) {
@@ -208,7 +212,10 @@ fn dot(ui: &mut Ui, d: Density, color: Color32) {
 fn meta_icon(ui: &mut Ui, d: Density, icon: &str, color: Color32) {
     ui.label(
         RichText::new(icon)
-            .font(egui::FontId::new(d.px(12.0), egui::FontFamily::Proportional))
+            .font(egui::FontId::new(
+                d.px(12.0),
+                egui::FontFamily::Proportional,
+            ))
             .color(color),
     );
 }
