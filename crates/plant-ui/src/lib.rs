@@ -2,6 +2,7 @@
 //! 不认识数据库、不认识 Bevy：输入 &Vm，输出 Vec<Cmd>。
 //! M0 骨架：占位面板只为验证依赖图与增量编译，组件层在 M0-6 迁入。
 
+pub mod style;
 pub mod vm;
 
 /// UI 发出的命令：独立应用直接执行，接进 Bevy 后转成 Event。
