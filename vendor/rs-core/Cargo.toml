@@ -1,0 +1,161 @@
+[package]
+name = "aios_core"
+version = "0.2.0"
+edition = "2024"
+resolver = "2"
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+default = [
+    "occ",
+    "gen_model",
+    "sql",
+    # "debug_spatial",
+] #"occ", "gen_model", "sql"
+occ = ["dep:opencascade"]
+render = ["dep:bevy_render"]
+manifold = ["dep:manifold-sys"]
+truck = [
+    # "dep:truck-base",
+    # "dep:truck-geotrait",
+    # "dep:truck-geometry",
+    # "dep:truck-polymesh",
+    # "dep:truck-topology",
+    # "dep:truck-modeling",
+    # "dep:truck-meshalgo",
+    # "dep:truck-stepio",
+]
+gen_model = ["manifold"]
+debug_expr = []
+debug_wire = []
+debug_spatial = []
+web = ["render"]
+sql = []
+hh = []
+
+
+[dependencies]
+strum = { version = "0.25.0", features = ["derive"] }
+strum_macros = "0.25"
+deku = "0.16.0"
+smol_str = { version = "0.3.2", features = ["serde"] }
+glam = { version = "0.29.3", features = ["serde", "rkyv"] }
+id_tree = { git = "https://gitee.com/happydpc/id_tree", features = [
+    "serde_support",
+] }
+dashmap = { version = "=7.0.0-rc2", features = ["serde"] }
+hexasphere = "15.0.0"
+anyhow = "1.0.57"
+#lyon = "1.0.0"
+nalgebra = { git = "https://gitee.com/happydpc/nalgebra", features = [
+    "serde",
+    "rkyv",
+    "glam029",
+    "convert-glam029",
+] }
+parry3d = { git = "https://gitee.com/happydpc/parry", package = "parry3d", features = [
+    "serde-serialize",
+    "rkyv",
+    "rkyv-serialize",
+] }
+parry2d = { git = "https://gitee.com/happydpc/parry", package = "parry2d", features = [
+    "serde-serialize",
+    "rkyv",
+    "rkyv-serialize",
+] }
+approx = "0.5.1"
+memchr = "2.5.0"
+nom = "7.1.1"
+itertools = "0.13.0"
+flate2 = "1.1.1"
+lazy_static = "1.4.0"
+smallvec = "1.8.0"
+derive_more = { version = "1.0.0", features = ["deref", "deref_mut"] }
+bitflags = "2.4.0"
+ordered-float = "4.2.0"
+phf = { version = "0.11.2", features = ["macros"] }
+derivative = "2.2.0"
+dyn-clone = "1.0.9"
+#axum-login = { version = "0.4.1"}
+rstar = { git = "https://gitee.com/happydpc/rstar", features = ["serde"] }
+uuid = "1.3.0"
+config = "0.14.1"
+calamine = { git = "https://gitee.com/happydpc/calamine" }
+
+thiserror = "1.0.60"
+log = "0.4.21"
+simplelog = "0.12.2"
+
+
+bevy_transform = { git = "https://gitee.com/happydpc/bevy", package = "bevy_transform", features = [
+    "serialize",
+] }
+bevy_math = { git = "https://gitee.com/happydpc/bevy", package = "bevy_math" }
+bevy_ecs = { git = "https://gitee.com/happydpc/bevy", package = "bevy_ecs" }
+bevy_reflect = { git = "https://gitee.com/happydpc/bevy", package = "bevy_reflect" }
+bevy_render = { git = "https://gitee.com/happydpc/bevy", package = "bevy_render", optional = true }
+
+base64 = "0.22.0"
+serde = { version = "1.0.133", features = ["derive"] }
+serde_derive = "1.0.133"
+serde_json = { version = "1.0" }
+hash32 = "0.3.0"
+bincode = "1.3.3"
+clap = { version = "^4.0", features = ["derive"] }
+
+# truck-base = { version = "0.4.0", path = "../truck/truck-base", optional = true }
+# truck-geotrait = { version = "0.3.0", path = "../truck/truck-geotrait", optional = true }
+# truck-geometry = { version = "0.4.0", path = "../truck/truck-geometry", optional = true }
+# truck-polymesh = { version = "0.5.0", path = "../truck/truck-polymesh", optional = true }
+# truck-topology = { version = "0.5.0", path = "../truck/truck-topology", optional = true }
+# truck-modeling = { version = "0.5.1", path = "../truck/truck-modeling", optional = true }
+# truck-meshalgo = { version = "0.3.0", path = "../truck/truck-meshalgo", optional = true }
+# truck-stepio = { version = "0.2.0", path = "../truck/truck-stepio", optional = true }
+rkyv = { version = "0.7.42", features = ["hashbrown"] }
+serde_with = { version = "3.9.0", features = ["macros"] }
+
+
+# geo = "0.28.0"
+cavalier_contours = { git = "https://gitee.com/happydpc/cavalier_contours", features = [
+    "serde",
+] }
+indexmap = { version = "2.0.0", features = ["serde"] }
+pretty-hex = "0.4.0"
+once_cell_serde = "1.17.1"
+jsonxf = "1.1.1"
+once_cell = "1.18.0"
+#sea-orm = { version = "0.12.4"}
+urlencoding = "2.1.3"
+chrono = "0.4"
+
+surrealdb = { git = "https://gitee.com/happydpc/surrealdb", default-features = false, features = [
+    "protocol-ws",
+] }
+num-traits = "0.2.17"
+regex = "1.10.2"
+petgraph = { version = "0.6.4", features = ["serde-1"] }
+cached = { version = "0.54.0", features = ["wasm", "async", "proc_macro"] }
+async-recursion = "1.0.5"
+async-trait = "0.1.78"
+num_enum = "0.7.1"
+tokio = { version = "1", features = ["rt", "sync"] }
+downcast-rs = "1.2.0"
+futures = "0.3.30"
+evalexpr = "12.0.1"
+serde_repr = "0.1.19"
+rust-ploop-processor = { git = "https://gitee.com/happydpc/rust-ploop-processor", package = "rust-ploop-processor"}
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread"] }
+redb = "1.4.0"
+manifold-sys = { git = "https://gitee.com/happydpc/manifold-sys", optional = true }
+opencascade = { git = "https://gitee.com/happydpc/occt-rs", optional = true }
+sqlx = { version = "0.7.4", default-features = false, features = [
+    "runtime-async-std-rustls",
+    "rust_decimal",
+    "mysql",
+] }
+duckdb = { version = "1.2.2" }
+
+
+#[patch."https://gitee.com/happydpc/surrealdb.git"]
+#surrealdb = { path = "../../surrealdb/crates/sdk" }

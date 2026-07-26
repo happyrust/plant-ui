@@ -1,0 +1,11 @@
+[package]
+name = "plant-ui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+egui.workspace = true
+egui_extras.workspace = true
+egui_dock.workspace = true
+egui-phosphor.workspace = true
+aios_core.workspace = true

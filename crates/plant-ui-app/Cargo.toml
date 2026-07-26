@@ -1,0 +1,13 @@
+[package]
+name = "plant-ui-app"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+plant-ui.workspace = true
+plant-ui-data.workspace = true
+egui.workspace = true
+eframe.workspace = true
+egui-phosphor.workspace = true
+tokio.workspace = true
+anyhow.workspace = true

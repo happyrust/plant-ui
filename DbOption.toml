@@ -1,0 +1,143 @@
+#同步文件配置
+# 非CATA增量测试：数据已解析，跳过重新解析
+total_sync = true
+incr_sync = false
+sync_history = false
+enable_log = false
+sync_graph_db = false
+sync_versioned = false
+sync_tidb = false
+# gen-model-9 全量DESI复验：跑完退出
+sync_live = false
+replace_dbs = true
+enable_index = false
+sync_chunk_size = 10_0000
+
+#项目设置
+project_path = "D:/AVEVA/Projects/E3D3.1"
+# project_path = "/Users/dongpengcheng/Documents/models/e3d_models"
+# included_projects = ["AvevaMarineSample", "AvevaCatalogue", "SCB", "ZDJ"]
+included_projects = ["AvevaMarineSample", "AvevaCatalogue", "ZDJ"]
+#project_dirs = ["AvevaMarineSample"]
+
+mdb_name = "ALL"
+project_name = "AvevaMarineSample"
+project_code = 1516
+surreal_ns = 1516
+module = "DESI"
+#是否生成模型数据
+# 非CATA增量监听模式：启动不做全量重算，靠 watcher 增量刷新（增量路径自行强制 gen_model/gen_mesh=true）
+gen_model = false
+gen_mesh = false
+replace_mesh = false
+save_db = true
+apply_boolean_operation = true
+mesh_tol_ratio = 3.0
+#是否生成房间树
+gen_spatial_tree = false
+load_spatial_tree = false
+save_spatial_tree_to_db = false
+gen_model_batch_size = 16
+
+build_cate_relate = false
+
+# 最小交付单元类型（增量 / 手动 / 按需生成共用的生成根口径）
+# 不配置时使用默认集合 ["BRAN", "HANG", "SUPPO", "EQUI"]
+# delivery_unit_types      完全取代默认集合；写成 [] 表示不使用交付单元，全部按正常颗粒生成
+# append_delivery_unit_types  在默认集合之外追加，仅在未配置 delivery_unit_types 时生效
+# 两者都会 trim + 转大写 + 去重，且拒绝 WORL/WORLD/SITE/ZONE 和管件 FTUB
+# delivery_unit_types = ["BRAN", "HANG", "SUPPO", "EQUI"]
+# append_delivery_unit_types = ["PIPE"]
+
+#meshes_path = "E:/RustProject/new/rs-plant3-d/assets/meshes"
+
+#生成补充类型的graph，方便查询直接生成语句
+gen_noun_graph = false
+
+#arangodb 配置
+arangodb_database = "ams"
+multi_threads = false
+only_sync_sys = false
+arangodb_url = "http://127.0.0.1:8529"
+rebuild_ssc_tree = false
+arangodb_user = "root"
+arangodb_password = ""
+
+#tidb 配置
+ip = "127.0.0.1"
+user = "root"
+password = ""
+port = "3306"
+#port = "4000"
+sql_threads_number = 10
+batch_insert_sql_cnt = 100 #mysql 批量插入的数量
+
+
+#版本数据库服务配置
+v_ip = "localhost"
+v_port = 8009
+v_user = "root"
+v_password = "root"
+pe_chunk = 300
+att_chunk = 200
+
+kv_ip = "localhost"
+kv_port = "8010"
+
+
+#mqtt 事件 ip
+mqtt_host = "192.168.31.58"
+mqtt_port = 1883
+
+location = "SJZ"
+location_dbs = [1112]
+
+#服务器启动配置
+server_release_ip = "127.0.0.1:9099"
+
+# hash文件的站点
+remote_file_server_hosts = []
+file_server_host = "http://192.168.31.58:8000/assets/archives"
+
+# Web服务(REST+WebSocket)监听地址；注释掉则不启动（需编译 http_api feature）
+# 评审决议：0.0.0.0 供局域网前端访问；接口文档见 docs/specs/web-service-api.md
+http_api_addr = "0.0.0.0:8020"
+http_api_cors = ["*"]
+
+
+#调试选项
+save_model_mesh_to_graph_db = true
+need_sync_refno_basic = false       #是否重新生成 refno_basic 缓存
+reset_mdb_project = false           #是否重新生成 mdb 缓存
+only_update_dbinfo = false
+debug_print_world_transform = false
+only_rebuild_pdms_element = false
+
+debug_refno_types = ["LOOP", "PRIM"]
+# ams8000 的 SPRE/CATR 实际依赖
+included_db_files = ["ams8000_0001"]
+#included_db_files = ["zdj7600_0001"]
+#manual_db_nums = [7999, 7997, 8000, 1112]
+#manual_db_nums = [1112]
+# AMS 增量回归固定覆盖这三个设计库。
+manual_db_nums = [7997, 7999, 8000]
+# exclude_db_nums = [] #不参与生成模型的数据库编号
+plat_url = ""
+
+#puhua
+puhua_database_ip = ""
+puhua_database_user = ""
+puhua_database_password = ""
+
+
+# room_keyword = "-RM" # 2016  K-R-K100   (-R-)
+room_keyword = "-R-" # 2016  K-R-K100   (-R-)
+
+#test_refno = "24381_46952"
+
+#debug_root_refnos = ["24381_46952"]
+gen_history_model = false
+#debug_root_refnos = ["17496/201375"]
+# debug_root_refnos = []
+
+# debug_root_refnos = ["17496_195578"]

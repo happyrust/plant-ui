@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = ["crates/plant-ui", "crates/plant-ui-data", "crates/plant-ui-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+plant-ui = { path = "crates/plant-ui" }
+plant-ui-data = { path = "crates/plant-ui-data" }
+# vendored from rs-core-pin (= git rev 5667b70 + get_world fallthrough fix), editable
+aios_core = { path = "vendor/rs-core", default-features = false }
+
+egui = "0.35.0"
+eframe = "0.35"
+egui_extras = "0.35"
+egui_dock = "0.20.1"
+egui-phosphor = "0.13.0"
+
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
+anyhow = "1"
+
+# egui upstream advice: optimize deps for runtime smoothness, keep own code at 0 for fast incremental builds
+[profile.dev.package."*"]
+opt-level = 2

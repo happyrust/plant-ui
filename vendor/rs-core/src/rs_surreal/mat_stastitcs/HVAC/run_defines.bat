@@ -1,0 +1,12 @@
+surreal import --conn http://127.0.0.1:8008 --user root --password root --namespace 1516 --database AvevaMarineSample BEND.surql
+surreal import --conn http://127.0.0.1:8008 --user root --password root --namespace 1516 --database AvevaMarineSample BRCO.surql
+surreal import --conn http://127.0.0.1:8008 --user root --password root --namespace 1516 --database AvevaMarineSample CAP.surql
+surreal import --conn http://127.0.0.1:8008 --user root --password root --namespace 1516 --database AvevaMarineSample FLEX.surql
+surreal import --conn http://127.0.0.1:8008 --user root --password root --namespace 1516 --database AvevaMarineSample OFST.surql
+surreal import --conn http://127.0.0.1:8008 --user root --password root --namespace 1516 --database AvevaMarineSample STIF.surql
+surreal import --conn http://127.0.0.1:8008 --user root --password root --namespace 1516 --database AvevaMarineSample STRT.surql
+surreal import --conn http://127.0.0.1:8008 --user root --password root --namespace 1516 --database AvevaMarineSample TAPE.surql
+surreal import --conn http://127.0.0.1:8008 --user root --password root --namespace 1516 --database AvevaMarineSample THRE.surql
+surreal import --conn http://127.0.0.1:8008 --user root --password root --namespace 1516 --database AvevaMarineSample TRNS.surql
+surreal import --conn http://127.0.0.1:8008 --user root --password root --namespace 1516 --database AvevaMarineSample EMPTY.surql
+surreal import --conn http://127.0.0.1:8008 --user root --password root --namespace 1516 --database AvevaMarineSample HVAC.surql

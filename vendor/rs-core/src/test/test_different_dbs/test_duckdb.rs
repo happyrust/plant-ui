@@ -1,0 +1,468 @@
+// use crate::rs_surreal::SUL_DB;
+// use crate::types::RefnoEnum;
+// use crate::{init_test_surreal, pe::SPdmsElement};
+// use anyhow::{Context, Result};
+// use duckdb::{params, Connection, Result as DuckResult};
+// use std::time::{Duration, Instant};
+// use tokio::sync::mpsc::{self, Receiver, Sender};
+//
+// /// # DuckDB Integration Test
+// ///
+// /// This module implements functionality to transfer SPdmsElement data from SurrealDB to DuckDB
+// /// and benchmark query performance, especially for ORDER BY operations.
+// ///
+// /// ## Setup Instructions
+// ///
+// /// To use this module properly, ensure:
+// ///
+// /// 1. DuckDB is installed and properly linked in your build environment
+// /// 2. Set up DuckDB headers and libraries in your project
+// /// 3. Add `duckdb = "0.10.0"` to your Cargo.toml dependencies
+// ///
+// /// If you encounter linking errors, ensure the DuckDB library (duckdb.lib/libduckdb.so)
+// /// is in your library path or copy it to your project's lib directory.
+//
+// /// Creates a DuckDB table for storing SPdmsElement data
+// fn create_duckdb_table(conn: &Connection) -> DuckResult<()> {
+//     conn.execute_batch(
+//         "CREATE TABLE IF NOT EXISTS pe_elements (
+//             refno VARCHAR,
+//             owner VARCHAR,
+//             name VARCHAR,
+//             noun VARCHAR,
+//             dbnum INTEGER,
+//             sesno INTEGER,
+//             status_code VARCHAR,
+//             cata_hash VARCHAR,
+//             lock BOOLEAN,
+//             deleted BOOLEAN,
+//             op INTEGER
+//         )",
+//     )?;
+//
+//     // Create indexes to improve query performance
+//     conn.execute_batch(
+//         "CREATE INDEX IF NOT EXISTS idx_pe_name ON pe_elements (name);
+//          CREATE INDEX IF NOT EXISTS idx_pe_dbnum ON pe_elements (dbnum);
+//          CREATE INDEX IF NOT EXISTS idx_pe_noun ON pe_elements (noun);
+//          CREATE INDEX IF NOT EXISTS idx_pe_sesno ON pe_elements (sesno)",
+//     )?;
+//
+//     // Create a property graph to represent the owner relationship (edges defined directly from vertex table)
+//     conn.execute_batch(
+//         "CREATE PROPERTY GRAPH IF NOT EXISTS pe_owner_graph
+//             VERTEX TABLES (
+//                 pe_elements
+//             )
+//             EDGE TABLES (
+//                 pe_elements AS owns -- Use the same table to define the 'owns' relationship
+//                     SOURCE KEY (refno) REFERENCES pe_elements (refno) -- Source from row's refno
+//                     DESTINATION KEY (owner) REFERENCES pe_elements (refno) -- Destination from row's owner column
+//                     LABEL owns
+//             );
+//         "
+//     )?;
+//
+//     Ok(())
+// }
+//
+// /// Insert an SPdmsElement into DuckDB
+// fn insert_element(conn: &mut Connection, element: &SPdmsElement) -> DuckResult<()> {
+//     conn.execute(
+//         "INSERT INTO pe_elements
+//          (refno, owner, name, noun, dbnum, sesno, status_code, cata_hash, lock, deleted, op)
+//          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+//         params![
+//             element.refno.to_string(),
+//             element.owner.to_string(),
+//             &element.name,
+//             &element.noun,
+//             element.dbnum,
+//             element.sesno,
+//             element.status_code.as_deref().unwrap_or(""),
+//             &element.cata_hash,
+//             element.lock,
+//             element.deleted,
+//             element.op.into_num(), // Convert EleOperation to integer
+//         ],
+//     )?;
+//
+//     Ok(())
+// }
+//
+// /// Batch insert multiple SPdmsElements into DuckDB
+// fn batch_insert_elements(conn: &mut Connection, elements: &[SPdmsElement]) -> DuckResult<()> {
+//     let tx = conn.transaction()?;
+//
+//     for element in elements {
+//         tx.execute(
+//             "INSERT INTO pe_elements
+//              (refno, owner, name, noun, dbnum, sesno, status_code, cata_hash, lock, deleted, op)
+//              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+//             params![
+//                 element.refno.to_string(),
+//                 element.owner.to_string(),
+//                 &element.name,
+//                 &element.noun,
+//                 element.dbnum,
+//                 element.sesno,
+//                 element.status_code.as_deref().unwrap_or(""),
+//                 &element.cata_hash,
+//                 element.lock,
+//                 element.deleted,
+//                 element.op.into_num(), // Convert EleOperation to integer
+//             ],
+//         )?;
+//     }
+//
+//     tx.commit()?;
+//     Ok(())
+// }
+//
+// /// Query elements with ORDER BY and measure performance
+// fn benchmark_order_by_query(conn: &Connection, field: &str) -> DuckResult<Duration> {
+//     let start = Instant::now();
+//
+//     let query = format!("SELECT * FROM pe_elements ORDER BY {} LIMIT 1000", field);
+//     let mut stmt = conn.prepare(&query)?;
+//     let _rows = stmt.query_map([], |_row| {
+//         // Just iterate through results to measure performance
+//         Ok(())
+//     })?;
+//
+//     for _r in _rows {}
+//
+//     Ok(start.elapsed())
+// }
+//
+// /// Fetch SPdmsElements from SurrealDB
+// async fn fetch_elements_from_surrealdb(limit: usize) -> Result<Vec<SPdmsElement>> {
+//     let sql = format!("SELECT * FROM pe LIMIT {}", limit);
+//     let mut response = SUL_DB.query(sql).await?;
+//     let elements: Vec<SPdmsElement> = response.take(0)?;
+//
+//     Ok(elements)
+// }
+//
+// /// Fetch all SPdmsElements from SurrealDB with chunking and send through channel
+// async fn fetch_all(chunk_size: usize) -> Result<Receiver<Vec<SPdmsElement>>> {
+//     // First get the total count
+//     let count_sql = "object::values(SELECT value count() FROM only pe group all limit 1)[0]";
+//     let mut count_response = SUL_DB.query(count_sql).await?;
+//     let count: Option<usize> = count_response.take(0)?;
+//     let count = count.unwrap_or(0);
+//     dbg!(&count);
+//
+//     println!("Total count of elements: {}", count);
+//
+//     let (tx, rx) = mpsc::channel(5); // Buffer size of 5 batches
+//
+//     // Spawn a task to fetch and send data
+//     tokio::spawn(async move {
+//         let chunk_count = (count + chunk_size - 1) / chunk_size; // Ceiling division
+//         let mut total_fetched = 0;
+//
+//         for i in 0..chunk_count {
+//             let offset = i * chunk_size;
+//             let sql = format!("SELECT * FROM pe LIMIT {} START {}", chunk_size, offset);
+//             match SUL_DB.query(sql).await {
+//                 Ok(mut response) => {
+//                     match response.take::<Vec<SPdmsElement>>(0) {
+//                         Ok(chunk) => {
+//                             let chunk_len = chunk.len();
+//                             println!(
+//                                 "Fetched chunk {}/{} with {} elements",
+//                                 i + 1,
+//                                 chunk_count,
+//                                 chunk_len
+//                             );
+//                             total_fetched += chunk_len;
+//
+//                             // Send the chunk through the channel
+//                             if tx.send(chunk).await.is_err() {
+//                                 println!("Receiver was dropped, stopping fetch");
+//                                 break;
+//                             }
+//                         }
+//                         Err(e) => println!("Error taking data from response: {}", e),
+//                     }
+//                 }
+//                 Err(e) => println!("Error fetching chunk {}: {}", i, e),
+//             }
+//         }
+//
+//         println!("Total fetched: {}/{}", total_fetched, count);
+//     });
+//
+//     Ok(rx)
+// }
+//
+// /// Process data from channel and insert into DuckDB
+// async fn process_and_insert_to_duckdb(
+//     mut rx: Receiver<Vec<SPdmsElement>>,
+//     conn: &mut Connection,
+// ) -> Result<()> {
+//     let mut total_inserted = 0;
+//     let start = Instant::now();
+//
+//     while let Some(batch) = rx.recv().await {
+//         let batch_size = batch.len();
+//         batch_insert_elements(conn, &batch)?;
+//         total_inserted += batch_size;
+//         println!(
+//             "Inserted batch of {} elements into DuckDB (total: {})",
+//             batch_size, total_inserted
+//         );
+//     }
+//
+//     println!(
+//         "Completed insertion of {} elements in {:?}",
+//         total_inserted,
+//         start.elapsed()
+//     );
+//     Ok(())
+// }
+//
+// /// Main test function to compare DuckDB performance with SurrealDB
+// pub async fn test_duckdb_performance() -> Result<()> {
+//     println!("Starting DuckDB performance test...");
+//
+//     // Open persistent DuckDB database
+//     let mut conn = Connection::open("pe_elements.duckdb")?;
+//
+//     // Benchmark ORDER BY queries on different fields
+//     println!("\nBenchmarking ORDER BY queries in DuckDB:");
+//
+//     // Print the total number of records in DuckDB
+//     match conn.query_row("SELECT COUNT(*) FROM pe_elements", [], |row| {
+//         let count: i64 = row.get(0)?;
+//         Ok(count)
+//     }) {
+//         Ok(count) => println!("Total records in DuckDB: {}", count),
+//         Err(e) => println!("Failed to count records in DuckDB: {}", e),
+//     }
+//
+//     let fields = ["name", "noun", "dbnum", "sesno"];
+//     for field in fields {
+//         match benchmark_order_by_query(&conn, field) {
+//             Ok(duration) => println!("ORDER BY {} took: {:?}", field, duration),
+//             Err(e) => println!("Failed to benchmark ORDER BY {} query: {}", field, e),
+//         }
+//     }
+//
+//     // For comparison, measure SurrealDB ORDER BY performance
+//     println!("\nBenchmarking ORDER BY queries in SurrealDB:");
+//
+//     for field in fields {
+//         let start = Instant::now();
+//         match SUL_DB
+//             .query(format!("SELECT * FROM pe ORDER BY {} LIMIT 1000", field))
+//             .await
+//         {
+//             Ok(_) => println!("ORDER BY {} took: {:?}", field, start.elapsed()),
+//             Err(e) => println!(
+//                 "Failed to execute ORDER BY {} query in SurrealDB: {}",
+//                 field, e
+//             ),
+//         }
+//     }
+//
+//     Ok(())
+// }
+//
+// /// Create a persistent DuckDB database for SPdmsElements
+// pub async fn create_persistent_duckdb() -> Result<()> {
+//     println!("Ensuring persistent DuckDB database and owner graph exist...");
+//
+//     // Open the existing persistent database file
+//     let conn = Connection::open("pe_elements.duckdb")?;
+//
+//     // Install and load the duckpgq extension
+//     conn.execute_batch(
+//         "INSTALL duckpgq FROM community;
+//          LOAD duckpgq;",
+//     )?;
+//
+//     // Ensure the table and property graph definitions exist
+//     create_duckdb_table(&conn)?;
+//
+//     // // init_test_surreal().await.unwrap(); // Removed: No longer initializing SurrealDB
+//
+//     // // Fetch data from SurrealDB using chunking and channels // Removed: No longer fetching
+//     // // let elements_rx = fetch_all(10_000).await?;
+//
+//     // // Process and insert data into DuckDB // Removed: No longer inserting
+//     // // process_and_insert_to_duckdb(elements_rx, &mut conn).await?;
+//
+//     println!("DuckDB table and owner graph definitions are ensured.");
+//     Ok(())
+// }
+//
+// /// Ensures the property graph definition for the owner relationship exists in the DuckDB database.
+// /// Assumes the 'pe_elements' table already exists and is populated.
+// pub fn ensure_owner_graph_definition() -> Result<()> {
+//     println!("Ensuring owner graph definition exists in DuckDB...");
+//
+//     // Open the existing persistent database file
+//     let conn = Connection::open("pe_elements.duckdb")?;
+//
+//     // Install and load the duckpgq extension
+//     conn.execute_batch(
+//         "INSTALL duckpgq FROM community;
+//          LOAD duckpgq;",
+//     )?;
+//
+//     // Define the property graph based on the existing pe_elements table (edges defined directly from vertex table)
+//     conn.execute_batch(
+//         "CREATE PROPERTY GRAPH IF NOT EXISTS pe_owner_graph
+//             VERTEX TABLES (
+//                 pe_elements -- Assume this table exists
+//             )
+//             EDGE TABLES (
+//                 pe_elements AS owns -- Use the same table for edges
+//                     SOURCE KEY (refno) REFERENCES pe_elements (refno)
+//                     DESTINATION KEY (owner) REFERENCES pe_elements (refno)
+//                     LABEL owns
+//             );
+//         ",
+//     )?;
+//
+//     println!("Owner graph definition ensured successfully.");
+//     Ok(())
+// }
+//
+// /// Tests querying the property graph using DuckPGQ
+// pub fn test_graph_query() -> Result<()> {
+//     println!("Testing graph query on pe_owner_graph...");
+//
+//     // Open the existing persistent database file
+//     let conn = Connection::open("pe_elements.duckdb")?;
+//
+//     // Load the duckpgq extension
+//     conn.execute_batch("LOAD duckpgq;")?;
+//
+//     // Execute a graph query to find ownership relationships
+//     let mut stmt = conn.prepare(
+//         "
+//         SELECT * FROM GRAPH_TABLE (pe_owner_graph
+//             MATCH (a:pe_elements)-[k:owns]->(b:pe_elements)
+//             COLUMNS (a.refno, b.refno)
+//         )
+//         LIMIT 10;
+//     ",
+//     )?;
+//
+//     // Execute the query and print results
+//     let rows = stmt.query_map([], |row| {
+//         let owner_refno: String = row.get(0)?;
+//         let owned_refno: String = row.get(1)?;
+//         Ok((owner_refno, owned_refno))
+//     })?;
+//
+//     println!("Graph query results:");
+//     let mut count = 0;
+//     for row in rows {
+//         let (owner, owned) = row?;
+//         println!("Owner: {}, Owns: {}", owner, owned);
+//         count += 1;
+//     }
+//
+//     println!("Found {} ownership relationships", count);
+//     Ok(())
+// }
+//
+// fn test_shortest_path() -> Result<()> {
+//     println!("Testing shortest path query on pe_owner_graph...");
+//
+//     let conn = Connection::open("pe_elements.duckdb")?;
+//     conn.execute_batch("LOAD duckpgq;")?;
+//
+//     // Find a valid element refno for shortest path test
+//     println!("Finding a valid refno for shortest path test...");
+//     let mut element_refno = String::new();
+//
+//     let mut stmt = conn.prepare("SELECT refno FROM pe_elements LIMIT 1")?;
+//     let rows = stmt.query_map([], |row| {
+//         let refno: String = row.get(0)?;
+//         Ok(refno)
+//     })?;
+//
+//     for row in rows {
+//         element_refno = row?;
+//         break;
+//     }
+//
+//     let element_refno = "17496_98576";
+//     dbg!(&element_refno);
+//     if !element_refno.is_empty() {
+//         println!(
+//             "Using element with refno {} for shortest path test",
+//             element_refno
+//         );
+//
+//         // Execute a shortest path query to find ownership chains
+//         println!("Testing shortest path query on pe_owner_graph...");
+//
+//         let shortest_path_query = format!(
+//             "
+//             FROM GRAPH_TABLE (pe_owner_graph
+//               MATCH p = ANY SHORTEST (p1:pe_elements WHERE p1.refno = '{}')-[k:owns]->*(p2:pe_elements)
+//               COLUMNS (p1.refno, p2.refno AS owned_refno, element_id(p), path_length(p))
+//             )
+//             LIMIT 10;
+//             ",
+//             element_refno
+//         );
+//
+//         match conn.prepare(&shortest_path_query) {
+//             Ok(mut stmt) => {
+//                 match stmt.query_map([], |row| {
+//                     let start_refno: String = row.get(0)?;
+//                     let end_refno: String = row.get(1)?;
+//                     let path_id: String = row.get(2)?;
+//                     let path_length: i32 = row.get(3)?;
+//                     Ok((start_refno, end_refno, path_id, path_length))
+//                 }) {
+//                     Ok(rows) => {
+//                         println!("Shortest path query results:");
+//                         let mut count = 0;
+//                         for row in rows {
+//                             match row {
+//                                 Ok((start, end, path_id, length)) => {
+//                                     println!("Path from {} to {}, ID: {}, Length: {}", start, end, path_id, length);
+//                                     count += 1;
+//                                 },
+//                                 Err(e) => println!("Error reading row: {}", e),
+//                             }
+//                         }
+//                         println!("Found {} paths", count);
+//                     },
+//                     Err(e) => println!("Error executing shortest path query: {}", e),
+//                 }
+//             },
+//             Err(e) => println!("Error preparing shortest path query: {}. This feature may not be supported in your version of DuckDB/DuckPGQ.", e),
+//         }
+//     } else {
+//         println!("No elements found to use for shortest path test");
+//     }
+//     Ok(())
+// }
+//
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
+//
+//     #[tokio::test]
+//     async fn test_duckdb() -> Result<()> {
+//         ensure_owner_graph_definition()?;
+//         test_duckdb_performance().await;
+//         test_graph_query()?;
+//         test_shortest_path()?;
+//         Ok(())
+//     }
+//
+//     #[tokio::test]
+//     async fn test_create_persistent_db() -> Result<()> {
+//         create_persistent_duckdb().await
+//     }
+// }

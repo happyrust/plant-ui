@@ -1,0 +1,9 @@
+[package]
+name = "plant-ui-data"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aios_core.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
