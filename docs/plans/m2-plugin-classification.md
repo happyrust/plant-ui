@@ -117,11 +117,30 @@ M2-3 说「38 个 plugin 里 UI 与业务逻辑混在一起，删之前必须逐
 
 前两步做完就能跑一次 `cargo check` 拿到干净的基线，再往下每步都能验证。
 
-## 六、一处还没定的事
+## 六、两份 rs-plant3-d：本文的结论通用，但动手改哪一份要先定
 
 `D:\work\plant-code\old\rs-plant3-d` 与 `D:\work\plant-code\rs-plant3-d` **是两份**，
-都在分支 3.0 上。前者停在 `fe8fb07a`、101 个脏文件；后者多一笔
-`519bddea add manual incremental model update UI`、183 个脏文件。
+都在分支 3.0 上。
 
-本文分析的是前者，理由是计划文档写明 `old\` 是独立工作环境、rs-plant3-d 就在它旁边。
-但后者更新。**M2 真要动手删代码之前，得先确认改哪一份。**
+**先说结论通用性**：本文第一、二、三节的分类对两份都成立。逐项核过——
+`plugins/` 下 38 个目录的集合、18 个参与编译的模块、19 个已注释的模块，两份**完全一致**；
+`editor_tab.rs`、`plugins/mod.rs`、`lib.rs`、`material_statistic_plugin/plugin.rs`
+的差异全是 rustfmt 的导入排序与空白，无语义差别。
+
+**但两份是双向分叉的，不是简单的一前一后**：
+
+| | `old\rs-plant3-d` | `plant-code\rs-plant3-d` |
+|---|---|---|
+| HEAD | `fe8fb07a` | `519bddea`（多一笔 manual incremental model update UI） |
+| 脏文件 | 101 | 183 |
+| `ui_plugin.rs` 最后改动 | **07-27 00:37**（今天） | 07-25 14:33 |
+| 默认 dock 布局 | **已裁到 5 个页签** | 仍挂着 VersionView / PdmsDocs / Review3D / VersionTimeline / VersionTable / PEVersionHistory |
+| `setup_style` | 走 `RsTheme::default()` 的成套样式 | 内联 `RSStyle` 描边 |
+| Ctrl+U 手动更新快捷键 | 无 | 有 |
+
+关键的一格是**默认 dock 布局**：`old\` 那份的工作区里已经把六个页签从默认布局里摘掉了，
+这本身就是 M2 的一部分，已经做了一半。`plant-code\` 那份还是全的。
+
+所以「谁更新」这个问题没有单一答案——提交历史上 `plant-code\` 领先一笔，
+但工作区里 `old\` 有更靠近 M2 目标的未提交改动。**动手删代码之前必须先定改哪一份，
+否则会和已经做掉的那半截打架。**
