@@ -325,11 +325,14 @@ impl App {
                     let msg = format!("{attr} = {value}（仅改内存，未写回数据库）");
                     self.console.warn_of(&mut self.vm.console, el, msg);
                 }
+                // 面板错误态上的「重试」，与命令行那条走同一段处置逻辑。
+                Cmd::Reconnect => self.reconnect(),
+                Cmd::RetryProps(refno) if self.vm.selected == Some(refno) => {
+                    self.refetch_props(refno)
+                }
+                Cmd::RetryProps(_) => {}
                 Cmd::RetryLog(id) => match self.console.retry_of(id) {
-                    Some(Retry::Connect) => {
-                        self.console.info(&mut self.vm.console, "正在重连数据源…");
-                        let _ = self.bridge.req.send(data::Req::Reconnect);
-                    }
+                    Some(Retry::Connect) => self.reconnect(),
                     Some(Retry::Children(refno)) => {
                         // 重试即重新展开：箭头上次失败时被收回了，这里一并推回展开态。
                         self.tree.expanded.insert(refno);
@@ -339,8 +342,7 @@ impl App {
                         dirty = true;
                     }
                     Some(Retry::Props(refno)) if self.vm.selected == Some(refno) => {
-                        self.vm.props = PropsVm::Loading;
-                        let _ = self.bridge.req.send(data::Req::Props(refno));
+                        self.refetch_props(refno)
                     }
                     // 选中早就挪走的话，属性重查回来也没地方摆，直接跳过。
                     _ => {}
@@ -359,8 +361,18 @@ impl App {
             return;
         }
         self.vm.selected = Some(refno);
+        self.refetch_props(refno);
+    }
+
+    fn refetch_props(&mut self, refno: RefU64) {
         self.vm.props = PropsVm::Loading;
         let _ = self.bridge.req.send(data::Req::Props(refno));
+    }
+
+    fn reconnect(&mut self) {
+        self.vm.tree = TreeVm::Loading;
+        self.console.info(&mut self.vm.console, "正在重连数据源…");
+        let _ = self.bridge.req.send(data::Req::Reconnect);
     }
 
     fn rebuild_tree(&mut self) {

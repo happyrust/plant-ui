@@ -13,7 +13,8 @@ use egui::{Color32, Mesh, Rect, RichText, Sense, Shape, Stroke, Ui, pos2, vec2};
 use egui_phosphor::regular as ph;
 
 use crate::style::theme_tokens::Font;
-use crate::style::tokens::{Density, Tokens, radius, space};
+use crate::style::tokens::{Density, Tokens, radius};
+use crate::style::widgets;
 use crate::vm::WorkbenchVm;
 
 /// 占位纹理的不透明度，取自 S1 的「模型场景」矩形。压这么一点让渐变底透上来，
@@ -26,14 +27,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
         .add(gradient(rect, t.viewport_top, t.viewport_bottom));
 
     let Some(view) = vm.view3d else {
-        note(
-            ui,
-            t,
-            d,
-            rect,
-            "占位纹理未能载入",
-            "assets/textures 下的图缺了或读不了",
-        );
+        note(ui, t, d, rect);
         return;
     };
 
@@ -109,22 +103,30 @@ fn hud(ui: &mut Ui, t: &Tokens, d: Density, view: Rect) {
         });
 }
 
-/// 纹理都没有时的居中提示。四态统一视觉 M1-7 收口。
-fn note(ui: &mut Ui, t: &Tokens, d: Density, view: Rect, title: &str, hint: &str) {
+/// 没有纹理时的错误态。
+///
+/// 三维视图只有这一态：占位图是 App 启动时同步载入的，没有「加载中」，
+/// 也没有「未初始化」——`vm.view3d` 为 None 只可能是载入失败。M3 接回 Bevy 后
+/// 相机还没给出渲染目标的那一段才会有真正的未初始化，到时候再加。
+///
+/// 底色不铺：渐变已经画在下面了，`pane_note` 的 bg-panel 会把它盖掉，所以这里
+/// 用一个背景透明的子 Ui 套住它。
+fn note(ui: &mut Ui, t: &Tokens, d: Density, view: Rect) {
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(view));
-    child.vertical_centered(|ui| {
-        ui.add_space(view.height() / 2.0 - d.px(40.0));
-        ui.label(
-            RichText::new(ph::IMAGE_BROKEN)
-                .font(egui::FontId::proportional(d.px(28.0)))
-                .color(t.text_muted),
-        );
-        ui.add_space(space::S2);
-        ui.label(
-            RichText::new(title)
-                .font(Font::label(d))
-                .color(t.text_secondary),
-        );
-        ui.label(RichText::new(hint).font(Font::meta(d)).color(t.text_muted));
-    });
+    let transparent = Tokens {
+        bg_panel: Color32::TRANSPARENT,
+        ..*t
+    };
+    widgets::pane_note(
+        &mut child,
+        &transparent,
+        d,
+        widgets::PaneNote {
+            state: widgets::PaneState::Error,
+            icon: ph::IMAGE_BROKEN,
+            text: "占位纹理未能载入",
+            detail: Some("assets/textures 下的图缺了或读不了"),
+            retry: false,
+        },
+    );
 }

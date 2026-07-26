@@ -7,11 +7,10 @@
 //! 分级也不再靠关键词猜。旧壳的 `PrintConsoleLine` 只带一个字符串，词表照真实
 //! 语料校准过仍会错判；这里发日志的就是 App 自己，级别在发的那一刻定死。
 
-use egui::{Align, Layout, Margin, RichText, ScrollArea, Ui};
+use egui::{Align, Layout, Margin, ScrollArea, Ui};
 use egui_phosphor::regular as ph;
 
 use crate::Cmd;
-use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Tokens, space};
 use crate::style::widgets::{self, LogRow};
 use crate::vm::{LogLevel, LogLineVm, WorkbenchVm};
@@ -101,12 +100,26 @@ fn list(
         .collect();
 
     if lines.is_empty() {
-        let text = if vm.console.lines.is_empty() {
-            "暂无输出"
+        // 两种空不是一回事：缓冲真的空是「空态」，筛掉之后才空得给用户指条路
+        // ——不然他会以为是这一屏坏了。命令行没有加载中与错误态：日志是 App
+        // 自己往里写的，既不查库也不会失败。
+        let (text, detail) = if vm.console.lines.is_empty() {
+            ("暂无输出", None)
         } else {
-            "当前分级没有输出"
+            ("当前分级没有输出", Some("点上面的「全部」看其余分级"))
         };
-        note(ui, t, d, ph::TERMINAL_WINDOW, text);
+        widgets::pane_note(
+            ui,
+            t,
+            d,
+            widgets::PaneNote {
+                state: widgets::PaneState::Empty,
+                icon: ph::TERMINAL_WINDOW,
+                text,
+                detail,
+                retry: false,
+            },
+        );
         return;
     }
 
@@ -167,25 +180,4 @@ fn full_text(line: &LogLineVm) -> String {
         Some(detail) if detail != &line.message => format!("{head}\n{detail}"),
         _ => head,
     }
-}
-
-/// 命令行区的居中提示（无输出 / 筛选后为空）。四态统一视觉 M1-7 收口。
-fn note(ui: &mut Ui, t: &Tokens, d: Density, icon: &str, text: &str) {
-    egui::Frame::new().fill(t.bg_panel).show(ui, |ui| {
-        ui.set_min_size(ui.available_size());
-        ui.vertical_centered(|ui| {
-            ui.add_space(d.px(28.0));
-            ui.label(
-                RichText::new(icon)
-                    .font(egui::FontId::proportional(d.px(24.0)))
-                    .color(t.text_muted),
-            );
-            ui.add_space(space::S2);
-            ui.label(
-                RichText::new(text)
-                    .font(Font::meta(d))
-                    .color(t.text_secondary),
-            );
-        });
-    });
 }

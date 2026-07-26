@@ -843,6 +843,96 @@ fn selectable_at(ui: &mut Ui, rect: Rect, text: egui::RichText, truncate: bool) 
     .inner
 }
 
+// ---------------------------------------------------------------- 面板四态
+
+/// 数据面板「这会儿没有内容可画」的四种由来。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PaneState {
+    /// 还没轮到它加载——用户尚未做出让它有内容的动作。文案该是一句指引。
+    Uninit,
+    /// 查询在途。
+    Loading,
+    /// 查完了，确实没有数据。
+    Empty,
+    /// 失败。
+    Error,
+}
+
+pub struct PaneNote<'a> {
+    pub state: PaneState,
+    /// 状态图标。`Loading` 忽略它——那一态画的是会转的 spinner，静态的转圈字形
+    /// 比不画还糟，它看着就像界面卡死了。
+    pub icon: &'a str,
+    pub text: &'a str,
+    /// 次要说明（错误链、下一步提示），比正文低一号且更弱。
+    pub detail: Option<&'a str>,
+    /// 给一枚「重试」，返回值即它是否被点。只有调用点还原得出可重做的操作时才该给。
+    pub retry: bool,
+}
+
+/// 面板四态的居中提示，四个视图共用一份。
+///
+/// 收敛之前模型树 / 属性 / 命令行 / 三维视图各写了一份 `note`：图标 24 与 28、
+/// 顶部间距 40 与 28 与垂直居中、三处只有一行字而三维视图是标题加副文——同一个
+/// 应用里四块面板的「没东西可看」长四个样。
+///
+/// 设计稿没有对应画板可抄：`DESIGN-SYSTEM.md` 把「S8 状态词汇」列进了画板表，但
+/// .pen 里 S5 往后一张都没画（原仓库那份也一样）。所以分寸是按设计令牌定的——
+/// 前三态说的都是「还没有内容」，共用 text-muted 图标加 text-secondary 文字，靠
+/// 图标与措辞区分；只有错误态换 danger 图标并给出处置入口，出了事才值得跳出来。
+pub fn pane_note(ui: &mut Ui, t: &Tokens, d: Density, note: PaneNote<'_>) -> bool {
+    let mut retried = false;
+    egui::Frame::new().fill(t.bg_panel).show(ui, |ui| {
+        ui.set_min_size(ui.available_size());
+        let icon_h = d.px(26.0);
+        // 先量出这一块多高，才好把它摆在正中。面板高度从命令行那样的窄条到整根
+        // 属性栏都有，固定顶距会在矮面板上贴边、在高面板上浮到上三分之一。
+        let mut block = icon_h + space::S2 + d.meta();
+        if note.detail.is_some() {
+            block += space::S1 + d.micro();
+        }
+        if note.retry {
+            block += space::S2 + d.px(22.0);
+        }
+        ui.add_space(((ui.available_height() - block) / 2.0).max(d.px(20.0)));
+        ui.vertical_centered(|ui| {
+            ui.spacing_mut().item_spacing.y = space::S2;
+            let icon_fg = if note.state == PaneState::Error {
+                t.danger
+            } else {
+                t.text_muted
+            };
+            if note.state == PaneState::Loading {
+                ui.add(egui::Spinner::new().size(icon_h).color(icon_fg));
+            } else {
+                ui.label(
+                    egui::RichText::new(note.icon)
+                        .font(FontId::new(icon_h, FontFamily::Proportional))
+                        .color(icon_fg),
+                );
+            }
+            ui.label(
+                egui::RichText::new(note.text)
+                    .font(Font::meta(d))
+                    .color(t.text_secondary),
+            );
+            if let Some(detail) = note.detail {
+                ui.spacing_mut().item_spacing.y = space::S1;
+                ui.label(
+                    egui::RichText::new(detail)
+                        .font(Font::mono_micro(d))
+                        .color(t.text_muted),
+                );
+            }
+            if note.retry {
+                ui.spacing_mut().item_spacing.y = space::S2;
+                retried = ui.add(chip(t, d, "重试", false)).clicked();
+            }
+        });
+    });
+    retried
+}
+
 // ---------------------------------------------------------------- 容器
 
 pub fn section_header(ui: &mut Ui, t: &Tokens, d: Density, title: &str, note: &str) {

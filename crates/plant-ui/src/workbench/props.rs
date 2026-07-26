@@ -23,14 +23,34 @@ use egui_phosphor::regular as ph;
 use crate::Cmd;
 use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Tokens, radius, space};
-use crate::style::widgets::{PropRow, prop_row_edit, prop_row_ui, toggle};
+use crate::style::widgets::{
+    self, PaneNote, PaneState, PropRow, prop_row_edit, prop_row_ui, toggle,
+};
 use crate::vm::{PropKind, PropRowVm, PropsDataVm, PropsVm, WorkbenchVm};
 
 pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Vec<Cmd>) {
     match &vm.props {
-        PropsVm::Empty => note(ui, t, d, ph::CURSOR_CLICK, "在模型树中选中元素查看属性"),
-        PropsVm::Loading => note(ui, t, d, ph::SPINNER, "属性加载中…"),
-        PropsVm::Failed(reason) => note(ui, t, d, ph::WARNING, reason),
+        PropsVm::Uninit => {
+            note(
+                ui,
+                t,
+                d,
+                PaneState::Uninit,
+                ph::CURSOR_CLICK,
+                "在模型树中选中元素查看属性",
+            );
+        }
+        PropsVm::Loading => {
+            note(ui, t, d, PaneState::Loading, ph::SPINNER, "属性加载中…");
+        }
+        // 重查的是当前选中元素；选中已经挪走的话 App 侧会把这条丢掉。
+        PropsVm::Failed(reason) => {
+            if note(ui, t, d, PaneState::Error, ph::WARNING, reason)
+                && let Some(refno) = vm.selected
+            {
+                cmds.push(Cmd::RetryProps(refno));
+            }
+        }
         PropsVm::Ready(data) => {
             egui::Frame::new().fill(t.bg_panel).show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
@@ -263,23 +283,18 @@ fn valid(kind: PropKind, text: &str) -> bool {
     }
 }
 
-/// 属性区的居中提示（未选中 / 加载中 / 失败）。四态统一视觉 M1-7 收口。
-fn note(ui: &mut Ui, t: &Tokens, d: Density, icon: &str, text: &str) {
-    egui::Frame::new().fill(t.bg_panel).show(ui, |ui| {
-        ui.set_min_size(ui.available_size());
-        ui.vertical_centered(|ui| {
-            ui.add_space(d.px(40.0));
-            ui.label(
-                RichText::new(icon)
-                    .font(FontId::proportional(d.px(24.0)))
-                    .color(t.text_muted),
-            );
-            ui.add_space(space::S2);
-            ui.label(
-                RichText::new(text)
-                    .font(Font::meta(d))
-                    .color(t.text_secondary),
-            );
-        });
-    });
+/// 属性区的三态提示（未选中 / 加载中 / 失败）。返回值是「重试」是否被点。
+fn note(ui: &mut Ui, t: &Tokens, d: Density, state: PaneState, icon: &str, text: &str) -> bool {
+    widgets::pane_note(
+        ui,
+        t,
+        d,
+        PaneNote {
+            state,
+            icon,
+            text,
+            detail: None,
+            retry: state == PaneState::Error,
+        },
+    )
 }

@@ -171,11 +171,13 @@ pub struct TreeRowVm {
 }
 
 /// 属性视图数据状态（跟随 `WorkbenchVm::selected`）。
+///
+/// 没有「空」态：属性表至少带 TYPE 与 NAME，选中了元素就不会一条都没有。
 #[derive(Debug, Clone, Default)]
 pub enum PropsVm {
-    /// 尚未选中任何元素。
+    /// 尚未选中任何元素——是「还没轮到它」而不是「查完了没有」。
     #[default]
-    Empty,
+    Uninit,
     /// 选中元素的属性查询在途。
     Loading,
     /// 属性到位，按设计稿分组展示。

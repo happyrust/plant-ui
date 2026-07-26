@@ -4,21 +4,35 @@
 //! 这里用 `show_rows` 只画视口内的行；行内文字裁剪由 `tree_row_ui` 保证，
 //! 长 PDMS 名不会撑破行。
 
-use egui::{RichText, ScrollArea, Ui};
+use egui::{ScrollArea, Ui};
 use egui_phosphor::regular as ph;
 
 use crate::Cmd;
-use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Status, Tokens, space};
-use crate::style::widgets::{self, RowIcon, TreeRow};
+use crate::style::widgets::{self, PaneNote, PaneState, RowIcon, TreeRow};
 use crate::vm::{TreeRowVm, TreeVm, WorkbenchVm};
 
 pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Vec<Cmd>) {
     match &vm.tree {
-        TreeVm::Loading => note(ui, t, d, ph::SPINNER, "正在连接数据源…"),
-        TreeVm::Failed(reason) => note(ui, t, d, ph::WARNING, reason),
+        TreeVm::Loading => {
+            note(ui, t, d, PaneState::Loading, ph::SPINNER, "正在连接数据源…");
+        }
+        // 树上的失败只有一种来源：连接或根层查询没成。重试就是重连，
+        // 不必让用户跑去命令行找那一行的「重试」。
+        TreeVm::Failed(reason) => {
+            if note(ui, t, d, PaneState::Error, ph::WARNING, reason) {
+                cmds.push(Cmd::Reconnect);
+            }
+        }
         TreeVm::Ready(rows) if rows.is_empty() => {
-            note(ui, t, d, ph::TREE_STRUCTURE, "当前库下没有 SITE")
+            note(
+                ui,
+                t,
+                d,
+                PaneState::Empty,
+                ph::TREE_STRUCTURE,
+                "当前库下没有 SITE",
+            );
         }
         TreeVm::Ready(rows) => {
             egui::Frame::new()
@@ -103,26 +117,21 @@ fn reveal_offset(
     Some((idx as f32 * row_h + row_h / 2.0 - view_h / 2.0).clamp(0.0, max))
 }
 
-/// 树区的居中提示（连接中 / 失败 / 空库）。
-fn note(ui: &mut Ui, t: &Tokens, d: Density, icon: &str, text: &str) {
-    egui::Frame::new().fill(t.bg_panel).show(ui, |ui| {
-        ui.set_min_size(ui.available_size());
-        ui.vertical_centered(|ui| {
-            ui.add_space(d.px(40.0));
-            ui.label(
-                RichText::new(icon)
-                    .font(egui::FontId::new(
-                        d.px(24.0),
-                        egui::FontFamily::Proportional,
-                    ))
-                    .color(t.text_muted),
-            );
-            ui.add_space(space::S2);
-            ui.label(
-                RichText::new(text)
-                    .font(Font::meta(d))
-                    .color(t.text_secondary),
-            );
-        });
-    });
+/// 树区的四态提示（连接中 / 空库 / 失败）。返回值是错误态那枚「重试」是否被点。
+///
+/// 树没有「未初始化」态：应用一启动就发连接请求，`TreeVm` 的默认值直接是
+/// `Loading`，没有中间那一帧。造一个永远不出现的态就是摆假状态。
+fn note(ui: &mut Ui, t: &Tokens, d: Density, state: PaneState, icon: &str, text: &str) -> bool {
+    widgets::pane_note(
+        ui,
+        t,
+        d,
+        PaneNote {
+            state,
+            icon,
+            text,
+            detail: None,
+            retry: state == PaneState::Error,
+        },
+    )
 }
