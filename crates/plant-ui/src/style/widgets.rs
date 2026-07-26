@@ -531,48 +531,64 @@ pub fn tree_row_ui(ui: &mut Ui, t: &Tokens, d: Density, row: TreeRow<'_>) -> Tre
     }
 }
 
-pub fn prop_row<'a>(
-    t: &'a Tokens,
-    d: Density,
-    key: &'a str,
-    value: &'a str,
-    mono: bool,
-    zebra: bool,
-) -> impl Widget + 'a {
-    move |ui: &mut Ui| {
-        let h = d.row_h();
-        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
-        if !ui.is_rect_visible(rect) {
-            return resp;
-        }
-        if zebra {
-            ui.painter()
-                .rect_filled(rect, CornerRadius::ZERO, t.bg_header);
-        }
-        let pad = d.px(12.0);
-        let kg = lay(ui, key, Font::meta(d));
-        draw_galley(
-            ui,
-            pos2(rect.left() + pad, rect.center().y - kg.size().y / 2.0),
-            kg,
-            t.text_muted,
-        );
-        let vg = lay(
-            ui,
-            value,
-            if mono { Font::mono(d) } else { Font::label(d) },
-        );
-        draw_galley(
-            ui,
-            pos2(
-                rect.left() + pad + prop_key_w(d),
-                rect.center().y - vg.size().y / 2.0,
-            ),
-            vg,
-            t.text_primary,
-        );
-        resp
+pub struct PropRow<'a> {
+    pub key: &'a str,
+    pub value: &'a str,
+    /// 值列走等宽字体。数值、方位串、refno 靠它上下对齐。
+    pub mono: bool,
+    /// 偶数行斑马底。
+    pub zebra: bool,
+    /// unset / 空值弱化，与有值的行一眼可分。
+    pub muted: bool,
+}
+
+/// 只读属性行。两列各自裁剪：PDMS 的键名和值都可能超长，不裁的话键名会顶穿
+/// 值列、值会溢出面板右缘。
+pub fn prop_row_ui(ui: &mut Ui, t: &Tokens, d: Density, row: PropRow<'_>) -> Response {
+    let h = d.row_h();
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return resp;
     }
+    if row.zebra {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::ZERO, t.bg_header);
+    }
+    let pad = d.px(12.0);
+    let key_x = rect.left() + pad;
+    let value_x = rect.left() + prop_value_x(d);
+
+    let kg = lay(ui, row.key, Font::meta(d));
+    let key_clip = Rect::from_min_max(
+        pos2(key_x, rect.top()),
+        pos2(value_x - d.px(4.0), rect.bottom()),
+    );
+    ui.painter().with_clip_rect(key_clip).galley(
+        pos2(key_x, rect.center().y - kg.size().y / 2.0),
+        kg,
+        t.text_muted,
+    );
+
+    let vg = lay(
+        ui,
+        row.value,
+        if row.mono { Font::mono(d) } else { Font::label(d) },
+    );
+    let value_clip = Rect::from_min_max(
+        pos2(value_x, rect.top()),
+        pos2(rect.right() - pad, rect.bottom()),
+    );
+    let fg = if row.muted {
+        t.text_muted
+    } else {
+        t.text_primary
+    };
+    ui.painter().with_clip_rect(value_clip).galley(
+        pos2(value_x, rect.center().y - vg.size().y / 2.0),
+        vg,
+        fg,
+    );
+    resp
 }
 
 /// 键名列宽。只读的 `prop_row` 与可编辑的 `prop_row_edit` 必须共用它，

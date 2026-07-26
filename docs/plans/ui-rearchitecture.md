@@ -116,6 +116,12 @@ D:\work\plant-code\old\plant-ui\
 | 自家代码 `aios_core` | `vendor/rs-core/` 可编辑源码树 + path 依赖 | **拷贝自 `rs-core-pin` 钉版**（= git rev 5667b70 + get_world 顺延修复，与 gen-model 当前 patch 一致），不是脏检出的 `plant-code\rs-core` |
 | Bevy 生态 fork | **M3 才引入**，届时以可编辑源码树进入 | 里程碑 1 用不到 |
 
+#### `vendor/rs-core` 的改动记录（换钉版时要重放）
+
+| 位置 | 改动 | 缘由 |
+|---|---|---|
+| `rs_surreal/query.rs` `get_named_attmap_with_uda` | `pub(crate)` -> `pub` | UI 版属性表 `get_ui_named_attmap` 会把引用与未设值都压成 `StringType`，属性面板判「哪些字段可编辑」需要压之前的原始类型。该函数带 `#[cached]`，多取一次不额外打库 |
+
 ### 里程碑 1 的完整依赖清单（已核实全部在 crates.io 上游，**零 fork**）
 
 | crate | 版本 | 用途 |
@@ -159,6 +165,8 @@ D:\work\plant-code\old\plant-ui\
 | M1-7 状态四态 | 每个视图都有加载 / 空 / 错误 / 未初始化四态（参照 S8） |
 
 验收统一用 `egui_mcp` + 像素采样，不依赖桌面截图工具。
+
+M1-3 的「可编辑」到**发出 `Cmd::EditAttr` 并更新内存 Vm** 为止，独立应用里不写回 SurrealDB：写回要连会话号、撤销、依赖重算一起做，归 M3-3 命令派发接现有 Event。可编辑的只有标量（整数 / 实数 / 布尔 / 文本）；引用、方位串、数组、未设值一律只读——它们要元素选择器或方位串解析器才能安全地改。
 
 ### M2 · rs-plant 侧拆除（可与 M1 并行，互不阻塞）
 

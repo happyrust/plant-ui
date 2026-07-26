@@ -11,6 +11,8 @@ use plant_ui_data::{EleTreeNode, RefU64};
 pub enum Req {
     /// 懒加载某节点的直接子层。
     Children(RefU64),
+    /// 选中元素的 UI 属性表。
+    Props(RefU64),
 }
 
 /// 启动序列（连接 + 工程标识 + SITE 根层）的合并产物。
@@ -24,6 +26,7 @@ pub struct ReadyInfo {
 pub enum Evt {
     Ready(anyhow::Result<ReadyInfo>),
     Children(RefU64, anyhow::Result<Vec<EleTreeNode>>),
+    Props(RefU64, anyhow::Result<Vec<plant_ui_data::Attr>>),
 }
 
 pub struct Bridge {
@@ -63,6 +66,11 @@ pub fn spawn(ctx: egui::Context) -> Bridge {
                         Req::Children(refno) => {
                             let r = plant_ui_data::child_nodes(refno.into()).await;
                             let _ = evt_tx.send(Evt::Children(refno, r));
+                            ctx.request_repaint();
+                        }
+                        Req::Props(refno) => {
+                            let r = plant_ui_data::element_props(refno.into()).await;
+                            let _ = evt_tx.send(Evt::Props(refno, r));
                             ctx.request_repaint();
                         }
                     }

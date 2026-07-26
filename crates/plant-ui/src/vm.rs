@@ -21,6 +21,8 @@ pub struct WorkbenchVm {
     pub selected: Option<RefU64>,
     /// 模型树（M1-2）。
     pub tree: TreeVm,
+    /// 属性视图（M1-3）。
+    pub props: PropsVm,
 }
 
 /// 模型树数据状态。
@@ -55,4 +57,70 @@ pub struct TreeRowVm {
     pub expandable: Option<bool>,
     /// 子层查询在途（行尾以「加载中…」提示）。
     pub loading: bool,
+}
+
+/// 属性视图数据状态（跟随 `WorkbenchVm::selected`）。
+#[derive(Debug, Clone, Default)]
+pub enum PropsVm {
+    /// 尚未选中任何元素。
+    #[default]
+    Empty,
+    /// 选中元素的属性查询在途。
+    Loading,
+    /// 属性到位，按设计稿分组展示。
+    Ready(PropsDataVm),
+    /// 查询失败，附原因。
+    Failed(String),
+}
+
+/// 一个元素的属性面板内容。
+///
+/// 分组口径：通用属性 = 类型 / 名称 / OWNER / REFNO 四行定序；
+/// UDA 属性 = 以 ':' 开头的用户自定义属性；其余全部进元件属性（字母序）。
+/// 设计稿里的会话号 / 修改人 / 修改时间是版本数据，M4 接 his_pe 后再补——
+/// 外壳原则：宁可少一行，不摆假数据。
+#[derive(Debug, Clone, Default)]
+pub struct PropsDataVm {
+    pub refno: RefU64,
+    /// 面板头：元素显示名 + noun。
+    pub name: String,
+    pub noun: String,
+    pub common: Vec<PropRowVm>,
+    pub attrs: Vec<PropRowVm>,
+    pub udas: Vec<PropRowVm>,
+}
+
+/// 属性面板的一行（C/PropRow：键 88pt 次级色 + 值等宽填充）。
+#[derive(Debug, Clone)]
+pub struct PropRowVm {
+    /// 显示用键名，通用组会译成中文（TYPE -> 类型）。
+    pub key: String,
+    /// 真实属性名，`Cmd::EditAttr` 用它回指，不能拿 `key` 顶替。
+    pub attr: String,
+    pub value: String,
+    /// 值的可编辑形态，决定给什么控件。
+    pub kind: PropKind,
+    /// unset / 空值以弱化色渲染。
+    pub muted: bool,
+}
+
+/// 值的可编辑形态（对应数据层的 `AttrKind`）。
+///
+/// 旧壳的属性行由 `reflect_att_map` 反射驱动，值是可编辑的；新链路没有 Bevy 反射，
+/// 由数据层把 `NamedAttrValue` 的变体降成这个枚举，绘制层据此选控件。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PropKind {
+    /// 未设值，或引用 / 方位 / 数组这类要选择器才能改的值：只读。
+    #[default]
+    ReadOnly,
+    Int,
+    Real,
+    Bool,
+    Text,
+}
+
+impl PropKind {
+    pub fn editable(self) -> bool {
+        self != PropKind::ReadOnly
+    }
 }

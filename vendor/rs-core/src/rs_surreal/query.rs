@@ -587,8 +587,10 @@ pub async fn get_default_full_name(refno: RefnoEnum) -> anyhow::Result<String> {
 }
 
 ///通过surql查询属性数据，包含UDA数据
+// 放开给 plant-ui-data：UI 版属性表会把引用与未设值都压成 StringType，
+// 属性面板判可编辑需要压之前的原始类型。
 #[cached(result = true)]
-pub(crate) async fn get_named_attmap_with_uda(
+pub async fn get_named_attmap_with_uda(
     refno_enum: RefnoEnum,
 ) -> anyhow::Result<NamedAttrMap> {
     let sql = format!(

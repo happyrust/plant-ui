@@ -11,4 +11,11 @@ pub enum Cmd {
     SelectElement(aios_core::RefU64),
     /// 展开 / 折叠模型树节点；子层未加载时由 App 侧懒加载。
     ToggleExpand(aios_core::RefU64),
+    /// 属性面板提交了一次改值（回车或失焦）。`attr` 是真实属性名，
+    /// `value` 是已按类型校验过的显示串。
+    EditAttr {
+        refno: aios_core::RefU64,
+        attr: String,
+        value: String,
+    },
 }

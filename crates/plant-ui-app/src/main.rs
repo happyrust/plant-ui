@@ -11,7 +11,7 @@ use eframe::egui;
 use plant_ui::Cmd;
 use plant_ui::style::theme_tokens::{self, set_weight_families_ready};
 use plant_ui::style::tokens::{Density, Tokens};
-use plant_ui::vm::{TreeRowVm, TreeVm, WorkbenchVm};
+use plant_ui::vm::{PropKind, PropRowVm, PropsDataVm, PropsVm, TreeRowVm, TreeVm, WorkbenchVm};
 use plant_ui::workbench::{self, WorkbenchState};
 use plant_ui_data::{EleTreeNode, RefU64};
 
@@ -133,6 +133,14 @@ impl App {
                     eprintln!("[data] 子层加载失败 {refno:?}: {e:#}");
                     dirty = true;
                 }
+                // 晚到的旧选中结果直接丢弃，属性面板只认当前选中。
+                data::Evt::Props(refno, result) if self.vm.selected == Some(refno) => {
+                    self.vm.props = match result {
+                        Ok(kvs) => PropsVm::Ready(self.build_props(refno, kvs)),
+                        Err(e) => PropsVm::Failed(format!("属性查询失败：{e:#}")),
+                    };
+                }
+                data::Evt::Props(..) => {}
             }
         }
         if dirty {
@@ -145,7 +153,11 @@ impl App {
         for cmd in cmds {
             match cmd {
                 Cmd::SelectElement(refno) => {
-                    self.vm.selected = Some(refno);
+                    if self.vm.selected != Some(refno) {
+                        self.vm.selected = Some(refno);
+                        self.vm.props = PropsVm::Loading;
+                        let _ = self.bridge.req.send(data::Req::Props(refno));
+                    }
                 }
                 Cmd::ToggleExpand(refno) => {
                     if !self.tree.expanded.remove(&refno) {
@@ -158,6 +170,30 @@ impl App {
                     }
                     dirty = true;
                 }
+                // 独立应用里派发层就是这里：先只落到内存 Vm，写回 SurrealDB 要连
+                // 会话号、撤销、依赖重算一起做，归 M3-3 命令派发接现有 Event。
+                Cmd::EditAttr { refno, attr, value } => {
+                    if let PropsVm::Ready(data) = &mut self.vm.props
+                        && data.refno == refno
+                    {
+                        let rows = data
+                            .common
+                            .iter_mut()
+                            .chain(&mut data.attrs)
+                            .chain(&mut data.udas);
+                        for row in rows {
+                            if row.attr == attr {
+                                row.value = value.clone();
+                                row.muted = false;
+                                break;
+                            }
+                        }
+                        if attr == "NAME" {
+                            data.name = value.clone();
+                        }
+                    }
+                    eprintln!("[edit] {refno:?} {attr} = {value}（未写回数据库）");
+                }
             }
         }
         if dirty {
@@ -168,6 +204,72 @@ impl App {
     fn rebuild_tree(&mut self) {
         self.vm.tree = TreeVm::Ready(self.tree.flatten());
         self.vm.element_count = self.tree.element_count();
+    }
+
+    /// 数据层属性 -> 面板分组。通用组固定 类型/名称/OWNER 顺序，
+    /// ':' 前缀进 UDA 组，其余按数据侧的字母序进元件属性组。
+    /// REFNO 不进任何一组——它是面板头的 refno 芯片，摆进通用组就重复了。
+    fn build_props(&self, refno: RefU64, attrs: Vec<plant_ui_data::Attr>) -> PropsDataVm {
+        let mut data = PropsDataVm {
+            refno,
+            ..Default::default()
+        };
+        let mut common: HashMap<String, PropRowVm> = HashMap::new();
+        for attr in attrs {
+            let muted = attr.value == "unset";
+            let row = PropRowVm {
+                key: attr.name.clone(),
+                attr: attr.name,
+                value: attr.value,
+                kind: prop_kind(attr.kind),
+                muted,
+            };
+            match row.attr.as_str() {
+                "TYPE" => {
+                    data.noun = row.value.clone();
+                    common.insert("TYPE".into(), PropRowVm {
+                        key: "类型".into(),
+                        ..row
+                    });
+                }
+                "NAME" => {
+                    data.name = row.value.clone();
+                    common.insert("NAME".into(), PropRowVm {
+                        key: "名称".into(),
+                        ..row
+                    });
+                }
+                "OWNER" => {
+                    common.insert("OWNER".into(), row);
+                }
+                "REFNO" => {}
+                k if k.starts_with(':') => data.udas.push(row),
+                _ => data.attrs.push(row),
+            }
+        }
+        for k in ["TYPE", "NAME", "OWNER"] {
+            if let Some(row) = common.remove(k) {
+                data.common.push(row);
+            }
+        }
+        // 无名元素面板头回退到 noun 序号名之前，先用 refno 占位。
+        if data.name.is_empty() || data.name == "unset" {
+            data.name = refno.to_string();
+        }
+        data
+    }
+}
+
+/// 数据层的属性形态 -> 绘制层的控件选择。数据层的 `Unset` / `Opaque` 在 UI 侧
+/// 都只是「不给控件」，合成一个 `ReadOnly`。
+fn prop_kind(kind: plant_ui_data::AttrKind) -> PropKind {
+    use plant_ui_data::AttrKind as K;
+    match kind {
+        K::Unset | K::Opaque => PropKind::ReadOnly,
+        K::Int => PropKind::Int,
+        K::Real => PropKind::Real,
+        K::Bool => PropKind::Bool,
+        K::Text => PropKind::Text,
     }
 }
 

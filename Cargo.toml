@@ -19,6 +19,8 @@ eframe = { version = "0.35", default-features = false, features = ["glow", "defa
 egui_extras = "0.35"
 egui_dock = "0.20.1"
 egui-phosphor = "0.13.0"
+# 验收探针用它的线协议直连运行中的应用（eframe 的 inspection feature 是服务端那一半）
+egui_inspection = "0.35"
 
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 anyhow = "1"

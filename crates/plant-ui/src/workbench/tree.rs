@@ -43,7 +43,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                                     d,
                                     TreeRow {
                                         depth: row.depth as usize,
-                                        icon: RowIcon::Glyph(noun_icon(&row.noun)),
+                                        icon: RowIcon::Glyph(super::noun_icon(&row.noun)),
                                         label: &row.name,
                                         meta,
                                         selected: vm.selected == Some(row.refno),
@@ -73,20 +73,6 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                         });
                 });
         }
-    }
-}
-
-/// PDMS 类型 -> 行首图标。挑常见层级给个可辨识的形状，其余统一立方体。
-fn noun_icon(noun: &str) -> &'static str {
-    match noun {
-        "SITE" => ph::FACTORY,
-        "ZONE" => ph::BOUNDING_BOX,
-        "PIPE" => ph::PIPE,
-        "BRAN" => ph::GIT_BRANCH,
-        "EQUI" => ph::ENGINE,
-        "STRU" | "FRMW" => ph::WALL,
-        "HANG" | "SUPPO" => ph::ANCHOR,
-        _ => ph::CUBE,
     }
 }
 

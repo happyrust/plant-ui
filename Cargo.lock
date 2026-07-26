@@ -5695,6 +5695,7 @@ dependencies = [
  "eframe",
  "egui",
  "egui-phosphor",
+ "egui_inspection",
  "plant-ui",
  "plant-ui-data",
  "tokio",

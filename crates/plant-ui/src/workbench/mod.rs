@@ -5,15 +5,33 @@
 
 pub mod chrome;
 pub mod panes;
+pub mod props;
 pub mod tree;
 
 pub use panes::Pane;
 
 use egui_dock::{DockArea, DockState, NodeIndex};
+use egui_phosphor::regular as ph;
 
 use crate::Cmd;
 use crate::style::tokens::{Density, Tokens};
 use crate::vm::WorkbenchVm;
+
+/// PDMS 类型 -> 图标。模型树行首与属性面板头共用一套，同一个元素在两处
+/// 不能是两个形状。挑常见层级给可辨识的形状，其余统一立方体。
+pub fn noun_icon(noun: &str) -> &'static str {
+    match noun {
+        "SITE" => ph::FACTORY,
+        "ZONE" => ph::BOUNDING_BOX,
+        "PIPE" => ph::PIPE,
+        "BRAN" => ph::GIT_BRANCH,
+        "EQUI" => ph::ENGINE,
+        "NOZZ" => ph::PLUGS_CONNECTED,
+        "STRU" | "FRMW" => ph::WALL,
+        "HANG" | "SUPPO" => ph::ANCHOR,
+        _ => ph::CUBE,
+    }
+}
 
 /// 外壳持久状态（dock 布局）。属于界面本身而非数据，所以不进 Vm。
 pub struct WorkbenchState {

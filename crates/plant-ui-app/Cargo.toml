@@ -9,5 +9,6 @@ plant-ui-data.workspace = true
 egui.workspace = true
 eframe.workspace = true
 egui-phosphor.workspace = true
+egui_inspection.workspace = true
 tokio.workspace = true
 anyhow.workspace = true

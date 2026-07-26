@@ -194,6 +194,9 @@ impl Font {
     pub fn meta(d: Density) -> FontId {
         FontId::new(d.meta(), FontFamily::Proportional)
     }
+    pub fn meta_strong(d: Density) -> FontId {
+        weighted(d.meta(), semibold())
+    }
     pub fn body(d: Density) -> FontId {
         FontId::new(d.body(), FontFamily::Proportional)
     }
