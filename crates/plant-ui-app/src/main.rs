@@ -53,7 +53,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let t = theme_tokens::current();
         let d = Density::Standard;
-        egui::CentralPanel::default().show_inside(ui, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             widgets::section_header(
                 ui,
                 &t,

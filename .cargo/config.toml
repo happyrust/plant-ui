@@ -1,0 +1,41 @@
+# 源替换：全部依赖改读 vendor/registry（cargo vendor 产物，只读、带校验和）。
+# 可编辑源码树（vendor/rs-core、vendor/forks/*）走 path 依赖，不受此替换影响。
+# 片段由 `cargo vendor vendor/registry` 生成；重跑 vendor 前先移开本文件。
+
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source."git+https://gitee.com/happydpc/bevy"]
+git = "https://gitee.com/happydpc/bevy"
+replace-with = "vendored-sources"
+
+[source."git+https://gitee.com/happydpc/calamine"]
+git = "https://gitee.com/happydpc/calamine"
+replace-with = "vendored-sources"
+
+[source."git+https://gitee.com/happydpc/cavalier_contours"]
+git = "https://gitee.com/happydpc/cavalier_contours"
+replace-with = "vendored-sources"
+
+[source."git+https://gitee.com/happydpc/id_tree"]
+git = "https://gitee.com/happydpc/id_tree"
+replace-with = "vendored-sources"
+
+[source."git+https://gitee.com/happydpc/nalgebra"]
+git = "https://gitee.com/happydpc/nalgebra"
+replace-with = "vendored-sources"
+
+[source."git+https://gitee.com/happydpc/rust-ploop-processor"]
+git = "https://gitee.com/happydpc/rust-ploop-processor"
+replace-with = "vendored-sources"
+
+[source."git+https://gitee.com/happydpc/surrealdb"]
+git = "https://gitee.com/happydpc/surrealdb"
+replace-with = "vendored-sources"
+
+[source."git+https://gitee.com/happydpc/wgpu"]
+git = "https://gitee.com/happydpc/wgpu"
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor/registry"

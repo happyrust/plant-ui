@@ -52,12 +52,13 @@ nalgebra = { git = "https://gitee.com/happydpc/nalgebra", features = [
     "glam029",
     "convert-glam029",
 ] }
-parry3d = { git = "https://gitee.com/happydpc/parry", package = "parry3d", features = [
+# fork 转 path：parry 仓库是 2d/3d 共享顶层 src 的 workspace，cargo vendor 收不到包外共享源码（产物缺 src）
+parry3d = { path = "../forks/parry/crates/parry3d", package = "parry3d", features = [
     "serde-serialize",
     "rkyv",
     "rkyv-serialize",
 ] }
-parry2d = { git = "https://gitee.com/happydpc/parry", package = "parry2d", features = [
+parry2d = { path = "../forks/parry/crates/parry2d", package = "parry2d", features = [
     "serde-serialize",
     "rkyv",
     "rkyv-serialize",
@@ -76,7 +77,8 @@ phf = { version = "0.11.2", features = ["macros"] }
 derivative = "2.2.0"
 dyn-clone = "1.0.9"
 #axum-login = { version = "0.4.1"}
-rstar = { git = "https://gitee.com/happydpc/rstar", features = ["serde"] }
+# fork 转 path：与 crates-io rstar 0.11.0（geo 传递依赖）同名同版本，git 源会让 cargo vendor 报 duplicate
+rstar = { path = "../forks/rstar", features = ["serde"] }
 uuid = "1.3.0"
 config = "0.14.1"
 calamine = { git = "https://gitee.com/happydpc/calamine" }
