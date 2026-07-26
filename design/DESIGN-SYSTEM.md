@@ -7,20 +7,26 @@ HTML 参照：`design/export/*.html`（离线可看，含精确尺寸与颜色�
 
 ## 1. 画板索引
 
-| 画板 | 尺寸 | 对应代码 |
-|---|---|---|
-| S1 主工作台（深色） | 1600×1000 | `dock.rs`、`editor_ui/ui_plugin.rs`、`ui/menu_bar.rs` |
-| S2 模型更新 · 预览 | 1040×720 | `data_interface/model_update_plan.rs`（gen-model 侧） |
-| S3 主工作台（浅色） | 1600×1000 | 同 S1，仅主题切换 |
-| S4 模型更新 · 执行进度 | 1040×720 | `data_interface/increment_pipeline.rs` |
-| S5 项目选择 | 1600×1000 | `ui/ui_project_page.rs`（当前整体注释掉） |
-| S6 设置 | 880×740 | `editor_ui/dashboard/preference.rs` |
-| S7 防火封堵材料统计 | 1240×820 | `ui/plugging_material_statistics/` |
-| S8 状态词汇 | 1240×560 | 所有数据面板通用 |
-| S9 创建元件 | 900×680 | `plugins/pipe_plugin/component_creation_ui.rs` |
-| S10 元件库 | 1400×860 | `UiOption::ComponentWarehouseUI` |
-| S11 模糊查询 | 1240×820 | `ui/fuzzy_search/` |
-| S12 保存 / 搜索记录 | 1280×560 | `fuzzy_search/save_ui.rs`、`import_ui.rs` |
+这是**规划**，不是 `.pen` 的现状：截至 2026-07-27，文件里只有 S1–S4 加 6 个组件
+（C/Tab、C/TreeRow、C/PropRow、C/LogRow、C/ToolBtn、C/Button），S5 往后一张都没画。
+「已画」一列就是为此加的——查过 `old\rs-plant3-d\design\rs-plant3d-ui.pen` 那份原始文件，
+体积是本项目这份的三倍，顶层节点却完全一样，所以不是迁移时漏拷。
+下游要照着某张画板做之前，先看这一列。
+
+| 画板 | 尺寸 | 已画 | 对应代码 |
+|---|---|---|---|
+| S1 主工作台（深色） | 1600×1000 | 是 | `dock.rs`、`editor_ui/ui_plugin.rs`、`ui/menu_bar.rs` |
+| S2 模型更新 · 预览 | 1040×720 | 是 | `data_interface/model_update_plan.rs`（gen-model 侧） |
+| S3 主工作台（浅色） | 1600×1000 | 是 | 同 S1，仅主题切换 |
+| S4 模型更新 · 执行进度 | 1040×720 | 是 | `data_interface/increment_pipeline.rs` |
+| S5 项目选择 | 1600×1000 | 否 | `ui/ui_project_page.rs`（当前整体注释掉） |
+| S6 设置 | 880×740 | 否 | `editor_ui/dashboard/preference.rs` |
+| S7 防火封堵材料统计 | 1240×820 | 否 | `ui/plugging_material_statistics/` |
+| S8 状态词汇 | 1240×560 | 否 | 所有数据面板通用；M1-7 已改按设计令牌收敛，不等它 |
+| S9 创建元件 | 900×680 | 否 | `plugins/pipe_plugin/component_creation_ui.rs` |
+| S10 元件库 | 1400×860 | 否 | `UiOption::ComponentWarehouseUI` |
+| S11 模糊查询 | 1240×820 | 否 | `ui/fuzzy_search/` |
+| S12 保存 / 搜索记录 | 1280×560 | 否 | `fuzzy_search/save_ui.rs`、`import_ui.rs` |
 
 ---
 
