@@ -41,8 +41,20 @@
 | 欠 N 个单元 | `欠 2 个单元` | 契约 | `GET /update/pending-units` 按 dbnum 过滤计数。它走持久表，**不依赖任务历史**（ADR-011 §11）|
 | 失败单元标识 | `EQUI /P-1201B` | 契约 | `ModelUnitResult.noun` + `root_refno`，或 `PendingModelUnit` 同名字段 |
 | 尝试次数 | `第 3 次尝试` | 契约 | `ModelUnitResult.attempts` / `PendingModelUnit.attempts`（跨重试累计）|
-| 「重试」按钮 | | 契约 | `POST /api/v1/model/ensure { refno }`，幂等，无需后端改动 |
+| 「重试」按钮 | | 契约 + **待修** | `POST /api/v1/model/ensure { refno }`，幂等。**「无需后端改动」这句已经不成立**——空单元回 500，见表下那段 |
 | 上次结果 | `上次 partial · 10:04` | 契约 | 该 dbnum 最近一条终态 `TaskEntry` 的 `state` + `finished_at`。分层保留策略保证它一定还在（ADR-011 §11）|
+
+**那枚「重试」在空交付单元上今天必然误导**（2026-07-27 实测，rollout 六之六 G4）：
+无子件的 BRAN 之类生成后 0 实例，`/model/ensure` 回
+`500 {"code":"internal","message":"已生成生成根 …，但请求构件 … 没有落下任何模型实例"}`，
+而规格 `web-service-api.md` §4.5 定义此形态应是 200 + `NoRenderableGeometry`。
+客户端把 500 归到 `internal`，界面上就是一次服务故障——**人会对着一个本来就空的单元
+反复按重试，而每按一次服务端都真的重跑一遍生成**。
+
+服务端修法：`written == 0 && renderable == 0` 且生成流程本身成功 → 归
+`NoRenderableGeometry`（200，`model_available = false`），并给 `OnDemandModelResult`
+加 `empty_unit: bool`。**界面等这个字段**——「画不出来」与「本来就没东西」是两句话，
+在拿到它之前这一格只能照旧说「生成失败 · 待重试」，那是错的，但比自己猜一个更错。
 
 ---
 
