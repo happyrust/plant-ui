@@ -188,6 +188,33 @@ pub enum PropsVm {
     Failed(String),
 }
 
+impl PropsVm {
+    /// Apply an accepted scalar edit to the displayed snapshot.
+    pub fn edit(&mut self, refno: RefU64, attr: &str, value: String) {
+        let Self::Ready(data) = self else {
+            return;
+        };
+        if data.refno != refno {
+            return;
+        }
+        for row in data
+            .common
+            .iter_mut()
+            .chain(&mut data.attrs)
+            .chain(&mut data.udas)
+        {
+            if row.attr == attr {
+                row.value = value.clone();
+                row.muted = false;
+                break;
+            }
+        }
+        if attr == "NAME" {
+            data.name = value;
+        }
+    }
+}
+
 /// 一个元素的属性面板内容。
 ///
 /// 分组口径：通用属性 = 类型 / 名称 / OWNER / REFNO 四行定序；

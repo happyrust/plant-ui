@@ -6,7 +6,7 @@ use plant_ui::model_update::{Accepted, Preview, Run};
 
 pub fn base_url() -> String {
     std::env::var("PLANT_MODEL_API_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:3100".into())
+        .unwrap_or_else(|_| "http://127.0.0.1:8020".into())
         .trim_end_matches('/')
         .to_owned()
 }
@@ -15,28 +15,27 @@ pub fn preview(base: &str, project: &str) -> anyhow::Result<Preview> {
     post(
         base,
         "/api/v1/update/preview",
-        serde_json::json!({ "project": project, "dbnums": [] }).to_string(),
+        serde_json::json!({ "project": project }).to_string(),
         Duration::from_secs(600),
     )
 }
 
-pub fn execute(base: &str, project: &str, dbnums: &[u32]) -> anyhow::Result<Accepted> {
+pub fn execute(base: &str, project: &str) -> anyhow::Result<Accepted> {
     post(
         base,
         "/api/v1/update/execute",
-        serde_json::json!({ "project": project, "dbnums": dbnums }).to_string(),
+        serde_json::json!({ "project": project }).to_string(),
         Duration::from_secs(60),
     )
 }
 
 pub fn task(base: &str, run_id: &str) -> anyhow::Result<Run> {
-    let response: TaskResponse = request(
+    request(
         agent(Duration::from_secs(15))
             .get(format!("{base}/api/v1/tasks/{run_id}"))
             .call()
             .context("请求模型更新任务状态失败")?,
-    )?;
-    Ok(response.run)
+    )
 }
 
 fn agent(timeout: Duration) -> ureq::Agent {
@@ -72,7 +71,7 @@ fn request<T: DeserializeOwned>(
     if !status.is_success() {
         let message = serde_json::from_str::<ErrorResponse>(&body)
             .ok()
-            .and_then(|value| value.error)
+            .and_then(|value| value.message)
             .unwrap_or(body);
         bail!("HTTP {status}: {message}");
     }
@@ -80,13 +79,8 @@ fn request<T: DeserializeOwned>(
 }
 
 #[derive(serde::Deserialize)]
-struct TaskResponse {
-    run: Run,
-}
-
-#[derive(serde::Deserialize)]
 struct ErrorResponse {
-    error: Option<String>,
+    message: Option<String>,
 }
 
 #[cfg(test)]
@@ -98,23 +92,51 @@ mod tests {
         let preview: Preview = serde_json::from_str(
             r#"{
                 "project":"ProjAMS",
-                "execution_scope":"dbnum+sesno",
                 "dbnums":[{
                     "dbnum":7997,
-                    "sessions":[{"sesno":42,"added":1,"modified":2,"deleted":0,"changed_count":3}],
-                    "zones":[{"zone_refno":"24384/1","unit_count":1,"units":[{
-                        "root_refno":"24384/12","noun":"BRAN","model_category":"BRAN"
-                    }]}]
-                }]
+                    "db_type":"DESI",
+                    "file_name":"des000.db",
+                    "file_path":"C:/project/des000.db",
+                    "applied_sesno":41,
+                    "file_latest_sesno":42,
+                    "sessions":[{"sesno":42,"added":1,"modified":2,"deleted":0}],
+                    "net_added":1,
+                    "net_modified":2,
+                    "net_deleted":0,
+                    "model_affecting":3,
+                    "units":[],
+                    "zones":[{"zone_refno":"24384/1","name":"/ZONE","units":[{
+                        "root_refno":"24384/12","noun":"BRAN","name":"/PIPE"
+                    }]}],
+                    "no_generation":0,
+                    "blocked":false,
+                    "anomaly":null,
+                    "initialization_required":false
+                }],
+                "pending_model_retries":[],
+                "warnings":[],
+                "up_to_date":false
             }"#,
         )
         .unwrap();
         assert_eq!(preview.dbnums[0].zones[0].units[0].noun, "BRAN");
 
-        let run: TaskResponse = serde_json::from_str(
-            r#"{"run":{"run_id":"sync+generate-db7997","dbnum":7997,"state":"succeeded"}}"#,
+        let run: Run = serde_json::from_str(
+            r#"{
+                "task_id":"mu-1",
+                "kind":"manual_update",
+                "project":"ProjAMS",
+                "state":"partial",
+                "created_at":"2026-07-27T10:00:00+08:00",
+                "finished_at":"2026-07-27T10:01:00+08:00",
+                "events_seen":3,
+                "result":{"batches":[],"units":[],"warnings":[]}
+            }"#,
         )
         .unwrap();
-        assert!(run.run.terminal());
+        assert!(run.terminal());
+        assert!(serde_json::from_str::<Preview>("{}").is_err());
+        assert!(serde_json::from_str::<Accepted>("{}").is_err());
+        assert!(serde_json::from_str::<Run>("{}").is_err());
     }
 }

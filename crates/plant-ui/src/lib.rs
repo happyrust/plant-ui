@@ -3,6 +3,8 @@
 
 pub mod fonts;
 pub mod model_update;
+pub mod project_picker;
+pub mod settings;
 pub mod style;
 pub mod vm;
 pub mod workbench;
@@ -33,10 +35,16 @@ pub enum Cmd {
     RetryProps(aios_core::RefU64),
     /// 清空命令行缓冲。
     ClearConsole,
+    /// 打开项目选择窗口。
+    OpenProjectPicker,
+    /// 使用宿主提供的配置加载一个项目。
+    LoadProject(String),
+    /// 打开设置任务窗。
+    OpenSettings,
     /// 打开并刷新模型增量更新预览。
     OpenModelUpdate,
     /// 重新读取当前项目的增量范围。
     RefreshModelUpdate,
-    /// 按 dbnum 执行；sesno 范围由服务端的 Committed Watermark 决定。
-    ExecuteModelUpdate(Vec<u32>),
+    /// 执行当前项目的全部待更新库；范围由服务端的 Committed Watermark 决定。
+    ExecuteModelUpdate,
 }

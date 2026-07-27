@@ -23,7 +23,6 @@ pub enum Req {
     ModelUpdateExecute {
         base: String,
         project: String,
-        dbnums: Vec<u32>,
     },
     ModelUpdateTask {
         base: String,
@@ -107,16 +106,12 @@ pub fn spawn(ctx: egui::Context) -> Bridge {
                                 repaint.request_repaint();
                             });
                         }
-                        Req::ModelUpdateExecute {
-                            base,
-                            project,
-                            dbnums,
-                        } => {
+                        Req::ModelUpdateExecute { base, project } => {
                             let tx = evt_tx.clone();
                             let repaint = ctx.clone();
                             std::thread::spawn(move || {
                                 let _ = tx.send(Evt::ModelUpdateExecute(
-                                    crate::model_update_api::execute(&base, &project, &dbnums),
+                                    crate::model_update_api::execute(&base, &project),
                                 ));
                                 repaint.request_repaint();
                             });

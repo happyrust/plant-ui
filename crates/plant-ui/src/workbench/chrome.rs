@@ -71,8 +71,13 @@ pub fn command_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: 
                     .into_iter()
                     .enumerate()
                 {
-                    // M1-1 只有视觉：菜单项的下拉与任务窗在 M4 接。
-                    let _ = ui.add(widgets::chip(t, d, name, i == 0));
+                    if ui.add(widgets::chip(t, d, name, i == 0)).clicked() {
+                        match name {
+                            "项目" => cmds.push(Cmd::OpenProjectPicker),
+                            "设置" => cmds.push(Cmd::OpenSettings),
+                            _ => {}
+                        }
+                    }
                 }
                 ui.add_space(space::S2);
                 divider(ui, t, d);

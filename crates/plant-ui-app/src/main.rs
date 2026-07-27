@@ -17,6 +17,8 @@ use plant_ui::fonts;
 use plant_ui::model_update::{
     self, Run as ModelUpdateRun, State as ModelUpdateState, Vm as ModelUpdateVm,
 };
+use plant_ui::project_picker::{self, State as ProjectPickerState};
+use plant_ui::settings::{self, State as SettingsState};
 use plant_ui::style::theme_tokens::{self, set_weight_families_ready};
 use plant_ui::style::tokens::{Density, Tokens};
 use plant_ui::vm::{
@@ -148,6 +150,8 @@ struct App {
     state: WorkbenchState,
     model_update: ModelUpdateVm,
     model_update_state: ModelUpdateState,
+    project_picker_state: ProjectPickerState,
+    settings_state: SettingsState,
     model_api_url: String,
     last_model_poll: Instant,
     pending_model_polls: HashSet<String>,
@@ -169,6 +173,8 @@ impl App {
             state: WorkbenchState::default(),
             model_update: ModelUpdateVm::default(),
             model_update_state: ModelUpdateState::default(),
+            project_picker_state: ProjectPickerState::new(Vec::new(), false),
+            settings_state: SettingsState::default(),
             model_api_url: model_update_api::base_url(),
             last_model_poll: Instant::now(),
             pending_model_polls: HashSet::new(),
@@ -271,7 +277,6 @@ impl App {
                 data::Evt::Props(..) => {}
                 data::Evt::ModelUpdatePreview(result) => match result {
                     Ok(preview) => {
-                        self.model_update_state.select_defaults(&preview);
                         self.console.info(
                             &mut self.vm.console,
                             format!(
@@ -290,31 +295,19 @@ impl App {
                 },
                 data::Evt::ModelUpdateExecute(result) => match result {
                     Ok(accepted) => {
-                        let runs = accepted
-                            .run_ids
-                            .into_iter()
-                            .zip(accepted.dbnums)
-                            .map(|(run_id, dbnum)| ModelUpdateRun {
-                                run_id,
-                                dbnum,
-                                state: "queued".into(),
-                                ..Default::default()
-                            })
-                            .collect::<Vec<_>>();
-                        let warnings = accepted
-                            .skipped
-                            .into_iter()
-                            .chain(accepted.excluded)
-                            .map(|item| format!("DB {} 已跳过：{}", item.dbnum, item.reason))
-                            .collect();
                         self.console.info(
                             &mut self.vm.console,
-                            format!("已提交 {} 个模型增量更新任务", runs.len()),
+                            format!("模型增量更新任务已提交：{}", accepted.task_id),
                         );
                         self.last_model_poll = Instant::now() - Duration::from_secs(1);
                         self.model_update = ModelUpdateVm::Running {
-                            runs,
-                            warnings,
+                            run: ModelUpdateRun {
+                                task_id: accepted.task_id,
+                                kind: accepted.kind,
+                                state: accepted.state,
+                                project: self.vm.project.clone(),
+                                ..Default::default()
+                            },
                             poll_error: None,
                         };
                     }
@@ -331,15 +324,11 @@ impl App {
                 },
                 data::Evt::ModelUpdateTask(run_id, result) => {
                     self.pending_model_polls.remove(&run_id);
-                    if let ModelUpdateVm::Running {
-                        runs, poll_error, ..
-                    } = &mut self.model_update
-                    {
+                    if let ModelUpdateVm::Running { run, poll_error } = &mut self.model_update {
                         match result {
-                            Ok(run) => {
-                                if let Some(slot) = runs.iter_mut().find(|run| run.run_id == run_id)
-                                {
-                                    *slot = run;
+                            Ok(latest) => {
+                                if latest.task_id == run_id {
+                                    *run = latest;
                                 }
                                 *poll_error = None;
                             }
@@ -397,25 +386,7 @@ impl App {
                 // 独立应用里派发层就是这里：先只落到内存 Vm，写回 SurrealDB 要连
                 // 会话号、撤销、依赖重算一起做，归 M3-3 命令派发接现有 Event。
                 Cmd::EditAttr { refno, attr, value } => {
-                    if let PropsVm::Ready(data) = &mut self.vm.props
-                        && data.refno == refno
-                    {
-                        let rows = data
-                            .common
-                            .iter_mut()
-                            .chain(&mut data.attrs)
-                            .chain(&mut data.udas);
-                        for row in rows {
-                            if row.attr == attr {
-                                row.value = value.clone();
-                                row.muted = false;
-                                break;
-                            }
-                        }
-                        if attr == "NAME" {
-                            data.name = value.clone();
-                        }
-                    }
+                    self.vm.props.edit(refno, &attr, value.clone());
                     let el = self.tree.element(refno);
                     let msg = format!("{attr} = {value}（仅改内存，未写回数据库）");
                     self.console.warn_of(&mut self.vm.console, el, msg);
@@ -443,6 +414,9 @@ impl App {
                     _ => {}
                 },
                 Cmd::ClearConsole => self.console.clear(&mut self.vm.console),
+                Cmd::OpenProjectPicker => self.project_picker_state.open = true,
+                Cmd::LoadProject(_) => self.project_picker_state.open = false,
+                Cmd::OpenSettings => self.settings_state.open(),
                 Cmd::OpenModelUpdate => {
                     self.model_update_state.open = true;
                     if !matches!(
@@ -455,15 +429,11 @@ impl App {
                     }
                 }
                 Cmd::RefreshModelUpdate => self.refresh_model_update(),
-                Cmd::ExecuteModelUpdate(dbnums) => {
-                    if dbnums.is_empty() {
-                        continue;
-                    }
+                Cmd::ExecuteModelUpdate => {
                     self.model_update = ModelUpdateVm::Starting;
                     let _ = self.bridge.req.send(data::Req::ModelUpdateExecute {
                         base: self.model_api_url.clone(),
                         project: self.vm.project.clone(),
-                        dbnums,
                     });
                 }
             }
@@ -511,10 +481,10 @@ impl App {
     }
 
     fn poll_model_update(&mut self, ctx: &egui::Context) {
-        let ModelUpdateVm::Running { runs, .. } = &self.model_update else {
+        let ModelUpdateVm::Running { run, .. } = &self.model_update else {
             return;
         };
-        if runs.iter().all(ModelUpdateRun::terminal) {
+        if run.terminal() {
             return;
         }
         ctx.request_repaint_after(Duration::from_secs(1));
@@ -522,13 +492,8 @@ impl App {
             return;
         }
         self.last_model_poll = Instant::now();
-        for run_id in runs
-            .iter()
-            .filter(|run| !run.terminal() && !self.pending_model_polls.contains(&run.run_id))
-            .map(|run| run.run_id.clone())
-            .collect::<Vec<_>>()
-        {
-            self.pending_model_polls.insert(run_id.clone());
+        let run_id = run.task_id.clone();
+        if self.pending_model_polls.insert(run_id.clone()) {
             let _ = self.bridge.req.send(data::Req::ModelUpdateTask {
                 base: self.model_api_url.clone(),
                 run_id,
@@ -632,7 +597,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.pump_events();
         let t = theme_tokens::current();
-        let d = Density::Standard;
+        let d = self.settings_state.saved.density;
         let mut cmds = workbench::show(ui, &t, d, &self.vm, &mut self.state);
         cmds.extend(model_update::show(
             ui.ctx(),
@@ -642,6 +607,16 @@ impl eframe::App for App {
             &self.model_update,
             &mut self.model_update_state,
         ));
+        cmds.extend(project_picker::show(
+            ui.ctx(),
+            &t,
+            d,
+            &mut self.project_picker_state,
+        ));
+        if let Some(saved) = settings::show(ui.ctx(), &t, d, &mut self.settings_state) {
+            theme_tokens::apply(ui.ctx(), &saved.theme.tokens(), saved.density);
+            ui.ctx().request_repaint();
+        }
         // 定位请求只管一帧：树刚才已经滚过去了，绘制层只读、消费不掉自己。
         self.vm.tree_reveal = None;
         self.handle_cmds(cmds);

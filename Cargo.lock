@@ -5688,6 +5688,7 @@ dependencies = [
  "egui_dock",
  "egui_extras",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
