@@ -101,7 +101,7 @@ pub struct TaskEntry {
     pub detail: Option<RoomCounts>,
     /// 终态结果；queued / running 时缺席。
     #[serde(default)]
-    pub result: Option<BatchOutcome>,
+    pub result: Option<crate::model_update::Outcome>,
 }
 
 impl TaskEntry {
@@ -130,23 +130,8 @@ pub struct RoomCounts {
     pub dead_letters: usize,
 }
 
-/// 数据批次的终态摘要，与 gen-model 的 `DataBatchTaskResult` 同形。
-///
-/// **`batch` 是单数**：合流之后一个任务就是一个数据批次，「一次运行装着几个批次」
-/// 那种形状随「运行」一并退役。
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct BatchOutcome {
-    #[serde(default)]
-    pub project: String,
-    #[serde(default)]
-    pub status: crate::model_update::RunStatus,
-    #[serde(default)]
-    pub batch: Option<crate::model_update::BatchResult>,
-    #[serde(default)]
-    pub units: Vec<crate::model_update::UnitResult>,
-    #[serde(default)]
-    pub warnings: Vec<String>,
-}
+/// 数据批次的终态摘要就是 [`crate::model_update::Outcome`]：那个类型改成单数
+/// `batch` 之后，两边已经是同一个形状，没有理由维护两份。
 
 /// `GET /api/v1/health`。三个字段各撑一句界面上的话：`started_at` 撑「队列是重建的」，
 /// `gen_spatial_tree` 撑「房间增量没开」，`queue_paused` 是暂停横幅的兜底来源。

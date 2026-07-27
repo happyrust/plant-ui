@@ -191,6 +191,9 @@ struct App {
     project_picker_state: ProjectPickerState,
     settings_state: SettingsState,
     model_api_url: String,
+    /// 当前 MDB 名（带前导 `/`），连库时取回。模型更新的预览与执行都要带上它
+    /// ——本期执行范围就是照这个 MDB 解出来的 DESI 库号。
+    mdb: String,
     /// 执行期的明细长连接。它的生命周期就是运行实例的生命周期，丢掉即断开。
     model_feed: Option<model_update_ws::Feed>,
     last_model_poll: Instant,
@@ -201,6 +204,9 @@ struct App {
     queue_feed: Option<model_update_ws::Feed>,
     last_queue_poll: Instant,
     queue_poll_pending: bool,
+    /// 已经见过终态的数据批次。轮询靠它认出「这一拍新跑完了哪几个」——
+    /// 终态之后快照还会带着它们好几拍，每拍都刷一次就是反复拆装同一批几何。
+    queue_finished: HashSet<String>,
     /// 已经发出去还没回来的那次取回工作。菜单点快了不该排成一串重查。
     get_work_pending: bool,
     bridge: data::Bridge,
@@ -239,6 +245,7 @@ impl App {
             project_picker_state: ProjectPickerState::new(Vec::new(), false),
             settings_state,
             model_api_url,
+            mdb: String::new(),
             model_feed: None,
             last_model_poll: Instant::now(),
             pending_model_polls: HashSet::new(),
@@ -247,6 +254,7 @@ impl App {
             // 开机就欠一拍：第一帧立刻去取第一份快照，别让面板空等一秒。
             last_queue_poll: Instant::now() - QUEUE_POLL_BUSY,
             queue_poll_pending: false,
+            queue_finished: HashSet::new(),
             get_work_pending: false,
             bridge: data::spawn(ctx.clone()),
             tree: TreeModel::default(),
@@ -292,6 +300,7 @@ impl App {
                     self.logs.info(&mut self.vm.logs, msg);
                     self.vm.data_source_ok = true;
                     self.vm.project = info.project;
+                    self.mdb = info.mdb;
                     self.vm.db = db_label(&info.ns, &info.db_nums);
                     self.tree.roots = info.sites;
                     let _ = self.bridge.req.send(data::Req::PendingSessions);
@@ -419,16 +428,24 @@ impl App {
                         }
                     }
                 }
+                // 向导不再跟着某一次运行走，这条通道已经没有发起方了；它随
+                // 「砍第三步」一并退役。留着只为让旧形态在退役前仍能自洽。
                 data::Evt::ModelUpdateTask(run_id, result) => {
                     self.pending_model_polls.remove(&run_id);
                     // 只认「这一轮刚跨进终态」这一次。终态之后轮询还会再来几拍，
                     // 每拍都取一次的话就是反复拆装同一批几何。
-                    let mut just_finished = false;
+                    let mut finished = Vec::new();
                     if let ModelUpdateVm::Running(session) = &mut self.model_update {
                         match result {
                             Ok(latest) => {
                                 if latest.task_id == run_id {
-                                    just_finished = !session.run.terminal() && latest.terminal();
+                                    if !session.run.terminal() && latest.terminal() {
+                                        finished = latest
+                                            .result
+                                            .as_ref()
+                                            .map(model_update::Outcome::refresh_units)
+                                            .unwrap_or_default();
+                                    }
                                     session.run = latest;
                                 }
                                 session.poll_error = None;
@@ -438,9 +455,7 @@ impl App {
                             }
                         }
                     }
-                    if just_finished {
-                        self.refresh_after_update();
-                    }
+                    self.refresh_for_units(finished);
                 }
                 // 「生成跑完了但一条都画不出来」是 200，不是失败——照实说，
                 // 别把它混进「已重新生成」里让人以为三维上该看得见东西了。
@@ -529,8 +544,10 @@ impl App {
                     self.queue_poll_pending = false;
                     match result {
                         Ok(poll) => {
+                            let fresh = self.newly_finished(&poll);
                             self.queue.project = self.vm.project.clone();
                             self.queue.adopt(poll);
+                            self.refresh_for_units(fresh);
                         }
                         // 上一份快照留在界面上，横幅把「这份是旧的」说出来。
                         Err(error) => self.queue.error = Some(logs::error_chain(&error)),
@@ -667,6 +684,7 @@ impl App {
                     let _ = self.bridge.req.send(data::Req::ModelUpdateExecute {
                         base: self.model_api_url.clone(),
                         project: self.vm.project.clone(),
+                        mdb: self.mdb.clone(),
                     });
                 }
                 Cmd::ReconnectModelUpdateFeed => self.reopen_model_feed(ctx),
@@ -686,6 +704,7 @@ impl App {
                     let _ = self.bridge.req.send(data::Req::ModelUpdateExecute {
                         base: self.model_api_url.clone(),
                         project: self.vm.project.clone(),
+                        mdb: self.mdb.clone(),
                     });
                 }
                 Cmd::SetQueuePaused(paused) => {
@@ -870,22 +889,38 @@ impl App {
         let _ = self.bridge.req.send(data::Req::GetWork { branches });
     }
 
-    /// 增量更新跑完之后自动取回一次，人不用记得再去点一下菜单。
+    /// 这一份快照里**刚刚跨进终态**的那些数据批次带来的刷新线索。
     ///
-    /// 与菜单点进来的那次不同：这里手上有一份确切的清单，所以只重查真正会变的
+    /// 合流之前这件事挂在向导那次运行的终态上；现在向导不跟运行了，只能由队列
+    /// 轮询来发现跃迁——**不发现就等于批次跑完了、树和三维还停在旧模型上**，
+    /// 而人只会以为更新没生效。
+    ///
+    /// 第一份快照只做登记不触发：那时手上这些终态是历史，不是刚发生的事，
+    /// 照它们刷一遍等于开机就把整棵树重查一次。
+    fn newly_finished(&mut self, poll: &plant_ui::task_queue::Poll) -> Vec<model_update::RefreshUnit> {
+        let first = !self.queue.loaded;
+        let mut units = Vec::new();
+        for task in &poll.tasks {
+            if task.kind != plant_ui::task_queue::KIND_DATA_BATCH || !task.terminal() {
+                continue;
+            }
+            if !self.queue_finished.insert(task.task_id.clone()) || first {
+                continue;
+            }
+            if let Some(outcome) = task.result.as_ref() {
+                units.extend(outcome.refresh_units());
+            }
+        }
+        units
+    }
+
+    /// 按一份确切的清单取回工作，人不用记得再去点一下菜单。
+    ///
+    /// 与菜单点进来的那次不同：这里手上有确切线索，所以只重查真正会变的
     /// 分支——单元自己、它的原 OWNER、新 OWNER，外加树里记着的当前父节点
     /// （元素被移走时后端的 `old_owner` 未必解得出来，本端的缓存却还留着移动前
     /// 那一头）。一个单元都没生成成功时整件事跳过：界面上不会有任何东西变。
-    fn refresh_after_update(&mut self) {
-        let units = match &self.model_update {
-            ModelUpdateVm::Running(session) => session
-                .run
-                .result
-                .as_ref()
-                .map(model_update::Outcome::refresh_units)
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        };
+    fn refresh_for_units(&mut self, units: Vec<model_update::RefreshUnit>) {
         if units.is_empty() {
             return;
         }
@@ -913,6 +948,7 @@ impl App {
         self.tree = TreeModel::default();
         self.vm.data_source_ok = false;
         self.vm.project.clear();
+        self.mdb.clear();
         self.vm.db.clear();
         self.vm.element_count = 0;
         self.vm.selection.clear();
@@ -928,6 +964,7 @@ impl App {
         let _ = self.bridge.req.send(data::Req::ModelUpdatePreview {
             base: self.model_api_url.clone(),
             project: self.vm.project.clone(),
+            mdb: self.mdb.clone(),
         });
     }
 
