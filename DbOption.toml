@@ -20,6 +20,9 @@ project_path = "D:/AVEVA/Projects/E3D3.1"
 included_projects = ["AvevaMarineSample", "AvevaCatalogue", "ZDJ"]
 #project_dirs = ["AvevaMarineSample"]
 
+# 模型树根层按本 MDB 解析出的 DESI 库号取 SITE（rs-core 的 MDB_DESI_DBNOS）。
+# /ALL1 在 8009 这个库里只对应一个 DESI 库 7997，而 7997 还没解析，选它模型树是空的；
+# /ALL 对应 29 个库，含已解析的 8000，能展出四个 SITE。
 mdb_name = "ALL"
 project_name = "AvevaMarineSample"
 project_code = 1516
@@ -74,6 +77,10 @@ batch_insert_sql_cnt = 100 #mysql 批量插入的数量
 
 
 #版本数据库服务配置
+# 后端是 D:/work/plant-code/old/gen-model（进程名 aios-database），工作库由那边的
+# bin/surreal.exe 起在 8009；gen-model / plant-ui / rs-plant3-d 三份 v_port 必须一致，
+# 起法与单个 dbnum 的解析流程见 gen-model/docs/runbook-local-stack-and-dbnum-parse.md。
+# 8022 是 ams7997 的专用落盘实例，ns 与库名跟 8009 完全同名，指错了看不出来。
 v_ip = "localhost"
 v_port = 8009
 v_user = "root"
@@ -99,10 +106,10 @@ server_release_ip = "127.0.0.1:9099"
 remote_file_server_hosts = []
 file_server_host = "http://192.168.31.58:8000/assets/archives"
 
-# Web服务(REST+WebSocket)监听地址；注释掉则不启动（需编译 http_api feature）
-# 评审决议：0.0.0.0 供局域网前端访问；接口文档见 docs/specs/web-service-api.md
-http_api_addr = "0.0.0.0:8020"
-http_api_cors = ["*"]
+# 这里不配置模型服务地址。http_api_addr 是 gen-model 那一侧的**监听**地址，
+# plant-ui 作为客户端不读本文件的这一项；要改连哪台机器走 S6 设置窗的
+# 「模型服务地址」，或启动前设 PLANT_MODEL_API_URL。出厂默认 http://127.0.0.1:8021
+# 指的就是 gen-model 那个进程。
 
 
 #调试选项

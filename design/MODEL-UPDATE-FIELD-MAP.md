@@ -59,7 +59,7 @@
 | 其中影响模型的变化 | `361` | 契约 | `Σ DbnumPreview.model_affecting` |
 | 树行库标识 | `db8000 · DESI` | 契约 | `dbnum` + `db_type` |
 | 树行会话区间 | `sesno 1 024 → 1 031` | 契约 | `applied_sesno + 1` → `file_latest_sesno` |
-| ZONE 分组行 | `ZONE /RXC0-Z1 · N 个生成单元` | 契约 | `DbnumPreview.zones[]`（`ZoneSummary`）；`zone_refno` 为空的那桶就是「归属未知」 |
+| ~~ZONE 分组行~~ | | | **已删**。ZONE 分桶全局退役，树从 dbnum → ZONE → 交付单元三层改为 dbnum → 交付单元两层；分组一律按 dbnum（`docs/adr/0011`）|
 | 阻断卡 | `db8003 文件回退 812 < 已应用 1 005` | 契约 | `anomaly = Rollback { file_latest_sesno, applied_sesno }` 且 `blocked = true` |
 | no_generation 卡 | `14 项变化找不到可生成的交付单元` | 契约 | `Σ DbnumPreview.no_generation` |
 | 待重试卡 | `1 个待重试单元将合并` | 契约 | `pending_model_retries[]` |
@@ -184,7 +184,7 @@
 | `DbnumPreview.file_name` / `file_path` | 只在 S2-A 的扫描行露过脸，预览结果页与终态页都没有 |
 | `DeliveryUnitSummary.moved_in` / `moved_out` | 元素跨交付单元迁移的计数，没画。这恰恰是最容易让人困惑的一类变化 |
 | `DeliveryUnitSummary.name` | 只用了 `noun + root_refno`，人可读的名字没显示 |
-| `ZoneSummary.model_affecting` | ZONE 分桶里影响模型的计数，没画 |
+| `DbnumPreview.zones[]`（含 `ZoneSummary.model_affecting`） | 曾经画过，`docs/adr/0011` 之后整组退役。契约字段保留，反序列化仍在守（`model_update_api` 的解码用例），但界面不再用它分组 |
 | ~~`FileAnomaly` 五种只画了 `Rollback`~~ | **五种已在 S2-E 画齐**；还欠的是把它们接进 S2 的树行与右栏阻断卡（现在只有 `Rollback` 一种有卡片形态） |
 | `PendingModelUnit.last_error` / `source_end_sesno` | 待重试单元的上次错误与来源会话号，没画 |
 | `ManualUpdatePreview.warnings[]` | 预览期的非致命告警（读不了库头、遍历目录失败等）在 S2 上没有落脚点 |
