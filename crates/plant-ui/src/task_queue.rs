@@ -1686,9 +1686,16 @@ fn retry_line(ui: &mut Ui, t: &Tokens, d: Density, unit: &PendingModelUnit) -> b
     );
     let mut clicked = false;
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        // 按下去真的会重跑一遍生成，但**上面那个欠账数不会跟着减**：服务端
+        // `ensure_model_generated` 成功后不清 `model_update_pending` 里对应的
+        // regen_root 行（QUEUE-FIELD-MAP §1 那段「今天会显假账」）。不把这句说出来，
+        // 这枚按钮看着就是按了没反应。
         clicked = ui
             .add(widgets::button(t, d, "重试"))
-            .on_hover_text("重新生成这个交付单元；幂等，可以反复按")
+            .on_hover_text(
+                "重新生成这个交付单元；幂等，可以反复按。\
+                 注意：服务端成功后不清这条欠账记录（已知问题），所以上面的「欠 N 个单元」不会立刻减少。",
+            )
             .clicked();
     });
     clicked
