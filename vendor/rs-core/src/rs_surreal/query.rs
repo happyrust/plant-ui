@@ -826,6 +826,31 @@ pub async fn clear_all_caches(refno: RefnoEnum) {
     clear_all_caches_batch(std::slice::from_ref(&refno)).await;
 }
 
+/// Every memo keyed by a single refno, listed exactly once.
+///
+/// Both invalidation paths expand this list — [`clear_all_caches_batch`] drops
+/// the named refnos, [`clear_all_caches_wholesale`] drops the table. A new cache
+/// added to only one of the two would be missed silently, so neither writes its
+/// own copy of the list.
+macro_rules! per_element_caches {
+    ($op:ident) => {
+        $op!(QUERY_ANCESTOR_REFNOS);
+        $op!(QUERY_DEEP_CHILDREN_REFNOS);
+        $op!(GET_PE);
+        $op!(GET_TYPE_NAME);
+        $op!(GET_SIBLINGS);
+        $op!(GET_NAMED_ATTMAP);
+        // GET_ANCESTOR_ATTMAPS
+        $op!(GET_NAMED_ATTMAP_WITH_UDA);
+        $op!(GET_CHILDREN_REFNOS);
+        $op!(GET_CHILDREN_NAMED_ATTMAPS);
+        $op!(GET_CAT_ATTMAP);
+        $op!(GET_CAT_REFNO);
+        // GET_UI_NAMED_ATTMAP
+        $op!(GET_CHILDREN_PES);
+    };
+}
+
 /// Invalidate every per-element cache for a whole set of refnos in one pass.
 ///
 /// The world caches are keyed by more than the changed element, so they can
@@ -850,20 +875,33 @@ pub async fn clear_all_caches_batch(refnos: &[RefnoEnum]) {
         }};
     }
 
-    remove_all!(QUERY_ANCESTOR_REFNOS);
-    remove_all!(QUERY_DEEP_CHILDREN_REFNOS);
-    remove_all!(GET_PE);
-    remove_all!(GET_TYPE_NAME);
-    remove_all!(GET_SIBLINGS);
-    remove_all!(GET_NAMED_ATTMAP);
-    // GET_ANCESTOR_ATTMAPS
-    remove_all!(GET_NAMED_ATTMAP_WITH_UDA);
-    remove_all!(GET_CHILDREN_REFNOS);
-    remove_all!(GET_CHILDREN_NAMED_ATTMAPS);
-    remove_all!(GET_CAT_ATTMAP);
-    remove_all!(GET_CAT_REFNO);
-    // GET_UI_NAMED_ATTMAP
-    remove_all!(GET_CHILDREN_PES);
+    per_element_caches!(remove_all);
+}
+
+/// 丢掉本进程全部查询 memoize。
+///
+/// 给「取回工作」用：增量是别的进程应用的，本进程只被告知发生过更新、拿不到
+/// 逐个 refno 的明细，逐项失效无从下手。代价是之后头几次查询都要打库，换来的是
+/// 取回来的确实是新的。
+///
+/// 逐项失效那条路碰不到最后三张——它们的键里没有元素本身：根层按
+/// `(mdb, module)` 记，库编号按 `module` 记，可见实例按查询根记而不是按变化的
+/// 元素记。所以增量之后新增的 SITE、新登记的库、根下多出来的几何，只有整表清
+/// 才回得来。
+pub async fn clear_all_caches_wholesale() {
+    macro_rules! clear_one {
+        ($cache:expr) => {{
+            $cache.lock().await.cache_clear();
+        }};
+    }
+
+    clear_one!(crate::GET_WORLD_TRANSFORM);
+    clear_one!(crate::GET_WORLD_MAT4);
+    per_element_caches!(clear_one);
+
+    clear_one!(super::mdb::GET_MDB_WORLD_SITE_ELE_NODES);
+    clear_one!(super::mdb::QUERY_MDB_DB_NUMS);
+    clear_one!(super::geom::QUERY_DEEP_VISIBLE_INST_REFNOS);
 }
 
 ///获得children

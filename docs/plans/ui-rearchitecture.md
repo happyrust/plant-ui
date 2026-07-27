@@ -128,6 +128,8 @@ D:\work\plant-code\old\plant-ui\
 | `rs_surreal/mdb.rs` `get_mdb_world_site_ele_nodes` | `SUL_DB.query(&sql).await.unwrap()` -> `?` | 同上。这是模型树根层查询的第一跳，M1-7 验收错误态时就是从这里逼出来的——把 `v_port` 指到无人监听的端口，原先是 panic 而不是错误态 |
 | `rs_surreal/mdb.rs` `get_mdb_world_site_ele_nodes` | 根层查询去掉 WORL 那一跳，改成 `pe where noun='SITE' and dbnum in $dbnos` | 原查询是 `MDB -> WORL -> SITE` 三跳，中间那跳要求每个设计库都有世界元素，而同步经常不写它：`admin_sites/ams7997-e3d31` 那个库 `WORL` 表 0 条、`pe` 里也没有 `noun='WORL'`，8009 内存库里 db 8000 的真实世界 `pe:16192_0` 同样缺。缺的只是那一个节点——15 个 SITE 与指向它的 15 条 `pe_owner` 边都在——但整棵树因此全空。SITE 自己带 `dbnum`，够定位根层 |
 | `rs_surreal/mdb.rs` `query_mdb_db_nums` | 同上，由 `WORL` 改为按 `SITE` 取 dbnum 去重 | 与根层同源，否则状态栏的库标识会和树对不上：树有 15 个 SITE 而库标识是空的。顺带得到一个好性质——MDB 里声明了却一个元素都没同步过来的库自动不出现（`/ALL` 在 8022 上声明 29 个库，实际只报 7997） |
+| `rs_surreal/query.rs` | 新增 `per_element_caches!` 宏 + `clear_all_caches_wholesale()` | 「取回工作」要整进程缓存失效：增量是 gen-model 那个进程应用的，本进程拿不到逐 refno 明细，逐项失效无从下手；且根层 / 库号 / 可见实例三张表的键里没有元素本身，只有整表清才回得来。宏把逐元素缓存清单收拢成一份，批量失效与整体失效共用，新缓存漏加一边会静默失效的坑就堵住了 |
+| `prim_geo/category.rs` `convert_to_brep_shapes` | Extrusion 分支补 `d.verts.len() <= 2` 早退（与 Revolution 同一道卡） | 少了它，轮廓解不出来时会造出空挤出体：`gen_occ_shape` 必然拒绝，但它已经被 hash、落库、挂上 geo_relate——且所有空轮廓算出来是同一个 hash，一整批构件会共用这一条建不出形状的几何 |
 
 `init_surreal` 与 `get_mdb_world_site_ele_nodes` 那两条 `unwrap` 是 M1-7 验收错误态时顺手改的，当时没进表。**这类改动不进表就等于不存在**：换钉版时按表重放，表里没有的会静默丢失，而丢失的形态是「某天又开始 panic 了」，很难回想起是重放漏了。
 
