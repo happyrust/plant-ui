@@ -15,6 +15,8 @@ pub enum Req {
     Children(RefU64),
     /// 选中元素的 UI 属性表。
     Props(RefU64),
+    /// 加载这些模型树根下已经生成的几何实例。
+    Models(Vec<RefU64>),
     /// 命令行按名称定位元素。
     ResolveName(String),
     /// 重跑启动序列。连库失败后命令行上的「重试」走这条，结果仍走 `Evt::Ready`。
@@ -42,13 +44,20 @@ pub enum Req {
     ///
     /// 分支由 App 侧算好交下来。数据线程不认识展开状态，也不该认识——它只是
     /// 「照这张单子重查一遍」。
-    GetWork { branches: Vec<RefU64> },
+    GetWork {
+        branches: Vec<RefU64>,
+    },
     /// 读一次设计库水位，给取回工作旁边那行提示用。
     PendingSessions,
     /// 队列面板的一次轮询（队列快照 + 任务表 + health + 持久欠账）。
-    QueuePoll { base: String },
+    QueuePoll {
+        base: String,
+    },
     /// 暂停 / 恢复出队。
-    QueueSetPaused { base: String, paused: bool },
+    QueueSetPaused {
+        base: String,
+        paused: bool,
+    },
 }
 
 /// 一次取回工作重新查回来的那部分树。
@@ -75,6 +84,7 @@ pub enum Evt {
     Ready(anyhow::Result<ReadyInfo>),
     Children(RefU64, anyhow::Result<Vec<EleTreeNode>>),
     Props(RefU64, anyhow::Result<Vec<plant_ui_data::Attr>>),
+    Models(anyhow::Result<Vec<aios_core::GeomInstQuery>>),
     ResolvedName(String, anyhow::Result<Option<RefU64>>),
     ModelUpdatePreview(anyhow::Result<Preview>),
     /// 「扫描 + 入队」的回执。合流之后它不再是单个 task_id。
@@ -148,118 +158,91 @@ async fn ready() -> anyhow::Result<ReadyInfo> {
 }
 
 /// 起数据线程：连库、抓工程标识与 SITE 根层，然后循环处理懒加载请求。
-pub fn spawn(ctx: egui::Context) -> Bridge {
+pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
     let (req_tx, req_rx) = mpsc::channel();
     let (evt_tx, evt_rx) = mpsc::channel();
     let evt_tx_out = evt_tx.clone();
-    std::thread::Builder::new()
-        .name("plant-ui-data".into())
-        .spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("tokio runtime");
-            rt.block_on(async move {
-                let _ = evt_tx.send(Evt::Ready(ready().await));
-                ctx.request_repaint();
+    let worker = move |mut task_ctx: bevy_wasm_tasks::TaskContext| async move {
+        let _ = evt_tx.send(Evt::Ready(ready().await));
+        ctx.request_repaint();
 
-                while let Ok(req) = req_rx.recv() {
-                    match req {
-                        Req::Reconnect => {
-                            let _ = evt_tx.send(Evt::Ready(ready().await));
-                            ctx.request_repaint();
-                        }
-                        Req::Children(refno) => {
-                            let r = plant_ui_data::child_nodes(refno.into()).await;
-                            let _ = evt_tx.send(Evt::Children(refno, r));
-                            ctx.request_repaint();
-                        }
-                        Req::Props(refno) => {
-                            let r = plant_ui_data::element_props(refno.into()).await;
-                            let _ = evt_tx.send(Evt::Props(refno, r));
-                            ctx.request_repaint();
-                        }
-                        Req::ResolveName(name) => {
-                            let result = plant_ui_data::resolve_name(&name).await;
-                            let _ = evt_tx.send(Evt::ResolvedName(name, result));
-                            ctx.request_repaint();
-                        }
-                        Req::ModelUpdatePreview { base, project, mdb } => {
-                            let tx = evt_tx.clone();
-                            let repaint = ctx.clone();
-                            std::thread::spawn(move || {
-                                let _ = tx.send(Evt::ModelUpdatePreview(
-                                    crate::model_update_api::preview(&base, &project, &mdb),
-                                ));
-                                repaint.request_repaint();
-                            });
-                        }
-                        Req::ModelUpdateExecute { base, project, mdb } => {
-                            let tx = evt_tx.clone();
-                            let repaint = ctx.clone();
-                            std::thread::spawn(move || {
-                                let _ = tx.send(Evt::ModelUpdateExecute(
-                                    crate::model_update_api::execute(&base, &project, &mdb),
-                                ));
-                                repaint.request_repaint();
-                            });
-                        }
-                        Req::ModelUpdateTask { base, run_id } => {
-                            let tx = evt_tx.clone();
-                            let repaint = ctx.clone();
-                            std::thread::spawn(move || {
-                                let result = crate::model_update_api::task(&base, &run_id);
-                                let _ = tx.send(Evt::ModelUpdateTask(run_id, result));
-                                repaint.request_repaint();
-                            });
-                        }
-                        Req::GetWork { branches } => {
-                            let result = get_work(&branches).await;
-                            let _ = evt_tx.send(Evt::GetWork(result));
-                            ctx.request_repaint();
-                        }
-                        Req::PendingSessions => {
-                            let result = plant_ui_data::pending_sessions().await;
-                            let _ = evt_tx.send(Evt::PendingSessions(result));
-                            ctx.request_repaint();
-                        }
-                        // 队列轮询与暂停都是纯 HTTP，另起线程发：它们跟 SurrealDB
-                        // 那条链路没关系，排在同一个队列里会被一次慢查询挡住。
-                        Req::QueuePoll { base } => {
-                            let tx = evt_tx.clone();
-                            let repaint = ctx.clone();
-                            std::thread::spawn(move || {
-                                let _ = tx.send(Evt::QueuePoll(
-                                    crate::model_update_api::poll_queue(&base),
-                                ));
-                                repaint.request_repaint();
-                            });
-                        }
-                        Req::QueueSetPaused { base, paused } => {
-                            let tx = evt_tx.clone();
-                            let repaint = ctx.clone();
-                            std::thread::spawn(move || {
-                                let result =
-                                    crate::model_update_api::set_queue_paused(&base, paused);
-                                let _ = tx.send(Evt::QueueSetPaused(paused, result));
-                                repaint.request_repaint();
-                            });
-                        }
-                        Req::EnsureModel { base, root_refno } => {
-                            let tx = evt_tx.clone();
-                            let repaint = ctx.clone();
-                            std::thread::spawn(move || {
-                                let result =
-                                    crate::model_update_api::ensure_model(&base, &root_refno);
-                                let _ = tx.send(Evt::EnsureModel(root_refno, result));
-                                repaint.request_repaint();
-                            });
-                        }
+        loop {
+            while let Ok(req) = req_rx.try_recv() {
+                match req {
+                    Req::Reconnect => {
+                        let _ = evt_tx.send(Evt::Ready(ready().await));
+                        ctx.request_repaint();
+                    }
+                    Req::Children(refno) => {
+                        let r = plant_ui_data::child_nodes(refno.into()).await;
+                        let _ = evt_tx.send(Evt::Children(refno, r));
+                        ctx.request_repaint();
+                    }
+                    Req::Props(refno) => {
+                        let r = plant_ui_data::element_props(refno.into()).await;
+                        let _ = evt_tx.send(Evt::Props(refno, r));
+                        ctx.request_repaint();
+                    }
+                    Req::Models(roots) => {
+                        let result = plant_ui_data::model_instances(&roots).await;
+                        let _ = evt_tx.send(Evt::Models(result));
+                        ctx.request_repaint();
+                    }
+                    Req::ResolveName(name) => {
+                        let result = plant_ui_data::resolve_name(&name).await;
+                        let _ = evt_tx.send(Evt::ResolvedName(name, result));
+                        ctx.request_repaint();
+                    }
+                    Req::ModelUpdatePreview { base, project, mdb } => {
+                        let result = crate::model_update_api::preview(&base, &project, &mdb).await;
+                        let _ = evt_tx.send(Evt::ModelUpdatePreview(result));
+                        ctx.request_repaint();
+                    }
+                    Req::ModelUpdateExecute { base, project, mdb } => {
+                        let result = crate::model_update_api::execute(&base, &project, &mdb).await;
+                        let _ = evt_tx.send(Evt::ModelUpdateExecute(result));
+                        ctx.request_repaint();
+                    }
+                    Req::ModelUpdateTask { base, run_id } => {
+                        let result = crate::model_update_api::task(&base, &run_id).await;
+                        let _ = evt_tx.send(Evt::ModelUpdateTask(run_id, result));
+                        ctx.request_repaint();
+                    }
+                    Req::GetWork { branches } => {
+                        let result = get_work(&branches).await;
+                        let _ = evt_tx.send(Evt::GetWork(result));
+                        ctx.request_repaint();
+                    }
+                    Req::PendingSessions => {
+                        let result = plant_ui_data::pending_sessions().await;
+                        let _ = evt_tx.send(Evt::PendingSessions(result));
+                        ctx.request_repaint();
+                    }
+                    Req::QueuePoll { base } => {
+                        let result = crate::model_update_api::poll_queue(&base).await;
+                        let _ = evt_tx.send(Evt::QueuePoll(result));
+                        ctx.request_repaint();
+                    }
+                    Req::QueueSetPaused { base, paused } => {
+                        let result = crate::model_update_api::set_queue_paused(&base, paused).await;
+                        let _ = evt_tx.send(Evt::QueueSetPaused(paused, result));
+                        ctx.request_repaint();
+                    }
+                    Req::EnsureModel { base, root_refno } => {
+                        let result =
+                            crate::model_update_api::ensure_model(&base, &root_refno).await;
+                        let _ = evt_tx.send(Evt::EnsureModel(root_refno, result));
+                        ctx.request_repaint();
                     }
                 }
-            });
-        })
-        .expect("spawn data thread");
+            }
+            task_ctx.sleep_updates(1).await;
+        }
+    };
+    #[cfg(target_arch = "wasm32")]
+    tasks.spawn_wasm(worker);
+    #[cfg(not(target_arch = "wasm32"))]
+    tasks.spawn_tokio(worker);
     Bridge {
         req: req_tx,
         evt: evt_rx,

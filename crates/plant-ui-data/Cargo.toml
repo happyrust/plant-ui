@@ -6,4 +6,6 @@ edition.workspace = true
 [dependencies]
 aios_core.workspace = true
 anyhow.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio.workspace = true

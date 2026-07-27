@@ -1,17 +1,24 @@
-//! plant-ui-app：独立可执行外壳（eframe + plant-ui + plant-ui-data）。
+//! plant-ui-app：Bevy 宿主（bevy_egui35 + plant-ui + plant-ui-data）。
 //! 默认进入主工作台 S1；`--gallery` 进入 M0 组件画廊。
 
 mod command;
 mod data;
+#[cfg(not(target_arch = "wasm32"))]
 mod gallery;
 mod logs;
 mod model_update_api;
 mod model_update_ws;
 mod textures;
+mod view3d;
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use bevy::asset::AssetMetaCheck;
+use bevy::prelude::{
+    App as BevyApp, Camera2d, Commands, DefaultPlugins, PluginGroup, Window, WindowPlugin,
+};
+use bevy_egui35::{EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use command::ParsedCommand;
 use eframe::egui;
 use logs::Retry;
@@ -26,9 +33,9 @@ use plant_ui::model_update::{
 };
 use plant_ui::project_picker::{self, State as ProjectPickerState};
 use plant_ui::settings::{self, State as SettingsState};
-use plant_ui::task_queue;
 use plant_ui::style::theme_tokens::{self, set_weight_families_ready};
 use plant_ui::style::tokens::{Density, Tokens};
+use plant_ui::task_queue;
 use plant_ui::vm::{
     CommandLineKind, CommandLineVm, LogElement, PropKind, PropRowVm, PropsDataVm, PropsVm,
     RowVisibility, Selection, TreeRowVm, TreeVm, View3dVm, WorkbenchVm,
@@ -36,8 +43,79 @@ use plant_ui::vm::{
 use plant_ui::workbench::{self, Pane, WorkbenchState};
 use plant_ui_data::{EleTreeNode, RefU64};
 
-fn main() -> eframe::Result {
+#[cfg(not(target_arch = "wasm32"))]
+fn main() {
     let gallery = std::env::args().any(|a| a == "--gallery");
+    if gallery {
+        run_gallery().expect("组件画廊启动失败");
+    } else {
+        run("#plant-ui");
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn main() {}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(serde::Deserialize)]
+struct BrowserConfig {
+    db: BrowserDb,
+    model_api_url: String,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(serde::Deserialize)]
+struct BrowserDb {
+    host: String,
+    port: u16,
+    #[serde(default)]
+    secure: bool,
+    namespace: String,
+    database: String,
+    username: String,
+    password: String,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn start(canvas: String, config_json: String) -> Result<(), wasm_bindgen::JsValue> {
+    if !canvas.starts_with('#') || canvas.len() < 2 {
+        return Err(wasm_bindgen::JsValue::from_str(
+            "canvas 必须是形如 #plant-ui 的 CSS id 选择器",
+        ));
+    }
+    let config: BrowserConfig = serde_json::from_str(&config_json)
+        .map_err(|error| wasm_bindgen::JsValue::from_str(&format!("浏览器配置无效：{error}")))?;
+    if config.model_api_url.trim().is_empty() {
+        return Err(wasm_bindgen::JsValue::from_str("model_api_url 不能为空"));
+    }
+    let db_host = config.db.host.trim_end_matches('/');
+    let db = aios_core::options::DbOption {
+        v_ip: if config.db.secure
+            && !db_host.starts_with("ws://")
+            && !db_host.starts_with("wss://")
+        {
+            format!("wss://{db_host}")
+        } else {
+            db_host.to_owned()
+        },
+        v_port: config.db.port,
+        surreal_ns: config.db.namespace,
+        project_name: config.db.database,
+        v_user: config.db.username,
+        v_password: config.db.password,
+        ..Default::default()
+    };
+    aios_core::set_db_option(db)
+        .map_err(|error| wasm_bindgen::JsValue::from_str(&error.to_string()))?;
+    model_update_api::set_base_url(config.model_api_url)
+        .map_err(|error| wasm_bindgen::JsValue::from_str(&error.to_string()))?;
+    run(&canvas);
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn run_gallery() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1600.0, 1000.0])
@@ -48,18 +126,113 @@ fn main() -> eframe::Result {
         "plant-ui",
         options,
         Box::new(move |cc| {
-            let (defs, warnings) = fonts::definitions();
+            let (defs, _warnings) = fonts::definitions();
             let weights_ready = defs.font_data.contains_key(fonts::MEDIUM);
             cc.egui_ctx.set_fonts(defs);
             set_weight_families_ready(weights_ready);
             theme_tokens::apply(&cc.egui_ctx, &Tokens::light(), Density::Standard);
-            if gallery {
-                Ok(Box::new(gallery::GalleryApp::default()))
-            } else {
-                Ok(Box::new(App::new(cc.egui_ctx.clone(), warnings)))
-            }
+            Ok(Box::new(gallery::GalleryApp::default()))
         }),
     )
+}
+
+fn run(canvas: &str) {
+    let window = Window {
+        title: "plant-ui".into(),
+        resolution: (1600.0_f32, 1000.0_f32).into(),
+        ..Default::default()
+    };
+    #[cfg(target_arch = "wasm32")]
+    let window = Window {
+        canvas: Some(canvas.into()),
+        fit_canvas_to_parent: true,
+        prevent_default_event_handling: true,
+        ..window
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = canvas;
+
+    BevyApp::new()
+        .add_plugins(
+            DefaultPlugins
+                .set(WindowPlugin {
+                    primary_window: Some(window),
+                    ..Default::default()
+                })
+                .set(bevy::asset::AssetPlugin {
+                    file_path: asset_root(),
+                    meta_check: AssetMetaCheck::Never,
+                    ..Default::default()
+                }),
+        )
+        .add_plugins(bevy_wasm_tasks::TasksPlugin::default())
+        .add_plugins(EguiPlugin::default())
+        .add_plugins(view3d::View3dPlugin)
+        .add_systems(bevy::prelude::Startup, setup_ui_camera)
+        .add_systems(EguiPrimaryContextPass, show_app)
+        .run();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn asset_root() -> String {
+    std::env::var("PLANT_ASSET_ROOT").unwrap_or_else(|_| "../gen-model/assets".into())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn asset_root() -> String {
+    "assets".into()
+}
+
+fn setup_ui_camera(mut commands: Commands) {
+    commands.spawn(Camera2d);
+}
+
+fn show_app(
+    mut contexts: EguiContexts,
+    mut app: bevy::prelude::Local<Option<App>>,
+    mut view3d: bevy::prelude::ResMut<view3d::View3d>,
+    tasks: bevy_wasm_tasks::Tasks,
+) -> bevy::prelude::Result {
+    let ctx = contexts.ctx_mut()?;
+    let app = app.get_or_insert_with(|| {
+        let (defs, warnings) = fonts::definitions();
+        let weights_ready = defs.font_data.contains_key(fonts::MEDIUM);
+        ctx.set_fonts(defs);
+        set_weight_families_ready(weights_ready);
+        theme_tokens::apply(ctx, &Tokens::light(), Density::Standard);
+        App::new(ctx.clone(), warnings, &tasks)
+    });
+    if let Some(refno) = view3d.take_picked() {
+        app.select(refno);
+    }
+    app.vm.view3d = Some(View3dVm {
+        texture: view3d.texture,
+        size: egui::vec2(view3d.size.x as f32, view3d.size.y as f32),
+        live: true,
+        measurement_active: false,
+    });
+    let size = ctx.content_rect().size();
+    egui::Area::new("plant-workbench".into())
+        .fixed_pos(egui::Pos2::ZERO)
+        .order(egui::Order::Background)
+        .show(ctx, |ui| {
+            ui.set_min_size(size);
+            ui.set_max_size(size);
+            app.ui(ui);
+        });
+    if let Some(models) = app.pending_models.take() {
+        view3d.load(models);
+    }
+    for command in app.view3d_commands.drain(..) {
+        match command {
+            Cmd::PickViewport(uv) => view3d.pick(uv),
+            Cmd::Camera(gesture) => view3d.camera(gesture),
+            Cmd::Model(action) => view3d.model(action),
+            Cmd::ResizeViewport(size) => view3d.resize(size),
+            _ => unreachable!("只缓存三维命令"),
+        }
+    }
+    Ok(())
 }
 
 /// App 侧的树结构缓存与展开状态；`vm.tree` 是它按展开状态展平后的产物。
@@ -74,6 +247,7 @@ struct TreeModel {
     expanded: HashSet<RefU64>,
     /// 子层查询在途的节点。
     loading: HashSet<RefU64>,
+    visibility: HashMap<RefU64, bool>,
 }
 
 impl TreeModel {
@@ -90,9 +264,11 @@ impl TreeModel {
                     noun: n.noun.clone(),
                     expandable,
                     loading: model.loading.contains(&refno),
-                    // 独立壳没有渲染器，可见性无从谈起。这一格恒为未加载，
-                    // 而绘制层在 `live == false` 时整列不画，读不到它。
-                    visibility: RowVisibility::Unloaded,
+                    visibility: match model.visibility.get(&refno) {
+                        Some(true) => RowVisibility::Shown,
+                        Some(false) => RowVisibility::Hidden,
+                        None => RowVisibility::Unloaded,
+                    },
                 });
                 if expandable == Some(true)
                     && let Some(kids) = model.children.get(&refno)
@@ -212,6 +388,8 @@ struct App {
     bridge: data::Bridge,
     tree: TreeModel,
     logs: logs::LogBuffer,
+    pending_models: Option<Vec<aios_core::GeomInstQuery>>,
+    view3d_commands: Vec<Cmd>,
     /// 占位纹理的所有者：句柄一丢纹理就被回收，Vm 里那个 id 会指向空。
     _view3d_tex: Option<egui::TextureHandle>,
 }
@@ -225,7 +403,11 @@ const QUEUE_POLL_BUSY: Duration = Duration::from_secs(1);
 const QUEUE_POLL_IDLE: Duration = Duration::from_secs(5);
 
 impl App {
-    fn new(ctx: egui::Context, font_warnings: Vec<String>) -> Self {
+    fn new(
+        ctx: egui::Context,
+        font_warnings: Vec<String>,
+        tasks: &bevy_wasm_tasks::Tasks<'_>,
+    ) -> Self {
         let model_api_url = model_update_api::base_url();
         let mut settings_state = SettingsState::default();
         settings_state.adopt(settings::Settings {
@@ -256,9 +438,11 @@ impl App {
             queue_poll_pending: false,
             queue_finished: HashSet::new(),
             get_work_pending: false,
-            bridge: data::spawn(ctx.clone()),
+            bridge: data::spawn(ctx.clone(), tasks),
             tree: TreeModel::default(),
             logs: logs::LogBuffer::default(),
+            pending_models: None,
+            view3d_commands: Vec::new(),
             _view3d_tex: None,
         };
         // 队列的明细通道进程一起来就开：队列是常驻视图，不像向导那样跟着某一次
@@ -287,6 +471,12 @@ impl App {
     }
 
     fn pump_events(&mut self) {
+        if let Some(feed) = &mut self.model_feed {
+            feed.poll();
+        }
+        if let Some(feed) = &mut self.queue_feed {
+            feed.poll();
+        }
         let mut dirty = false;
         while let Ok(evt) = self.bridge.evt.try_recv() {
             match evt {
@@ -302,7 +492,13 @@ impl App {
                     self.vm.project = info.project;
                     self.mdb = info.mdb;
                     self.vm.db = db_label(&info.ns, &info.db_nums);
+                    let roots = info
+                        .sites
+                        .iter()
+                        .map(|site| site.refno.refno())
+                        .collect();
                     self.tree.roots = info.sites;
+                    let _ = self.bridge.req.send(data::Req::Models(roots));
                     let _ = self.bridge.req.send(data::Req::PendingSessions);
                     dirty = true;
                 }
@@ -359,6 +555,31 @@ impl App {
                     };
                 }
                 data::Evt::Props(..) => {}
+                data::Evt::Models(result) => match result {
+                    Ok(models) => {
+                        self.set_get_work_busy(false);
+                        let mesh_count = models.iter().map(|model| model.insts.len()).sum::<usize>();
+                        self.tree.visibility.clear();
+                        self.tree
+                            .visibility
+                            .extend(models.iter().map(|model| (model.refno.refno(), true)));
+                        self.logs.info(
+                            &mut self.vm.logs,
+                            format!("三维模型已就绪：{} 个元素，{} 个网格实例", models.len(), mesh_count),
+                        );
+                        self.pending_models = Some(models);
+                        dirty = true;
+                    }
+                    Err(error) => {
+                        self.set_get_work_busy(false);
+                        self.logs.error(
+                            &mut self.vm.logs,
+                            "三维模型查询失败",
+                            &error,
+                            None,
+                        );
+                    }
+                },
                 data::Evt::ResolvedName(name, result) => match result {
                     Ok(Some(refno)) => {
                         let revealed = self.locate(refno);
@@ -483,12 +704,18 @@ impl App {
                     self.vm.pending_sessions = result.ok();
                 }
                 data::Evt::GetWork(result) => {
-                    self.set_get_work_busy(false);
                     let _ = self.bridge.req.send(data::Req::PendingSessions);
                     match result {
                         Ok(fresh) => {
                             let before = self.tree.element_count();
                             self.tree.roots = fresh.sites;
+                            let roots = self
+                                .tree
+                                .roots
+                                .iter()
+                                .map(|site| site.refno.refno())
+                                .collect();
+                            let _ = self.bridge.req.send(data::Req::Models(roots));
                             for (refno, kids) in fresh.branches {
                                 for kid in &kids {
                                     self.tree.parent.insert(kid.refno.refno(), refno);
@@ -518,6 +745,7 @@ impl App {
                             dirty = true;
                         }
                         Err(error) => {
+                            self.set_get_work_busy(false);
                             self.logs
                                 .error(&mut self.vm.logs, "取回工作失败", &error, None);
                         }
@@ -715,10 +943,35 @@ impl App {
                     });
                 }
                 Cmd::ReconnectQueueFeed => self.reopen_queue_feed(ctx),
-                // 独立壳没有渲染器，`view3d.live` 恒为 false，树菜单、视口工具栏、
-                // 相机手势与渲染目标改尺寸都不会露头（占位图是磁盘上那张，改不得）。
-                // 这几支留成明确的空实现，不写日志装作做了事。
-                Cmd::PickViewport(_) | Cmd::Camera(_) | Cmd::Model(_) | Cmd::ResizeViewport(_) => {}
+                Cmd::Model(action) => {
+                    match &action {
+                        plant_ui::ModelAction::SetVisible { refnos, visible } => {
+                            for refno in refnos {
+                                if let Some(current) = self.tree.visibility.get_mut(refno) {
+                                    *current = *visible;
+                                }
+                            }
+                        }
+                        plant_ui::ModelAction::HideAll => {
+                            self.tree
+                                .visibility
+                                .values_mut()
+                                .for_each(|visible| *visible = false);
+                        }
+                        plant_ui::ModelAction::ShowAll => {
+                            self.tree
+                                .visibility
+                                .values_mut()
+                                .for_each(|visible| *visible = true);
+                        }
+                        _ => {}
+                    }
+                    dirty = true;
+                    self.view3d_commands.push(Cmd::Model(action));
+                }
+                command @ (Cmd::PickViewport(_) | Cmd::Camera(_) | Cmd::ResizeViewport(_)) => {
+                    self.view3d_commands.push(command)
+                }
             }
         }
         if dirty {
@@ -898,7 +1151,10 @@ impl App {
     ///
     /// 第一份快照只做登记不触发：那时手上这些终态是历史，不是刚发生的事，
     /// 照它们刷一遍等于开机就把整棵树重查一次。
-    fn newly_finished(&mut self, poll: &plant_ui::task_queue::Poll) -> Vec<model_update::RefreshUnit> {
+    fn newly_finished(
+        &mut self,
+        poll: &plant_ui::task_queue::Poll,
+    ) -> Vec<model_update::RefreshUnit> {
         let first = !self.queue.loaded;
         let mut units = Vec::new();
         for task in &poll.tasks {
@@ -1148,8 +1404,8 @@ fn db_label(ns: &str, db_nums: &[u32]) -> String {
     }
 }
 
-impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+impl App {
+    fn ui(&mut self, ui: &mut egui::Ui) {
         self.pump_events();
         let t = theme_tokens::current();
         let d = self.settings_state.saved.density;

@@ -117,11 +117,19 @@ use crate::options::{DbOption, SecondUnitDbOption};
 use once_cell_serde::sync::OnceCell;
 use surrealdb::opt::auth::Root;
 
+static DB_OPTION: OnceCell<DbOption> = OnceCell::new();
+
+/// 注入数据库配置。浏览器没有工作目录，wasm 启动入口必须先调用它。
+pub fn set_db_option(option: DbOption) -> anyhow::Result<()> {
+    DB_OPTION
+        .set(option)
+        .map_err(|_| anyhow::anyhow!("DbOption 已初始化，不能重复覆盖"))
+}
+
 ///获得db option
 #[inline]
 pub fn get_db_option() -> &'static DbOption {
-    static INSTANCE: OnceCell<DbOption> = OnceCell::new();
-    INSTANCE.get_or_init(|| {
+    DB_OPTION.get_or_init(|| {
         use config::{Config, ConfigError, Environment, File};
         let s = Config::builder()
             .add_source(File::with_name("DbOption"))
@@ -240,10 +248,10 @@ pub async fn init_test_surreal() -> Result<DbOption, HandleError> {
 }
 
 pub async fn init_surreal() -> anyhow::Result<()> {
-    let s = Config::builder()
-        .add_source(File::with_name("DbOption"))
-        .build()?;
-    let db_option: DbOption = s.try_deserialize()?;
+    init_surreal_with(get_db_option()).await
+}
+
+pub async fn init_surreal_with(db_option: &DbOption) -> anyhow::Result<()> {
     // 创建配置
     let config = surrealdb::opt::Config::default().ast_payload(); // 启用AST格式
     SUL_DB

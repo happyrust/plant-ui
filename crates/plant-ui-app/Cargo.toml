@@ -6,15 +6,26 @@ edition.workspace = true
 [dependencies]
 plant-ui.workspace = true
 plant-ui-data.workspace = true
+aios_core.workspace = true
 egui.workspace = true
 eframe.workspace = true
 egui-phosphor.workspace = true
 egui_inspection.workspace = true
-tokio.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-ureq.workspace = true
-tungstenite.workspace = true
 chrono.workspace = true
 image.workspace = true
+bevy.workspace = true
+bevy_egui35.workspace = true
+ehttp.workspace = true
+ewebsock.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bevy-wasm-tasks = { workspace = true, features = ["tokio"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+bevy-wasm-tasks = { workspace = true, features = ["wasm"] }
+getrandom = { workspace = true, features = ["wasm_js"] }
+ring = { workspace = true, features = ["wasm32_unknown_unknown_js"] }
+wasm-bindgen.workspace = true

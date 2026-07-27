@@ -33,6 +33,20 @@ pub async fn child_nodes(refno: RefnoEnum) -> Result<Vec<EleTreeNode>> {
     aios_core::get_children_ele_nodes(refno).await
 }
 
+/// 当前模型树根下已经生成的几何实例。数据库只给实例与网格 hash，
+/// 网格文件仍由 Bevy AssetServer 从 `assets/meshes` 加载。
+pub async fn model_instances(roots: &[RefU64]) -> Result<Vec<aios_core::GeomInstQuery>> {
+    let mut refnos = Vec::new();
+    for root in roots {
+        refnos.extend(aios_core::query_deep_visible_inst_refnos((*root).into()).await?);
+    }
+    let mut models = Vec::new();
+    for chunk in refnos.chunks(500) {
+        models.extend(aios_core::query_insts(chunk.iter(), false).await?);
+    }
+    Ok(models)
+}
+
 /// 设计库里还没被应用到模型的会话数。
 ///
 /// 直连 gen-model 的 `dbnum_watermark` 表读，不走它的 HTTP 接口：取回工作是纯

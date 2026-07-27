@@ -1,12 +1,21 @@
 # 源替换：全部依赖改读 vendor/registry（cargo vendor 产物，只读、带校验和）。
-# 可编辑源码树（vendor/rs-core、vendor/forks/*）走 path 依赖，不受此替换影响。
+# 可编辑源码树（vendor/rs-core、vendor/bevy_egui35、vendor/forks/*）走 path 依赖，不受此替换影响。
 # 片段由 `cargo vendor vendor/registry` 生成；重跑 vendor 前先移开本文件。
 
 [source.crates-io]
 replace-with = "vendored-sources"
 
+[source."git+https://gitee.com/happydpc/accesskit.git"]
+git = "https://gitee.com/happydpc/accesskit.git"
+replace-with = "vendored-sources"
+
 [source."git+https://gitee.com/happydpc/bevy"]
 git = "https://gitee.com/happydpc/bevy"
+replace-with = "vendored-sources"
+
+[source."git+https://gitee.com/happydpc/bevy-wasm-tasks?rev=51aabcb8124ad80be902fa120c84a2e91d28c9ed"]
+git = "https://gitee.com/happydpc/bevy-wasm-tasks"
+rev = "51aabcb8124ad80be902fa120c84a2e91d28c9ed"
 replace-with = "vendored-sources"
 
 [source."git+https://gitee.com/happydpc/calamine"]
@@ -19,6 +28,10 @@ replace-with = "vendored-sources"
 
 [source."git+https://gitee.com/happydpc/id_tree"]
 git = "https://gitee.com/happydpc/id_tree"
+replace-with = "vendored-sources"
+
+[source."git+https://gitee.com/happydpc/naga-oil.git"]
+git = "https://gitee.com/happydpc/naga-oil.git"
 replace-with = "vendored-sources"
 
 [source."git+https://gitee.com/happydpc/nalgebra"]
@@ -37,5 +50,12 @@ replace-with = "vendored-sources"
 git = "https://gitee.com/happydpc/wgpu"
 replace-with = "vendored-sources"
 
+[source."git+https://gitee.com/happydpc/winit"]
+git = "https://gitee.com/happydpc/winit"
+replace-with = "vendored-sources"
+
 [source.vendored-sources]
 directory = "vendor/registry"
+
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", "getrandom_backend=\"wasm_js\""]

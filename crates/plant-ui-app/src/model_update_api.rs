@@ -1,5 +1,6 @@
 use anyhow::Context;
 use serde::de::DeserializeOwned;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use plant_ui::model_update::{Enqueued, Failure, Preview, Run};
@@ -33,38 +34,51 @@ pub fn failure_of(error: &anyhow::Error) -> Failure {
 /// 解析模型服务地址。优先级：S6 设置项 > 环境变量 > 出厂默认，
 /// 这里负责后两级，设置项由 `settings::State::adopt` 之后的保存覆盖。
 pub fn base_url() -> String {
-    std::env::var("PLANT_MODEL_API_URL")
-        .unwrap_or_else(|_| plant_ui::settings::DEFAULT_MODEL_API_URL.into())
+    BASE_URL
+        .get()
+        .cloned()
+        .or_else(|| std::env::var("PLANT_MODEL_API_URL").ok())
+        .unwrap_or_else(|| plant_ui::settings::DEFAULT_MODEL_API_URL.into())
         .trim_end_matches('/')
         .to_owned()
+}
+
+static BASE_URL: OnceLock<String> = OnceLock::new();
+
+pub fn set_base_url(base: String) -> anyhow::Result<()> {
+    BASE_URL
+        .set(base.trim_end_matches('/').to_owned())
+        .map_err(|_| anyhow::anyhow!("模型服务地址已初始化，不能重复覆盖"))
 }
 
 /// 预览。`mdb` 决定本期执行范围——服务端照它解出「当前 MDB 声明的 DESI 库号」
 /// 作为扫描白名单。**由客户端给**：范围既然由 MDB 定，界面显示的范围与服务端
 /// 真跑的范围就必须同源；让服务端读自己那份 `DbOption.toml`，两边配置一错开
 /// 就是静默的。
-pub fn preview(base: &str, project: &str, mdb: &str) -> anyhow::Result<Preview> {
+pub async fn preview(base: &str, project: &str, mdb: &str) -> anyhow::Result<Preview> {
     post(
         base,
         "/api/v1/update/preview",
         serde_json::json!({ "project": project, "mdb": mdb }).to_string(),
         Duration::from_secs(600),
     )
+    .await
 }
 
 /// 扫描 + 入队。合流之后它**一律入队**，回执是入队的批次数组而不是单个 task_id
 /// ——进度去任务队列视图看（ADR-0011）。范围口径与 [`preview`] 同源。
-pub fn execute(base: &str, project: &str, mdb: &str) -> anyhow::Result<Enqueued> {
+pub async fn execute(base: &str, project: &str, mdb: &str) -> anyhow::Result<Enqueued> {
     post(
         base,
         "/api/v1/update/execute",
         serde_json::json!({ "project": project, "mdb": mdb }).to_string(),
         Duration::from_secs(60),
     )
+    .await
 }
 
-pub fn task(base: &str, run_id: &str) -> anyhow::Result<Run> {
-    get(base, &format!("/api/v1/tasks/{run_id}"))
+pub async fn task(base: &str, run_id: &str) -> anyhow::Result<Run> {
+    get(base, &format!("/api/v1/tasks/{run_id}")).await
 }
 
 /// 队列面板的一次轮询。
@@ -74,18 +88,20 @@ pub fn task(base: &str, run_id: &str) -> anyhow::Result<Run> {
 ///
 /// 分工是定死的——**排队与运行中的行以 `/queue` 为准**（那一份不封顶，287 行也全在），
 /// `/tasks` 只补计时、单元计数与终态历史，它服务端那边 `limit` 钳到 200。
-pub fn poll_queue(base: &str) -> anyhow::Result<Poll> {
-    let queue: QueueSnapshot = get(base, "/api/v1/queue")?;
-    let tasks: TaskList = get(base, "/api/v1/tasks?limit=200")?;
+pub async fn poll_queue(base: &str) -> anyhow::Result<Poll> {
+    let queue: QueueSnapshot = get(base, "/api/v1/queue").await?;
+    let tasks: TaskList = get(base, "/api/v1/tasks?limit=200").await?;
     // 后两份取不到不该让整次轮询作废：队列行已经在手上了，缺的只是「队列已重建」
     // 横幅与「欠 N 个单元」，各自缺席时那一格不画就是了。
-    let health = get::<Health>(base, "/api/v1/health").ok();
+    let health = get::<Health>(base, "/api/v1/health").await.ok();
     let pending = get::<PendingUnits>(base, "/api/v1/update/pending-units")
+        .await
         .map(|p| p.units)
         .unwrap_or_default();
     // `/dbnums` 要重扫项目目录，是这四个里最慢的一个；取不到就少画「本期不执行」
     // 那一格，不该拖垮整次轮询。
     let dbnums = get::<DbnumReport>(base, "/api/v1/dbnums")
+        .await
         .map(|r| r.dbnums)
         .unwrap_or_default();
     Ok(Poll {
@@ -98,20 +114,21 @@ pub fn poll_queue(base: &str) -> anyhow::Result<Poll> {
 }
 
 /// 暂停 / 恢复出队。暂停**只挡出队**，正在跑的那一批会跑完为止。
-pub fn set_queue_paused(base: &str, paused: bool) -> anyhow::Result<()> {
+pub async fn set_queue_paused(base: &str, paused: bool) -> anyhow::Result<()> {
     let path = if paused {
         "/api/v1/queue/pause"
     } else {
         "/api/v1/queue/resume"
     };
-    let _: serde_json::Value = post(base, path, "{}".to_owned(), Duration::from_secs(15))?;
+    let _: serde_json::Value = post(base, path, "{}".to_owned(), Duration::from_secs(15)).await?;
     Ok(())
 }
 
-fn get<T: DeserializeOwned>(base: &str, path: &str) -> anyhow::Result<T> {
-    let response = agent(Duration::from_secs(15))
-        .get(format!("{base}{path}"))
-        .call()
+async fn get<T: DeserializeOwned>(base: &str, path: &str) -> anyhow::Result<T> {
+    let mut req = ehttp::Request::get(format!("{base}{path}"));
+    req.timeout = Some(Duration::from_secs(15));
+    let response = ehttp::fetch_async(req)
+        .await
         .map_err(transport)
         .context("请求模型服务失败")?;
     request(response)
@@ -135,33 +152,28 @@ pub struct Ensured {
 ///
 /// 带 `force`：人按下重试就是要它重跑一遍。不带的话，服务端对「已经生成过、
 /// 只是画不出来」的生成根会直接回状态，那正是这枚按钮不该有的行为。
-pub fn ensure_model(base: &str, root_refno: &str) -> anyhow::Result<Ensured> {
+pub async fn ensure_model(base: &str, root_refno: &str) -> anyhow::Result<Ensured> {
     post(
         base,
         "/api/v1/model/ensure",
         serde_json::json!({ "refno": root_refno, "force": true }).to_string(),
         Duration::from_secs(120),
     )
+    .await
 }
 
-fn agent(timeout: Duration) -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .timeout_global(Some(timeout))
-        .build()
-        .new_agent()
-}
-
-fn post<T: DeserializeOwned>(
+async fn post<T: DeserializeOwned>(
     base: &str,
     path: &str,
     body: String,
     timeout: Duration,
 ) -> anyhow::Result<T> {
-    let response = agent(timeout)
-        .post(format!("{base}{path}"))
-        .header("content-type", "application/json")
-        .send(body)
+    let mut req = ehttp::Request::post(format!("{base}{path}"), body.into_bytes());
+    req.headers
+        .insert("content-type", "application/json; charset=utf-8");
+    req.timeout = Some(timeout);
+    let response = ehttp::fetch_async(req)
+        .await
         .map_err(transport)
         .context("请求模型更新服务失败")?;
     request(response)
@@ -169,30 +181,25 @@ fn post<T: DeserializeOwned>(
 
 /// 传输层失败：连不上、超时、握手不成。对用的人来说这些是同一件事——服务够不着，
 /// 没有任何数据被改动，直接重试即可，所以统一归 `timeout`。
-fn transport(error: ureq::Error) -> anyhow::Error {
+fn transport(error: String) -> anyhow::Error {
     anyhow::Error::new(ApiError(Failure::new("timeout", error.to_string())))
 }
 
-fn request<T: DeserializeOwned>(
-    mut response: ureq::http::Response<ureq::Body>,
-) -> anyhow::Result<T> {
-    let status = response.status();
-    let body = response
-        .body_mut()
-        .read_to_string()
-        .context("读取模型更新服务响应失败")?;
-    if !status.is_success() {
-        return Err(anyhow::Error::new(ApiError(error_packet(status, &body))));
+fn request<T: DeserializeOwned>(response: ehttp::Response) -> anyhow::Result<T> {
+    let status = response.status;
+    let body = response.text().context("模型更新服务响应不是 UTF-8")?;
+    if !response.ok {
+        return Err(anyhow::Error::new(ApiError(error_packet(status, body))));
     }
     serde_json::from_str(&body).context("解析模型更新服务响应失败")
 }
 
 /// 解错误包封。`code` 缺失时按状态码兜底——422 是前置条件不满足、409 是任务冲突、
 /// 504 是超时，其余一律 internal。
-fn error_packet(status: ureq::http::StatusCode, body: &str) -> Failure {
+fn error_packet(status: u16, body: &str) -> Failure {
     let packet = serde_json::from_str::<ErrorResponse>(body).unwrap_or_default();
     let code = packet.code.unwrap_or_else(|| {
-        match status.as_u16() {
+        match status {
             422 => "precondition",
             409 => "conflict",
             504 => "timeout",

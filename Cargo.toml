@@ -12,7 +12,20 @@ edition = "2024"
 plant-ui = { path = "crates/plant-ui" }
 plant-ui-data = { path = "crates/plant-ui-data" }
 # vendored from rs-core-pin (= git rev 5667b70 + get_world fallthrough fix), editable
-aios_core = { path = "vendor/rs-core", default-features = false }
+# `render` 开着 bevy_render：三维搬进来之后几何侧要它（view3d-migration.md 决定 1）
+aios_core = { path = "vendor/rs-core", default-features = false, features = ["render"] }
+
+# 三维那一半的地基。特性列表照抄 rs-plant3-d，换列表要连带核对 e3d_plugin 的用法。
+bevy = { git = "https://gitee.com/happydpc/bevy", default-features = false, features = [
+    "std", "bevy_winit", "bevy_asset", "bevy_render", "bevy_core_pipeline",
+    "bevy_pbr", "bevy_picking", "bevy_mesh_picking_backend", "png", "webgl2",
+] }
+# egui 0.35 + Bevy 0.16 脱离上游支持矩阵，所以以可编辑源码树进 vendor（计划书 M3-1）
+bevy_egui35 = { path = "vendor/bevy_egui35", default-features = false, features = [
+    "render", "default_fonts",
+] }
+# 双端 spawn：原生走 tokio、浏览器走 spawn_local（view3d-migration.md 决定 5）
+bevy-wasm-tasks = { git = "https://gitee.com/happydpc/bevy-wasm-tasks", rev = "51aabcb8124ad80be902fa120c84a2e91d28c9ed" }
 
 egui = "0.35.0"
 eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts", "accesskit", "inspection"] }
@@ -27,6 +40,13 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = "3.3.0"
+# 双端 HTTP / WebSocket（决定 7）。原生后端就是上面这个 ureq 与下面那个 tungstenite，
+# 所以两个加起来只多两个 crate。声明先于使用：换掉 model_update_api / _ws 是第二步的活。
+ehttp = { version = "0.7", features = ["native-async"] }
+ewebsock = "0.8"
+getrandom = "0.3"
+ring = "0.17"
+wasm-bindgen = "=0.2.126"
 # 手动更新的逐单元进度只在 /api/v1/ws 上发（ADR-0005）。版本对齐 vendor 里已有的那一份
 # （surrealdb 的 ws 协议带进来的），不新增下载；服务端不上 TLS，所以只要 handshake。
 tungstenite = "0.23.0"
@@ -35,6 +55,13 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # 三维视口的占位纹理。只开这两种编码，够读 assets/textures 下的图；
 # 包本身与两个解码器链上都已有，vendor 里不新增
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+# 上游 gpu-allocator 绑的 `windows` 版本与 wgpu-hal 的对不上，直接编不过：
+# `expected ID3D12Device, found a different ID3D12Device`（两份 windows crate）。
+# 这份 fork 把它钉到 windows 0.58，与 wgpu-hal 一致。rs-plant3-d 早就这么打了这个补丁，
+# 搬过来的时候漏掉它就会在 wgpu-hal 上停 10 个错。
+[patch.crates-io]
+gpu-allocator = { path = "vendor/gpu-allocator" }
 
 # egui upstream advice: optimize deps for runtime smoothness, keep own code at 0 for fast incremental builds
 [profile.dev.package."*"]

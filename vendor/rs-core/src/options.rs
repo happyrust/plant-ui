@@ -4,6 +4,15 @@ use crate::{RefU64, RefnoEnum};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 
+fn version_db_conn_str(host: &str, port: u16) -> String {
+    let host = host.trim_end_matches('/');
+    if host.starts_with("ws://") || host.starts_with("wss://") {
+        format!("{host}:{port}")
+    } else {
+        format!("ws://{host}:{port}")
+    }
+}
+
 #[derive(Debug, Default, Clone, Parser, Serialize, Deserialize)]
 pub struct DbOption {
     /// 是否启用日志
@@ -382,9 +391,7 @@ impl DbOption {
 
     #[inline]
     pub fn get_version_db_conn_str(&self) -> String {
-        let ip = self.v_ip.as_str();
-        let port = self.v_port;
-        format!("ws://{ip}:{port}")
+        version_db_conn_str(&self.v_ip, self.v_port)
     }
 
     // #[inline]
@@ -450,8 +457,23 @@ pub struct SecondUnitDbOption {
 impl SecondUnitDbOption {
     #[inline]
     pub fn get_version_db_conn_str(&self) -> String {
-        let ip = self.v_ip.as_str();
-        let port = self.v_port;
-        format!("ws://{ip}:{port}")
+        version_db_conn_str(&self.v_ip, self.v_port)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::version_db_conn_str;
+
+    #[test]
+    fn version_db_connection_keeps_secure_websocket_scheme() {
+        assert_eq!(
+            version_db_conn_str("wss://db.example.test/", 443),
+            "wss://db.example.test:443"
+        );
+        assert_eq!(
+            version_db_conn_str("127.0.0.1", 8000),
+            "ws://127.0.0.1:8000"
+        );
     }
 }
