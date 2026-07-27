@@ -172,8 +172,9 @@ pub struct DbnumStatus {
     /// 不入队、不应用，水位不动。五种异常里**只有路径迁移不阻断**。
     #[serde(default)]
     pub blocked: bool,
-    /// 压根不在本期执行范围（`manual_db_nums` / 类型门控）。与阻断**不是一回事**，
-    /// 界面上不许合成一行：混起来会把「出事了」讲成「本来就不跑」。
+    /// 压根不在本期执行范围：类型不对，或者不在当前 MDB 声明的 DESI 名单里
+    /// （ADR-0013 之后范围由 MDB 定，`manual_db_nums` 那份手写名单已经退役）。
+    /// 与阻断**不是一回事**，界面上不许合成一行：混起来会把「出事了」讲成「本来就不跑」。
     #[serde(default)]
     pub excluded: bool,
 }
@@ -598,10 +599,12 @@ pub fn rows(vm: &Vm) -> Vec<RowVm> {
             dbnum,
             db_type: entry.db_type.clone().unwrap_or_default(),
             phase,
-            window: window(
-                entry.start_sesno.unwrap_or_default(),
-                entry.end_sesno.unwrap_or_default(),
-            ),
+            // 契约把这两个字段给成 `Option` 就是因为它们可能缺席。补 0 的话这一格会
+            // 摆出「sesno 0 → 0」——一个指不到任何契约字段的数。宁可空着。
+            window: match (entry.start_sesno, entry.end_sesno) {
+                (Some(start), Some(end)) => window(start, end),
+                _ => String::new(),
+            },
             position: None,
             units_done: entry.units_done,
             total_units: entry.total_units,
@@ -1272,15 +1275,15 @@ fn excluded_row(ui: &mut Ui, t: &Tokens, d: Density, db: &DbnumStatus) {
         Font::mono(d),
         t.text_primary,
     );
-    // 排除有两种来源：类型不对，或者 DESI 但不在 `manual_db_nums` 里。一律写「非 DESI」
-    // 的话，后一种就是假话——那个库明明是 DESI，只是这一期没排它。
+    // 排除有两种来源：类型不对，或者是 DESI 但当前 MDB 没声明它（ADR-0013）。一律写
+    // 「非 DESI」的话，后一种就是假话——那个库明明是 DESI，只是这一期的 MDB 没要它。
     let reason = match (&db.anomaly, blocked) {
         (Some(anomaly), _) => anomaly_brief(anomaly),
         (None, true) => "阻断，原因未随契约给出".to_owned(),
         (None, false) if db.db_type != "DESI" => {
             format!("非 DESI（{}），不在本期范围", db.db_type)
         }
-        (None, false) => "DESI，但不在本期执行范围内".to_owned(),
+        (None, false) => "DESI，但不在当前 MDB 声明的名单里".to_owned(),
     };
     text_at(
         ui,
@@ -2191,5 +2194,24 @@ mod tests {
         assert!(hhmm("not-a-time").is_none());
         assert_eq!(window(1024, 1038), "sesno 1 024 → 1 038");
         assert_eq!(clock(Duration::from_secs(3725)), "1:02:05");
+    }
+
+    /// 会话区间同理：契约给 `Option` 就是因为它可能缺席，补 0 会摆出「sesno 0 → 0」。
+    /// 队列快照那一侧的 `start_sesno` 是必填，所以只有终态历史行会走到这一档。
+    #[test]
+    fn a_history_row_without_sesnos_shows_no_window() {
+        let mut bare = entry("db-7997-9", 7997, "succeeded");
+        bare.finished_at = Some("2026-07-27T10:04:00+08:00".into());
+        bare.start_sesno = None;
+        bare.end_sesno = None;
+
+        let mut full = entry("db-8000-9", 8000, "succeeded");
+        full.finished_at = Some("2026-07-27T10:05:00+08:00".into());
+        full.start_sesno = Some(1024);
+        full.end_sesno = Some(1038);
+
+        let all = rows(&vm(Vec::new(), vec![bare, full]));
+        assert_eq!(all[0].window, "", "缺一个就整格不画，不许摆 sesno 0 → 0");
+        assert_eq!(all[1].window, "sesno 1 024 → 1 038");
     }
 }

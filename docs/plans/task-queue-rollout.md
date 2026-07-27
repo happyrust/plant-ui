@@ -691,8 +691,8 @@ clamp、搜索不受筛选芯片限制。下面六条按能不能自己了结分
 
 | # | 项 | 说明 |
 |---|---|---|
-| Q1 | **终态行会摆出 `sesno 0 → 0`** | `rows()` 拿 `entry.start_sesno.unwrap_or_default()` 填历史行的会话区间。`TaskEntry` 上这两个字段是 `Option<i32>` 正因为它们可能缺席（队列快照那侧的 `QueueRow.start_sesno` 是必填、不是 Option）。这是这个文件唯一一处摆假数字的地方，与 `model_update.rs` 里刚修掉的 `NotInProject` 行 meta 列同源。修法：`window` 改成缺一个就整格不画，配一条单测 |
-| Q2 | **两处注释还写着 `manual_db_nums`** | `DbnumStatus.excluded` 的字段文档与 `excluded_row` 的内联注释，而 `manual_db_nums` 正是 ADR-0013 干掉的东西。界面上那句「DESI，但不在本期执行范围内」字面还成立，但能说得更准：「不在当前 MDB 声明的名单里」 |
+| ~~Q1~~ | ~~**终态行会摆出 `sesno 0 → 0`**~~ | **已修**。`rows()` 原先拿 `entry.start_sesno.unwrap_or_default()` 填历史行的会话区间。`TaskEntry` 上这两个字段是 `Option<i32>` 正因为它们可能缺席（队列快照那侧的 `QueueRow.start_sesno` 是必填、不是 Option）。这是这个文件唯一一处摆假数字的地方，与 `model_update.rs` 里同一轮修掉的 `NotInProject` 行 meta 列同源。现在缺一个就整格不画，配了一条单测——撤掉修复它会报 `left: "sesno 0 → 0"` |
+| ~~Q2~~ | ~~**两处注释还写着 `manual_db_nums`**~~ | **已修**。`DbnumStatus.excluded` 的字段文档与 `excluded_row` 的内联注释，而 `manual_db_nums` 正是 ADR-0013 干掉的东西。界面上那句也从「DESI，但不在本期执行范围内」改成「DESI，但不在当前 MDB 声明的名单里」——原句字面成立，但读不出该去哪儿改 |
 | Q3 | **「本期不执行」那一格不报总数** | 防护本身到位（84px 封顶 + `ScrollArea` + `is_rect_visible` 剪枝 + 阻断排前面，布局炸不了）。但 ADR-0013 之后 `/dbnums` 的 `excluded` 覆盖面从「几个非 DESI」变成「MDB 之外的所有设计库」——AvevaMarineSample 上是 258 个 DESI。一个 84px 的框里滚 260 行而不报总数，跟这个文件自己在 `filtered_out` 上坚持的「过滤不许无声」是同一条原则的反面。加个 `N 项` 就够 |
 | Q4 | **`rows()` 在积压态是 O(队列行 × 任务行)，而它每帧都跑** | `vm.task()` 是 `iter().find()`、`vm.owed()` 又扫一遍 `pending`。本文件自己写着「287 行是积压态不是稳态，但面板得扛得住那一天」——那一天就是 287 × 200 ≈ 5.7 万次字符串比较/帧，而且 `show()` 里 `rows()` 一次、`visible()` 两次（自己一次、`toolbar` 里又一次），旁边还挂着实时三维视口。修法很小：`rows()` 开头建一个 `HashMap<&str, &TaskEntry>` |
 
@@ -712,9 +712,10 @@ clamp、搜索不受筛选芯片限制。下面六条按能不能自己了结分
 正在跑的那条一定在 200 窗口内——但判据用错了来源。另：终态行 `entry.dbnum` 为 `None` 时
 直接 `continue`，既不显示也不计入 `filtered_out()`，是一次无声丢弃。
 
-### 为什么先记不改
+### Q3 / Q4 为什么先记不改
 
-Q1 是唯一会让人看错的一条，其余是体验、性能与文案。而 Q3 / Q4 的严重程度都取决于
-`/dbnums` 在 MDB 收窄之后到底回多少行——这件事只有真服务答得出来，而**那笔实机验收
-仍然欠着**（第十节第 3 条、六之六末尾都记着，8021 上跑的还是旧服务）。在拿到真实行数
-之前动手调 Q3 / Q4，等于对着一个猜出来的数字优化。Q1 与 Q2 随时可以单独收掉。
+**它们的严重程度都取决于 `/dbnums` 在 MDB 收窄之后到底回多少行**——这件事只有真服务
+答得出来，而**那笔实机验收仍然欠着**（第十节第 3 条、六之六末尾都记着，8021 上跑的还是
+旧服务）。在拿到真实行数之前动手调，等于对着一个猜出来的数字优化。
+
+Q1 与 Q2 不依赖这个数，同一轮里已经单独收掉了。
