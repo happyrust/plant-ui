@@ -841,7 +841,13 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, state: &mut State, cmd
                         sub_line(ui, t, d, &row.note, row.note_tone == Status::Error);
                     }
                     if open {
-                        row_detail(ui, t, d, vm, row, cmds);
+                        // 明细里的控件也按 task_id 定号，理由同 `row_id`：那枚「重试」
+                        // 按错行不是显示问题，服务端会真的去重跑一遍生成。
+                        ui.scope_builder(
+                            egui::UiBuilder::new()
+                                .id(egui::Id::new(("task-queue-detail", row.task_id.as_str()))),
+                            |ui| row_detail(ui, t, d, vm, row, cmds),
+                        );
                     }
                 }
                 ui.add_space(d.px(8.0));
@@ -1387,6 +1393,20 @@ fn cols(rect: Rect, d: Density) -> Cols {
     }
 }
 
+/// 行的交互 id：**只由 task_id 决定，不许跟着行序走**。
+///
+/// 这个列表会重排——运行中置顶、行随批次进出、每 2 秒一份新快照。而 egui 的点击是
+/// 「按下那一帧记 id、松开那一帧按 id 兑现」：用自动号（等于「第几行」）的话，按与松
+/// 之间夹进的那次重排会把这一下交给**另一行**。展开错行只是烦，行内那枚「重试」按错
+/// 是服务端真的去重跑一遍生成。
+///
+/// 与 `workbench/tree.rs` 同一条教训，也同一个写法：要 `Ui::interact` / `UiBuilder::id`
+/// 这种直接定死 id 的路子，`push_id` 不行——它只定住子 Ui 的 `id`，内部控件仍从
+/// `unique_id = id.with(父 Ui 的自动计数)` 取号，行序又被混了回来。
+fn row_id(task_id: &str) -> egui::Id {
+    egui::Id::new(("task-queue-row", task_id))
+}
+
 /// 组件 `C/QueueRow`：状态点 / 设计库 / 类型 / 会话区间 / 状态 / 进度与说明 / 计时。
 /// 返回行的响应，以及「进度 / 说明」那一格有没有装下——装不下的由调用点
 /// 在行下面补一行，不许截没。
@@ -1398,8 +1418,8 @@ fn queue_row(
     paused: bool,
     open: bool,
 ) -> (egui::Response, bool) {
-    let (rect, resp) =
-        ui.allocate_exact_size(vec2(ui.available_width(), d.px(34.0)), Sense::click());
+    let (_, rect) = ui.allocate_space(vec2(ui.available_width(), d.px(34.0)));
+    let resp = ui.interact(rect, row_id(&row.task_id), Sense::click());
     if !ui.is_rect_visible(rect) {
         return (resp, true);
     }
