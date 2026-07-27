@@ -9,9 +9,10 @@
 - 性质：设计已定稿，本文件只排施工顺序。已落地的改动见第六节；服务端只新增了一个
   **不依赖 `web_service`** 的纯逻辑模块，接口层一行未改。
 
-**一句话现状：设计与字段出处都齐了，两个卡口卡在人手上——gen-model 的
-`src/web_service/` 还没入库；画板存没存下来要在 Pencil 里验证（19:52 旧名文件被
-写过，见第一节）。第二轮对齐的十一条决定见第八节。**
+**一句话现状：两个卡口都已解（2026-07-27 晚）——gen-model 最小基线
+`4184a5b1` 已入库；S12 画板确认存活于 19:52 的旧名文件并已 rename 回权威名
+`plant-ui.pen`。下一步是第五节第 2 步：服务端 1–4 项 + 心脏。
+两轮拷问定案见第八、九节。**
 
 ---
 
@@ -22,12 +23,12 @@
 | gen-model 未提基线 | 215 个脏文件，且 `src/web_service/` 整个目录是 `??`（未跟踪） | 第二节九项里的**前八项全落在那个目录里**。未入库意味着改坏了没有 `git diff` 可看、没有 `git checkout` 可回 |
 | 画板存盘待验证 | `plant-ui.pen` 仍是 17:24 那份；但旧名 `rs-plant3d-ui.pen` 在 19:52 被写过（727KB > 654KB），`S12` / `S12-B` / `C/QueueRow` **可能已存进旧名文件**——.pen 加密，只能在 Pencil 里打开验证 | 验证之前不知道画板是不是丢了。HTML 快照在 `output/queue-boards-backup.html`，但那是只读的，回写不了 .pen |
 
-卡口一的解法已定（第八节第 2 条）：最小基线单独一个 commit——`src/web_service/`
+卡口一已解（第九节第 2 条，gen-model `4184a5b1`）：最小基线单独一个 commit——`src/web_service/`
 （5 文件）+ `src/data_interface/batch_queue.rs` + `data_interface/mod.rs` 那两行挂载，
 提交前跑 `cargo check`；其余 200+ 脏文件是别的工作流的中间态，不动。
 `increment_manager.rs` 与 `lib.rs`（心脏手术对象）本来就是干净的，已有基线。
 
-卡口二的解法已定（第八节第 3 条）：权威定 `plant-ui.pen`（rollout 与
+卡口二已解（第九节第 3 条，S12 确认存活、已 rename）：权威定 `plant-ui.pen`（rollout 与
 `QUEUE-FIELD-MAP.md` 引用的都是它，文档不用改）。先在 Pencil 打开
 `rs-plant3d-ui.pen` 验证 S12 画板在不在：在，就把那份存成 `plant-ui.pen`、
 git 里 rename 掉旧名；两份都没有，按 `QUEUE-FIELD-MAP.md` 重画——那张表
@@ -60,7 +61,7 @@ HTML 导出没有这个偏移（172 个 flex 容器、2 处绝对定位），所
 | 9 | 暂停标志持久化（与水位同库，不进队列表） | `handlers.rs` + 水位所在的持久层 | ADR-011 §9：暂停最常见的后继动作就是重启服务；不活过重启等于把暂停的用意抹掉 |
 
 注：表里写的 `web_service/tasks.rs` 指注册表**搬家之后**的位置——`TaskRegistry`
-先搬出 `web_service`（第三节第一条、第八节第 4 条），九项再往上落。
+先搬出 `web_service`（第三节第一条、第九节第 4 条），九项再往上落。
 
 还要删的其实是**四处**（第二轮对齐逐行核实；首稿那句「不在领域层」与代码不符，
 领域层有第二道）：
@@ -77,7 +78,7 @@ HTML 导出没有这个偏移（172 个 flex 容器、2 处绝对定位），所
 它本来就是按单库执行的函数，不必先拆循环。探针 `bin/manual_exec_probe.rs` 改走
 入队后等队空。`POST /update/execute` 的 202 从单 task_id 改成入队回执数组
 `{scanned, enqueued:[{task_id, dbnum, position}], merged, already_covered}`
-——S2-D 的「已入队，排在第 N 位」直接有数据，前端不用拼（第八节第 7 条）。
+——S2-D 的「已入队，排在第 N 位」直接有数据，前端不用拼（第九节第 7 条）。
 
 `insert_running`（`tasks.rs:77`）的剔除逻辑要从一句 `find(|t| t.state != Running)` 变成三条规则：
 queued / running 免除 → 每个 dbnum 保留最近一条终态 → 其余最老先剔（ADR-011 §11）。
@@ -89,7 +90,7 @@ queued / running 免除 → 每个 dbnum 保留最近一条终态 → 其余最�
 
 不在接口层，是本轮工作量最大的一块，落在 `data_interface/increment_manager.rs`。
 
-- **任务注册表搬家先行**（第八节第 4 条）：`TaskRegistry` 从 `web_service/tasks.rs`
+- **任务注册表搬家先行**（第九节第 4 条）：`TaskRegistry` 从 `web_service/tasks.rs`
   搬到 feature 无关层，`web_service` 只留 HTTP 映射。`pub mod web_service` 整个在
   `#[cfg(feature = "http_api")]` 门后（`lib.rs:82`），队列真身若住在门里，http_api
   关闭时合流路径就没有队列可用——两种编译形态两种执行行为。WS 广播照现成先例
@@ -98,7 +99,7 @@ queued / running 免除 → 每个 dbnum 保留最近一条终态 → 其余最�
 - `async_watch` 的 while 循环（`:1036` 起）：`resolve_with_header` 拿到 plan 之后不再直接
   apply，改为 `enqueue`。
 - 新增单 worker 调度循环——**无条件 spawn，不放进 `lib.rs:303` 那个 `tokio::join!`**
-  （第八节第 5 条）：那个 join! 在 `if sync_live` 分支里，而合流后手动模式
+  （第九节第 5 条）：那个 join! 在 `if sync_live` 分支里，而合流后手动模式
   （sync_live=false）的执行也走队列，worker 若只活在自动分支，手动模式的队列就没有
   消费者——首稿这处写错了。进程起来就有且只有一个 worker：
   取队首 → `mark_started` → 数据应用 + 模型生成 → `finish`；队空且未暂停 → 跑一轮
@@ -192,7 +193,7 @@ clippy 在 `model_update.rs` 上只剩两条早就在的「too many arguments」
 
 要让房间泳道有东西可报，前置是把带房间结构的那个 DESI 库重新纳入解析范围并生成到
 PANE 这一层。是哪个库，需要对着 E3D 项目的 MDB 结构查，本轮没查到底——那要动实库。
-第二轮对齐已定（第八节第 10 条）：**这件事不进本轮**，房间泳道按
+第二轮对齐已定（第九节第 10 条）：**这件事不进本轮**，房间泳道按
 「房间增量没开 / 无数据」的诚实形态验收，数据准备单列跟踪项。
 
 顺带一条与队列直接相关的实测，**读的时候要连着配置一起看**：
@@ -210,7 +211,7 @@ PANE 这一层。是哪个库，需要对着 E3D 项目的 MDB 结构查，本�
 - **今天打开 `sync_live` 不会有风暴**，只会有三个库。
 - 但风暴离得只有一行配置那么远：`manual_db_nums` 一旦放宽或去掉，第一轮就是几百个库
   同时进队。所以第五节第 2 步（心脏）跑通之后，**压测要拿放宽后的规模压**，
-  不能拿这三个库的手感去判断队列够不够用。压测环境已定（第八节第 9 条）：
+  不能拿这三个库的手感去判断队列够不够用。压测环境已定（第九节第 9 条）：
   **可丢弃副本库**——复制数据目录另起端口、放宽 `manual_db_nums` 压
   287 库 / 13 323 会话的全量，不动 8009 实库。
 
@@ -230,7 +231,7 @@ PANE 这一层。是哪个库，需要对着 E3D 项目的 MDB 结构查，本�
    「queued / running 永不剔 + 每个 dbnum 保留最近一条终态」，那么首轮放宽之后光是
    287 条排队 + 287 条终态就要 **≥ 574** 的容量。策略本身护住了排队行不被误删，
    但常量必须跟着抬，否则终态会被当场冲光、「上次跑成什么样」永远查不到。
-   数值已定（第八节第 8 条）：**1000**——574 打底，余量留给全局最近终态；
+   数值已定（第九节第 8 条）：**1000**——574 打底，余量留给全局最近终态；
    分层规则先行，常量只是兜底上限。
 2. **队列面板扛不住 287 行。** 画板 `S12` 上是 8 行的形态。287 行是**积压态**
    （首轮放宽范围、或服务停了很久），稳态下队列只有刚被保存过的那几个库。
@@ -280,18 +281,25 @@ PANE 这一层。是哪个库，需要对着 E3D 项目的 MDB 结构查，本�
 
 ---
 
-## 八、第二轮对齐（2026-07-27 晚 · ZhiMoAll-16 会话代决）
+## 九、第二轮对齐（2026-07-27 晚 · ZhiMoAll-16 会话代决）
 
 对着代码逐行核实后的十一条决定。与第七节同一性质：**要推翻只需一句话**。
-（对齐会上人不在场，均按推荐项超时自决——更要盯着这一节复核。）
+（对齐会上人不在场，均按推荐项超时自决——更要盯着这一节复核。
+本节与上一节是同日两个会话各自的拷问记录，先编号撞成两个「八」，已改九。）
 
 1. 施工照第五节顺序，不重排；本轮只细化。
 2. 卡口一最小基线：`src/web_service/`（5 文件）+ `batch_queue.rs` +
    `data_interface/mod.rs` 两行挂载，单独一个 commit，提交前 `cargo check`。
    其余 200+ 脏文件是别的工作流的中间态，不动。
+   **已执行**：gen-model `4184a5b1`（7 文件 1006 行，`cargo check --features
+   http_api` 通过）——上一节第 3 条「gen-model 卡口仍未解」自此过时。
 3. 画板权威定 `plant-ui.pen`：先在 Pencil 打开 `rs-plant3d-ui.pen` 验证
    S12 / S12-B / C/QueueRow 是否已存盘；在，就把那份存成 `plant-ui.pen`、git 里
    rename 掉旧名；两份都没有，按 `QUEUE-FIELD-MAP.md` 重画。
+   **已执行**：三者都在 19:52 的旧名文件里（S12 `IoAZx` / S12-B `c58Zc0` /
+   C/QueueRow `smhp5`），其余 17 个顶层节点两文件逐 id 一致、旧 `plant-ui.pen`
+   是纯子集；已 `git mv` 旧名为 `plant-ui.pen`，17:24 那份留了
+   `plant-ui.pen.stale-20260727-1724.bak`（git 历史 `504d4c1` 里也有），可删。
 4. `TaskRegistry` 搬出 `web_service` 到 feature 无关层；队列真身单一，
    不随编译形态分叉（详见第三节第一条）。
 5. worker 无条件 spawn：一个进程一个消费者，不分 sync_live（详见第三节）。
