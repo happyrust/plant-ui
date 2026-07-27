@@ -128,6 +128,49 @@ M2-3 说「38 个 plugin 里 UI 与业务逻辑混在一起，删之前必须逐
 
 两处的处置是同一个形状：事件的注册要跟着**消费方**走，不能留在被删的插件里。
 
+### 更正：上面两段有一段是错的，另一段已经被 plant-ui 宿主架空（回填 07-27 下午）
+
+准备动手做第五节第 3 步时逐行核了一遍，结论是这一步**不必做了**，两条理由分别对应上面两段。
+
+**一、`ShowSscModelEvent` 那段的判断不成立。** 上面说「读它的系统留在 e3d_plugin 里」，
+所以删掉 `pbs_plugin` 会留下一个读没注册事件的系统。实际是：
+
+| 环节 | 在哪 |
+|---|---|
+| 事件定义 | `e3d_plugin/pdms_events/mod.rs:93` |
+| 消费系统的**函数体** | `e3d_plugin/systems/show_ssc_system.rs:14` |
+| 消费系统的**注册** | **`pbs_plugin/plugin.rs:49`** —— `add_systems(Update, show_ssc_meshes)` |
+| `add_event` | `pbs_plugin/plugin.rs:46` |
+| **写入方** | `pbs_plugin/pbs_tree.rs:99`（PBS 树的 UI） |
+
+注册与读取**挨在一起，就差三行**，写入方也在同一个插件里。
+整体删掉 `pbs_plugin`，`add_event` 与 `add_systems` 一起消失，谁都不会去读一个没注册的事件，
+剩下的只是 e3d_plugin 里那个事件结构体和那个函数体变成死代码——**是死代码，不是运行时炸**。
+
+错在哪值得记一笔：上一版只 grep 了 `EventReader<ShowSscModelEvent>` 落在哪个文件里，
+就断定「消费方在 e3d_plugin」。**但决定运行时行为的是 `add_systems` 写在哪，不是 `fn` 写在哪**——
+这和本文第一节自己总结的那条（判据得是「能不能从模块树走到」，不是「文件在不在」）是同一类错误，
+只是这次错在函数与它的注册被分在两个插件里。
+
+**二、`VersionFetchEvent` 那段描述的不是「注册错位」。** `add_event`（`version_plugin/plugin.rs:57`）
+与读它的 `fetch_version_compare_system`（同文件 :68 注册）本来就在一起，没有需要搬的东西。
+真正为真的只有半句：写它的是模型树（`e3d_plugin/trees/e3d_tree.rs:138`），
+而模型树是要留的。但按第三节的分类 `version_plugin` 是「仅删 UI，保留逻辑」，
+`fetch_version_compare_system` 属于保留的那一半，所以这个风险在既定方案下不会兑现。
+
+**三、更要紧的是：这两处在默认构建下已经根本不存在了。** `plant-ui-host` 是默认特性，
+开着它时 `lib.rs:110` 的 `setup_bevy_app` 在第 114 行就 `return` 了，
+而 `PbsPlugin` 与 `E3dVersionPlugin` 的 `add_plugins` 在第 161、162 行——**永远走不到**。
+新宿主 `plant_ui_host::run()` 自己组装应用，只挂 `DefaultPlugins` / `RsTokioTasksPlugin` /
+`EguiPlugin` / `SelectedPlugin` / `PdmsPlugin` 五个；而 `PdmsPlugin::build` 同样在开头
+`build_plant_ui_pdms(app); return;`，那里是一份手挑的最小事件与系统集合，
+`ShowSscModelEvent` 与 `VersionFetchEvent` 一个都不在其中。
+
+所以现在去搬 `add_event` 是白搬：改动只会落在早已 `return` 掉的旧分支里，
+默认构建下一行代码的行为都不会变。**这两处耦合不再是「删除前必须先拆的雷」，
+而是「旧路径整体删除时会一起消失的东西」——它们已经从第 3 步的前置条件，
+变成了 M2-4 的一部分。**
+
 ## 五、建议的执行顺序
 
 1. ~~先删那 21 个不参与编译的目录，连同 `plugins/mod.rs` 里 19 行注释。~~
@@ -146,11 +189,12 @@ M2-3 说「38 个 plugin 里 UI 与业务逻辑混在一起，删之前必须逐
    但**这三个目录仍在磁盘上**。第四个 `docs_plugin` 本来就没被声明过，第一步已经连目录一起删了。
    摘声明不删目录的后果，就是它们变成与第一步删掉那 20 个同性质的死代码——
    判据同一条（能不能从模块树走到），下一个人得重新数一遍才知道它们是死的。
-3. 处理第四节那两处事件耦合——把 `add_event` 移到消费方所在的插件。
-   **未做**：`add_event::<ShowSscModelEvent>()` 仍在 `pbs_plugin/plugin.rs:46`，
-   `add_event::<VersionFetchEvent>()` 仍在 `version_plugin/plugin.rs:57`，逐行核过。
-   现在不出事只是因为这两个插件还没删。**这是接着往下做之前的第一件事**：
-   顺序颠倒过来（先删插件后解耦）就是运行时炸，而且炸的是要留的模型树。
+3. ~~处理第四节那两处事件耦合——把 `add_event` 移到消费方所在的插件。~~
+   **撤销这一步**：核过之后不必做了，理由见第四节末尾的更正。
+   一句话——`ShowSscModelEvent` 的注册与读取本来就挨在一起（都在 `pbs_plugin/plugin.rs`，:46 与 :49），
+   删掉插件不会留下悬空的读取方；`VersionFetchEvent` 的注册与读取也本来就在
+   `version_plugin` 内部同一文件里。而且在默认的 `plant-ui-host` 构建下这两个插件根本没被 `add_plugins`，
+   现在搬 `add_event` 只是在已经 `return` 掉的旧分支里挪代码，行为一行都不会变。
 4. 然后才动 5 个「仅删 UI」的，逐个把面板代码与系统拆开。
    **未做**：面板代码原样都在。全仓库 15 处 `impl EditorTabTrait`，
    运行时注册的只有 4 处，剩下 11 处是编译得到但打不开的 UI，`version_plugin` 一家占 4 处
