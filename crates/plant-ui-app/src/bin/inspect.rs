@@ -7,12 +7,14 @@
 //!
 //! 应用需带 `EGUI_INSPECTION=1` 启动。用法：
 //!   inspect tree [关键字]         列控件：角色 / 文本 / 逻辑坐标包围盒，给了关键字就只列匹配的
-//!   inspect click <x> <y>         在逻辑坐标点一下
+//!   inspect click <x> <y> [键]    在逻辑坐标点一下；键为 left（默认）或 right，
+//!                                 可带 ctrl+ / shift+ 前缀点出多选
 //!   inspect drag <x0> <y0> <x1> <y1>  按住左键从一点拖到另一点（选文本、拖分隔条）
 //!   inspect copy                  发一次复制事件，选中的文本进系统剪贴板
 //!   inspect scroll <x> <y> <dy>   在逻辑坐标滚一下（dy 正值内容下移）
 //!   inspect type <文本>           往当前焦点控件敲一段文本
-//!   inspect key <键>              敲一个键：enter / esc / tab / backspace / ctrl+a
+//!   inspect key <键>              敲一个键：enter / esc / tab / up / down / backspace / home
+//!                                 / a / f / h / s，可带 ctrl+ 或 shift+ 前缀
 //!   inspect shot <文件>           截图存 PNG
 
 use std::net::TcpStream;
@@ -29,19 +31,20 @@ fn main() -> anyhow::Result<()> {
         "tree" => tree(args.get(1).map(String::as_str)),
         "click" => {
             let pos = pos2(num(&args, 1)?, num(&args, 2)?);
+            let (button, modifiers) = parse_button(args.get(3).map(String::as_str))?;
             apply(vec![
                 egui::Event::PointerMoved(pos),
                 egui::Event::PointerButton {
                     pos,
-                    button: PointerButton::Primary,
+                    button,
                     pressed: true,
-                    modifiers: Modifiers::NONE,
+                    modifiers,
                 },
                 egui::Event::PointerButton {
                     pos,
-                    button: PointerButton::Primary,
+                    button,
                     pressed: false,
-                    modifiers: Modifiers::NONE,
+                    modifiers,
                 },
             ])
         }
@@ -100,18 +103,55 @@ fn num(args: &[String], i: usize) -> anyhow::Result<f32> {
         .map_err(Into::into)
 }
 
-/// 只认属性面板验收用得上的这几个键，不做通用键盘映射。
-fn parse_key(name: &str) -> anyhow::Result<(Key, Modifiers)> {
-    let (mods, bare) = match name.strip_prefix("ctrl+") {
-        Some(rest) => (Modifiers::CTRL, rest),
-        None => (Modifiers::NONE, name),
+/// Windows 上 egui-winit 会把 Ctrl 同时映射成 `command`，而 `Modifiers::CTRL`
+/// 这个常量只置 `ctrl`。探针得照真实按键的样子发，否则读 `modifiers.command` 的
+/// 代码（模型树的 Ctrl 多选就是）永远收不到注入的这一下。
+const CTRL: Modifiers = Modifiers {
+    alt: false,
+    ctrl: true,
+    shift: false,
+    mac_cmd: false,
+    command: true,
+};
+
+/// `ctrl+` / `shift+` 前缀，`click` 与 `key` 共用一套写法。
+fn split_modifiers(name: &str) -> (Modifiers, &str) {
+    if let Some(rest) = name.strip_prefix("ctrl+") {
+        (CTRL, rest)
+    } else if let Some(rest) = name.strip_prefix("shift+") {
+        (Modifiers::SHIFT, rest)
+    } else {
+        (Modifiers::NONE, name)
+    }
+}
+
+/// 右键菜单要靠副键点出来，多选要靠修饰键，所以点击得说清楚按的是哪个键、带什么修饰。
+fn parse_button(name: Option<&str>) -> anyhow::Result<(PointerButton, Modifiers)> {
+    let (mods, bare) = split_modifiers(name.unwrap_or("left"));
+    let button = match bare {
+        "left" => PointerButton::Primary,
+        "right" => PointerButton::Secondary,
+        other => anyhow::bail!("不认识的鼠标键 {other}；可用：left / right，可带 ctrl+ / shift+"),
     };
+    Ok((button, mods))
+}
+
+/// 只认验收用得上的这几个键，不做通用键盘映射。
+fn parse_key(name: &str) -> anyhow::Result<(Key, Modifiers)> {
+    let (mods, bare) = split_modifiers(name);
     let key = match bare {
         "enter" => Key::Enter,
         "esc" => Key::Escape,
         "tab" => Key::Tab,
+        "up" => Key::ArrowUp,
+        "down" => Key::ArrowDown,
         "backspace" => Key::Backspace,
+        "home" => Key::Home,
         "a" => Key::A,
+        // 视口工具栏的键位。
+        "f" => Key::F,
+        "h" => Key::H,
+        "s" => Key::S,
         other => anyhow::bail!("不认识的键 {other}"),
     };
     Ok((key, mods))

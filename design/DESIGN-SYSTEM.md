@@ -2,13 +2,14 @@
 
 设计源文件：`design/rs-plant3d-ui.pen`（Pencil 打开，勿用文本编辑器）
 HTML 参照：`design/export/*.html`（离线可看，含精确尺寸与颜色）
+字段对照：`design/MODEL-UPDATE-FIELD-MAP.md`（模型更新七张画板每个元素的出处，实现的验收基准）
 
 ---
 
 ## 1. 画板索引
 
-这是**规划**，不是 `.pen` 的现状：截至 2026-07-27，文件里只有 S1–S4 加 6 个组件
-（C/Tab、C/TreeRow、C/PropRow、C/LogRow、C/ToolBtn、C/Button），S5 往后一张都没画。
+这是**规划**，不是 `.pen` 的现状：截至 2026-07-27，文件里有 S1–S4 加后补的 S2-A、S2-B、S2-D、S2-E、S4-B、S4-C，
+再加 6 个组件（C/Tab、C/TreeRow、C/PropRow、C/LogRow、C/ToolBtn、C/Button），S5 往后一张都没画。
 「已画」一列就是为此加的——查过 `old\rs-plant3-d\design\rs-plant3d-ui.pen` 那份原始文件，
 体积是本项目这份的三倍，顶层节点却完全一样，所以不是迁移时漏拷。
 下游要照着某张画板做之前，先看这一列。
@@ -16,9 +17,15 @@ HTML 参照：`design/export/*.html`（离线可看，含精确尺寸与颜色�
 | 画板 | 尺寸 | 已画 | 对应代码 |
 |---|---|---|---|
 | S1 主工作台（深色） | 1600×1000 | 是 | `dock.rs`、`editor_ui/ui_plugin.rs`、`ui/menu_bar.rs` |
-| S2 模型更新 · 预览 | 1040×720 | 是 | `data_interface/model_update_plan.rs`（gen-model 侧） |
+| S2 模型更新 · 预览 | 1040×720 | 是 | `data_interface/manual_update.rs` 的 `preview_manual_update`（gen-model 侧） |
+| S2-A 模型更新 · 正在预览 | 1040×720 | 是 | 尚无实现；预览改异步任务后的等待态，见 ADR-0006 |
+| S2-B 模型更新 · 确认执行 | 1040×720 | 是 | 尚无实现；三步向导的第二步，见下方「三步向导」 |
+| S2-D 模型更新 · 不可用与失败态 | 1040×720 | 是 | 错误包封 `{ code, message, detail }` 的五种分型；是形态表不是窗 |
+| S2-E 模型更新 · 设计库行形态表 | 1040×720 | 是 | `DbnumPreview` 的 `anomaly` / `blocked` / `initialization_required` 七种行状态；同为形态表 |
 | S3 主工作台（浅色） | 1600×1000 | 是 | 同 S1，仅主题切换 |
-| S4 模型更新 · 执行进度 | 1040×720 | 是 | `data_interface/increment_pipeline.rs` |
+| S4 模型更新 · 执行进度 | 1040×720 | 是 | `ManualUpdateEvent` 两阶段事件，经 WS 推送 |
+| S4-B 模型更新 · 实时通道断开 | 1040×720 | 是 | 同 S4 的降级形态，见 ADR-0005 |
+| S4-C 模型更新 · 部分完成 | 1040×720 | 是 | `ManualUpdateResult` 的 `partial` 终态，见下方「三步向导」 |
 | S5 项目选择 | 1600×1000 | 否 | `ui/ui_project_page.rs`（当前整体注释掉） |
 | S6 设置 | 880×740 | 否 | `editor_ui/dashboard/preference.rs` |
 | S7 防火封堵材料统计 | 1240×820 | 否 | `ui/plugging_material_statistics/` |
@@ -27,6 +34,45 @@ HTML 参照：`design/export/*.html`（离线可看，含精确尺寸与颜色�
 | S10 元件库 | 1400×860 | 否 | `UiOption::ComponentWarehouseUI` |
 | S11 模糊查询 | 1240×820 | 否 | `ui/fuzzy_search/` |
 | S12 保存 / 搜索记录 | 1280×560 | 否 | `fuzzy_search/save_ui.rs`、`import_ui.rs` |
+
+### 三步向导：预览 → 确认执行 → 执行进度
+
+S2 / S2-B / S4 是同一个任务窗的三步，步骤条六张画板上都有；S2-A 是第一步的等待态，
+S4-B 是第三步的断线降级形态，S4-C 是第三步的终态。另有 **S2-D 是形态表而不是窗**，
+单独收拢五种不可用与失败形态，S2-E 同样是形态表，收拢七种设计库行状态。
+2026-07-27 照 gen-model 的 `manual_update.rs`、`dbnum_state.rs` 与 `web_service/mod.rs`
+逐格核过一遍，八条要点：
+
+- **执行范围不等于预览列表。** 阻断的库不跑、非 DESI 的库压根不在范围内、需初始化的库会跑、
+  上次失败的待重试单元会并入。S2-B 就是为把这四类差异摆清楚才补的——按下去的是一个不可取消的按钮。
+- **「阻断」与「排除」不是一回事**，来自契约里的不同位置，界面上不许合成一行：阻断是 DESI 库出了
+  文件异常（`FileAnomaly` 五种），排除是非 DESI 压根不进本期。
+- **ZONE 只用于归类**，不参与执行；向上找不到交付单元的变化计入 `no_generation` 并告警，
+  **不会**退化成一个 ZONE 级的兜底单元（`manual_update.rs:21`、`:492` 各写了一遍）。
+- **界面上每个数字都要能指到契约里的字段。** 原稿上的「预计生成耗时 ~ 4 分 20 秒」与单元行的
+  「生成中 62%」都没有来源，已拿掉；已用时、落后事件条数、`14 / 24` 计数都算得出来，留着。
+  交付单元的分母是 24 = 预览的 23 个新单元 + 1 个待重试单元，S2-B / S4 / S4-B / S4-C 四张必须同一个数。
+- **终态有四种，`partial` 才是常态。** `aggregate_manual_status` 按「有成功也有失败」判定，
+  给出 `Success` / `Partial` / `Failed` / `UpToDate`。S4-C 按最难的 `partial` 画：数据批次一旦
+  `Applied`，水位不因后面的模型生成失败而回退；失败的交付单元单独登记为待重试，带累计 `attempts`。
+  结果摘要里**必须逐条列出 `merged_sesnos`** —— 预览扫描之后才并入本批次的会话，是契约写死的要求，
+  也是「执行范围 ≠ 预览列表」在终态上的最后一次交代。
+- **第一步也得有等待态，预览的超时上限是 600 秒。** S2-A 按 ADR-0006 的异步任务形态画：逐库推进
+  （已扫描 / 扫描中 / 不需扫描）、本地已用时，以及扫描期间仍摆着的上一次预览结果（灰掉、标明已过期，
+  比空屏强）。非 DESI 不进扫描循环，写「不需扫描」且不占分母。「取消预览」只放弃客户端等待——
+  服务端没有 cancel 接口，界面上不许暗示它会停。
+- **失败按 `code` 分型，不许把错误链摊给人看。** 服务端的错误包封是 `{ code, message, detail }`
+  （`web_service/mod.rs` 的 `ApiError`），三种拒绝各有各的码：`sync_live` 拒绝是
+  **422 · precondition**、同项目任务冲突是 **409 · conflict**、超时是 **504 · timeout**，
+  其余才落到 **500 · internal**。S2-D 把这三种、加上 `up_to_date` 空态与
+  `data_source_ok = false` 的未初始化态，五种一次摆齐，每种都给原因、影响和一个出路按钮。
+  **只有 `internal` 那一类才需要把原始 message 摊出来**，还得收进「详情」默认折起。
+- **五种 `FileAnomaly` 里只有一种不阻断。** `preview_dbnum` 里写死了
+  `matches!(anomaly, Rollback | TypeChanged)`，项目扫描器另把 `Duplicate` / `Missing` 直接置
+  `blocked = true` —— **只有 `PathMigrated` 照常执行**，登记路径还能自动跟新。四种阻断的出路
+  各不相同（换回文件 / 人工确认身份 / 人工挑一个 / 补文件或注销登记），不许合并成一句「不可更新」。
+  还有 `initialization_required` 的库：契约根本不为它解会话区间，`net_*` 全是 0，**但它确实会跑**，
+  所以绝不能显示成「无变化」。七种行状态见 S2-E。
 
 ---
 
@@ -239,7 +285,8 @@ pub mod space {
 6. ~~组件层可编辑 `prop_row` / 纹理图标 `tree_row`~~ **已完成**，属性面板与模型树都已改由组件排版
 7. 其余几棵树（PBS / 房间 / 校审）套同一模式 —— 下一步
 8. egui_dock 页签自绘（激活页签顶部 2px 强调条）——`egui_dock::Style` 表达不了，必须自绘
-9. 模型更新预览 / 进度两个窗口（对应 S2 / S4）
+9. 模型更新的三步向导（S2 / S2-B / S4，外加 S2-A 的预览等待、S4-B 的断线降级、S4-C 的 `partial` 终态，
+   以及 S2-D 那张五形态表）；进度通道见 ADR-0005，预览改异步任务见 ADR-0006
 10. 其余面板按 S7 / S11 范式逐个套
 
 ### 组件层：源文件只有一份，两个面板的阻碍已经解除
@@ -267,8 +314,13 @@ pub mod space {
 
 - 正文对背景对比度 ≥ 4.5:1，`text-muted` 也不例外
 - 同一屏内只有一个 `accent` 底的主操作
-- 每个数据面板都实现了加载 / 空 / 错误 / 未初始化四态（参照 S8）
+- 每个数据面板都实现了加载 / 空 / 错误 / 未初始化四态（参照 S8；模型更新这条流程见 S2-A 与 S2-D）
 - 数值列右对齐且等宽
+- 每个数字都指得到契约里的字段或本地可算的量，指不到就不摆
+  （模型更新那八张画板已经逐条列在 `MODEL-UPDATE-FIELD-MAP.md`，改画板要同步改它）
+- **真实界面上不出现契约字段名**（`status = partial`、`anomaly.kind = rollback` 这类）。
+  字段出处归 `MODEL-UPDATE-FIELD-MAP.md`；形态表 S2-D / S2-E 是给实现者看的，可以留。
+  用户界面只放人要做决定时用得上的信息——**能少一格就少一格**
 - 没有出现 16px 以上圆角、没有装饰性侧边色条、没有渐变文字
 
 ---

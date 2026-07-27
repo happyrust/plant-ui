@@ -7,10 +7,10 @@
 use egui::{ScrollArea, Ui};
 use egui_phosphor::regular as ph;
 
-use crate::Cmd;
 use crate::style::tokens::{Density, Status, Tokens, space};
 use crate::style::widgets::{self, PaneNote, PaneState, RowIcon, TreeRow};
-use crate::vm::{TreeRowVm, TreeVm, WorkbenchVm};
+use crate::vm::{Selection, TreeRowVm, TreeVm, WorkbenchVm};
+use crate::{Cmd, ModelAction};
 
 pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Vec<Cmd>) {
     match &vm.tree {
@@ -53,6 +53,9 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                     if let Some(y) = reveal_offset(ui, d, rows, vm.tree_reveal) {
                         area = area.vertical_scroll_offset(y);
                     }
+                    // 模型动作要有真的渲染器才做得成，独立壳里不摆这几项。
+                    let live = vm.view3d.is_some_and(|v| v.live);
+                    let primary = vm.selection.primary();
                     area.show_rows(ui, d.row_h(), rows.len(), |ui, range| {
                         for row in &rows[range] {
                             let meta = if row.loading {
@@ -60,22 +63,30 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                             } else {
                                 row.noun.as_str()
                             };
-                            let out = widgets::tree_row_ui(
-                                ui,
-                                t,
-                                d,
-                                TreeRow {
-                                    depth: row.depth as usize,
-                                    icon: RowIcon::Glyph(super::noun_icon(&row.noun)),
-                                    label: &row.name,
-                                    meta,
-                                    selected: vm.selected == Some(row.refno),
-                                    expandable: row.expandable,
-                                    tone: Status::Neutral,
-                                    tags: &[],
-                                },
-                            );
+                            // 行 id 按 refno 定：虚拟滚动下自动 id 是「视野内第几行」，
+                            // 滚一下同一个 id 就落到另一个元素上，右键菜单会跟着串行。
+                            let out = ui
+                                .push_id(row.refno, |ui| {
+                                    widgets::tree_row_ui(
+                                        ui,
+                                        t,
+                                        d,
+                                        TreeRow {
+                                            depth: row.depth as usize,
+                                            icon: RowIcon::Glyph(super::noun_icon(&row.noun)),
+                                            label: &row.name,
+                                            meta,
+                                            selected: vm.selection.contains(row.refno),
+                                            primary: primary == Some(row.refno),
+                                            expandable: row.expandable,
+                                            tone: Status::Neutral,
+                                            tags: &[],
+                                        },
+                                    )
+                                })
+                                .inner;
                             // 点箭头只折叠 / 展开；点行其他区域选中；双击整行也展开。
+                            // `clicked` / `double_clicked` 都只认主键，右键落不进这几支。
                             let on_caret = out.caret_rect.is_some_and(|r| {
                                 out.response
                                     .interact_pointer_pos()
@@ -90,13 +101,147 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                                 if on_caret && !out.response.double_clicked() {
                                     cmds.push(Cmd::ToggleExpand(row.refno));
                                 } else if !out.response.double_clicked() {
-                                    cmds.push(Cmd::SelectElement(row.refno));
+                                    let mods = ui.input(|i| i.modifiers);
+                                    cmds.push(click_selection(
+                                        &vm.selection,
+                                        rows,
+                                        row.refno,
+                                        mods,
+                                    ));
                                 }
                             }
+                            // 右键落在选择集**外**才重设选中；落在集内保持整批，
+                            // 否则「选中三个再右键其中一个」会把批量选择打散，
+                            // 菜单上那句「隐藏所选 3 项」也就无从谈起。
+                            if out.response.secondary_clicked()
+                                && !vm.selection.contains(row.refno)
+                            {
+                                cmds.push(Cmd::SelectElement(row.refno));
+                            }
+                            out.response.context_menu(|ui| {
+                                row_menu(ui, row, &vm.selection, live, cmds)
+                            });
                         }
                     });
                 });
         }
+    }
+}
+
+/// 一次左键点击落到什么选择集上。
+///
+/// 修饰键在绘制层判、结果整体交出：Shift 区间要按**可见行序**取，那个序只有这里
+/// 手上的 `rows` 才有；宿主拿到一个 refno 是复原不出用户跨过了哪几行的。
+///
+/// Ctrl+Shift（在已有选择上追加一段）不做，落到 Shift 一支：多一档语义就得多一个
+/// 锚，而这一档在模型树上少见到不值得为它养第二个锚。
+fn click_selection(
+    current: &Selection,
+    rows: &[TreeRowVm],
+    refno: aios_core::RefU64,
+    mods: egui::Modifiers,
+) -> Cmd {
+    let mut next = current.clone();
+    if mods.shift {
+        let order: Vec<_> = rows.iter().map(|r| r.refno).collect();
+        next.range(&order, refno);
+    } else if mods.command {
+        next.toggle(refno);
+    } else {
+        next = Selection::single(refno);
+    }
+    Cmd::SetSelection(next)
+}
+
+/// 行的右键菜单。
+///
+/// 作用对象在这里就地算死，不回头读 `vm.selection`：右键落在选择集外时，重设选中的
+/// `Cmd` 要下一帧才被宿主处理，而菜单这一帧就画出来了——读 Vm 会让首帧的菜单作用到
+/// 上一批元素上。
+///
+/// 「隐藏全部」是全局动作，只在工具栏出现：每个节点的菜单里重复一遍，看着像
+/// 「隐藏这一支的全部」，其实不是。
+fn row_menu(
+    ui: &mut Ui,
+    row: &TreeRowVm,
+    selection: &Selection,
+    live: bool,
+    cmds: &mut Vec<Cmd>,
+) {
+    // 右键落在集内 = 对整批操作；落在集外 = 只对这一行。
+    let targets: Vec<_> = if selection.contains(row.refno) {
+        selection.to_vec()
+    } else {
+        vec![row.refno]
+    };
+    // 「1 项」是废话，只有真成批时才报数。
+    let count = (targets.len() > 1).then(|| format!(" {} 项", targets.len()));
+    let suffix = count.as_deref().unwrap_or_default();
+
+    let mut grouped = false;
+    if let Some(open) = row.expandable {
+        let (icon, label) = if open {
+            (ph::CARET_DOWN, "折叠")
+        } else {
+            (ph::CARET_RIGHT, "展开")
+        };
+        if ui.button(format!("{icon}  {label}")).clicked() {
+            cmds.push(Cmd::ToggleExpand(row.refno));
+            ui.close();
+        }
+        grouped = true;
+    }
+    if live {
+        if grouped {
+            ui.separator();
+        }
+        for (icon, label, action) in [
+            (
+                ph::EYE,
+                format!("显示模型{suffix}"),
+                ModelAction::SetVisible {
+                    refnos: targets.clone(),
+                    visible: true,
+                },
+            ),
+            (
+                ph::EYE_SLASH,
+                format!("隐藏模型{suffix}"),
+                ModelAction::SetVisible {
+                    refnos: targets.clone(),
+                    visible: false,
+                },
+            ),
+            // 定位不带计数：它只把相机带到右键的这一行跟前，见 `ModelAction::Focus`。
+            (
+                ph::CROSSHAIR_SIMPLE,
+                "定位模型".to_owned(),
+                ModelAction::Focus(row.refno),
+            ),
+        ] {
+            if ui.button(format!("{icon}  {label}")).clicked() {
+                cmds.push(Cmd::Model(action));
+                ui.close();
+            }
+        }
+        grouped = true;
+    }
+    if grouped {
+        ui.separator();
+    }
+    if ui
+        .button(format!("{}  复制 REFNO{suffix}", ph::COPY_SIMPLE))
+        .clicked()
+    {
+        // 一行一个，方便直接贴进命令行的 `=<参考号>`；`RefU64` 的 FromStr
+        // 认 `_` 也认 `/`，还会剃掉前导 `=`，所以贴回来一定认得。
+        let text = targets
+            .iter()
+            .map(|r| r.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        ui.ctx().copy_text(text);
+        ui.close();
     }
 }
 

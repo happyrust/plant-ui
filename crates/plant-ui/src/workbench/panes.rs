@@ -1,6 +1,6 @@
-//! dock 视图：四个常驻视图的枚举、egui_dock 样式与页签内容分发。
+//! dock 视图：常驻视图枚举、egui_dock 样式与页签内容分发。
 //!
-//! 决定 4：dock 只有模型树 / 三维视图 / 命令行 / 属性四个常驻视图，
+//! dock 包含模型树 / 三维视图 / 命令行 / 日志 / 属性五个常驻视图，
 //! 一次性任务走任务窗（M4），不再和常驻视图挤同一排页签。
 //!
 //! 已知与设计稿的偏差：egui_dock 的 Style 表达不了「激活页签顶部 2px 强调条」，
@@ -18,7 +18,8 @@ use crate::vm::WorkbenchVm;
 pub enum Pane {
     ModelTree,
     View3d,
-    Console,
+    CommandLine,
+    Logs,
     Properties,
 }
 
@@ -27,7 +28,8 @@ impl Pane {
         match self {
             Pane::ModelTree => (ph::TREE_STRUCTURE, "模型树"),
             Pane::View3d => (ph::CUBE, "三维视图"),
-            Pane::Console => (ph::TERMINAL_WINDOW, "命令行"),
+            Pane::CommandLine => (ph::TERMINAL_WINDOW, "命令行"),
+            Pane::Logs => (ph::LIST_DASHES, "日志"),
             Pane::Properties => (ph::SLIDERS_HORIZONTAL, "属性"),
         }
     }
@@ -88,6 +90,7 @@ pub struct Viewer<'a> {
     pub t: &'a Tokens,
     pub d: Density,
     pub vm: &'a WorkbenchVm,
+    pub command: &'a mut super::command_line::State,
     pub cmds: &'a mut Vec<Cmd>,
 }
 
@@ -103,7 +106,10 @@ impl TabViewer for Viewer<'_> {
         match tab {
             Pane::ModelTree => super::tree::show(ui, self.t, self.d, self.vm, self.cmds),
             Pane::Properties => super::props::show(ui, self.t, self.d, self.vm, self.cmds),
-            Pane::Console => super::console::show(ui, self.t, self.d, self.vm, self.cmds),
+            Pane::CommandLine => {
+                super::command_line::show(ui, self.t, self.d, self.vm, self.command, self.cmds)
+            }
+            Pane::Logs => super::logs::show(ui, self.t, self.d, self.vm, self.cmds),
             Pane::View3d => super::view3d::show(ui, self.t, self.d, self.vm, self.cmds),
         }
     }

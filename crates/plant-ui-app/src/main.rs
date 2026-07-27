@@ -1,28 +1,34 @@
 //! plant-ui-app：独立可执行外壳（eframe + plant-ui + plant-ui-data）。
 //! 默认进入主工作台 S1；`--gallery` 进入 M0 组件画廊。
 
-mod console;
+mod command;
 mod data;
 mod gallery;
+mod logs;
 mod model_update_api;
+mod model_update_ws;
 mod textures;
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use console::Retry;
+use command::ParsedCommand;
 use eframe::egui;
+use logs::Retry;
 use plant_ui::Cmd;
+use plant_ui::data_publish::{self, State as DataPublishState};
 use plant_ui::fonts;
 use plant_ui::model_update::{
-    self, Run as ModelUpdateRun, State as ModelUpdateState, Vm as ModelUpdateVm,
+    self, Feed as ModelUpdateFeed, Run as ModelUpdateRun, RunVm as ModelUpdateRunVm,
+    State as ModelUpdateState, Vm as ModelUpdateVm,
 };
 use plant_ui::project_picker::{self, State as ProjectPickerState};
 use plant_ui::settings::{self, State as SettingsState};
 use plant_ui::style::theme_tokens::{self, set_weight_families_ready};
 use plant_ui::style::tokens::{Density, Tokens};
 use plant_ui::vm::{
-    LogElement, PropKind, PropRowVm, PropsDataVm, PropsVm, TreeRowVm, TreeVm, View3dVm, WorkbenchVm,
+    CommandLineKind, CommandLineVm, LogElement, PropKind, PropRowVm, PropsDataVm, PropsVm,
+    Selection, TreeRowVm, TreeVm, View3dVm, WorkbenchVm,
 };
 use plant_ui::workbench::{self, WorkbenchState};
 use plant_ui_data::{EleTreeNode, RefU64};
@@ -150,20 +156,31 @@ struct App {
     state: WorkbenchState,
     model_update: ModelUpdateVm,
     model_update_state: ModelUpdateState,
+    data_publish_state: DataPublishState,
     project_picker_state: ProjectPickerState,
     settings_state: SettingsState,
     model_api_url: String,
+    /// 执行期的明细长连接。它的生命周期就是运行实例的生命周期，丢掉即断开。
+    model_feed: Option<model_update_ws::Feed>,
     last_model_poll: Instant,
     pending_model_polls: HashSet<String>,
     bridge: data::Bridge,
     tree: TreeModel,
-    console: console::Console,
+    logs: logs::LogBuffer,
     /// 占位纹理的所有者：句柄一丢纹理就被回收，Vm 里那个 id 会指向空。
     _view3d_tex: Option<egui::TextureHandle>,
 }
 
+const COMMAND_CAP: usize = 2000;
+
 impl App {
     fn new(ctx: egui::Context, font_warnings: Vec<String>) -> Self {
+        let model_api_url = model_update_api::base_url();
+        let mut settings_state = SettingsState::default();
+        settings_state.adopt(settings::Settings {
+            model_api_url: model_api_url.clone(),
+            ..settings_state.saved.clone()
+        });
         let mut app = Self {
             // 连接前不摆任何工程数据：项目 / 库标识等 Ready 事件带真实值。
             vm: WorkbenchVm {
@@ -173,18 +190,20 @@ impl App {
             state: WorkbenchState::default(),
             model_update: ModelUpdateVm::default(),
             model_update_state: ModelUpdateState::default(),
+            data_publish_state: DataPublishState::default(),
             project_picker_state: ProjectPickerState::new(Vec::new(), false),
-            settings_state: SettingsState::default(),
-            model_api_url: model_update_api::base_url(),
+            settings_state,
+            model_api_url,
+            model_feed: None,
             last_model_poll: Instant::now(),
             pending_model_polls: HashSet::new(),
             bridge: data::spawn(ctx.clone()),
             tree: TreeModel::default(),
-            console: console::Console::default(),
+            logs: logs::LogBuffer::default(),
             _view3d_tex: None,
         };
         for w in font_warnings {
-            app.console.warn(&mut app.vm.console, w);
+            app.logs.warn(&mut app.vm.logs, w);
         }
         match textures::viewport_placeholder(&ctx) {
             Ok(tex) => {
@@ -192,19 +211,20 @@ impl App {
                     texture: tex.id(),
                     size: tex.size_vec2(),
                     live: false,
+                    measurement_active: false,
                 });
                 app._view3d_tex = Some(tex);
             }
-            // 缺一张占位图不该拦住启动，但也不能悄悄少画一块——挂到命令行上。
+            // 缺一张占位图不该拦住启动，但也不能悄悄少画一块——写进日志。
             Err(e) => app
-                .console
-                .error(&mut app.vm.console, "三维视口占位纹理载入失败", &e, None),
+                .logs
+                .error(&mut app.vm.logs, "三维视口占位纹理载入失败", &e, None),
         }
-        app.console.info(&mut app.vm.console, "正在连接数据源…");
+        app.logs.info(&mut app.vm.logs, "正在连接数据源…");
         app
     }
 
-    fn pump_events(&mut self) {
+    fn pump_events(&mut self, ctx: &egui::Context) {
         let mut dirty = false;
         while let Ok(evt) = self.bridge.evt.try_recv() {
             match evt {
@@ -215,7 +235,7 @@ impl App {
                         db_label(&info.ns, &info.db_nums),
                         info.sites.len()
                     );
-                    self.console.info(&mut self.vm.console, msg);
+                    self.logs.info(&mut self.vm.logs, msg);
                     self.vm.data_source_ok = true;
                     self.vm.project = info.project;
                     self.vm.db = db_label(&info.ns, &info.db_nums);
@@ -224,9 +244,9 @@ impl App {
                 }
                 data::Evt::Ready(Err(e)) => {
                     self.vm.tree =
-                        TreeVm::Failed(format!("数据源连接失败：{}", console::error_chain(&e)));
-                    self.console.error(
-                        &mut self.vm.console,
+                        TreeVm::Failed(format!("数据源连接失败：{}", logs::error_chain(&e)));
+                    self.logs.error(
+                        &mut self.vm.logs,
                         "数据源连接失败",
                         &e,
                         Some(Retry::Connect),
@@ -236,7 +256,7 @@ impl App {
                     self.tree.loading.remove(&refno);
                     let el = self.tree.element(refno);
                     let msg = format!("展开：{} 个子元素", kids.len());
-                    self.console.info_of(&mut self.vm.console, el, msg);
+                    self.logs.info_of(&mut self.vm.logs, el, msg);
                     for kid in &kids {
                         self.tree.parent.insert(kid.refno.refno(), refno);
                     }
@@ -248,8 +268,8 @@ impl App {
                     self.tree.loading.remove(&refno);
                     self.tree.expanded.remove(&refno);
                     let el = self.tree.element(refno);
-                    self.console.error_of(
-                        &mut self.vm.console,
+                    self.logs.error_of(
+                        &mut self.vm.logs,
                         el,
                         "子层加载失败",
                         &e,
@@ -258,27 +278,43 @@ impl App {
                     dirty = true;
                 }
                 // 晚到的旧选中结果直接丢弃，属性面板只认当前选中。
-                data::Evt::Props(refno, result) if self.vm.selected == Some(refno) => {
+                data::Evt::Props(refno, result) if self.vm.selection.primary() == Some(refno) => {
                     self.vm.props = match result {
                         Ok(kvs) => PropsVm::Ready(self.build_props(refno, kvs)),
                         Err(e) => {
                             let el = self.tree.element(refno);
-                            self.console.error_of(
-                                &mut self.vm.console,
+                            self.logs.error_of(
+                                &mut self.vm.logs,
                                 el,
                                 "属性查询失败",
                                 &e,
                                 Some(Retry::Props(refno)),
                             );
-                            PropsVm::Failed(format!("属性查询失败：{}", console::error_chain(&e)))
+                            PropsVm::Failed(format!("属性查询失败：{}", logs::error_chain(&e)))
                         }
                     };
                 }
                 data::Evt::Props(..) => {}
+                data::Evt::ResolvedName(name, result) => match result {
+                    Ok(Some(refno)) => {
+                        let revealed = self.locate(refno);
+                        let suffix = if revealed {
+                            ""
+                        } else {
+                            "（不在已加载的模型树中，只切换了属性）"
+                        };
+                        self.command_output(format!("/{name} = {refno}{suffix}"));
+                        dirty |= revealed;
+                    }
+                    Ok(None) => self.command_error(format!("未找到元素：/{name}")),
+                    Err(error) => {
+                        self.command_error(format!("名称查询失败：{}", logs::error_chain(&error)))
+                    }
+                },
                 data::Evt::ModelUpdatePreview(result) => match result {
                     Ok(preview) => {
-                        self.console.info(
-                            &mut self.vm.console,
+                        self.logs.info(
+                            &mut self.vm.logs,
                             format!(
                                 "模型更新预览完成：{} 个设计库，执行范围 dbnum + sesno",
                                 preview.dbnums.len()
@@ -287,20 +323,27 @@ impl App {
                         self.model_update = ModelUpdateVm::Ready(preview);
                     }
                     Err(error) => {
-                        let detail = console::error_chain(&error);
-                        self.console
-                            .error(&mut self.vm.console, "模型更新预览失败", &error, None);
+                        let detail = logs::error_chain(&error);
+                        self.logs
+                            .error(&mut self.vm.logs, "模型更新预览失败", &error, None);
                         self.model_update = ModelUpdateVm::Failed(detail);
                     }
                 },
                 data::Evt::ModelUpdateExecute(result) => match result {
                     Ok(accepted) => {
-                        self.console.info(
-                            &mut self.vm.console,
+                        self.logs.info(
+                            &mut self.vm.logs,
                             format!("模型增量更新任务已提交：{}", accepted.task_id),
                         );
                         self.last_model_poll = Instant::now() - Duration::from_secs(1);
-                        self.model_update = ModelUpdateVm::Running {
+                        // 明细通道跟着运行实例开；终态时 `poll_model_update` 里丢掉它。
+                        self.model_feed = Some(model_update_ws::Feed::open(
+                            &self.model_api_url,
+                            accepted.task_id.clone(),
+                            self.bridge.evt_tx.clone(),
+                            ctx.clone(),
+                        ));
+                        self.model_update = ModelUpdateVm::Running(Box::new(ModelUpdateRunVm {
                             run: ModelUpdateRun {
                                 task_id: accepted.task_id,
                                 kind: accepted.kind,
@@ -308,32 +351,47 @@ impl App {
                                 project: self.vm.project.clone(),
                                 ..Default::default()
                             },
-                            poll_error: None,
-                        };
+                            ..Default::default()
+                        }));
                     }
                     Err(error) => {
-                        let detail = console::error_chain(&error);
-                        self.console.error(
-                            &mut self.vm.console,
-                            "提交模型增量更新失败",
-                            &error,
-                            None,
-                        );
+                        let detail = logs::error_chain(&error);
+                        self.logs
+                            .error(&mut self.vm.logs, "提交模型增量更新失败", &error, None);
                         self.model_update = ModelUpdateVm::Failed(detail);
                     }
                 },
                 data::Evt::ModelUpdateTask(run_id, result) => {
                     self.pending_model_polls.remove(&run_id);
-                    if let ModelUpdateVm::Running { run, poll_error } = &mut self.model_update {
+                    if let ModelUpdateVm::Running(session) = &mut self.model_update {
                         match result {
                             Ok(latest) => {
                                 if latest.task_id == run_id {
-                                    *run = latest;
+                                    session.run = latest;
                                 }
-                                *poll_error = None;
+                                session.poll_error = None;
                             }
-                            Err(error) => *poll_error = Some(console::error_chain(&error)),
+                            Err(error) => {
+                                session.poll_error = Some(logs::error_chain(&error));
+                            }
                         }
+                    }
+                }
+                data::Evt::ModelUpdateProgress(event) => {
+                    if let ModelUpdateVm::Running(session) = &mut self.model_update {
+                        session.progress.apply(event);
+                    }
+                }
+                data::Evt::ModelUpdateFeedLive => {
+                    if let ModelUpdateVm::Running(session) = &mut self.model_update {
+                        session.progress.feed = ModelUpdateFeed::Live;
+                    }
+                }
+                data::Evt::ModelUpdateFeedDown(reason) => {
+                    if let ModelUpdateVm::Running(session) = &mut self.model_update {
+                        session.progress.feed = ModelUpdateFeed::Down(reason);
+                        // 没收到收尾事件的行现在说不清做没做完，别再显示「进行中」。
+                        session.progress.mark_unknown();
                     }
                 }
             }
@@ -348,29 +406,18 @@ impl App {
         for cmd in cmds {
             match cmd {
                 Cmd::SelectElement(refno) => self.select(refno),
-                // 命令行点元素名过来的：先把挡着的祖先展开、记下要滚到哪一行，
-                // 再走一遍与树上点选相同的选中路径，属性视图自然跟上。
+                Cmd::SetSelection(selection) => self.set_selection(selection),
                 Cmd::LocateElement(refno) => {
-                    match self.tree.ancestors(refno) {
-                        Some(chain) => {
-                            for ancestor in chain {
-                                self.tree.expanded.insert(ancestor);
-                            }
-                            self.vm.tree_reveal = Some(refno);
-                            dirty = true;
-                        }
-                        // 按缓存只增不减的前提到不了这里。真到了也得说一声，
-                        // 不能点了没动静。
-                        None => {
-                            let el = self.tree.element(refno);
-                            self.console.warn_of(
-                                &mut self.vm.console,
-                                el,
-                                "不在已加载的模型树里，只切了属性",
-                            );
-                        }
+                    if self.locate(refno) {
+                        dirty = true;
+                    } else {
+                        let el = self.tree.element(refno);
+                        self.logs.warn_of(
+                            &mut self.vm.logs,
+                            el,
+                            "不在已加载的模型树里，只切了属性",
+                        );
                     }
-                    self.select(refno);
                 }
                 Cmd::ToggleExpand(refno) => {
                     if !self.tree.expanded.remove(&refno) {
@@ -389,15 +436,15 @@ impl App {
                     self.vm.props.edit(refno, &attr, value.clone());
                     let el = self.tree.element(refno);
                     let msg = format!("{attr} = {value}（仅改内存，未写回数据库）");
-                    self.console.warn_of(&mut self.vm.console, el, msg);
+                    self.logs.warn_of(&mut self.vm.logs, el, msg);
                 }
                 // 面板错误态上的「重试」，与命令行那条走同一段处置逻辑。
                 Cmd::Reconnect => self.reconnect(),
-                Cmd::RetryProps(refno) if self.vm.selected == Some(refno) => {
+                Cmd::RetryProps(refno) if self.vm.selection.primary() == Some(refno) => {
                     self.refetch_props(refno)
                 }
                 Cmd::RetryProps(_) => {}
-                Cmd::RetryLog(id) => match self.console.retry_of(id) {
+                Cmd::RetryLog(id) => match self.logs.retry_of(id) {
                     Some(Retry::Connect) => self.reconnect(),
                     Some(Retry::Children(refno)) => {
                         // 重试即重新展开：箭头上次失败时被收回了，这里一并推回展开态。
@@ -407,16 +454,27 @@ impl App {
                         }
                         dirty = true;
                     }
-                    Some(Retry::Props(refno)) if self.vm.selected == Some(refno) => {
+                    Some(Retry::Props(refno)) if self.vm.selection.primary() == Some(refno) => {
                         self.refetch_props(refno)
                     }
                     // 选中早就挪走的话，属性重查回来也没地方摆，直接跳过。
                     _ => {}
                 },
-                Cmd::ClearConsole => self.console.clear(&mut self.vm.console),
+                Cmd::ClearLogs => self.logs.clear(&mut self.vm.logs),
+                Cmd::SubmitCommand(command) => dirty |= self.submit_command(command),
                 Cmd::OpenProjectPicker => self.project_picker_state.open = true,
                 Cmd::LoadProject(_) => self.project_picker_state.open = false,
                 Cmd::OpenSettings => self.settings_state.open(),
+                Cmd::OpenDataPublish => self.data_publish_state.open = true,
+                Cmd::SubmitDataPublish(request) => self.logs.warn(
+                    &mut self.vm.logs,
+                    format!(
+                        "三维数据发布未提交：后端尚未接入（{}，接口 {}，{} 个元素）",
+                        request.category.label(),
+                        request.category.endpoint(),
+                        request.elements.len()
+                    ),
+                ),
                 Cmd::OpenModelUpdate => {
                     self.model_update_state.open = true;
                     if !matches!(
@@ -436,7 +494,10 @@ impl App {
                         project: self.vm.project.clone(),
                     });
                 }
-                Cmd::PickViewport(_) => {}
+                // 独立壳没有渲染器，`view3d.live` 恒为 false，树菜单、视口工具栏、
+                // 相机手势与渲染目标改尺寸都不会露头（占位图是磁盘上那张，改不得）。
+                // 这几支留成明确的空实现，不写日志装作做了事。
+                Cmd::PickViewport(_) | Cmd::Camera(_) | Cmd::Model(_) | Cmd::ResizeViewport(_) => {}
             }
         }
         if dirty {
@@ -444,13 +505,129 @@ impl App {
         }
     }
 
-    /// 选中元素并让属性视图跟上。重复选同一个不再发查询。
+    fn submit_command(&mut self, input: String) -> bool {
+        let input = input.trim();
+        let parsed = command::parse(input);
+        if parsed == ParsedCommand::Empty {
+            return false;
+        }
+        self.push_command_line(CommandLineKind::Input, input);
+
+        match parsed {
+            ParsedCommand::Empty => false,
+            ParsedCommand::Help => {
+                self.command_output(
+                    "help          显示帮助\nclear         清空命令会话\nq <属性>      查询当前元素属性\n/<名称>       按名称定位元素\n=<参考号>     按参考号定位元素",
+                );
+                false
+            }
+            ParsedCommand::Clear => {
+                self.vm.command.lines.clear();
+                false
+            }
+            ParsedCommand::Query(attr) => {
+                match self.query_attr(&attr) {
+                    Ok(value) => self.command_output(value),
+                    Err(error) => self.command_error(error),
+                }
+                false
+            }
+            ParsedCommand::LocateName(name) => {
+                if self.bridge.req.send(data::Req::ResolveName(name)).is_err() {
+                    self.command_error("名称查询失败：数据线程已关闭");
+                }
+                false
+            }
+            ParsedCommand::LocateRef(refno) => {
+                let revealed = self.locate(refno);
+                let suffix = if revealed {
+                    ""
+                } else {
+                    "（不在已加载的模型树中，只切换了属性）"
+                };
+                self.command_output(format!("已定位 {refno}{suffix}"));
+                revealed
+            }
+            ParsedCommand::Error(error) => {
+                self.command_error(error);
+                false
+            }
+        }
+    }
+
+    fn query_attr(&self, attr: &str) -> Result<String, String> {
+        let data = match &self.vm.props {
+            PropsVm::Uninit => return Err("当前未选中元素".into()),
+            PropsVm::Loading => return Err("当前元素属性仍在加载".into()),
+            PropsVm::Failed(error) => return Err(format!("当前元素属性不可用：{error}")),
+            PropsVm::Ready(data) => data,
+        };
+        let attr = attr.trim();
+        let value = if attr.eq_ignore_ascii_case("REF") || attr.eq_ignore_ascii_case("REFNO") {
+            data.refno.to_string()
+        } else {
+            data.common
+                .iter()
+                .chain(&data.attrs)
+                .chain(&data.udas)
+                .find(|row| row.attr.eq_ignore_ascii_case(attr))
+                .map(|row| row.value.clone())
+                .ok_or_else(|| format!("属性不存在：{}", attr.to_ascii_uppercase()))?
+        };
+        Ok(format!("{} = {value}", attr.to_ascii_uppercase()))
+    }
+
+    /// 展开已知祖先、请求滚动并选中。返回是否能在当前树缓存中显示该元素。
+    fn locate(&mut self, refno: RefU64) -> bool {
+        let Some(chain) = self.tree.ancestors(refno) else {
+            self.select(refno);
+            return false;
+        };
+        for ancestor in chain {
+            self.tree.expanded.insert(ancestor);
+        }
+        self.vm.tree_reveal = Some(refno);
+        self.select(refno);
+        true
+    }
+
+    fn command_output(&mut self, text: impl Into<String>) {
+        self.push_command_line(CommandLineKind::Output, text);
+    }
+
+    fn command_error(&mut self, text: impl Into<String>) {
+        self.push_command_line(CommandLineKind::Error, text);
+    }
+
+    fn push_command_line(&mut self, kind: CommandLineKind, text: impl Into<String>) {
+        self.vm.command.lines.push(CommandLineVm {
+            kind,
+            text: text.into(),
+        });
+        if self.vm.command.lines.len() > COMMAND_CAP {
+            self.vm.command.lines.drain(..COMMAND_CAP / 4);
+        }
+    }
+
+    /// 选中单个元素并让属性视图跟上。重复选同一个不再发查询。
     fn select(&mut self, refno: RefU64) {
-        if self.vm.selected == Some(refno) {
+        self.set_selection(Selection::single(refno));
+    }
+
+    /// 换一整个选择集。属性只跟主选中，主选中没变就不重新查——
+    /// Ctrl 点掉一个非主选中的元素时选择集变了而主选中没变，那一下不该打库。
+    fn set_selection(&mut self, selection: Selection) {
+        if self.vm.selection == selection {
             return;
         }
-        self.vm.selected = Some(refno);
-        self.refetch_props(refno);
+        let before = self.vm.selection.primary();
+        self.vm.selection = selection;
+        match self.vm.selection.primary() {
+            Some(refno) if before != Some(refno) => self.refetch_props(refno),
+            // 全都取消选中了，属性回到「还没轮到它」而不是留着上一个的残影。
+            None => self.vm.props = PropsVm::Uninit,
+            _ => {}
+        }
     }
 
     fn refetch_props(&mut self, refno: RefU64) {
@@ -465,11 +642,11 @@ impl App {
         self.vm.project.clear();
         self.vm.db.clear();
         self.vm.element_count = 0;
-        self.vm.selected = None;
+        self.vm.selection.clear();
         self.vm.tree_reveal = None;
         self.vm.tree = TreeVm::Loading;
         self.vm.props = PropsVm::Uninit;
-        self.console.info(&mut self.vm.console, "正在重连数据源…");
+        self.logs.info(&mut self.vm.logs, "正在重连数据源…");
         let _ = self.bridge.req.send(data::Req::Reconnect);
     }
 
@@ -482,10 +659,14 @@ impl App {
     }
 
     fn poll_model_update(&mut self, ctx: &egui::Context) {
-        let ModelUpdateVm::Running { run, .. } = &self.model_update else {
+        let ModelUpdateVm::Running(session) = &self.model_update else {
+            self.model_feed = None;
             return;
         };
+        let run = &session.run;
         if run.terminal() {
+            // 终态由轮询收口（WS 上的 task_finished 断线期间会丢），到此明细通道没用了。
+            self.model_feed = None;
             return;
         }
         ctx.request_repaint_after(Duration::from_secs(1));
@@ -596,10 +777,17 @@ fn db_label(ns: &str, db_nums: &[u32]) -> String {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.pump_events();
+        self.pump_events(ui.ctx());
         let t = theme_tokens::current();
         let d = self.settings_state.saved.density;
         let mut cmds = workbench::show(ui, &t, d, &self.vm, &mut self.state);
+        cmds.extend(data_publish::show(
+            ui.ctx(),
+            &t,
+            d,
+            &self.vm,
+            &mut self.data_publish_state,
+        ));
         cmds.extend(model_update::show(
             ui.ctx(),
             &t,
@@ -616,6 +804,7 @@ impl eframe::App for App {
         ));
         if let Some(saved) = settings::show(ui.ctx(), &t, d, &mut self.settings_state) {
             theme_tokens::apply(ui.ctx(), &saved.theme.tokens(), saved.density);
+            self.model_api_url = saved.model_api_url;
             ui.ctx().request_repaint();
         }
         // 定位请求只管一帧：树刚才已经滚过去了，绘制层只读、消费不掉自己。

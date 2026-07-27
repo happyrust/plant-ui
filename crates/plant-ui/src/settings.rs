@@ -1,9 +1,17 @@
 //! S6 设置任务窗。只暴露当前两端都能立即生效的选项。
 
-use egui::{Align, Layout, RichText};
+use egui::{Align, Layout, RichText, TextEdit};
 
+use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Tokens};
 use crate::style::widgets;
+
+/// 模型服务地址的出厂默认。
+///
+/// 8020 的回环侧被另一个 SurrealDB 实例占着，gen-model 因此让到了 8021
+/// （见 gen-model/DbOption.toml 的注释）。指向 8020 不会干净地连不上，
+/// 而是打进那个实例、拿回一个看着像模像样的 HTTP 错误。
+pub const DEFAULT_MODEL_API_URL: &str = "http://127.0.0.1:8021";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Theme {
@@ -24,6 +32,7 @@ impl Theme {
 pub struct Settings {
     pub theme: Theme,
     pub density: Density,
+    pub model_api_url: String,
 }
 
 impl Default for Settings {
@@ -31,6 +40,7 @@ impl Default for Settings {
         Self {
             theme: Theme::Light,
             density: Density::Standard,
+            model_api_url: DEFAULT_MODEL_API_URL.to_owned(),
         }
     }
 }
@@ -56,6 +66,13 @@ impl State {
     pub fn open(&mut self) {
         self.draft = self.saved.clone();
         self.open = true;
+    }
+
+    /// 用宿主解析出来的值顶掉出厂默认。环境变量这类来源只有宿主认得，
+    /// 绘制层不去读它。
+    pub fn adopt(&mut self, settings: Settings) {
+        self.draft = settings.clone();
+        self.saved = settings;
     }
 }
 
@@ -106,6 +123,23 @@ pub fn show(ctx: &egui::Context, t: &Tokens, d: Density, state: &mut State) -> O
                 },
             );
 
+            ui.add_space(12.0);
+            ui.label(RichText::new("服务").strong().color(t.text_secondary));
+            setting_row(
+                ui,
+                t,
+                "模型服务地址",
+                "gen-model 的 REST 与 WebSocket 入口，保存后下一次预览生效",
+                |ui| {
+                    ui.add(
+                        TextEdit::singleline(&mut state.draft.model_api_url)
+                            .desired_width(300.0)
+                            .font(Font::mono(d))
+                            .hint_text(DEFAULT_MODEL_API_URL),
+                    );
+                },
+            );
+
             ui.with_layout(Layout::bottom_up(Align::RIGHT), |ui| {
                 ui.horizontal(|ui| {
                     if ui.add(widgets::button(t, d, "保存").primary()).clicked() {
@@ -126,11 +160,23 @@ pub fn show(ctx: &egui::Context, t: &Tokens, d: Density, state: &mut State) -> O
         return None;
     }
     if save {
+        state.draft.model_api_url = normalize_api_url(&state.draft.model_api_url);
         state.saved = state.draft.clone();
         state.open = false;
         return Some(state.saved.clone());
     }
     None
+}
+
+/// 地址拼接是 `{base}{path}`，尾斜杠会拼出 `//api/v1`；清空则退回出厂默认，
+/// 免得存下一个连不上任何东西的空串。
+fn normalize_api_url(raw: &str) -> String {
+    let url = raw.trim().trim_end_matches('/');
+    if url.is_empty() {
+        DEFAULT_MODEL_API_URL.to_owned()
+    } else {
+        url.to_owned()
+    }
 }
 
 fn setting_row(
@@ -158,5 +204,31 @@ mod tests {
     #[test]
     fn default_theme_is_light() {
         assert_eq!(Settings::default().theme, Theme::Light);
+    }
+
+    #[test]
+    fn default_api_url_avoids_the_surreal_port() {
+        assert_eq!(Settings::default().model_api_url, DEFAULT_MODEL_API_URL);
+        assert!(!DEFAULT_MODEL_API_URL.ends_with(":8020"));
+    }
+
+    #[test]
+    fn normalizing_strips_trailing_slash_and_refuses_empty() {
+        assert_eq!(
+            normalize_api_url("  http://10.0.0.9:8021/  "),
+            "http://10.0.0.9:8021"
+        );
+        assert_eq!(normalize_api_url("   "), DEFAULT_MODEL_API_URL);
+    }
+
+    #[test]
+    fn adopt_syncs_draft_so_the_dialog_opens_on_the_host_value() {
+        let mut state = State::default();
+        state.adopt(Settings {
+            model_api_url: "http://10.0.0.9:8021".into(),
+            ..Settings::default()
+        });
+        state.open();
+        assert_eq!(state.saved.model_api_url, "http://10.0.0.9:8021");
     }
 }

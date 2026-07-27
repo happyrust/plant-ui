@@ -46,7 +46,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
         // 重查的是当前选中元素；选中已经挪走的话 App 侧会把这条丢掉。
         PropsVm::Failed(reason) => {
             if note(ui, t, d, PaneState::Error, ph::WARNING, reason)
-                && let Some(refno) = vm.selected
+                && let Some(refno) = vm.selection.primary()
             {
                 cmds.push(Cmd::RetryProps(refno));
             }

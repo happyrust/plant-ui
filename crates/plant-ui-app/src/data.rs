@@ -6,7 +6,7 @@
 
 use std::sync::mpsc;
 
-use plant_ui::model_update::{Accepted, Preview, Run};
+use plant_ui::model_update::{Accepted, Preview, ProgressEvent, Run};
 use plant_ui_data::{EleTreeNode, RefU64};
 
 pub enum Req {
@@ -14,6 +14,8 @@ pub enum Req {
     Children(RefU64),
     /// 选中元素的 UI 属性表。
     Props(RefU64),
+    /// 命令行按名称定位元素。
+    ResolveName(String),
     /// 重跑启动序列。连库失败后命令行上的「重试」走这条，结果仍走 `Evt::Ready`。
     Reconnect,
     ModelUpdatePreview {
@@ -42,14 +44,22 @@ pub enum Evt {
     Ready(anyhow::Result<ReadyInfo>),
     Children(RefU64, anyhow::Result<Vec<EleTreeNode>>),
     Props(RefU64, anyhow::Result<Vec<plant_ui_data::Attr>>),
+    ResolvedName(String, anyhow::Result<Option<RefU64>>),
     ModelUpdatePreview(anyhow::Result<Preview>),
     ModelUpdateExecute(anyhow::Result<Accepted>),
     ModelUpdateTask(String, anyhow::Result<Run>),
+    /// 执行期的逐行明细。走 WebSocket，不经数据线程（见 `model_update_ws`）。
+    ModelUpdateProgress(ProgressEvent),
+    ModelUpdateFeedLive,
+    ModelUpdateFeedDown(String),
 }
 
 pub struct Bridge {
     pub req: mpsc::Sender<Req>,
     pub evt: mpsc::Receiver<Evt>,
+    /// 给数据线程之外的生产者用（现在只有那条 WebSocket）。UI 每帧只认一个收端，
+    /// 长连接自己另开一条 channel 的话就得在 `pump_events` 里再轮询一次。
+    pub evt_tx: mpsc::Sender<Evt>,
 }
 
 /// 启动序列：连库、抓工程标识、抓 SITE 根层。三步任一失败都算没连上。
@@ -69,6 +79,7 @@ async fn ready() -> anyhow::Result<ReadyInfo> {
 pub fn spawn(ctx: egui::Context) -> Bridge {
     let (req_tx, req_rx) = mpsc::channel();
     let (evt_tx, evt_rx) = mpsc::channel();
+    let evt_tx_out = evt_tx.clone();
     std::thread::Builder::new()
         .name("plant-ui-data".into())
         .spawn(move || {
@@ -94,6 +105,11 @@ pub fn spawn(ctx: egui::Context) -> Bridge {
                         Req::Props(refno) => {
                             let r = plant_ui_data::element_props(refno.into()).await;
                             let _ = evt_tx.send(Evt::Props(refno, r));
+                            ctx.request_repaint();
+                        }
+                        Req::ResolveName(name) => {
+                            let result = plant_ui_data::resolve_name(&name).await;
+                            let _ = evt_tx.send(Evt::ResolvedName(name, result));
                             ctx.request_repaint();
                         }
                         Req::ModelUpdatePreview { base, project } => {
@@ -133,5 +149,6 @@ pub fn spawn(ctx: egui::Context) -> Bridge {
     Bridge {
         req: req_tx,
         evt: evt_rx,
+        evt_tx: evt_tx_out,
     }
 }

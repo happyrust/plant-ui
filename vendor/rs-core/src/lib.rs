@@ -14,9 +14,9 @@ pub use types::db_info::PdmsDatabaseInfo;
 
 extern crate bitflags;
 extern crate core;
+extern crate futures;
 extern crate phf;
 extern crate serde_json;
-extern crate futures;
 
 pub mod accel_tree;
 pub mod aios_db_mgr;
@@ -242,8 +242,7 @@ pub async fn init_test_surreal() -> Result<DbOption, HandleError> {
 pub async fn init_surreal() -> anyhow::Result<()> {
     let s = Config::builder()
         .add_source(File::with_name("DbOption"))
-        .build()
-        .unwrap();
+        .build()?;
     let db_option: DbOption = s.try_deserialize()?;
     // 创建配置
     let config = surrealdb::opt::Config::default().ast_payload(); // 启用AST格式

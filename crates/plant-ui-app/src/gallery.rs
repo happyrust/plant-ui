@@ -48,18 +48,38 @@ impl eframe::App for GalleryApp {
                 let _ = ui.add(widgets::toggle(&t, d, &mut self.toggle_on));
             });
 
+            // 工具按钮的三态并排：常态 / 激活 / 禁用。视口工具栏没选中元素时靠
+            // 禁用态说话，画廊里不摆一份就没人看得出它和常态到底有没有分别。
             ui.add_space(12.0);
-            let rows: [(usize, &str, Option<bool>, bool); 3] = [
-                (0, "SITE /-RX-CSV", Some(true), false),
-                (1, "ZONE /-RX-CSV-S4009", Some(true), false),
+            ui.horizontal(|ui| {
+                let _ = ui.add(widgets::tool_btn(&t, d, egui_phosphor::regular::EYE, false));
+                let _ = ui.add(widgets::tool_btn(
+                    &t,
+                    d,
+                    egui_phosphor::regular::EYE_SLASH,
+                    true,
+                ));
+                let _ = ui.add_enabled(
+                    false,
+                    widgets::tool_btn(&t, d, egui_phosphor::regular::CROSSHAIR_SIMPLE, false),
+                );
+            });
+
+            ui.add_space(12.0);
+            // 第二三行都在选择集里，只有末行是主选中：多选下的主 / 从两种描边
+            // 就是靠这两行并排看出来的。
+            let rows: [(usize, &str, Option<bool>, bool, bool); 3] = [
+                (0, "SITE /-RX-CSV", Some(true), false, false),
+                (1, "ZONE /-RX-CSV-S4009", Some(true), true, false),
                 (
                     2,
                     "STRU /-RX-CSV-S4009-V1 一段很长的中文名称用来验证截断",
                     Some(false),
                     true,
+                    true,
                 ),
             ];
-            for (depth, label, expandable, selected) in rows {
+            for (depth, label, expandable, selected, primary) in rows {
                 let _ = widgets::tree_row_ui(
                     ui,
                     &t,
@@ -70,6 +90,7 @@ impl eframe::App for GalleryApp {
                         label,
                         meta: "24381/100060",
                         selected,
+                        primary,
                         expandable,
                         tone: Status::Neutral,
                         tags: &[RowTag {

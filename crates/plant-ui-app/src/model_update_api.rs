@@ -4,9 +4,11 @@ use std::time::Duration;
 
 use plant_ui::model_update::{Accepted, Preview, Run};
 
+/// 解析模型服务地址。优先级：S6 设置项 > 环境变量 > 出厂默认，
+/// 这里负责后两级，设置项由 `settings::State::adopt` 之后的保存覆盖。
 pub fn base_url() -> String {
     std::env::var("PLANT_MODEL_API_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8020".into())
+        .unwrap_or_else(|_| plant_ui::settings::DEFAULT_MODEL_API_URL.into())
         .trim_end_matches('/')
         .to_owned()
 }

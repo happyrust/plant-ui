@@ -1,4 +1,4 @@
-//! 命令行视图（M1-4）：分级 + 计数芯片筛选 + 错误行处置入口 + 文本可选中复制。
+//! 日志视图：分级 + 计数芯片筛选 + 错误行处置入口 + 文本可选中复制。
 //!
 //! 旧壳这一屏有过一次两难：换成组件层的绘制型 `log_row` 就丢了文本可选中复制，
 //! 留着 `TextEdit` 就丢了分级配色，最后选了后者。新项目里 `log_row_ui` 的时间 /
@@ -18,7 +18,7 @@ use crate::vm::{LogLevel, LogLineVm, WorkbenchVm};
 pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Vec<Cmd>) {
     // 筛选是界面自己的状态而非数据，跟属性面板的分组折叠一样存在 egui 的临时数据里，
     // 这样 show 的签名仍是 &Vm 进、Vec<Cmd> 出。
-    let filter_id = ui.id().with("console-filter");
+    let filter_id = ui.id().with("logs-filter");
     let mut filter = ui.data_mut(|s| *s.get_temp_mut_or::<Option<LogLevel>>(filter_id, None));
 
     egui::Frame::new().fill(t.bg_panel).show(ui, |ui| {
@@ -51,7 +51,7 @@ fn toolbar(
             ui.set_height(d.px(32.0));
             ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing.x = space::S1;
-                let counts = vm.console.counts;
+                let counts = vm.logs.counts;
                 let all = format!("全部 {}", counts.total());
                 if ui
                     .add(widgets::chip(t, d, &all, filter.is_none()))
@@ -71,10 +71,10 @@ fn toolbar(
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui
                         .add(widgets::tool_btn(t, d, ph::TRASH, false))
-                        .on_hover_text("清空命令行")
+                        .on_hover_text("清空日志")
                         .clicked()
                     {
-                        cmds.push(Cmd::ClearConsole);
+                        cmds.push(Cmd::ClearLogs);
                     }
                 });
             });
@@ -93,7 +93,7 @@ fn list(
     // show_rows 要按下标取行，筛选后必须先落成一张可索引的表。缓冲是限长的，
     // 这张表也就是有界的。
     let lines: Vec<&LogLineVm> = vm
-        .console
+        .logs
         .lines
         .iter()
         .filter(|l| filter.is_none_or(|f| l.level == f))
@@ -101,10 +101,10 @@ fn list(
 
     if lines.is_empty() {
         // 两种空不是一回事：缓冲真的空是「空态」，筛掉之后才空得给用户指条路
-        // ——不然他会以为是这一屏坏了。命令行没有加载中与错误态：日志是 App
+        // ——不然他会以为是这一屏坏了。日志没有加载中与错误态：内容是 App
         // 自己往里写的，既不查库也不会失败。
-        let (text, detail) = if vm.console.lines.is_empty() {
-            ("暂无输出", None)
+        let (text, detail) = if vm.logs.lines.is_empty() {
+            ("暂无日志", None)
         } else {
             ("当前分级没有输出", Some("点上面的「全部」看其余分级"))
         };

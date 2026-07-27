@@ -33,6 +33,13 @@ pub async fn child_nodes(refno: RefnoEnum) -> Result<Vec<EleTreeNode>> {
     aios_core::get_children_ele_nodes(refno).await
 }
 
+/// 按 PDMS 名称查元素，供命令行的 `/名称` 使用。
+pub async fn resolve_name(name: &str) -> Result<Option<RefU64>> {
+    Ok(aios_core::get_refno_by_name(name)
+        .await?
+        .map(|refno| refno.refno()))
+}
+
 /// 连接后的工程标识：项目名、SurrealDB 命名空间、当前 MDB（DESI）库编号列表。
 /// 外壳原则是不摆假数字，这些都取自真实配置与真实查询。
 pub async fn project_identity() -> Result<(String, String, Vec<u32>)> {

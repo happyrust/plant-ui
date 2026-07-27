@@ -19,8 +19,8 @@ pub struct WorkbenchVm {
     pub data_source_ok: bool,
     /// 已加载元素计数（状态栏右侧）。
     pub element_count: usize,
-    /// 当前选中元素（状态栏 + 属性视图跟随）。
-    pub selected: Option<RefU64>,
+    /// 当前选择集（状态栏 + 属性视图跟随其 `primary`）。
+    pub selection: Selection,
     /// 一次性的「把这个元素滚进模型树视野」请求（M1-6：命令行定位过来时用）。
     /// 绘制层只读，消费不掉自己，所以由 App 在每帧 `show` 之后清掉。
     pub tree_reveal: Option<RefU64>,
@@ -28,11 +28,117 @@ pub struct WorkbenchVm {
     pub tree: TreeVm,
     /// 属性视图（M1-3）。
     pub props: PropsVm,
-    /// 命令行视图（M1-4）。
-    pub console: ConsoleVm,
+    /// 命令交互视图。
+    pub command: CommandVm,
+    /// 应用运行日志。
+    pub logs: LogsVm,
     /// 三维视口的画面（M1-5 是占位纹理，M3 换成 Bevy 的渲染目标）。
     /// `None` = 还没有可画的东西。
     pub view3d: Option<View3dVm>,
+}
+
+/// 模型树的选择集。有序：批量动作的日志文案与将来的导出都要复现用户点选的先后。
+///
+/// 字段私有——`anchor`、`cursor` 与 `items` 的一致性只在这个文件里维护。三种落点
+/// （普通点 / Ctrl 点 / Shift 点）由绘制层算出**结果**整体交出（`TreeCmd::SetSelection`），
+/// App 侧不复原语义：区间要按可见行序算，那个序只有绘制层手上的 rows 才有。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Selection {
+    items: Vec<RefU64>,
+    /// Shift 区间的支点。它不跟着最后一次点击走，而是停在最初那一下——
+    /// 连着 Shift 点几下都该以最初那一下为准，Ctrl 点掉一个之后也不该漂。
+    anchor: Option<RefU64>,
+    /// 主选中：最后一次点中的那一个，属性视图与状态栏跟着它。
+    ///
+    /// 与 `anchor` 分成两个字段，是因为 Shift 区间之后两者必然分开：支点停在
+    /// 起点，而用户刚点的是终点。合用一个字段的话，行表 `[1,2,3,4,5]` 上点行 4
+    /// 再 Shift 点行 2，属性面板会去显示行 4。
+    cursor: Option<RefU64>,
+}
+
+impl Selection {
+    pub fn single(refno: RefU64) -> Self {
+        Self {
+            items: vec![refno],
+            anchor: Some(refno),
+            cursor: Some(refno),
+        }
+    }
+
+    /// Ctrl 点：加进来或去掉。点掉的若正好是支点或主选中，两者各自顺延到剩下的末位。
+    pub fn toggle(&mut self, refno: RefU64) {
+        if let Some(i) = self.items.iter().position(|r| *r == refno) {
+            self.items.remove(i);
+            if self.anchor == Some(refno) {
+                self.anchor = self.items.last().copied();
+            }
+            if self.cursor == Some(refno) {
+                self.cursor = self.items.last().copied();
+            }
+        } else {
+            self.items.push(refno);
+            self.anchor = Some(refno);
+            self.cursor = Some(refno);
+        }
+    }
+
+    /// Shift 点：从锚到落点，按 `order` 给的**可见行序**取闭区间，整体替换。
+    ///
+    /// 替换而不是并入，是 Shift 的常规语义；要在已有选择上追加一段是 Ctrl+Shift，
+    /// 那一档本轮不做。锚在区间选择后不动：连着 Shift 点几下都该以最初那一下为准。
+    ///
+    /// 锚或落点不在可见行里（被折叠进去了）就退化成单选——选中一段用户看不见的行
+    /// 比少选更糟。
+    pub fn range(&mut self, order: &[RefU64], to: RefU64) {
+        let Some(anchor) = self.anchor else {
+            *self = Self::single(to);
+            return;
+        };
+        let (Some(a), Some(b)) = (
+            order.iter().position(|r| *r == anchor),
+            order.iter().position(|r| *r == to),
+        ) else {
+            *self = Self::single(to);
+            return;
+        };
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        self.items = order[lo..=hi].to_vec();
+        self.cursor = Some(to);
+    }
+
+    pub fn clear(&mut self) {
+        self.items.clear();
+        self.anchor = None;
+        self.cursor = None;
+    }
+
+    pub fn contains(&self, refno: RefU64) -> bool {
+        self.items.contains(&refno)
+    }
+
+    /// 属性面板跟随的那一个 = 最后一次点中的元素。
+    ///
+    /// 多选时属性面板仍然显示它，面板头另给一枚「已选 N 项」说明属性只对应其中
+    /// 一个。比多选时整块空掉有用，也比合并显示公共属性诚实——求交集是另一件事。
+    pub fn primary(&self) -> Option<RefU64> {
+        self.cursor.or_else(|| self.items.last().copied())
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = RefU64> + '_ {
+        self.items.iter().copied()
+    }
+
+    pub fn to_vec(&self) -> Vec<RefU64> {
+        self.items.clone()
+    }
 }
 
 /// 三维视口对绘制层就是一张纹理。M1-5 里它是磁盘上的占位图，M3 接回 Bevy 后
@@ -43,20 +149,43 @@ pub struct View3dVm {
     /// 纹理的像素尺寸。视口要按它等比裁切铺满，不然图会被拉变形。
     pub size: egui::Vec2,
     /// true = Bevy 相机实时渲染目标；false = 独立壳的静态占位图。
+    /// 工具栏只在 true 时出现——没有渲染器的壳里那排按钮按下去什么都不会发生。
     pub live: bool,
+    /// 距离测量是否正在进行。真值只有宿主知道（测量状态机在 Bevy 侧），
+    /// 绘制层拿它点亮工具栏上的尺子，不自己维护开关。
+    pub measurement_active: bool,
 }
 
-/// 命令行视图数据。
+/// 应用运行日志数据。
 ///
 /// 旧壳的分级靠关键词猜（`PrintConsoleLine` 只带一个字符串），词表要照真实语料
 /// 校准还是会错判。新链路里发日志的就是 App 自己，级别在发的那一刻就定死，
 /// 不再有猜的环节。
 #[derive(Debug, Clone, Default)]
-pub struct ConsoleVm {
+pub struct LogsVm {
     /// 按时间先后排列的日志行（App 侧限长，最早的先丢）。
     pub lines: Vec<LogLineVm>,
     /// 分级计数。筛选芯片每帧都要显示它，App 侧增量维护，绘制层不逐帧扫全表。
     pub counts: LogCounts,
+}
+
+/// 命令行会话。输入框和上下键历史属于绘制状态，不进入 Vm。
+#[derive(Debug, Clone, Default)]
+pub struct CommandVm {
+    pub lines: Vec<CommandLineVm>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandLineKind {
+    Input,
+    Output,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommandLineVm {
+    pub kind: CommandLineKind,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -80,7 +209,7 @@ impl LogCounts {
     }
 }
 
-/// 命令行的一行（C/LogRow：高 24、时间等宽 + 52pt 分级标签 + 正文）。
+/// 日志的一行（C/LogRow：高 24、时间等宽 + 52pt 分级标签 + 正文）。
 #[derive(Debug, Clone)]
 pub struct LogLineVm {
     /// 稳定行号。处置入口拿它回指对应操作——缓冲限长会让 Vec 下标漂移。
@@ -264,5 +393,65 @@ pub enum PropKind {
 impl PropKind {
     pub fn editable(self) -> bool {
         self != PropKind::ReadOnly
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn r(n: u64) -> RefU64 {
+        RefU64(n)
+    }
+
+    #[test]
+    fn ctrl_click_toggles_and_keeps_order() {
+        let mut s = Selection::single(r(1));
+        s.toggle(r(3));
+        s.toggle(r(2));
+        assert_eq!(s.to_vec(), vec![r(1), r(3), r(2)]);
+        s.toggle(r(3));
+        assert_eq!(s.to_vec(), vec![r(1), r(2)]);
+    }
+
+    #[test]
+    fn dropping_the_anchor_moves_it_to_the_last_survivor() {
+        let mut s = Selection::single(r(1));
+        s.toggle(r(2));
+        assert_eq!(s.primary(), Some(r(2)));
+        s.toggle(r(2));
+        assert_eq!(s.primary(), Some(r(1)));
+    }
+
+    #[test]
+    fn shift_range_follows_visible_row_order_in_both_directions() {
+        let order = [r(1), r(2), r(3), r(4), r(5)];
+        let mut s = Selection::single(r(4));
+        s.range(&order, r(2));
+        assert_eq!(s.to_vec(), vec![r(2), r(3), r(4)]);
+        // 锚仍是 4，再 Shift 点一次以它为准而不是以上一段的端点为准。
+        s.range(&order, r(5));
+        assert_eq!(s.to_vec(), vec![r(4), r(5)]);
+    }
+
+    /// 支点停在起点、主选中跟到终点：属性视图与三维高亮跟的是用户刚点的那一行。
+    #[test]
+    fn shift_range_moves_the_primary_to_the_clicked_row() {
+        let order = [r(1), r(2), r(3), r(4), r(5)];
+        let mut s = Selection::single(r(4));
+        s.range(&order, r(2));
+        assert_eq!(s.primary(), Some(r(2)));
+        // 支点没动，所以下一次 Shift 仍以行 4 为准；主选中跟到行 5。
+        s.range(&order, r(5));
+        assert_eq!(s.to_vec(), vec![r(4), r(5)]);
+        assert_eq!(s.primary(), Some(r(5)));
+    }
+
+    #[test]
+    fn shift_onto_a_collapsed_row_degrades_to_single() {
+        let order = [r(1), r(2)];
+        let mut s = Selection::single(r(1));
+        s.range(&order, r(9));
+        assert_eq!(s.to_vec(), vec![r(9)]);
     }
 }

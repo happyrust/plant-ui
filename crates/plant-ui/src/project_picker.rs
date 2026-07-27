@@ -14,6 +14,20 @@ pub struct Entry {
     pub mdb: String,
 }
 
+/// 开机直接进的那份项目配置。
+pub const DEFAULT_ASSET_PATH: &str = "config/e3d.project.ron";
+
+/// 默认项目在条目表里的位置：认 [`DEFAULT_ASSET_PATH`]，找不着就取第一个。
+///
+/// 宿主开机加载谁、选择框默认选中哪一行，都得问它。两处各挑各的，就会出现
+/// 「打开选择框看到的选中项不是正在用的项目」。
+pub fn default_index(entries: &[Entry]) -> usize {
+    entries
+        .iter()
+        .position(|entry| entry.asset_path == DEFAULT_ASSET_PATH)
+        .unwrap_or(0)
+}
+
 pub struct State {
     pub open: bool,
     pub entries: Vec<Entry>,
@@ -22,10 +36,7 @@ pub struct State {
 
 impl State {
     pub fn new(entries: Vec<Entry>, open: bool) -> Self {
-        let selected = entries
-            .iter()
-            .position(|entry| entry.asset_path == "config/e3d.project.ron")
-            .unwrap_or(0);
+        let selected = default_index(&entries);
         Self {
             open,
             entries,

@@ -71,7 +71,15 @@ pub fn command_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: 
                     .into_iter()
                     .enumerate()
                 {
-                    if ui.add(widgets::chip(t, d, name, i == 0)).clicked() {
+                    let response = ui.add(widgets::chip(t, d, name, i == 0));
+                    if name == "创建" {
+                        egui::Popup::menu(&response).show(|ui| {
+                            if ui.button("三维数据接口").clicked() {
+                                cmds.push(Cmd::OpenDataPublish);
+                                ui.close();
+                            }
+                        });
+                    } else if response.clicked() {
                         match name {
                             "项目" => cmds.push(Cmd::OpenProjectPicker),
                             "设置" => cmds.push(Cmd::OpenSettings),
@@ -148,12 +156,22 @@ pub fn status_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
                 }
                 divider(ui, t, d);
                 meta_icon(ui, d, ph::CURSOR, t.text_secondary);
-                match &vm.selected {
-                    Some(refno) => ui.label(
-                        RichText::new(format!("{refno:?}"))
-                            .font(Font::mono_micro(d))
-                            .color(t.text_secondary),
-                    ),
+                // 多选时报主选中加余量：状态栏这一格只有一行，列不下整批，
+                // 而「属性面板在说哪一个」比「一共选了几个」更常被问到。
+                match vm.selection.primary() {
+                    Some(refno) => {
+                        let rest = vm.selection.len() - 1;
+                        let text = if rest > 0 {
+                            format!("{refno} +{rest}")
+                        } else {
+                            refno.to_string()
+                        };
+                        ui.label(
+                            RichText::new(text)
+                                .font(Font::mono_micro(d))
+                                .color(t.text_secondary),
+                        )
+                    }
                     None => ui.label(
                         RichText::new("未选中")
                             .font(Font::micro(d))

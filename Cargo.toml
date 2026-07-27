@@ -27,6 +27,9 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = "3.3.0"
+# 手动更新的逐单元进度只在 /api/v1/ws 上发（ADR-0005）。版本对齐 vendor 里已有的那一份
+# （surrealdb 的 ws 协议带进来的），不新增下载；服务端不上 TLS，所以只要 handshake。
+tungstenite = "0.23.0"
 # 命令行视图的本地时钟时间戳。aios_core 链上已经带进来了，不新增下载
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # 三维视口的占位纹理。只开这两种编码，够读 assets/textures 下的图；

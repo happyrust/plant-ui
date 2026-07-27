@@ -126,8 +126,10 @@ D:\work\plant-code\old\plant-ui\
 | `rs_surreal/query.rs` `get_named_attmap_with_uda` | `pub(crate)` -> `pub` | UI 版属性表 `get_ui_named_attmap` 会把引用与未设值都压成 `StringType`，属性面板判「哪些字段可编辑」需要压之前的原始类型。该函数带 `#[cached]`，多取一次不额外打库 |
 | `lib.rs` `init_surreal` | `.build().unwrap()` -> `.build()?` | 读不到 `DbOption.toml` 时原先直接 panic，整个应用连一条错误都留不下就没了。函数本来就返回 `anyhow::Result`，改成 `?` 之后这条失败会顺着数据线程回到面板的错误态与命令行 |
 | `rs_surreal/mdb.rs` `get_mdb_world_site_ele_nodes` | `SUL_DB.query(&sql).await.unwrap()` -> `?` | 同上。这是模型树根层查询的第一跳，M1-7 验收错误态时就是从这里逼出来的——把 `v_port` 指到无人监听的端口，原先是 panic 而不是错误态 |
+| `rs_surreal/mdb.rs` `get_mdb_world_site_ele_nodes` | 根层查询去掉 WORL 那一跳，改成 `pe where noun='SITE' and dbnum in $dbnos` | 原查询是 `MDB -> WORL -> SITE` 三跳，中间那跳要求每个设计库都有世界元素，而同步经常不写它：`admin_sites/ams7997-e3d31` 那个库 `WORL` 表 0 条、`pe` 里也没有 `noun='WORL'`，8009 内存库里 db 8000 的真实世界 `pe:16192_0` 同样缺。缺的只是那一个节点——15 个 SITE 与指向它的 15 条 `pe_owner` 边都在——但整棵树因此全空。SITE 自己带 `dbnum`，够定位根层 |
+| `rs_surreal/mdb.rs` `query_mdb_db_nums` | 同上，由 `WORL` 改为按 `SITE` 取 dbnum 去重 | 与根层同源，否则状态栏的库标识会和树对不上：树有 15 个 SITE 而库标识是空的。顺带得到一个好性质——MDB 里声明了却一个元素都没同步过来的库自动不出现（`/ALL` 在 8022 上声明 29 个库，实际只报 7997） |
 
-后两条是 M1-7 验收错误态时顺手改的，当时没进表。**这类改动不进表就等于不存在**：换钉版时按表重放，表里没有的会静默丢失，而丢失的形态是「某天又开始 panic 了」，很难回想起是重放漏了。
+`init_surreal` 与 `get_mdb_world_site_ele_nodes` 那两条 `unwrap` 是 M1-7 验收错误态时顺手改的，当时没进表。**这类改动不进表就等于不存在**：换钉版时按表重放，表里没有的会静默丢失，而丢失的形态是「某天又开始 panic 了」，很难回想起是重放漏了。
 
 ### 里程碑 1 的完整依赖清单（已核实全部在 crates.io 上游，**零 fork**）
 

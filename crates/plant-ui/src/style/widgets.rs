@@ -99,7 +99,9 @@ impl Widget for Btn<'_> {
         }
 
         let t = self.t;
-        let (bg, fg, border) = if self.primary {
+        let (bg, fg, border) = if !ui.is_enabled() {
+            (t.bg_input, t.text_muted, Some(t.border))
+        } else if self.primary {
             let bg = if resp.hovered() {
                 t.accent_strong
             } else {
@@ -291,7 +293,12 @@ pub fn tool_btn<'a>(t: &'a Tokens, d: Density, icon: &'a str, active: bool) -> i
         if !ui.is_rect_visible(rect) {
             return resp;
         }
-        let (bg, fg) = if active {
+        // 禁用态必须先判：调用点用 `add_enabled` 表达「这枚现在按不了」，组件不读
+        // `is_enabled` 的话画出来和常态一模一样，看着就是一枚点了没反应的按钮。
+        // 不加底色也不加描边——它悬在视口工具栏上，给填充反而比可用的那几枚还重。
+        let (bg, fg) = if !ui.is_enabled() {
+            (Color32::TRANSPARENT, t.text_muted)
+        } else if active {
             (t.accent_bg, t.accent)
         } else if resp.hovered() {
             (t.bg_hover, t.text_primary)
@@ -411,6 +418,9 @@ pub struct TreeRow<'a> {
     pub label: &'a str,
     pub meta: &'a str,
     pub selected: bool,
+    /// 选择集里的**主选中**：属性面板显示的是它。多选时整片都是 accent-bg，
+    /// 不额外标一下的话，用户看不出属性栏在说这几行里的哪一行。
+    pub primary: bool,
     pub expandable: Option<bool>,
     pub tone: Status,
     pub tags: &'a [RowTag<'a>],
@@ -439,7 +449,10 @@ pub fn tree_row_ui(ui: &mut Ui, t: &Tokens, d: Density, row: TreeRow<'_>) -> Tre
     } else {
         Color32::TRANSPARENT
     };
-    fill_rect(ui, rect, radius::SM, bg, None);
+    // 主选中多一圈 1px 描边而不是换底色：底色一换，多选时「选中的一片」就断成
+    // 深浅两段，看着像两组而不是一组。
+    let border = (row.selected && row.primary).then_some(t.accent);
+    fill_rect(ui, rect, radius::SM, bg, border);
 
     let gap = d.px(6.0);
     let mut x = rect.left() + d.px(10.0) + row.depth as f32 * d.px(13.0);

@@ -4,7 +4,8 @@
 //! 不认识数据库、不认识 Bevy。三维视口对本层只是一个 TextureId（M1-5 前用占位）。
 
 pub mod chrome;
-pub mod console;
+pub mod command_line;
+pub mod logs;
 pub mod panes;
 pub mod props;
 pub mod tree;
@@ -38,20 +39,25 @@ pub fn noun_icon(noun: &str) -> &'static str {
 /// 外壳持久状态（dock 布局）。属于界面本身而非数据，所以不进 Vm。
 pub struct WorkbenchState {
     dock: DockState<Pane>,
+    command: command_line::State,
 }
 
 impl Default for WorkbenchState {
     fn default() -> Self {
-        // S1 布局：中央三维视图，左 19% 模型树，右侧属性，中下命令行。
+        // 中央三维视图，左 19% 模型树，右侧属性，底部命令行 40% + 日志 60%。
         let mut dock = DockState::new(vec![Pane::View3d]);
         {
             let surface = dock.main_surface_mut();
             let [center, _left] =
                 surface.split_left(NodeIndex::root(), 0.19, vec![Pane::ModelTree]);
             let [center, _right] = surface.split_right(center, 0.76, vec![Pane::Properties]);
-            let [_center, _bottom] = surface.split_below(center, 0.7, vec![Pane::Console]);
+            let [_center, bottom] = surface.split_below(center, 0.7, vec![Pane::CommandLine]);
+            let [_command, _logs] = surface.split_right(bottom, 0.4, vec![Pane::Logs]);
         }
-        Self { dock }
+        Self {
+            dock,
+            command: command_line::State::default(),
+        }
     }
 }
 
@@ -86,13 +92,15 @@ pub fn show(
         .frame(egui::Frame::NONE)
         .show(ui, |ui| {
             let style = panes::dock_style(ui, t, d);
+            let WorkbenchState { dock, command } = state;
             let mut viewer = panes::Viewer {
                 t,
                 d,
                 vm,
+                command,
                 cmds: &mut cmds,
             };
-            DockArea::new(&mut state.dock)
+            DockArea::new(dock)
                 .style(style)
                 .show_close_buttons(false)
                 .show_leaf_close_all_buttons(false)

@@ -5707,6 +5707,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tungstenite",
  "ureq",
 ]
 
