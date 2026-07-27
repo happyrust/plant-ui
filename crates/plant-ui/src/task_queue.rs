@@ -22,7 +22,9 @@ use egui_phosphor::regular as ph;
 use serde::Deserialize;
 
 use crate::Cmd;
-use crate::model_update::{Feed, PendingModelUnit, ProgressEvent, RowState, UnitStatus};
+use crate::model_update::{
+    Feed, FileAnomaly, PendingModelUnit, ProgressEvent, RowState, UnitStatus,
+};
 use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Status, Tokens, radius};
 use crate::style::widgets;
@@ -170,6 +172,33 @@ pub struct PendingUnits {
     pub units: Vec<PendingModelUnit>,
 }
 
+/// `GET /api/v1/dbnums` 的一行。
+///
+/// 阻断与排除的库**压根不入队**，队列里没有它们的行——而阻断恰恰是「这个库的水位
+/// 为什么一直不动」的唯一解释。自动同步常开时更要命：人可能从不点预览，一个库
+/// 可以默默阻断好几周。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DbnumStatus {
+    pub dbnum: u32,
+    #[serde(default)]
+    pub db_type: String,
+    #[serde(default)]
+    pub anomaly: Option<FileAnomaly>,
+    /// 不入队、不应用，水位不动。五种异常里**只有路径迁移不阻断**。
+    #[serde(default)]
+    pub blocked: bool,
+    /// 压根不在本期执行范围（`manual_db_nums` / 类型门控）。与阻断**不是一回事**，
+    /// 界面上不许合成一行：混起来会把「出事了」讲成「本来就不跑」。
+    #[serde(default)]
+    pub excluded: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DbnumReport {
+    #[serde(default)]
+    pub dbnums: Vec<DbnumStatus>,
+}
+
 /// 一次轮询取回来的全部四份。四个请求打包成一次事件，免得界面上四份数据各更新各的、
 /// 中间态互相矛盾。
 #[derive(Debug, Clone, Default)]
@@ -178,6 +207,7 @@ pub struct Poll {
     pub tasks: Vec<TaskEntry>,
     pub health: Option<Health>,
     pub pending: Vec<PendingModelUnit>,
+    pub dbnums: Vec<DbnumStatus>,
 }
 
 // ================================================================ 视图模型
@@ -207,6 +237,8 @@ pub struct Vm {
     pub tasks: Vec<TaskEntry>,
     pub health: Option<Health>,
     pub pending: Vec<PendingModelUnit>,
+    /// 已登记的库及其异常 / 阻断 / 排除标志。队列里没有这些行，它们进「本期不执行」。
+    pub dbnums: Vec<DbnumStatus>,
     /// 逐单元明细，按 task_id 分桶。
     pub details: HashMap<String, Detail>,
     /// 明细长连接的状态。它与队列状态是两件事：连接断了队列照跑。
@@ -223,6 +255,7 @@ impl Vm {
         self.tasks = poll.tasks;
         self.health = poll.health;
         self.pending = poll.pending;
+        self.dbnums = poll.dbnums;
         self.error = None;
         self.loaded = true;
         // 数据源还没连上时本端不知道项目名，退回服务端说的那个：它是 `resolve_project`
@@ -632,6 +665,97 @@ pub fn status(vm: &Vm) -> crate::vm::QueueStatusVm {
     }
 }
 
+// ================================================================ 房间泳道
+
+/// 房间归属重算泳道的形态。它与 dbnum 列表**平级**，不挂在任何 dbnum 行下——
+/// 房间任务的行 id 刻意不带 dbnum，那个字段是「最后一次触发来源」而非归属。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaneState {
+    /// `gen_spatial_tree` 关着。**只说这一句**，不摆一条永远是 0 的空泳道。
+    Off,
+    Converging,
+    Waiting,
+    Converged,
+}
+
+/// 等这么久还排不上就算饿着了。画板上 14 分钟是常态、47 分钟是饥饿态，
+/// 阈值取在两者之间——它是一条界面提示线，不是服务端的什么承诺。
+const STARVING_AFTER: Duration = Duration::from_secs(30 * 60);
+
+#[derive(Debug, Clone)]
+pub struct Lane {
+    pub state: LaneState,
+    /// 有没有过房间轮记录。没有的话下面那几个计数**一个都不许摆**——
+    /// 「0 块面板待重算」和「从来没收过一轮」是两回事，前者是个没有出处的 0。
+    pub seen: bool,
+    pub panels: usize,
+    pub elements: usize,
+    pub dead_letters: usize,
+    pub done: Option<u32>,
+    pub total: Option<u32>,
+    /// 现在 − 上一轮 `room_recalc` 的 `finished_at`。持久表没有时间戳，
+    /// 「已等待多久」只能这么算。
+    pub waited: Option<Duration>,
+    pub starving: bool,
+}
+
+/// 房间泳道。`None` = 还没读到 `/health`，说不出开没开，那就一个字不提。
+pub fn lane(vm: &Vm) -> Option<Lane> {
+    let health = vm.health.as_ref()?;
+    if !health.gen_spatial_tree {
+        return Some(Lane {
+            state: LaneState::Off,
+            seen: false,
+            panels: 0,
+            elements: 0,
+            dead_letters: 0,
+            done: None,
+            total: None,
+            waited: None,
+            starving: false,
+        });
+    }
+    let task = vm.room_task();
+    let counts = task.and_then(|t| t.detail).unwrap_or_default();
+    let running = task.is_some_and(|t| t.state == "running");
+    let waited = task
+        .and_then(|t| t.finished_at.as_deref())
+        .and_then(since);
+    let live = counts.panels + counts.elements;
+    let state = if running {
+        LaneState::Converging
+    } else if live > 0 {
+        LaneState::Waiting
+    } else {
+        LaneState::Converged
+    };
+    Some(Lane {
+        state,
+        seen: task.is_some(),
+        panels: counts.panels,
+        elements: counts.elements,
+        dead_letters: counts.dead_letters,
+        done: task.and_then(|t| t.units_done),
+        total: task.and_then(|t| t.total_units),
+        // 饥饿只在「有活却排不上」时成立：已经收敛干净的泳道等再久也不算饿着。
+        starving: state == LaneState::Waiting
+            && waited.is_some_and(|elapsed| elapsed >= STARVING_AFTER),
+        waited,
+    })
+}
+
+/// 「本期不执行」那一格：阻断与排除的库。两者**不许合成一行**——阻断是出事了、
+/// 排除是本来就不跑，混起来会把前者讲成后者。阻断排在前面。
+pub fn not_running(vm: &Vm) -> Vec<&DbnumStatus> {
+    let mut rows: Vec<&DbnumStatus> = vm
+        .dbnums
+        .iter()
+        .filter(|db| db.blocked || db.excluded)
+        .collect();
+    rows.sort_by_key(|db| (!db.blocked, db.dbnum));
+    rows
+}
+
 /// 筛选与搜索。**搜索时不受筛选芯片限制**——搜一个已完成的库却搜不到，
 /// 会让人以为它不在队列里。
 pub fn visible(all: &[RowVm], filter: Filter, search: &str) -> Vec<usize> {
@@ -708,6 +832,9 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, state: &mut State, cmd
         let all = rows(vm);
         summary_bar(ui, t, d, vm, &all, cmds);
         toolbar(ui, t, d, &all, state);
+        // 泳道与「本期不执行」贴底：它们与 dbnum 列表平级，不该跟着列表一起滚走
+        // ——一个库默默阻断好几周的时候，滚出视野就等于没说。
+        footer(ui, t, d, vm);
         header(ui, t, d);
 
         let hits = visible(&all, state.filter, &state.search);
@@ -979,6 +1106,231 @@ fn toolbar(ui: &mut Ui, t: &Tokens, d: Density, all: &[RowVm], state: &mut State
                 .color(t.text_muted),
         );
     });
+}
+
+/// 贴底的两格：房间归属重算泳道 + 本期不执行。都与 dbnum 列表平级。
+fn footer(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm) {
+    let lane = lane(vm);
+    let excluded = not_running(vm);
+    if lane.is_none() && excluded.is_empty() {
+        return;
+    }
+    egui::Panel::bottom("task-queue-footer")
+        .frame(egui::Frame::new().fill(t.bg_panel))
+        .show_separator_line(false)
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+            if let Some(lane) = lane {
+                room_lane(ui, t, d, &lane);
+            }
+            if !excluded.is_empty() {
+                excluded_block(ui, t, d, &excluded);
+            }
+        });
+}
+
+fn room_lane(ui: &mut Ui, t: &Tokens, d: Density, lane: &Lane) {
+    let fill = if lane.starving { t.danger_bg } else { t.bg_header };
+    let head = strip_rect(ui, t, d.px(26.0), fill);
+    let mut row = child(ui, head.shrink2(vec2(d.px(14.0), 0.0)), Align::Center);
+    row.spacing_mut().item_spacing.x = d.px(8.0);
+    let (mark, _) = row.allocate_exact_size(vec2(d.px(13.0), d.px(13.0)), Sense::hover());
+    glyph(&row, mark.center(), ph::SELECTION_ALL, d.px(13.0), t.text_muted);
+    row.label(
+        RichText::new("房间归属重算")
+            .font(Font::strong(d))
+            .color(t.text_primary),
+    );
+    // 行 id 不带 dbnum 是刻意的：拿「最后一次触发来源」当归属会误导。
+    row.label(
+        RichText::new("跨库 · 不属于任何 dbnum")
+            .font(Font::micro(d))
+            .color(t.text_muted),
+    );
+    row.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        if let Some(waited) = lane.waited {
+            ui.label(
+                RichText::new(format!("已等待 {}", minutes(waited)))
+                    .font(Font::mono_meta(d))
+                    .color(if lane.starving { t.danger } else { t.text_muted }),
+            );
+        }
+        if let (Some(done), Some(total)) = (lane.done, lane.total)
+            && lane.state == LaneState::Converging
+        {
+            ui.label(
+                RichText::new(format!("{done} / {total}"))
+                    .font(Font::mono_meta(d))
+                    .color(t.accent),
+            );
+        }
+    });
+
+    let body = strip_rect(ui, t, d.px(48.0), fill);
+    let mut ui = child(ui, body.shrink2(vec2(d.px(14.0), d.px(5.0))), Align::Min);
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = d.px(4.0);
+        if lane.state == LaneState::Off {
+            // 房间增量没开时**只说这一句**：本项目 PANE / CWALL / CFLOOR 三张表都是空的，
+            // 画一条永远 0 的泳道比不画更糟。
+            ui.label(
+                RichText::new("房间增量没开（gen_spatial_tree = false），本项目当前不做房间归属重算。")
+                    .font(Font::meta(d))
+                    .color(t.text_muted),
+            );
+            return;
+        }
+        if !lane.seen {
+            ui.label(
+                RichText::new("房间增量开着，但还没有过房间轮记录——待重算的数量随第一轮任务带出来。")
+                    .font(Font::meta(d))
+                    .color(t.text_muted),
+            );
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = d.px(14.0);
+            ui.label(
+                RichText::new(format!("{} 块面板待重算", lane.panels))
+                    .font(Font::meta(d))
+                    .color(t.text_secondary),
+            );
+            ui.label(
+                RichText::new(format!("{} 个构件待重算", lane.elements))
+                    .font(Font::meta(d))
+                    .color(t.text_secondary),
+            );
+            // 死信到顶之后自动路径不会再碰它们，界面是唯一能把它们暴露出来的地方。
+            if lane.dead_letters > 0 {
+                ui.label(
+                    RichText::new(format!("{} 个已达重试上限", lane.dead_letters))
+                        .font(Font::meta(d))
+                        .color(t.danger),
+                );
+            }
+        });
+        let (text, color) = if lane.starving {
+            (
+                "队列一直不空，房间收敛排不上。这段窗口里材料表读到的房间号可能是旧的，且不会有任何报错。",
+                t.danger,
+            )
+        } else {
+            (
+                "队列跑空时才收一轮。队列持续繁忙，材料表的房间号可能滞后。",
+                t.text_muted,
+            )
+        };
+        ui.label(RichText::new(text).font(Font::micro(d)).color(color));
+    });
+}
+
+fn excluded_block(ui: &mut Ui, t: &Tokens, d: Density, rows: &[&DbnumStatus]) {
+    let head = strip_rect(ui, t, d.px(24.0), t.bg_panel);
+    let mut row = child(ui, head.shrink2(vec2(d.px(14.0), 0.0)), Align::Center);
+    row.spacing_mut().item_spacing.x = d.px(8.0);
+    row.label(
+        RichText::new("本期不执行")
+            .font(Font::strong(d))
+            .color(t.text_primary),
+    );
+    row.label(
+        RichText::new("这些库不入队，水位不动")
+            .font(Font::micro(d))
+            .color(t.text_muted),
+    );
+
+    ScrollArea::vertical()
+        .id_salt("task-queue-excluded")
+        .max_height(d.px(84.0))
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for db in rows {
+                excluded_row(ui, t, d, db);
+            }
+        });
+}
+
+fn excluded_row(ui: &mut Ui, t: &Tokens, d: Density, db: &DbnumStatus) {
+    let (rect, resp) =
+        ui.allocate_exact_size(vec2(ui.available_width(), d.px(24.0)), Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, CornerRadius::ZERO, t.bg_hover);
+    }
+    let blocked = db.blocked;
+    let tone = if blocked { t.danger } else { t.text_muted };
+    let mid = rect.center().y;
+    let x = rect.left() + d.px(14.0);
+    ui.painter().circle_filled(pos2(x, mid), d.px(4.0), tone);
+    text_at(
+        ui,
+        pos2(rect.left() + d.px(28.0), mid),
+        &format!("db{}", db.dbnum),
+        Font::mono(d),
+        t.text_primary,
+    );
+    // 排除有两种来源：类型不对，或者 DESI 但不在 `manual_db_nums` 里。一律写「非 DESI」
+    // 的话，后一种就是假话——那个库明明是 DESI，只是这一期没排它。
+    let reason = match (&db.anomaly, blocked) {
+        (Some(anomaly), _) => anomaly_brief(anomaly),
+        (None, true) => "阻断，原因未随契约给出".to_owned(),
+        (None, false) if db.db_type != "DESI" => {
+            format!("非 DESI（{}），不在本期范围", db.db_type)
+        }
+        (None, false) => "DESI，但不在本期执行范围内".to_owned(),
+    };
+    text_at(
+        ui,
+        pos2(rect.left() + d.px(108.0), mid),
+        &reason,
+        Font::meta(d),
+        if blocked { t.danger } else { t.text_muted },
+    );
+    // 「阻断」与「排除」两个词分开摆：一个是出事了，一个是本来就不跑。
+    let tag = if blocked { "阻断" } else { "排除" };
+    let g = layout(ui, tag, Font::mono_micro(d));
+    let pad = d.px(6.0);
+    let box_rect = Rect::from_min_size(
+        pos2(rect.right() - d.px(14.0) - g.size().x - pad * 2.0, mid - d.px(9.0)),
+        vec2(g.size().x + pad * 2.0, d.px(18.0)),
+    );
+    let (fg, bg) = t.status(if blocked { Status::Error } else { Status::Neutral });
+    ui.painter()
+        .rect_filled(box_rect, CornerRadius::same(radius::SM), bg);
+    ui.painter().galley(
+        pos2(box_rect.left() + pad, mid - g.size().y / 2.0),
+        g,
+        fg,
+    );
+    // 出路（同号重复要列出 paths[] 交给人挑、文件缺失是补回文件或注销登记）
+    // 与预览那边 S2-E 用的是同一段文案，两处不许各说各话。
+    if let Some(anomaly) = &db.anomaly {
+        resp.on_hover_text(anomaly.to_string());
+    }
+}
+
+/// 阻断原因的短说明。完整的出路在悬停里，与 S2-E 同一段文案。
+fn anomaly_brief(anomaly: &FileAnomaly) -> String {
+    match anomaly {
+        FileAnomaly::Rollback {
+            file_latest_sesno,
+            applied_sesno,
+        } => format!(
+            "文件回退 {} < 已应用 {}",
+            group(*file_latest_sesno as i64),
+            group(*applied_sesno as i64)
+        ),
+        FileAnomaly::TypeChanged {
+            stored_db_type,
+            observed_db_type,
+        } => format!("类型变化 {stored_db_type} → {observed_db_type}"),
+        FileAnomaly::Duplicate { paths } => format!("同号重复 · {} 个同号文件", paths.len()),
+        FileAnomaly::Missing { .. } => "文件缺失".to_owned(),
+        // 五种异常里只有它照常入队，所以只会出现在排除行上（如果真出现的话）。
+        FileAnomaly::PathMigrated { .. } => "路径迁移".to_owned(),
+    }
 }
 
 /// 表头。七个列位与 [`queue_row`] 共用 [`cols`] 算出来的那一组 x，两处不许各排各的。
@@ -1443,6 +1795,17 @@ fn hhmm(stamp: &str) -> Option<String> {
     Some(parse(stamp)?.format("%H:%M").to_string())
 }
 
+/// 房间泳道的「已等待」按分钟报。秒级精度在这里没有意义——它衡量的是
+/// 「队列忙了多久没腾出空来」。
+fn minutes(elapsed: Duration) -> String {
+    let m = elapsed.as_secs() / 60;
+    if m < 60 {
+        format!("{m} 分钟")
+    } else {
+        format!("{} 小时 {} 分钟", m / 60, m % 60)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1708,6 +2071,95 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(model.rooms_pending(), Some(30));
+    }
+
+    fn room(state: &str, counts: RoomCounts, finished_at: Option<&str>) -> TaskEntry {
+        TaskEntry {
+            task_id: "room-1".into(),
+            kind: KIND_ROOM_RECALC.into(),
+            state: state.into(),
+            detail: Some(counts),
+            finished_at: finished_at.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    fn health(gen_spatial_tree: bool) -> Health {
+        Health {
+            gen_spatial_tree,
+            ..Default::default()
+        }
+    }
+
+    /// 房间增量没开时泳道只说「没开」这一句。当前项目 PANE / CWALL / CFLOOR 三张表
+    /// 全空，画一条永远是 0 的泳道比不画更糟。
+    #[test]
+    fn the_lane_says_only_that_the_feature_is_off() {
+        let mut model = vm(Vec::new(), vec![room("running", RoomCounts { panels: 3, elements: 27, dead_letters: 2 }, None)]);
+        model.health = Some(health(false));
+        let off = lane(&model).expect("读到 health 就说得出开没开");
+        assert_eq!(off.state, LaneState::Off);
+        assert_eq!((off.panels, off.elements, off.dead_letters), (0, 0, 0));
+
+        // 连 health 都没读到就一个字不提——说不出开没开的时候不许猜。
+        model.health = None;
+        assert!(lane(&model).is_none());
+
+        // 开着、但一轮都没收过：那几个计数一个都不许摆，「0 块面板待重算」
+        // 与「从来没收过一轮」是两回事。
+        let mut fresh = vm(Vec::new(), Vec::new());
+        fresh.health = Some(health(true));
+        let never = lane(&fresh).unwrap();
+        assert!(!never.seen);
+        assert_eq!(never.state, LaneState::Converged);
+    }
+
+    /// 饥饿只在「有活却排不上」时成立：已经收敛干净的泳道等再久也不算饿着，
+    /// 那条 `$danger-bg` 的横幅不该为它亮起来。
+    #[test]
+    fn only_a_lane_with_work_left_can_starve() {
+        let long_ago = (Local::now() - chrono::Duration::minutes(47)).to_rfc3339();
+        let mut model = vm(
+            Vec::new(),
+            vec![room("succeeded", RoomCounts { panels: 5, elements: 63, dead_letters: 2 }, Some(&long_ago))],
+        );
+        model.health = Some(health(true));
+        let waiting = lane(&model).unwrap();
+        assert_eq!(waiting.state, LaneState::Waiting);
+        assert!(waiting.starving);
+
+        model.tasks[0].detail = Some(RoomCounts::default());
+        let converged = lane(&model).unwrap();
+        assert_eq!(converged.state, LaneState::Converged);
+        assert!(!converged.starving, "没活可干的泳道等再久也不是饿着");
+    }
+
+    /// 阻断与排除**不许合成一行**：一个是出事了、一个是本来就不跑，出路完全不同。
+    /// 阻断排在前面——它才是「这个库的水位为什么一直不动」的答案。
+    #[test]
+    fn blocked_and_excluded_stay_two_different_things() {
+        let mut model = vm(Vec::new(), Vec::new());
+        model.dbnums = vec![
+            DbnumStatus { dbnum: 7995, db_type: "CATA".into(), excluded: true, ..Default::default() },
+            DbnumStatus {
+                dbnum: 8003,
+                db_type: "DESI".into(),
+                blocked: true,
+                anomaly: Some(FileAnomaly::Rollback { file_latest_sesno: 812, applied_sesno: 1005 }),
+                ..Default::default()
+            },
+            // 正常入队的库不进这一格。
+            DbnumStatus { dbnum: 7997, db_type: "DESI".into(), ..Default::default() },
+        ];
+        let rows = not_running(&model);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].dbnum, 8003, "阻断排在前面");
+        assert!(rows[0].blocked && !rows[0].excluded);
+        assert!(rows[1].excluded && !rows[1].blocked);
+        assert_eq!(
+            anomaly_brief(rows[0].anomaly.as_ref().unwrap()),
+            "文件回退 812 < 已应用 1 005"
+        );
     }
 
     /// 计时解不出来就整格不画，绝不从 0 起算。

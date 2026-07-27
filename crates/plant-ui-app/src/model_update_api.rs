@@ -3,7 +3,7 @@ use serde::de::DeserializeOwned;
 use std::time::Duration;
 
 use plant_ui::model_update::{Enqueued, Failure, Preview, Run};
-use plant_ui::task_queue::{Health, PendingUnits, Poll, QueueSnapshot, TaskList};
+use plant_ui::task_queue::{DbnumReport, Health, PendingUnits, Poll, QueueSnapshot, TaskList};
 
 /// 服务端的统一错误包封 `{ code, message, detail }`（`web_service/mod.rs` 的 `ApiError`）。
 ///
@@ -79,11 +79,17 @@ pub fn poll_queue(base: &str) -> anyhow::Result<Poll> {
     let pending = get::<PendingUnits>(base, "/api/v1/update/pending-units")
         .map(|p| p.units)
         .unwrap_or_default();
+    // `/dbnums` 要重扫项目目录，是这四个里最慢的一个；取不到就少画「本期不执行」
+    // 那一格，不该拖垮整次轮询。
+    let dbnums = get::<DbnumReport>(base, "/api/v1/dbnums")
+        .map(|r| r.dbnums)
+        .unwrap_or_default();
     Ok(Poll {
         queue,
         tasks: tasks.tasks,
         health,
         pending,
+        dbnums,
     })
 }
 
