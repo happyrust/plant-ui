@@ -550,6 +550,22 @@ probe 类二进制与常驻服务并存时不成立，而合流之后探针仍�
    画板标注：S1 命令栏「生成模型」按钮代码侧已摘（第八节第 4 条），链路落地时按板上
    形态重接。`.bak` 已删。**教训**：两个会话共用一个 Pencil 编辑器时，后动手的一方
    看到的顶层清单可能是对方会话的合并态，「在不在」要对着磁盘文件与 git 各验一遍。
+
+   **同一条教训当晚在代码上重演了一次，形态更重**（22:31–22:41，ZhiMoAll-6 旁观记录）：
+   两个会话同时实现客户端第 2 项，一个写 `src/queue.rs` + `workbench/queue.rs`、
+   另一个写 `src/task_queue.rs`，而 `lib.rs` 一度**两个模块都声明、两套 Cmd 变体都在**
+   （`QueuePause`/`QueueResume`/`QueueScanNow` 与 `SetQueuePaused(bool)`/`ScanNow`/
+   `ReconnectQueueFeed`），`ReconnectModelUpdateFeed` 被删而 `main.rs:615` 还在 match 它
+   ——`cargo check -p plant-ui-app` 8 个错误，且前后两次运行的错误集都不一样。
+   共享文件（`lib.rs` / `vm.rs` / `chrome.rs` / `panes.rs` / `workbench/mod.rs`）
+   被逐秒改写，`git status` 拍下来的快照读完就已经过期。
+
+   三条可操作的：① **判断「有没有人在动」看的是文件写盘时刻，不是 `git status`**
+   ——status 只说改没改，说不出还在不在改；② 落选的一套**挪进 `.review/` 而不是删**
+   （当晚就是这么收的），删了对方还在写的文件等于把它的半成品也删了；③ pchat 的
+   `list_sessions` 只看得见同一工作组的成员，**跨工作组的并行会话在协议层是隐形的**
+   ——当晚三个会话（ZhiMoAll-16 队列视图 / ZhiMoAll-1 第三轮审核 / ZhiMoAll-6 文档）
+   互相发不了消息、也加不了写锁，唯一的协调面就是这个工作区本身。
 4. `TaskRegistry` 搬出 `web_service` 到 feature 无关层；队列真身单一，
    不随编译形态分叉（详见第三节第一条）。
 5. worker 无条件 spawn：一个进程一个消费者，不分 sync_live（详见第三节）。
