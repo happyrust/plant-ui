@@ -259,6 +259,43 @@ M2-3 是风险点：38 个 plugin 里 UI 与逻辑混在一起，**删之前必�
 但仍然全量参与编译。也就是说它已经**运行时死、编译期活**——既拿不到删除的收益
 （编译时间、依赖面），也不再有人验证它还能不能跑。这个中间态不宜长期停留。
 
+#### M2-4 的施工图与预期收益（实测，2026-07-27 下午）
+
+**先说结论：别拿「编译更快」当理由，那个收益只有一秒左右。** 实测 `rs-plant` 自己这个 crate
+重新 `cargo check` 是 **3.6s**（碰 mtime 触发，跑两次 3.58 / 3.62，日志确认了 `Checking rs-plant`）；
+而 79 个依赖里**只有 4 个是纯旧路径的**（`egui-toast` / `egui_data_table` / `indexmap` / `js-sys`），
+bevy 全家、surrealdb、parry 这些占掉冷检查约 50s 的大头宿主自己也在用，一秒都省不掉。
+删掉四分之一到一半的源码，省的是 3.6s 里的一两秒。要做这件事，理由得是风险表里那条
+「两处代码分叉」和「别让后来人在一万多行没人跑的代码里找路」，不是构建速度。
+
+**可删体量的下界是 14132 行 / 28%**（从宿主入口做模块级传递可达性算的）。说下界是因为
+文件粒度的可达性会高估——一个文件只要有一处被引用，整份就算活的。完全不可达的整棵子树里
+最干净的几块：`visual_nodes` 3362 行、`interactions` 756、`wasm_api.rs` 43、`renderer` 29、
+`assets.rs` 13、`state` 8；大比例不可达的还有 `settings` 74%、`utils` 68%。
+
+**边界在哪，是拿编译器问出来的，不是估的。** `editor_ui/mod.rs:63` 有一行
+`pub use ui_plugin::*;`——`ui_plugin` 就是 802 行的旧 dock 外壳。而 `plant_ui_host.rs`
+从 `editor_ui` 只拿两个常量（`MAIN_SCENE_LAYER` / `OLD_SCENE_LAYER`），它们恰好住在 `mod.rs` 里，
+于是这一行 glob 把整个旧外壳（含 `widgets` 2165 行、`theme` 1838 行）一起挂在了宿主身上，
+静态分析看上去全是活的。把这行注释掉跑一次 `cargo check`（改完立刻 `git checkout --` 还原，
+未留下改动），得到 16 个错误，边界一目了然：
+
+| 报错方 | 缺的东西 | 性质 |
+|---|---|---|
+| `editor_ui/editor_tab.rs:8`、`editor_ui/egui/mod.rs:1` | `EditorUiRef` / `EditorUiReg` / `EditorUi` | 旧 dock 自身的基础设施 |
+| 11 个插件（`console` / `e3d` / `model_review` / `review_drawing` / `material_statistic` / `pbs` / `version` / `status` / `angle_measurement` / `distance_measurement` / `measure`） | `EditorUiAppExt`、`EditorUi`、`check_main_scene_view_tab` | 全部是为了注册旧 dock 页签 |
+| **`plant_ui_host.rs`** | **零个错误** | **宿主不需要旧外壳的任何东西** |
+
+宿主对 `editor_ui` 的全部依赖就四项：`camera_plugin::focus_camera`、`shared::{...}`、
+`viewer::{interact, select}`、加那两个常量。`editor_tab` / `ui_plugin` / `widgets` / `theme`
+一个都不碰（`e3d_plugin/plugin.rs` 那句 `use ...editor_tab::EditorTab` 与两处
+`editor_tab_by_trait` 调用都在它自己的旧分支里）。
+
+**所以 M2-4 的顺序是清楚的**：旧 dock 外壳眼下唯一的消费者就是那 11 个插件的页签注册代码，
+而摘掉它们本来就是 M2-3「仅删 UI 保留逻辑」的活。**先做 M2-3，`editor_ui` 的 dock 外壳就会
+自动掉到零引用**，那时再删它不需要判断，编译器会证明。反过来先删外壳则要同时改 11 个地方。
+收尾时把那几个 scene layer 常量挪到 `consts.rs` 一类的中立位置，`editor_ui/mod.rs` 才能整个消失。
+
 ### M3 · 接回 Bevy
 
 | 任务 | 验收标准 |
