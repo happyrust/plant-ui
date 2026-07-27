@@ -1,11 +1,8 @@
-//! 字体注册（迁自 ui-next 沙盒，路径改为本项目 assets/fonts）。
-//!
-//! Monospace 家族保持 Hack 在前、中文字体只作末尾回退：ASCII 走 Hack、
-//! 汉字走 PuHuiTi，数字列才能对齐。字体不打进二进制，免得改一行 UI 重链 25 MB。
+//! plant-ui 共用字体注册。
 
 use std::sync::Arc;
 
-use eframe::egui::{FontData, FontDefinitions, FontFamily};
+use egui::{FontData, FontDefinitions, FontFamily};
 
 pub const MEDIUM: &str = "puhui-medium";
 pub const SEMIBOLD: &str = "puhui-semibold";
@@ -30,12 +27,9 @@ fn load(file: &str, warnings: &mut Vec<String>) -> Option<Vec<u8>> {
     }
 }
 
-/// 返回字体定义与告警。告警交给 App 上命令行——字面看不出缺字体，
-/// 只会觉得「字有点丑」，不上屏就没人知道。
 pub fn definitions() -> (FontDefinitions, Vec<String>) {
     let mut fonts = FontDefinitions::default();
     let mut warnings = Vec::new();
-
     let faces = [
         (REGULAR_KEY, "AlibabaPuHuiTi-2-55-Regular.ttf"),
         (MEDIUM, "AlibabaPuHuiTi-2-65-Medium.ttf"),
@@ -58,7 +52,6 @@ pub fn definitions() -> (FontDefinitions, Vec<String>) {
             .entry(FontFamily::Proportional)
             .or_default()
             .insert(0, REGULAR_KEY.to_owned());
-
         fonts
             .families
             .entry(FontFamily::Monospace)

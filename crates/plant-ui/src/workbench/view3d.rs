@@ -1,4 +1,4 @@
-//! 三维视口（M1-5：占位纹理）。
+//! 三维视口：独立壳显示占位纹理，Bevy 宿主显示实时渲染目标。
 //!
 //! 底是 `viewport-top` -> `viewport-bottom` 的竖直渐变，上面按 S1 那块「模型场景」
 //! 矩形等比裁切铺一张占位纹理（0.92 不透明）。等比裁切而不是拉伸：视口的宽高比
@@ -19,7 +19,7 @@ use crate::vm::WorkbenchVm;
 
 /// 占位纹理的不透明度，取自 S1 的「模型场景」矩形。压这么一点让渐变底透上来，
 /// 图与视口连成一片，不像贴上去的一张照片。
-const TEXTURE_ALPHA: u8 = 235;
+const PLACEHOLDER_ALPHA: u8 = 235;
 
 pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
     let (rect, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
@@ -35,9 +35,13 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
         view.texture,
         rect,
         cover_uv(rect.size(), view.size),
-        Color32::from_white_alpha(TEXTURE_ALPHA),
+        if view.live {
+            Color32::WHITE
+        } else {
+            Color32::from_white_alpha(PLACEHOLDER_ALPHA)
+        },
     );
-    hud(ui, t, d, rect);
+    hud(ui, t, d, rect, view.live);
 }
 
 /// 竖直渐变。egui 没有渐变笔刷，四个顶点各自带色的三角网格就是标准做法。
@@ -64,8 +68,7 @@ fn cover_uv(view: egui::Vec2, texture: egui::Vec2) -> Rect {
 }
 
 /// 左上角的 HUD（S1 的「HUD状态」位置与规格：距边 14、高 26、bg-elevated + 1px 边）。
-/// 内容换成实话：这是占位纹理，不是渲染出来的画面。
-fn hud(ui: &mut Ui, t: &Tokens, d: Density, view: Rect) {
+fn hud(ui: &mut Ui, t: &Tokens, d: Density, view: Rect, live: bool) {
     let inset = d.px(14.0);
     let mut child = ui.new_child(
         egui::UiBuilder::new()
@@ -85,19 +88,30 @@ fn hud(ui: &mut Ui, t: &Tokens, d: Density, view: Rect) {
             ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing.x = d.px(10.0);
                 let (dot, _) = ui.allocate_exact_size(egui::Vec2::splat(d.px(6.0)), Sense::hover());
-                ui.painter()
-                    .circle_filled(dot.center(), d.px(3.0), t.text_muted);
+                ui.painter().circle_filled(
+                    dot.center(),
+                    d.px(3.0),
+                    if live { t.success } else { t.text_muted },
+                );
                 ui.label(
-                    RichText::new("占位纹理 · 未接渲染器")
-                        .font(Font::mono_meta(d))
-                        .color(t.text_secondary),
+                    RichText::new(if live {
+                        "实时模型 · Bevy"
+                    } else {
+                        "占位纹理 · 未接渲染器"
+                    })
+                    .font(Font::mono_meta(d))
+                    .color(t.text_secondary),
                 );
                 let (div, _) = ui.allocate_exact_size(vec2(1.0, d.px(12.0)), Sense::hover());
                 ui.painter().rect_filled(div, 0, t.border);
                 ui.label(
-                    RichText::new("实时视口在 M3 接回 Bevy")
-                        .font(Font::mono_meta(d))
-                        .color(t.text_muted),
+                    RichText::new(if live {
+                        "相机渲染目标"
+                    } else {
+                        "实时视口在 M3 接回 Bevy"
+                    })
+                    .font(Font::mono_meta(d))
+                    .color(t.text_muted),
                 );
             });
         });

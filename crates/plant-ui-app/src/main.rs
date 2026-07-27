@@ -3,7 +3,6 @@
 
 mod console;
 mod data;
-mod fonts;
 mod gallery;
 mod textures;
 
@@ -12,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use console::Retry;
 use eframe::egui;
 use plant_ui::Cmd;
+use plant_ui::fonts;
 use plant_ui::style::theme_tokens::{self, set_weight_families_ready};
 use plant_ui::style::tokens::{Density, Tokens};
 use plant_ui::vm::{
@@ -170,6 +170,7 @@ impl App {
                 app.vm.view3d = Some(View3dVm {
                     texture: tex.id(),
                     size: tex.size_vec2(),
+                    live: false,
                 });
                 app._view3d_tex = Some(tex);
             }
@@ -371,7 +372,16 @@ impl App {
     }
 
     fn reconnect(&mut self) {
+        // 新连接必须从空缓存开始：否则失败时状态栏和属性仍在说旧模型已经就绪。
+        self.tree = TreeModel::default();
+        self.vm.data_source_ok = false;
+        self.vm.project.clear();
+        self.vm.db.clear();
+        self.vm.element_count = 0;
+        self.vm.selected = None;
+        self.vm.tree_reveal = None;
         self.vm.tree = TreeVm::Loading;
+        self.vm.props = PropsVm::Uninit;
         self.console.info(&mut self.vm.console, "正在重连数据源…");
         let _ = self.bridge.req.send(data::Req::Reconnect);
     }

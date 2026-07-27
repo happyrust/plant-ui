@@ -42,6 +42,8 @@ pub struct View3dVm {
     pub texture: egui::TextureId,
     /// 纹理的像素尺寸。视口要按它等比裁切铺满，不然图会被拉变形。
     pub size: egui::Vec2,
+    /// true = Bevy 相机实时渲染目标；false = 独立壳的静态占位图。
+    pub live: bool,
 }
 
 /// 命令行视图数据。
