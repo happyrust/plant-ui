@@ -368,11 +368,101 @@ impl Preview {
 
 // ================================================================ 执行契约
 
+/// `POST /api/v1/update/execute` 的 202 回执，与 gen-model 的 `ManualEnqueueReceipt` 同形。
+///
+/// 合流之后执行请求**一律入队**，回的不再是单个 task_id：一次扫描可能排下好几个库，
+/// 也可能一行都没排（都并进了既有排队行，或者水位本来就最新）。「已有任务在跑 · 409」
+/// 那一格随之退役——执行请求不会再被拒。进度去「任务队列」视图看。
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct Accepted {
+pub struct Enqueued {
+    #[serde(default)]
+    pub project: String,
+    /// 本次扫描到的候选 dbnum 数（含已是最新的与被阻断的）。
+    #[serde(default)]
+    pub scanned: usize,
+    /// 新排的行，含接在运行中批次之后的那种。
+    #[serde(default)]
+    pub enqueued: Vec<EnqueuedBatch>,
+    /// 并入既有排队行的：目标会话号被推高，不另开一行。
+    #[serde(default)]
+    pub merged: Vec<EnqueuedBatch>,
+    /// 已被既有排队行覆盖、无需动作的 dbnum。
+    #[serde(default)]
+    pub already_covered: Vec<u32>,
+    /// 阻断的库压根不入队，队列里不会有它们的行——这里是唯一说得出
+    /// 「它为什么没排上」的地方。
+    #[serde(default)]
+    pub blocked: Vec<BlockedDbnum>,
+    #[serde(default)]
+    pub up_to_date: usize,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct EnqueuedBatch {
     pub task_id: String,
-    pub kind: String,
-    pub state: String,
+    pub dbnum: u32,
+    #[serde(default)]
+    pub db_type: String,
+    /// 排队中的位置（1 起；运行中的行不占位置）。
+    #[serde(default)]
+    pub position: usize,
+    #[serde(default)]
+    pub start_sesno: i32,
+    #[serde(default)]
+    pub end_sesno: i32,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BlockedDbnum {
+    pub dbnum: u32,
+    #[serde(default)]
+    pub reason: String,
+}
+
+impl Enqueued {
+    /// 一句能写进日志的回执。入队、并入、阻断三件事分开说——它们的出路不一样：
+    /// 排上的等着跑，并入的已经在别人那一行里，阻断的要人去处理文件。
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.enqueued.is_empty() {
+            let list = self
+                .enqueued
+                .iter()
+                .map(|b| format!("db{} 排第 {} 位", b.dbnum, b.position))
+                .collect::<Vec<_>>()
+                .join("、");
+            parts.push(format!("已入队 {} 个数据批次（{list}）", self.enqueued.len()));
+        }
+        if !self.merged.is_empty() {
+            let list = self
+                .merged
+                .iter()
+                .map(|b| format!("db{}", b.dbnum))
+                .collect::<Vec<_>>()
+                .join("、");
+            parts.push(format!("{} 个并入已排队的批次（{list}）", self.merged.len()));
+        }
+        if !self.blocked.is_empty() {
+            let list = self
+                .blocked
+                .iter()
+                .map(|b| format!("db{}：{}", b.dbnum, b.reason))
+                .collect::<Vec<_>>()
+                .join("；");
+            parts.push(format!("{} 个阻断未入队（{list}）", self.blocked.len()));
+        }
+        if parts.is_empty() {
+            return format!(
+                "扫描 {} 个库，没有需要入队的批次：{} 个已是最新，{} 个已被排队中的批次覆盖",
+                self.scanned,
+                self.up_to_date,
+                self.already_covered.len()
+            );
+        }
+        format!("扫描 {} 个库；{}", self.scanned, parts.join("；"))
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -403,7 +493,11 @@ impl Run {
     }
 }
 
-/// 一次运行的结果摘要，与 gen-model 的 `ManualUpdateResult` 同形。
+/// 一个数据批次的结果摘要，与 gen-model 的 `DataBatchTaskResult` 同形。
+///
+/// **`batch` 是单数**：合流之后一个任务就是一个数据批次，「一次运行装着几个批次」
+/// 那种形状随「运行」一并退役（ADR-0011）。解成数组的话字段名对不上、又带
+/// `serde(default)`，会静默解成空——界面上看不出任何异样，摘要却整块空掉。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Outcome {
     #[serde(default)]
@@ -411,7 +505,7 @@ pub struct Outcome {
     #[serde(default)]
     pub status: RunStatus,
     #[serde(default)]
-    pub batches: Vec<BatchResult>,
+    pub batch: Option<BatchResult>,
     #[serde(default)]
     pub units: Vec<UnitResult>,
     #[serde(default)]
@@ -2253,16 +2347,16 @@ fn outcome_body(
         });
     };
     let applied = outcome
-        .batches
+        .batch
         .iter()
         .filter(|b| b.status == BatchStatus::Applied)
         .count();
     let failed_batches = outcome
-        .batches
+        .batch
         .iter()
         .filter(|b| b.status == BatchStatus::Failed)
         .count();
-    let skipped = outcome.batches.len() - applied - failed_batches;
+    let skipped = outcome.batch.iter().count() - applied - failed_batches;
     let failed_units: Vec<&UnitResult> = outcome
         .units
         .iter()
@@ -2310,14 +2404,14 @@ fn outcome_body(
             "阶段一 · 数据批次",
             &format!("{applied} 已应用 · {skipped} 阻断 · {failed_batches} 失败"),
             |ui| {
-                if outcome.batches.is_empty() {
+                if outcome.batch.is_none() {
                     ui.label(
                         RichText::new("这次没有数据批次（只跑了模型重试）。")
                             .font(Font::meta(d))
                             .color(t.text_muted),
                     );
                 }
-                for b in &outcome.batches {
+                if let Some(b) = &outcome.batch {
                     let (dot, note, color) = match b.status {
                         BatchStatus::Applied => (
                             Dot::Tone(t.success),
@@ -3360,20 +3454,21 @@ mod tests {
         );
     }
 
-    /// 结果摘要按契约字段名解。`status` 是 snake_case 的串，不是数字。
+    /// 结果摘要按契约字段名解。`status` 是 snake_case 的串，不是数字；
+    /// **`batch` 是单数**——合流之后一个任务就是一个数据批次。
     #[test]
     fn outcome_decodes_the_partial_terminal_contract() {
         let run: Run = serde_json::from_str(
             r#"{
-                "task_id":"mu-3c81","kind":"manual_update","state":"partial",
+                "task_id":"db-8000-7","kind":"data_batch","state":"partial",
                 "project":"AMS-8009","created_at":"2026-07-27T10:00:00+08:00",
                 "finished_at":"2026-07-27T10:04:38+08:00","events_seen":31,
                 "result":{
                     "project":"AMS-8009","status":"partial",
-                    "batches":[{"dbnum":8000,"db_type":"DESI","file_path":"a",
+                    "batch":{"dbnum":8000,"db_type":"DESI","file_path":"a",
                         "start_sesno":1024,"end_sesno":1034,"status":"applied",
                         "message":null,"merged_sesnos":[1032,1033,1034],
-                        "changed_elements":512}],
+                        "changed_elements":512},
                     "units":[{"dbnum":8000,"root_refno":"24381/2","noun":"EQUI",
                         "status":"failed","attempts":3,"message":"写入生成结果失败"}],
                     "warnings":["14 个变更无法解析合法生成根，跳过模型生成"]
@@ -3385,11 +3480,39 @@ mod tests {
         assert!(run.terminal());
         let outcome = run.result.expect("终态必须带结果摘要");
         assert_eq!(outcome.status, RunStatus::Partial);
-        assert_eq!(outcome.batches[0].status, BatchStatus::Applied);
-        assert_eq!(outcome.batches[0].merged_sesnos, vec![1032, 1033, 1034]);
+        let batch = outcome.batch.expect("数据批次摘要必须解得出来");
+        assert_eq!(batch.status, BatchStatus::Applied);
+        assert_eq!(batch.merged_sesnos, vec![1032, 1033, 1034]);
         assert_eq!(outcome.units[0].status, UnitStatus::Failed);
         assert_eq!(outcome.units[0].attempts, 3);
         // ADR-0007 的四个计数还没有，缺了不该让整个任务详情解不出来。
         assert_eq!(run.total_units, None);
+    }
+
+    /// 入队回执是数组不是单个 task_id：一次扫描可能排下好几个库，也可能一行都没排。
+    /// 解成旧的 `{task_id, kind, state}` 会**直接反序列化失败**，界面落到一个
+    /// 看不懂的 internal 错误页——这正是合流之后向导那枚按钮坏掉的形态。
+    #[test]
+    fn execute_returns_an_enqueue_receipt_not_a_single_task() {
+        let receipt: Enqueued = serde_json::from_str(
+            r#"{"project":"AMS-8009","scanned":3,
+                "enqueued":[{"task_id":"db-7997-1","dbnum":7997,"db_type":"DESI",
+                    "position":1,"start_sesno":1024,"end_sesno":1038}],
+                "merged":[{"task_id":"db-8000-2","dbnum":8000,"db_type":"DESI",
+                    "position":2,"start_sesno":812,"end_sesno":830}],
+                "already_covered":[],
+                "blocked":[{"dbnum":8003,"reason":"文件回退 812 < 已应用 1005"}],
+                "up_to_date":1,"warnings":[]}"#,
+        )
+        .expect("入队回执应当能解出来");
+        let summary = receipt.summary();
+        assert!(summary.contains("db7997 排第 1 位"), "{summary}");
+        assert!(summary.contains("1 个并入已排队的批次"), "{summary}");
+        assert!(summary.contains("db8003：文件回退"), "{summary}");
+
+        // 一行都没排也要说得清是为什么——不然人只会以为按钮没反应。
+        let idle: Enqueued =
+            serde_json::from_str(r#"{"scanned":3,"up_to_date":3}"#).expect("空回执也要解得出来");
+        assert!(idle.summary().contains("没有需要入队的批次"));
     }
 }

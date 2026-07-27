@@ -18,19 +18,22 @@ use logs::Retry;
 use plant_ui::Cmd;
 use plant_ui::data_publish::{self, State as DataPublishState};
 use plant_ui::fonts;
+// `Run` / `RunVm` 已经没有构造点了：合流之后执行请求一律入队，向导不再跟着某一次
+// 运行走，第三步对新服务端已经走不到——那一步连同这两个类型随「砍第三步」一起退役
+// （rollout 客户端第 3 项、第八节第 6 条）。
 use plant_ui::model_update::{
-    self, Feed as ModelUpdateFeed, Run as ModelUpdateRun, RunVm as ModelUpdateRunVm,
-    State as ModelUpdateState, Vm as ModelUpdateVm,
+    self, Feed as ModelUpdateFeed, State as ModelUpdateState, Vm as ModelUpdateVm,
 };
 use plant_ui::project_picker::{self, State as ProjectPickerState};
 use plant_ui::settings::{self, State as SettingsState};
+use plant_ui::task_queue;
 use plant_ui::style::theme_tokens::{self, set_weight_families_ready};
 use plant_ui::style::tokens::{Density, Tokens};
 use plant_ui::vm::{
     CommandLineKind, CommandLineVm, LogElement, PropKind, PropRowVm, PropsDataVm, PropsVm,
     RowVisibility, Selection, TreeRowVm, TreeVm, View3dVm, WorkbenchVm,
 };
-use plant_ui::workbench::{self, WorkbenchState};
+use plant_ui::workbench::{self, Pane, WorkbenchState};
 use plant_ui_data::{EleTreeNode, RefU64};
 
 fn main() -> eframe::Result {
@@ -192,6 +195,12 @@ struct App {
     model_feed: Option<model_update_ws::Feed>,
     last_model_poll: Instant,
     pending_model_polls: HashSet<String>,
+    /// 任务队列视图的数据。它不跟着任何一次运行走——队列是常驻的，进程活着它就在。
+    queue: task_queue::Vm,
+    /// 队列的明细长连接：订阅全部任务，逐条带 task_id 回来。
+    queue_feed: Option<model_update_ws::Feed>,
+    last_queue_poll: Instant,
+    queue_poll_pending: bool,
     /// 已经发出去还没回来的那次取回工作。菜单点快了不该排成一串重查。
     get_work_pending: bool,
     bridge: data::Bridge,
@@ -202,6 +211,12 @@ struct App {
 }
 
 const COMMAND_CAP: usize = 2000;
+
+/// 队列里有活在跑时的轮询节奏，与 ADR-0005 / 0007 给进度定的那一拍一致。
+const QUEUE_POLL_BUSY: Duration = Duration::from_secs(1);
+/// 队列全空时降到这一档。一份最多 200 条的任务表每秒拉一遍、只为看几行不会动的
+/// 历史，不值当；有活时 WS 的起讫信封还会把轮询提前叫醒。
+const QUEUE_POLL_IDLE: Duration = Duration::from_secs(5);
 
 impl App {
     fn new(ctx: egui::Context, font_warnings: Vec<String>) -> Self {
@@ -227,12 +242,20 @@ impl App {
             model_feed: None,
             last_model_poll: Instant::now(),
             pending_model_polls: HashSet::new(),
+            queue: task_queue::Vm::default(),
+            queue_feed: None,
+            // 开机就欠一拍：第一帧立刻去取第一份快照，别让面板空等一秒。
+            last_queue_poll: Instant::now() - QUEUE_POLL_BUSY,
+            queue_poll_pending: false,
             get_work_pending: false,
             bridge: data::spawn(ctx.clone()),
             tree: TreeModel::default(),
             logs: logs::LogBuffer::default(),
             _view3d_tex: None,
         };
+        // 队列的明细通道进程一起来就开：队列是常驻视图，不像向导那样跟着某一次
+        // 运行开合。连不上不影响队列行本身——那些走轮询，断的只是逐单元明细。
+        app.reopen_queue_feed(&ctx);
         for w in font_warnings {
             app.logs.warn(&mut app.vm.logs, w);
         }
@@ -255,7 +278,7 @@ impl App {
         app
     }
 
-    fn pump_events(&mut self, ctx: &egui::Context) {
+    fn pump_events(&mut self) {
         let mut dirty = false;
         while let Ok(evt) = self.bridge.evt.try_recv() {
             match evt {
@@ -365,38 +388,37 @@ impl App {
                         self.model_update = ModelUpdateVm::Failed(failure);
                     }
                 },
-                data::Evt::ModelUpdateExecute(result) => match result {
-                    Ok(accepted) => {
-                        self.logs.info(
-                            &mut self.vm.logs,
-                            format!("模型增量更新任务已提交：{}", accepted.task_id),
-                        );
-                        self.last_model_poll = Instant::now() - Duration::from_secs(1);
-                        // 明细通道跟着运行实例开；终态时 `poll_model_update` 里丢掉它。
-                        self.model_feed = Some(model_update_ws::Feed::open(
-                            &self.model_api_url,
-                            accepted.task_id.clone(),
-                            self.bridge.evt_tx.clone(),
-                            ctx.clone(),
-                        ));
-                        self.model_update = ModelUpdateVm::Running(Box::new(ModelUpdateRunVm {
-                            run: ModelUpdateRun {
-                                task_id: accepted.task_id,
-                                kind: accepted.kind,
-                                state: accepted.state,
-                                project: self.vm.project.clone(),
-                                ..Default::default()
-                            },
-                            ..Default::default()
-                        }));
+                // 「扫描 + 入队」的回执。执行请求一律入队，回的是一组批次而不是
+                // 一个 task_id，所以这里不再开运行实例——进度在任务队列视图上。
+                data::Evt::ModelUpdateExecute(result) => {
+                    // 只有向导发起的那次才动向导：队列面板上的「立刻扫一遍」打的是
+                    // 同一个接口，但它不该把人手上那份预览清掉。
+                    let from_wizard = matches!(self.model_update, ModelUpdateVm::Starting);
+                    match result {
+                        Ok(receipt) => {
+                            self.logs
+                                .info(&mut self.vm.logs, receipt.summary());
+                            for warning in &receipt.warnings {
+                                self.logs
+                                    .warn(&mut self.vm.logs, format!("入队告警：{warning}"));
+                            }
+                            if from_wizard {
+                                self.model_update = ModelUpdateVm::Idle;
+                                self.model_update_state.open = false;
+                                self.state.focus(Pane::TaskQueue);
+                            }
+                            self.poll_queue_now();
+                        }
+                        Err(error) => {
+                            let failure = model_update_api::failure_of(&error);
+                            self.logs
+                                .error(&mut self.vm.logs, "提交模型增量更新失败", &error, None);
+                            if from_wizard {
+                                self.model_update = ModelUpdateVm::Failed(failure);
+                            }
+                        }
                     }
-                    Err(error) => {
-                        let failure = model_update_api::failure_of(&error);
-                        self.logs
-                            .error(&mut self.vm.logs, "提交模型增量更新失败", &error, None);
-                        self.model_update = ModelUpdateVm::Failed(failure);
-                    }
-                },
+                }
                 data::Evt::ModelUpdateTask(run_id, result) => {
                     self.pending_model_polls.remove(&run_id);
                     // 只认「这一轮刚跨进终态」这一次。终态之后轮询还会再来几拍，
@@ -502,6 +524,41 @@ impl App {
                         // 没收到收尾事件的行现在说不清做没做完，别再显示「进行中」。
                         session.progress.mark_unknown();
                     }
+                }
+                data::Evt::QueuePoll(result) => {
+                    self.queue_poll_pending = false;
+                    match result {
+                        Ok(poll) => {
+                            self.queue.project = self.vm.project.clone();
+                            self.queue.adopt(poll);
+                        }
+                        // 上一份快照留在界面上，横幅把「这份是旧的」说出来。
+                        Err(error) => self.queue.error = Some(logs::error_chain(&error)),
+                    }
+                    self.vm.queue = task_queue::status(&self.queue);
+                }
+                data::Evt::QueueSetPaused(paused, result) => match result {
+                    Ok(()) => {
+                        let text = if paused {
+                            "队列已暂停：不再出队；正在跑的那一批会跑完为止"
+                        } else {
+                            "队列已恢复出队"
+                        };
+                        self.logs.info(&mut self.vm.logs, text);
+                        self.poll_queue_now();
+                    }
+                    Err(error) => {
+                        let what = if paused { "暂停队列失败" } else { "恢复队列失败" };
+                        self.logs.error(&mut self.vm.logs, what, &error, None);
+                    }
+                },
+                data::Evt::QueueProgress(task_id, event) => self.queue.apply(&task_id, event),
+                data::Evt::QueueTaskChanged => self.poll_queue_now(),
+                data::Evt::QueueFeedLive => self.queue.feed = ModelUpdateFeed::Live,
+                data::Evt::QueueFeedDown(reason) => {
+                    self.queue.feed = ModelUpdateFeed::Down(reason);
+                    // 没收到收尾事件的明细行说不清做没做完，别再显示「生成中」。
+                    self.queue.mark_unknown();
                 }
             }
         }
@@ -623,6 +680,21 @@ impl App {
                         format!("已请求重新生成交付单元 {root_refno}"),
                     );
                 }
+                // 与「确认执行」打同一个接口。它不插队，作用只是别等服务端下一个
+                // 30 秒轮询——回执照样进日志，进度在队列面板上。
+                Cmd::ScanNow => {
+                    let _ = self.bridge.req.send(data::Req::ModelUpdateExecute {
+                        base: self.model_api_url.clone(),
+                        project: self.vm.project.clone(),
+                    });
+                }
+                Cmd::SetQueuePaused(paused) => {
+                    let _ = self.bridge.req.send(data::Req::QueueSetPaused {
+                        base: self.model_api_url.clone(),
+                        paused,
+                    });
+                }
+                Cmd::ReconnectQueueFeed => self.reopen_queue_feed(ctx),
                 // 独立壳没有渲染器，`view3d.live` 恒为 false，树菜单、视口工具栏、
                 // 相机手势与渲染目标改尺寸都不会露头（占位图是磁盘上那张，改不得）。
                 // 这几支留成明确的空实现，不写日志装作做了事。
@@ -872,10 +944,50 @@ impl App {
         let task_id = session.run.task_id.clone();
         self.model_feed = Some(model_update_ws::Feed::open(
             &self.model_api_url,
-            task_id,
+            model_update_ws::Scope::Run(task_id),
             self.bridge.evt_tx.clone(),
             ctx.clone(),
         ));
+    }
+
+    /// 重开队列的明细通道。断线期间的事件不会补发，所以重连只让后续的行重新流进来，
+    /// 已经缺掉的那些补不回，界面上「落后 N 条」照旧成立。
+    fn reopen_queue_feed(&mut self, ctx: &egui::Context) {
+        self.queue.feed = ModelUpdateFeed::Connecting;
+        self.queue_feed = Some(model_update_ws::Feed::open(
+            &self.model_api_url,
+            model_update_ws::Scope::Queue,
+            self.bridge.evt_tx.clone(),
+            ctx.clone(),
+        ));
+    }
+
+    /// 让下一帧立刻去取一份新快照。按下暂停 / 入队之后等满一拍再刷新，界面会有
+    /// 一秒钟在说刚被推翻的话。
+    fn poll_queue_now(&mut self) {
+        self.last_queue_poll = Instant::now() - QUEUE_POLL_IDLE;
+    }
+
+    /// 队列轮询。队列是常驻视图，这一拍从进程起来一直打到关窗——状态栏那格计数
+    /// 就是靠它在面板折起时仍然叫得住人。
+    ///
+    /// 有活在跑时一秒一拍（行上的「已用 01:12」也要靠这一拍走字），全空时降到五秒。
+    fn poll_queue(&mut self, ctx: &egui::Context) {
+        let busy = !self.queue.queue.rows.is_empty();
+        let every = if busy {
+            QUEUE_POLL_BUSY
+        } else {
+            QUEUE_POLL_IDLE
+        };
+        ctx.request_repaint_after(every);
+        if self.queue_poll_pending || self.last_queue_poll.elapsed() < every {
+            return;
+        }
+        self.last_queue_poll = Instant::now();
+        self.queue_poll_pending = true;
+        let _ = self.bridge.req.send(data::Req::QueuePoll {
+            base: self.model_api_url.clone(),
+        });
     }
 
     fn poll_model_update(&mut self, ctx: &egui::Context) {
@@ -997,10 +1109,10 @@ fn db_label(ns: &str, db_nums: &[u32]) -> String {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.pump_events(ui.ctx());
+        self.pump_events();
         let t = theme_tokens::current();
         let d = self.settings_state.saved.density;
-        let mut cmds = workbench::show(ui, &t, d, &self.vm, &mut self.state);
+        let mut cmds = workbench::show(ui, &t, d, &self.vm, &self.queue, &mut self.state);
         cmds.extend(data_publish::show(
             ui.ctx(),
             &t,
@@ -1024,13 +1136,21 @@ impl eframe::App for App {
         ));
         if let Some(saved) = settings::show(ui.ctx(), &t, d, &mut self.settings_state) {
             theme_tokens::apply(ui.ctx(), &saved.theme.tokens(), saved.density);
+            let moved = self.model_api_url != saved.model_api_url;
             self.model_api_url = saved.model_api_url;
+            // 换了服务地址，那条长连接还挂在旧地址上——不重开的话队列明细会一直
+            // 指着一台没人管的服务。
+            if moved {
+                self.reopen_queue_feed(ui.ctx());
+                self.poll_queue_now();
+            }
             ui.ctx().request_repaint();
         }
         // 定位请求只管一帧：树刚才已经滚过去了，绘制层只读、消费不掉自己。
         self.vm.tree_reveal = None;
         self.handle_cmds(ui.ctx(), cmds);
         self.poll_model_update(ui.ctx());
+        self.poll_queue(ui.ctx());
         // 这一帧才记下的定位要等下一帧才画得出来，别让界面停在这儿等下一次输入。
         if self.vm.tree_reveal.is_some() {
             ui.ctx().request_repaint();

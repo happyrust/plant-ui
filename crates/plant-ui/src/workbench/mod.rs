@@ -36,15 +36,19 @@ pub fn noun_icon(noun: &str) -> &'static str {
     }
 }
 
-/// 外壳持久状态（dock 布局）。属于界面本身而非数据，所以不进 Vm。
+/// 外壳持久状态（dock 布局 + 各视图自己的绘制状态）。属于界面本身而非数据，
+/// 所以不进 Vm。
 pub struct WorkbenchState {
     dock: DockState<Pane>,
     command: command_line::State,
+    queue: crate::task_queue::State,
 }
 
 impl Default for WorkbenchState {
     fn default() -> Self {
         // 中央三维视图，左 19% 模型树，右侧属性，底部命令行 40% + 日志 60%。
+        // 任务队列与日志同一排页签：两者都是「余光扫一眼」的监控面，而命令行要
+        // 和它们同时看得见，所以不并进同一格（画板 S12 的页签条同此分组）。
         let mut dock = DockState::new(vec![Pane::View3d]);
         {
             let surface = dock.main_surface_mut();
@@ -52,11 +56,26 @@ impl Default for WorkbenchState {
                 surface.split_left(NodeIndex::root(), 0.19, vec![Pane::ModelTree]);
             let [center, _right] = surface.split_right(center, 0.76, vec![Pane::Properties]);
             let [_center, bottom] = surface.split_below(center, 0.7, vec![Pane::CommandLine]);
-            let [_command, _logs] = surface.split_right(bottom, 0.4, vec![Pane::Logs]);
+            let [_command, _logs] =
+                surface.split_right(bottom, 0.4, vec![Pane::Logs, Pane::TaskQueue]);
         }
         Self {
             dock,
             command: command_line::State::default(),
+            queue: crate::task_queue::State::default(),
+        }
+    }
+}
+
+impl WorkbenchState {
+    /// 把某个常驻视图切到前台。
+    ///
+    /// 「确认执行」按下之后要能自己跳到任务队列——按完一个不可撤销的按钮还得自己
+    /// 去找页签，等于没说清进度在哪看（ADR-0011）。找不到那个视图就什么也不做：
+    /// 用户可以把页签拖走，那是他的布局。
+    pub fn focus(&mut self, pane: Pane) {
+        if let Some(path) = self.dock.find_tab(&pane) {
+            let _ = self.dock.set_active_tab(path);
         }
     }
 }
@@ -68,6 +87,7 @@ pub fn show(
     t: &Tokens,
     d: Density,
     vm: &WorkbenchVm,
+    queue: &crate::task_queue::Vm,
     state: &mut WorkbenchState,
 ) -> Vec<Cmd> {
     let mut cmds = Vec::new();
@@ -92,12 +112,18 @@ pub fn show(
         .frame(egui::Frame::NONE)
         .show(ui, |ui| {
             let style = panes::dock_style(ui, t, d);
-            let WorkbenchState { dock, command } = state;
+            let WorkbenchState {
+                dock,
+                command,
+                queue: queue_state,
+            } = state;
             let mut viewer = panes::Viewer {
                 t,
                 d,
                 vm,
+                queue,
                 command,
+                queue_state,
                 cmds: &mut cmds,
             };
             DockArea::new(dock)

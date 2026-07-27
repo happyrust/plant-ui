@@ -1,7 +1,11 @@
 //! dock 视图：常驻视图枚举、egui_dock 样式与页签内容分发。
 //!
-//! dock 包含模型树 / 三维视图 / 命令行 / 日志 / 属性五个常驻视图，
+//! dock 包含模型树 / 三维视图 / 命令行 / 日志 / 属性 / 任务队列六个常驻视图，
 //! 一次性任务走任务窗（M4），不再和常驻视图挤同一排页签。
+//!
+//! 任务队列是常驻而不是任务窗：向导是人主动发起、用完就关，队列一直在跑
+//! ——「方便看到某个 dbnum 的进展」这句话里的「方便」，基本上把「得先点开一个
+//! 浮窗」排除了（`docs/adr/0011`）。
 //!
 //! 已知与设计稿的偏差：egui_dock 的 Style 表达不了「激活页签顶部 2px 强调条」，
 //! 这里用「激活页签底色与面板底色合并」表达；自绘页签是后续单独的增强项。
@@ -21,6 +25,7 @@ pub enum Pane {
     CommandLine,
     Logs,
     Properties,
+    TaskQueue,
 }
 
 impl Pane {
@@ -31,6 +36,7 @@ impl Pane {
             Pane::CommandLine => (ph::TERMINAL_WINDOW, "命令行"),
             Pane::Logs => (ph::LIST_DASHES, "日志"),
             Pane::Properties => (ph::SLIDERS_HORIZONTAL, "属性"),
+            Pane::TaskQueue => (ph::LIST_CHECKS, "任务队列"),
         }
     }
 }
@@ -90,7 +96,9 @@ pub struct Viewer<'a> {
     pub t: &'a Tokens,
     pub d: Density,
     pub vm: &'a WorkbenchVm,
+    pub queue: &'a crate::task_queue::Vm,
     pub command: &'a mut super::command_line::State,
+    pub queue_state: &'a mut crate::task_queue::State,
     pub cmds: &'a mut Vec<Cmd>,
 }
 
@@ -111,6 +119,14 @@ impl TabViewer for Viewer<'_> {
             }
             Pane::Logs => super::logs::show(ui, self.t, self.d, self.vm, self.cmds),
             Pane::View3d => super::view3d::show(ui, self.t, self.d, self.vm, self.cmds),
+            Pane::TaskQueue => crate::task_queue::show(
+                ui,
+                self.t,
+                self.d,
+                self.queue,
+                self.queue_state,
+                self.cmds,
+            ),
         }
     }
 

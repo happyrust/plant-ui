@@ -210,6 +210,8 @@ pub fn status_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
                     ),
                 };
 
+                queue_count(ui, t, d, vm);
+
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(
                         RichText::new(vm.element_count.to_string())
@@ -224,6 +226,42 @@ pub fn status_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
                 });
             });
         });
+}
+
+/// 队列计数。队列视图被折起时由它叫住人，**不重复面板上的明细**——同一组数字
+/// 两处渲染就是两处维护。
+///
+/// 还没读到过快照就整格不画：「队列 0」与「还没拿到第一份快照」是两句话，
+/// 摆一个假的 0 会让人以为没活可干。
+fn queue_count(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
+    let queue = vm.queue;
+    if !queue.known {
+        return;
+    }
+    divider(ui, t, d);
+    meta_icon(ui, d, ph::LIST_CHECKS, t.accent);
+    let text = if queue.paused {
+        format!("队列 {} · 已暂停", queue.active)
+    } else {
+        format!("队列 {}", queue.active)
+    };
+    ui.label(
+        RichText::new(text)
+            .font(Font::micro(d))
+            .color(if queue.paused {
+                t.warn
+            } else {
+                t.text_secondary
+            }),
+    );
+    // 跨项目过滤不许无声：不然人会对着一块空面板怀疑服务没连上。
+    if queue.filtered_out > 0 {
+        ui.label(
+            RichText::new(format!("已过滤 {} 条其它项目条目", queue.filtered_out))
+                .font(Font::micro(d))
+                .color(t.text_muted),
+        );
+    }
 }
 
 // ---------------------------------------------------------------- 小零件

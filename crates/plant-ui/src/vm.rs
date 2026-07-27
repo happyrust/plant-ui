@@ -43,6 +43,22 @@ pub struct WorkbenchVm {
     /// 三维视口的画面（M1-5 是占位纹理，M3 换成 Bevy 的渲染目标）。
     /// `None` = 还没有可画的东西。
     pub view3d: Option<View3dVm>,
+    /// 任务队列在状态栏上的那一格。
+    pub queue: QueueStatusVm,
+}
+
+/// 状态栏上的队列计数。队列视图被折起时由它叫住人，**不重复面板上的明细**
+/// ——同一组数字两处渲染就是两处维护。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct QueueStatusVm {
+    /// 还没干完的行数：运行中 + 排队中。
+    pub active: usize,
+    pub paused: bool,
+    /// 快照里属于别的项目、因此没画上去的条目数。跨项目过滤不许无声——
+    /// 不然人会对着一块空面板怀疑服务没连上。
+    pub filtered_out: usize,
+    /// 读到过队列快照没有。没有的话这一格整个不画，不摆一个假的 0。
+    pub known: bool,
 }
 
 /// 模型树的选择集。有序：批量动作的日志文案与将来的导出都要复现用户点选的先后。

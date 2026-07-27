@@ -11,3 +11,5 @@ egui-phosphor.workspace = true
 aios_core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# 队列行的「已排 / 已用」要拿服务端给的 RFC3339 时刻减本地现在，绘制层自己解一次
+chrono.workspace = true

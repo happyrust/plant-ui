@@ -6,7 +6,8 @@
 
 use std::sync::mpsc;
 
-use plant_ui::model_update::{Accepted, Preview, ProgressEvent, Run};
+use plant_ui::model_update::{Enqueued, Preview, ProgressEvent, Run};
+use plant_ui::task_queue::Poll as QueuePoll;
 use plant_ui_data::{EleTreeNode, RefU64};
 
 pub enum Req {
@@ -42,6 +43,10 @@ pub enum Req {
     GetWork { branches: Vec<RefU64> },
     /// 读一次设计库水位，给取回工作旁边那行提示用。
     PendingSessions,
+    /// 队列面板的一次轮询（队列快照 + 任务表 + health + 持久欠账）。
+    QueuePoll { base: String },
+    /// 暂停 / 恢复出队。
+    QueueSetPaused { base: String, paused: bool },
 }
 
 /// 一次取回工作重新查回来的那部分树。
@@ -68,7 +73,8 @@ pub enum Evt {
     Props(RefU64, anyhow::Result<Vec<plant_ui_data::Attr>>),
     ResolvedName(String, anyhow::Result<Option<RefU64>>),
     ModelUpdatePreview(anyhow::Result<Preview>),
-    ModelUpdateExecute(anyhow::Result<Accepted>),
+    /// 「扫描 + 入队」的回执。合流之后它不再是单个 task_id。
+    ModelUpdateExecute(anyhow::Result<Enqueued>),
     ModelUpdateTask(String, anyhow::Result<Run>),
     /// 单元重生成的回执。成功与否只进命令行日志——终态摘要是服务端那份，
     /// 不在本端就地改写它。
@@ -81,6 +87,16 @@ pub enum Evt {
     ModelUpdateProgress(ProgressEvent),
     ModelUpdateFeedLive,
     ModelUpdateFeedDown(String),
+    /// 队列面板的一次轮询结果。四份数据一起换代，不留自相矛盾的中间态。
+    QueuePoll(anyhow::Result<QueuePoll>),
+    /// 暂停 / 恢复的回执。真值仍以下一次轮询的快照为准，这里只负责把失败说出来。
+    QueueSetPaused(bool, anyhow::Result<()>),
+    /// 队列视图的逐单元明细，带发生在哪个任务上。
+    QueueProgress(String, ProgressEvent),
+    /// 有任务起讫。只当醒钟用：叫轮询早一拍去取，不拿它改行状态。
+    QueueTaskChanged,
+    QueueFeedLive,
+    QueueFeedDown(String),
 }
 
 pub struct Bridge {
@@ -201,6 +217,28 @@ pub fn spawn(ctx: egui::Context) -> Bridge {
                             let result = plant_ui_data::pending_sessions().await;
                             let _ = evt_tx.send(Evt::PendingSessions(result));
                             ctx.request_repaint();
+                        }
+                        // 队列轮询与暂停都是纯 HTTP，另起线程发：它们跟 SurrealDB
+                        // 那条链路没关系，排在同一个队列里会被一次慢查询挡住。
+                        Req::QueuePoll { base } => {
+                            let tx = evt_tx.clone();
+                            let repaint = ctx.clone();
+                            std::thread::spawn(move || {
+                                let _ = tx.send(Evt::QueuePoll(
+                                    crate::model_update_api::poll_queue(&base),
+                                ));
+                                repaint.request_repaint();
+                            });
+                        }
+                        Req::QueueSetPaused { base, paused } => {
+                            let tx = evt_tx.clone();
+                            let repaint = ctx.clone();
+                            std::thread::spawn(move || {
+                                let result =
+                                    crate::model_update_api::set_queue_paused(&base, paused);
+                                let _ = tx.send(Evt::QueueSetPaused(paused, result));
+                                repaint.request_repaint();
+                            });
                         }
                         Req::EnsureModel { base, root_refno } => {
                             let tx = evt_tx.clone();

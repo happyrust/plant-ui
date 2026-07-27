@@ -2,7 +2,8 @@ use anyhow::Context;
 use serde::de::DeserializeOwned;
 use std::time::Duration;
 
-use plant_ui::model_update::{Accepted, Failure, Preview, Run};
+use plant_ui::model_update::{Enqueued, Failure, Preview, Run};
+use plant_ui::task_queue::{Health, PendingUnits, Poll, QueueSnapshot, TaskList};
 
 /// 服务端的统一错误包封 `{ code, message, detail }`（`web_service/mod.rs` 的 `ApiError`）。
 ///
@@ -47,7 +48,9 @@ pub fn preview(base: &str, project: &str) -> anyhow::Result<Preview> {
     )
 }
 
-pub fn execute(base: &str, project: &str) -> anyhow::Result<Accepted> {
+/// 扫描 + 入队。合流之后它**一律入队**，回执是入队的批次数组而不是单个 task_id
+/// ——进度去任务队列视图看（ADR-0011）。
+pub fn execute(base: &str, project: &str) -> anyhow::Result<Enqueued> {
     post(
         base,
         "/api/v1/update/execute",
@@ -57,11 +60,50 @@ pub fn execute(base: &str, project: &str) -> anyhow::Result<Accepted> {
 }
 
 pub fn task(base: &str, run_id: &str) -> anyhow::Result<Run> {
+    get(base, &format!("/api/v1/tasks/{run_id}"))
+}
+
+/// 队列面板的一次轮询。
+///
+/// 四个只读接口打包成一次往返再一起交出去：分开更新会出现「队列已经空了、顶栏
+/// 摘要还说有一条在跑」这种自相矛盾的中间态。
+///
+/// 分工是定死的——**排队与运行中的行以 `/queue` 为准**（那一份不封顶，287 行也全在），
+/// `/tasks` 只补计时、单元计数与终态历史，它服务端那边 `limit` 钳到 200。
+pub fn poll_queue(base: &str) -> anyhow::Result<Poll> {
+    let queue: QueueSnapshot = get(base, "/api/v1/queue")?;
+    let tasks: TaskList = get(base, "/api/v1/tasks?limit=200")?;
+    // 后两份取不到不该让整次轮询作废：队列行已经在手上了，缺的只是「队列已重建」
+    // 横幅与「欠 N 个单元」，各自缺席时那一格不画就是了。
+    let health = get::<Health>(base, "/api/v1/health").ok();
+    let pending = get::<PendingUnits>(base, "/api/v1/update/pending-units")
+        .map(|p| p.units)
+        .unwrap_or_default();
+    Ok(Poll {
+        queue,
+        tasks: tasks.tasks,
+        health,
+        pending,
+    })
+}
+
+/// 暂停 / 恢复出队。暂停**只挡出队**，正在跑的那一批会跑完为止。
+pub fn set_queue_paused(base: &str, paused: bool) -> anyhow::Result<()> {
+    let path = if paused {
+        "/api/v1/queue/pause"
+    } else {
+        "/api/v1/queue/resume"
+    };
+    let _: serde_json::Value = post(base, path, "{}".to_owned(), Duration::from_secs(15))?;
+    Ok(())
+}
+
+fn get<T: DeserializeOwned>(base: &str, path: &str) -> anyhow::Result<T> {
     let response = agent(Duration::from_secs(15))
-        .get(format!("{base}/api/v1/tasks/{run_id}"))
+        .get(format!("{base}{path}"))
         .call()
         .map_err(transport)
-        .context("请求模型更新任务状态失败")?;
+        .context("请求模型服务失败")?;
     request(response)
 }
 
@@ -218,7 +260,10 @@ mod tests {
         .unwrap();
         assert!(run.terminal());
         assert!(serde_json::from_str::<Preview>("{}").is_err());
-        assert!(serde_json::from_str::<Accepted>("{}").is_err());
         assert!(serde_json::from_str::<Run>("{}").is_err());
+        // 入队回执与上面两个不同：**空回执是合法的**——一次扫描完全可能一行都不用排
+        // （都并进了既有排队行，或者水位本来就最新），那不是契约缺字段。
+        let idle = serde_json::from_str::<Enqueued>("{}").expect("空回执合法");
+        assert!(idle.enqueued.is_empty());
     }
 }

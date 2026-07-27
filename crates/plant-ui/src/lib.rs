@@ -7,6 +7,7 @@ pub mod model_update;
 pub mod project_picker;
 pub mod settings;
 pub mod style;
+pub mod task_queue;
 pub mod vm;
 pub mod workbench;
 
@@ -147,6 +148,13 @@ pub enum Cmd {
     /// 重新生成一个交付单元（`POST /api/v1/model/ensure`，带 `force`）。可以反复按，
     /// 但每按一次服务端就真的重跑一遍生成——它不是一次免费的查询。
     RetryModelUnit { root_refno: String },
+    /// 任务队列上的「立刻扫一遍」。它**不插队**，作用只是别等服务端下一个 30 秒轮询。
+    ScanNow,
+    /// 暂停 / 恢复队列出队。暂停**只挡出队**，正在跑的那一批会跑完为止——
+    /// 服务端没有中止接口，所以这条命令也不该被当成「停下来」。
+    SetQueuePaused(bool),
+    /// 重开队列视图的明细长连接。断线降级的是明细区，队列行走轮询不受影响。
+    ReconnectQueueFeed,
     /// 点击三维视口；坐标是离屏渲染纹理的归一化 UV。
     /// 测量态下宿主把它当取点，否则当模型拾取——判断哪一种归宿主。
     PickViewport([f32; 2]),
