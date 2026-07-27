@@ -1,9 +1,11 @@
 # M2 · rs-plant 侧插件分类与删除清单
 
-- 对象：`D:\work\plant-code\old\rs-plant3-d`（分支 3.0，HEAD `fe8fb07a`）
-- 日期：2026-07-27
+- 对象：`D:\work\plant-code\old\rs-plant3-d`（分支 3.0；分析时 HEAD `fe8fb07a`，回填时 `b51ef942`）
+- 日期：2026-07-27 凌晨成文，同日下午回填执行结果
 - 依据：`docs/plans/ui-rearchitecture.md` 的 M2-1 / M2-2 / M2-3
-- 性质：**只读分析，未改动 rs-plant 任何文件**
+- 性质：一至四节是**只读分析**，成文时未改动 rs-plant 任何文件；
+  第五节的执行结果与第六节的结论是事后回填的。
+  **一句话现状：五步做到第二步半，第 5 步的前半还插队先做了，详见第五节**
 
 M2-3 说「38 个 plugin 里 UI 与业务逻辑混在一起，删之前必须逐个分清」。逐个分清之后，
 第一个结论是这句话的分母不对。
@@ -138,11 +140,37 @@ M2-3 说「38 个 plugin 里 UI 与业务逻辑混在一起，删之前必须逐
    源码改动，把它们一并提交既会污染仓库也会张冠李戴。`plugins/mod.rs` 当时恰好是干净的，
    所以改它不会裹挟别人的改动。
 2. 再删 4 个「整体删除」的插件，同步摘掉 `lib.rs` 的 `use` 与 `add_plugins`。
+   **做了一半**（回填 07-27 下午）：`toast_test_plugin`、`controllable_toast_plugin`、
+   `meta_data_plugin` 的声明已从 `plugins/mod.rs` 摘掉——目录数从 38 降到 18，
+   `mod.rs` 里的声明从 18 条降到 15 条（原生 14 条，`web_plugin` 仍带 wasm32 cfg），
+   但**这三个目录仍在磁盘上**。第四个 `docs_plugin` 本来就没被声明过，第一步已经连目录一起删了。
+   摘声明不删目录的后果，就是它们变成与第一步删掉那 20 个同性质的死代码——
+   判据同一条（能不能从模块树走到），下一个人得重新数一遍才知道它们是死的。
 3. 处理第四节那两处事件耦合——把 `add_event` 移到消费方所在的插件。
+   **未做**：`add_event::<ShowSscModelEvent>()` 仍在 `pbs_plugin/plugin.rs:46`，
+   `add_event::<VersionFetchEvent>()` 仍在 `version_plugin/plugin.rs:57`，逐行核过。
+   现在不出事只是因为这两个插件还没删。**这是接着往下做之前的第一件事**：
+   顺序颠倒过来（先删插件后解耦）就是运行时炸，而且炸的是要留的模型树。
 4. 然后才动 5 个「仅删 UI」的，逐个把面板代码与系统拆开。
+   **未做**：面板代码原样都在。全仓库 15 处 `impl EditorTabTrait`，
+   运行时注册的只有 4 处，剩下 11 处是编译得到但打不开的 UI，`version_plugin` 一家占 4 处
+   （`VersionViewTab` / `VersionTimeline` / `VersionTable` / `PEVersionHistory`）。
 5. 最后收 `EditorTab` 枚举（M2-2）与 `editor_ui` 外壳（M2-4）。
+   **前半做了、后半没做，而且顺序跳了**：枚举现在只剩
+   `SceneView` / `PdmsSceneTree` / `PdmsConsole` / `PdmsAttView` / `Other(String)`，
+   全仓库只剩 4 处 `editor_tab_by_trait`，M2-2 的验收标准已经达到——
+   但它是在 `e59ddc99「feat: load selected project in shared plant workbench」`
+   里顺手做掉的，提交信息一个字没提 M2。
+   `editor_ui` 外壳没删，且已进入一个中间态：`plant-ui-host` 是默认特性，
+   开着它时 `lib.rs:111-115` 直接 `plant_ui_host::run()` 然后 `return`，
+   旧壳**运行时死、编译期活**——既没拿到删除的收益，也不再有人验证它还跑不跑得起来。
 
 前两步做完就能跑一次 `cargo check` 拿到干净的基线，再往下每步都能验证。
+
+**这份顺序被打乱之后的教训**：第 5 步的前半（收枚举）先于第 2、3、4 步做掉了。
+单看结果没造成损害——摘注册不影响运行——但它让「M2 做到哪了」这个问题从代码上看不出来：
+枚举已经是终态，会让人以为 M2 收尾了，而实际上面板代码、三个死目录、两处事件耦合都还在。
+**验收标准达成 ≠ 里程碑完成**，这是把它写下来的理由。
 
 ## 六、两份 rs-plant3-d：本文的结论通用，但动手改哪一份要先定
 
@@ -171,3 +199,20 @@ M2-3 说「38 个 plugin 里 UI 与业务逻辑混在一起，删之前必须逐
 所以「谁更新」这个问题没有单一答案——提交历史上 `plant-code\` 领先一笔，
 但工作区里 `old\` 有更靠近 M2 目标的未提交改动。**动手删代码之前必须先定改哪一份，
 否则会和已经做掉的那半截打架。**
+
+### 这个问题已经被事实定下来了（回填 07-27 下午）
+
+**改的是 `old\rs-plant3-d`**（分支 `3.0`，HEAD `b51ef942`，21 个脏文件）。
+M2 的删除、`EditorTab` 收敛、以及 M3 的 `plant_ui_host` 全在这一份上。
+
+`plant-code\rs-plant3-d` 不但没跟上，而且**岔到了另一件事上**：分支
+`codex/manual-incremental-verify-checkpoint`，HEAD `49dde866`（07-27 12:22
+「test(increment): add in-viewer comparison verification」），179 个脏文件，
+从 `fe8fb07a` + `519bddea` 分出去做增量校验，**一笔 plant-ui 宿主的提交都没有**。
+所以它现在不是「另一份候选」，是另一条线。
+
+还多出了第三份：`old\rs-plant3-d-model-load-push`（分支 `codex/model-load-fix`，
+HEAD `0ef22eeb`，2 个脏文件）。它带着 `a3fdfe54` / `e59ddc99` / `2d26e037` 这几笔宿主提交，
+并且把 `origin/3.0` 合了进来，与 `old\rs-plant3-d` 的头几笔基本同步——
+两边最新那笔连提交信息都一样（「fix: load available models for selected MDB」）却是两个哈希，
+**是并行做的同一件事，不是同一笔**。合并前得先比对，别当成快进。
