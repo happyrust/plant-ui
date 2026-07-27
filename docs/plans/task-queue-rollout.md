@@ -11,7 +11,11 @@
 
 **一句话现状：两个卡口都已解（2026-07-27 晚）——gen-model 最小基线
 `4184a5b1` 已入库；S12 画板确认存活于 19:52 的旧名文件并已 rename 回权威名
-`plant-ui.pen`。下一步是第五节第 2 步：服务端 1–4 项 + 心脏。
+`plant-ui.pen`。第五节第 2 步（服务端 1–4 项 + 心脏）与第 4 步（服务端 5–9 项：
+暂停端点+持久化、房间轮 detail 分项计数、/dbnums anomaly/blocked/excluded、
+/health started_at+gen_spatial_tree+queue_paused、新增 GET /queue 快照）均已落地
+（分别见六之三、六之四与 gen-model ADR-011 状态段；238 单测全绿，实机 curl 验收因 8021
+旧服务在跑欠一次）。下一步：客户端第 2 项起（dock 队列视图）——服务端契约已齐。
 两轮拷问定案见第八、九节。**
 
 ---
@@ -238,6 +242,76 @@ PANE 这一层。是哪个库，需要对着 E3D 项目的 MDB 结构查，本�
    收敛手段已定：**默认只看有变化的库**（运行中 + 排队中 + 欠单元的部分完成），
    另给 dbnum 搜索框与状态筛选芯片，「运行中」那一行置顶常驻
    ——见 `design/QUEUE-FIELD-MAP.md` 第 8 节。
+
+---
+
+## 六之三、服务端 1–4 项与心脏已落地（2026-07-27 深夜，ZhiMoAll-20 会话）
+
+全部在 gen-model 侧，`cargo test --lib` **238 passed / 0 failed**（较上一轮 +10 条队列层
+单测），lib / bins × default / http_api 四种编译形态全过。ADR-011 的状态段有逐条对照。
+
+| 项 | 落点 |
+|---|---|
+| `TaskRegistry` 搬家 + `queued` + 新字段（1/2 项）| `src/data_interface/task_registry.rs`（新文件；`web_service/tasks.rs` 删除）。`created_at`=入队时刻、`started_at`=开跑时刻；`units_done`/`total_units` 按数据批次算（3 项）|
+| 两个新 kind（4 项）| `data_batch` / `room_recalc`；`manual_update` kind 退役不再产生新行 |
+| 剔除三规则 + `MAX_TASKS=1000` | queued/running 永不剔 → 每 dbnum 留最近终态 → 全局最老终态先走；5 条单测 |
+| 心脏：发现即入队 | `increment_manager.rs`：`init_watcher`/`async_watch` 只发现（`discover_batch`）+ 入队（`enqueue_discovered`）；基线与增量在发现层不分家，worker 执行体 `needs_initial_load` 接管；watcher 里的启动/周期 drain 全部移走 |
+| 心脏：单 worker | `batch_scheduler.rs`（队列真身，行 ←→ 任务一一对应）+ `batch_worker.rs`（无条件 spawn，`ensure_batch_worker` 幂等守卫；出队冻结 → `execute_one_dbnum` → 每批交付单元生成；队列跑空先消化积压再收房间轮，包成 `room_recalc` 任务）|
+| 四处守卫退役 + 202 回执（§8.6/8.7）| HTTP 409/422、领域层 sync_live 检查、`ProjectExecGuard` 全删；`POST /update/execute` 返回 `{scanned, enqueued:[{task_id,dbnum,position,…}], merged, already_covered, blocked, up_to_date, warnings}`；探针改「入队后等队空」（`drain_queue_until_empty`）|
+
+**两笔注记**：① 同文件上此前未提交的 T903（watcher unwrap→上传播）与 SYST 按文件记账
+两组修复随本片一并入库——worker 的批次执行依赖它们。② 客户端对接时注意 task_id 前缀
+从 `mu-` 变为 `db-`（数据批次）/ `room-`（房间轮）；终态 result 形状是
+`{project, status, batch, units, warnings}`（单数 batch，「一次运行」退役）。
+
+**评审收尾（`8a0211e5`，ZhiMoAll-16 按第九节逐条核对后的跟进）**：
+退役三处死代码——`execute_incr_update`（合流后无调用方，不留第二条执行路径）、
+`notify_incr_applied` 与 `increments` WS 主题（从未有过消费者）、
+`complete_syst_jobs` / `fail_syst_jobs` / `IncrResult::has_db_type`（随旧编排失联）；
+MySQL 可选同步（feature=sql）从旧编排搬进 `execute_one_dbnum` 成功分支
+（注意：sql feature 本身在本仓早已编译不过，`team_data` / `versioned_db` 的
+AiosDBMgr 池 API 变更所致，与本轮无关）；`discover_batch` 统一 file_name 口径；
+11 处注释引用从「第八节」改「第九节」；spec 顶部加修订注记，全文修订随 5–9 项。
+`cargo test --lib` 238 通过，clippy 触及模块零告警。
+
+---
+
+## 六之四、服务端 5–9 项已落地（2026-07-27 夜，gen-model `c28c0f07`）
+
+第五节第 4 步整片收口，接 `796b50b4` / `8a0211e5`：8 文件 342 行，`cargo test --lib`
+仍是 **238 passed / 0 failed**，lib × default / http_api 编译干净。**客户端第 2、4 项要的
+契约到这里全齐**——下表与 gen-model `docs/specs/web-service-api.md` §4.1 / §4.7 / §4.8
+就是照着写界面的依据，不必再翻 ADR。
+
+| 项 | 落点 |
+|---|---|
+| 5 房间轮详情 | `count_room_targets` 分项统计，随 `room_recalc` 任务的 `TaskEntry.detail` 带出 `{panels, elements, dead_letters}`；done / total 仍走 `units_done` / `total_units` |
+| 6 + 9 暂停端点与持久化 | 新增 `GET /api/v1/queue` 快照 + `POST /api/v1/queue/pause`\|`/resume`；标志持久化在 `queue_control:main`（与水位同库，不进队列表），worker 起跑前恢复——**活过重启**，队列重建完也不开吃，直到 `resume`。暂停同时挡出队与空闲轮 |
+| 7 `GET /health` | 补 `started_at`（进程启动时刻，「队列是重建的」靠它）、`gen_spatial_tree`、`queue_paused` |
+| 8 `GET /dbnums` | 改走 `dbnum_statuses(project)`（登记表 ∪ 项目扫描，只读头部与最新会话号），逐行带 `anomaly` / `blocked` / `excluded`；判定与预览共用 `FileAnomaly::blocks`。旧字段是新形状的子集，既有消费者不受影响 |
+
+**给客户端的三条硬约束**（都是服务端形状直接决定的，不是口味）：
+
+1. **`blocked` 与 `excluded` 不许合成一行。** 阻断的库压根不入队、队列面板里没有它们的行，
+   `/dbnums` 的 `blocked` 因此是「这个库的水位为什么一直不动」的**唯一出处**；`excluded`
+   只是不在本期范围（`manual_db_nums` / 类型门控）。混进同一格「本期不执行」会把「出事了」
+   讲成「本来就不跑」。五种异常 `rollback` / `path_migrated` / `type_changed` /
+   `duplicate`（带 `paths[]` 交给人挑）/ `missing` 里**只有 `path_migrated` 不阻断**。
+2. **暂停的文案只能说「不再出队」。** 服务端没有中止接口，正在跑的那条跑完为止；也**没有
+   单条取消**——队列是派生态，从队里移掉一行不推水位，下一轮轮询照样把它发现回来，
+   那是个会自己撤销的按钮（ADR-011 §9）。
+3. **预览的 422 没了。** `POST /update/preview` 在 `sync_live=true` 下同样可用，代价是
+   「待应用」可能偏大（正在被应用的会话也算进去）；界面按 `/queue` 快照里的运行中批次数
+   标注「N 个库正在应用，数字可能偏大」。
+
+**一条到期的前提**：第八节第 6 条把 `FailForm::SyncLive / Conflict` 的退役押到「客户端队列
+视图 + 砍第三步」，理由是「今天的服务端还真会回 422 / 409，提前删就是对它说谎」——**那个
+理由到本片为止已经过期**：409 随 §12 在 `796b50b4` 退役，预览的 422 随本片退役，服务端两种
+都不会再回了。退役时机不改（仍随队列视图一起走，避免半截形态），但留着它们从此是「守着
+一段拦不到东西的死分支」，不再是「对服务端诚实」。
+
+**仍欠一次实机 curl 验收**（排队 / 合并 / 冻结实况）：验证当晚 8021 有在跑的旧服务 + 活动
+客户端，未做本机实跑，留待下次服务重启窗口——ADR-011 状态段同记。
 
 ---
 
