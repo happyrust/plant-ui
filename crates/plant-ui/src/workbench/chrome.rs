@@ -72,19 +72,52 @@ pub fn command_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: 
                     .enumerate()
                 {
                     let response = ui.add(widgets::chip(t, d, name, i == 0));
-                    if name == "创建" {
+                    if name == "项目" {
+                        egui::Popup::menu(&response).show(|ui| {
+                            if ui.button("打开项目…").clicked() {
+                                cmds.push(Cmd::OpenProjectPicker);
+                                ui.close();
+                            }
+                            ui.separator();
+                            // 没连上库时取回工作无从谈起：没有树可重查，也没有
+                            // 模型可重载。禁用而不是隐藏——菜单项换位置比灰着更难找。
+                            let busy = vm.get_work_busy;
+                            let label = if busy {
+                                "正在取回工作…"
+                            } else {
+                                "取回工作 GET WORK"
+                            };
+                            if ui
+                                .add_enabled(
+                                    vm.data_source_ok && !busy,
+                                    egui::Button::new(label),
+                                )
+                                .clicked()
+                            {
+                                cmds.push(Cmd::GetWork);
+                                ui.close();
+                            }
+                            // 取回工作只取界面。设计库里还躺着没应用的会话时，
+                            // 这一行是唯一告诉人「该去的是另一个入口」的地方。
+                            if let Some(pending) = vm.pending_sessions.filter(|n| *n > 0) {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "设计库还有 {pending} 个会话未应用 · 去「模型更新」"
+                                    ))
+                                    .font(Font::micro(d))
+                                    .color(t.text_muted),
+                                );
+                            }
+                        });
+                    } else if name == "创建" {
                         egui::Popup::menu(&response).show(|ui| {
                             if ui.button("三维数据接口").clicked() {
                                 cmds.push(Cmd::OpenDataPublish);
                                 ui.close();
                             }
                         });
-                    } else if response.clicked() {
-                        match name {
-                            "项目" => cmds.push(Cmd::OpenProjectPicker),
-                            "设置" => cmds.push(Cmd::OpenSettings),
-                            _ => {}
-                        }
+                    } else if response.clicked() && name == "设置" {
+                        cmds.push(Cmd::OpenSettings);
                     }
                 }
                 ui.add_space(space::S2);

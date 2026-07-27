@@ -4,7 +4,7 @@
 use eframe::egui;
 use plant_ui::style::theme_tokens;
 use plant_ui::style::tokens::{Density, Status};
-use plant_ui::style::widgets::{self, RowIcon, RowTag, TreeRow};
+use plant_ui::style::widgets::{self, Eye, RowIcon, RowTag, TreeRow};
 
 pub struct GalleryApp {
     chip_on: bool,
@@ -50,6 +50,9 @@ impl eframe::App for GalleryApp {
 
             // 工具按钮的三态并排：常态 / 激活 / 禁用。视口工具栏没选中元素时靠
             // 禁用态说话，画廊里不摆一份就没人看得出它和常态到底有没有分别。
+            //
+            // 后两枚是视口工具栏上「隐藏全部 / 显示全部」那一对，摆在一起才看得出
+            // 闭眼与复数眼这一对读不读得成「全部」——单看任何一枚都判断不了。
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 let _ = ui.add(widgets::tool_btn(&t, d, egui_phosphor::regular::EYE, false));
@@ -63,23 +66,45 @@ impl eframe::App for GalleryApp {
                     false,
                     widgets::tool_btn(&t, d, egui_phosphor::regular::CROSSHAIR_SIMPLE, false),
                 );
+                ui.add_space(12.0);
+                let _ = ui.add(widgets::tool_btn(
+                    &t,
+                    d,
+                    egui_phosphor::regular::EYE_CLOSED,
+                    false,
+                ));
+                let _ = ui.add(widgets::tool_btn(&t, d, egui_phosphor::regular::EYES, false));
             });
 
             ui.add_space(12.0);
-            // 第二三行都在选择集里，只有末行是主选中：多选下的主 / 从两种描边
+            // 后两行都在选择集里，只有末行是主选中：多选下的主 / 从两种描边
             // 就是靠这两行并排看出来的。
-            let rows: [(usize, &str, Option<bool>, bool, bool); 3] = [
-                (0, "SITE /-RX-CSV", Some(true), false, false),
-                (1, "ZONE /-RX-CSV-S4009", Some(true), true, false),
+            //
+            // 四行的眼睛各占一档：首行是「未选中 + 已隐藏」，验整行弱化；末行是
+            // 「选中 + 已隐藏」，验选中优先于弱化；第三行未加载，要把鼠标移上去
+            // 才画得出来——但那一格的宽度**任何时候都占着**，`24381/100060` 的
+            // 位置不该随悬停移动。
+            let rows: [(usize, &str, Option<bool>, bool, bool, Eye); 4] = [
+                (0, "SITE /-RX-CSV-OLD", Some(false), false, false, Eye::Hidden),
+                (0, "SITE /-RX-CSV", Some(true), false, false, Eye::Shown),
+                (
+                    1,
+                    "ZONE /-RX-CSV-S4009",
+                    Some(true),
+                    true,
+                    false,
+                    Eye::Unloaded,
+                ),
                 (
                     2,
                     "STRU /-RX-CSV-S4009-V1 一段很长的中文名称用来验证截断",
                     Some(false),
                     true,
                     true,
+                    Eye::Hidden,
                 ),
             ];
-            for (depth, label, expandable, selected, primary) in rows {
+            for (depth, label, expandable, selected, primary, eye) in rows {
                 let _ = widgets::tree_row_ui(
                     ui,
                     &t,
@@ -92,6 +117,7 @@ impl eframe::App for GalleryApp {
                         selected,
                         primary,
                         expandable,
+                        eye: Some(eye),
                         tone: Status::Neutral,
                         tags: &[RowTag {
                             icon: None,

@@ -33,6 +33,43 @@ pub async fn child_nodes(refno: RefnoEnum) -> Result<Vec<EleTreeNode>> {
     aios_core::get_children_ele_nodes(refno).await
 }
 
+/// 设计库里还没被应用到模型的会话数。
+///
+/// 直连 gen-model 的 `dbnum_watermark` 表读，不走它的 HTTP 接口：取回工作是纯
+/// 数据库操作，不该因为那个服务没起就连提示都给不出。**代价是这里认得后端的表名
+/// 和字段名**——那张表改了结构，这一处得跟着改，而编译器不会提醒。
+///
+/// 两个边界必须知道：
+///
+/// - `file_latest_sesno` 是**上一次扫描或应用时记下的**，不是实时读文件。所以这个
+///   数只配当提示，不能拿来判断「需不需要取回」。
+/// - 水位为 0 的库是从没应用过的（gen-model 那边叫「需初始化」），不参与这个加法。
+///   算进去的话一个新登记的库会报出一个天文数字。
+pub async fn pending_sessions() -> Result<u32> {
+    let sql = format!(
+        "SELECT VALUE [applied_sesno, file_latest_sesno] FROM {WATERMARK_TABLE} \
+         WHERE db_type = 'DESI' AND applied_sesno > 0 AND file_latest_sesno > applied_sesno"
+    );
+    let mut response = SUL_DB.query(&sql).await?;
+    let rows: Vec<(i32, i32)> = response.take(0)?;
+    Ok(rows
+        .into_iter()
+        .map(|(applied, latest)| (latest - applied).max(0) as u32)
+        .sum())
+}
+
+/// gen-model 的水位表。跟着 `gen-model/src/data_interface/dbnum_state.rs` 走。
+const WATERMARK_TABLE: &str = "dbnum_watermark";
+
+/// 取回工作前先把本进程的查询缓存丢干净。
+///
+/// 增量更新跑在 gen-model 那个进程里，它清的是它自己那份 memoize；本进程这份
+/// 从连上库那一刻起就没人动过。不清就会出现「树重查过了，属性还是旧的」这种
+/// 最难查的一类现象——树子层查询恰好没上缓存，属性和根层却上了。
+pub async fn invalidate_all() {
+    aios_core::clear_all_caches_wholesale().await;
+}
+
 /// 按 PDMS 名称查元素，供命令行的 `/名称` 使用。
 pub async fn resolve_name(name: &str) -> Result<Option<RefU64>> {
     Ok(aios_core::get_refno_by_name(name)

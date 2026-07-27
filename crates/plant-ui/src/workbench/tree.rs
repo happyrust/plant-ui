@@ -8,8 +8,8 @@ use egui::{ScrollArea, Ui};
 use egui_phosphor::regular as ph;
 
 use crate::style::tokens::{Density, Status, Tokens, space};
-use crate::style::widgets::{self, PaneNote, PaneState, RowIcon, TreeRow};
-use crate::vm::{Selection, TreeRowVm, TreeVm, WorkbenchVm};
+use crate::style::widgets::{self, Eye, PaneNote, PaneState, RowIcon, TreeRow};
+use crate::vm::{RowVisibility, Selection, TreeRowVm, TreeVm, WorkbenchVm};
 use crate::{Cmd, ModelAction};
 
 pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Vec<Cmd>) {
@@ -79,20 +79,36 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                                             selected: vm.selection.contains(row.refno),
                                             primary: primary == Some(row.refno),
                                             expandable: row.expandable,
+                                            // 没有实时渲染器时整列不出现，同右键菜单里那几项。
+                                            eye: live.then(|| eye_of(row.visibility)),
                                             tone: Status::Neutral,
                                             tags: &[],
                                         },
                                     )
                                 })
                                 .inner;
-                            // 点箭头只折叠 / 展开；点行其他区域选中；双击整行也展开。
-                            // `clicked` / `double_clicked` 都只认主键，右键落不进这几支。
-                            let on_caret = out.caret_rect.is_some_and(|r| {
-                                out.response
-                                    .interact_pointer_pos()
-                                    .is_some_and(|p| r.contains(p))
-                            });
-                            if out.response.double_clicked()
+                            // 点箭头只折叠 / 展开；点眼睛只切可见性；点行其他区域选中；
+                            // 双击整行也展开。`clicked` / `double_clicked` 都只认主键，
+                            // 右键落不进这几支——右键在下面单独处理。
+                            let hit = |r: Option<egui::Rect>| {
+                                r.is_some_and(|r| {
+                                    out.response
+                                        .interact_pointer_pos()
+                                        .is_some_and(|p| r.contains(p))
+                                })
+                            };
+                            let on_caret = hit(out.caret_rect);
+                            if hit(out.eye_rect) {
+                                // 眼睛这一格只切可见性：不选中也不展开，双击不例外
+                                // （连点两下就是切两次，开关本来就该这样）。
+                                // 只作用于这一行——整批走右键菜单与视口的 S / H。
+                                if out.response.clicked() {
+                                    cmds.push(Cmd::Model(ModelAction::SetVisible {
+                                        refnos: vec![row.refno],
+                                        visible: row.visibility.on_click(),
+                                    }));
+                                }
+                            } else if out.response.double_clicked()
                                 && row.expandable.is_some()
                                 && !on_caret
                             {
@@ -125,6 +141,16 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                     });
                 });
         }
+    }
+}
+
+/// Vm 的三态可见性翻成组件层的画法。两个枚举是同一件事在两层的说法——
+/// 组件层不认识 `vm`，见 `widgets::Eye`。
+fn eye_of(vis: RowVisibility) -> Eye {
+    match vis {
+        RowVisibility::Unloaded => Eye::Unloaded,
+        RowVisibility::Shown => Eye::Shown,
+        RowVisibility::Hidden => Eye::Hidden,
     }
 }
 

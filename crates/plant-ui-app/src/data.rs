@@ -30,6 +30,28 @@ pub enum Req {
         base: String,
         run_id: String,
     },
+    /// 重新生成一个交付单元。幂等，S4-C 的失败行上那枚「重试」走它。
+    EnsureModel {
+        base: String,
+        root_refno: String,
+    },
+    /// 取回工作：丢缓存，重查 SITE 根层与这些已展开分支的子层。
+    ///
+    /// 分支由 App 侧算好交下来。数据线程不认识展开状态，也不该认识——它只是
+    /// 「照这张单子重查一遍」。
+    GetWork { branches: Vec<RefU64> },
+    /// 读一次设计库水位，给取回工作旁边那行提示用。
+    PendingSessions,
+}
+
+/// 一次取回工作重新查回来的那部分树。
+pub struct GetWork {
+    pub sites: Vec<EleTreeNode>,
+    /// 重查成功的分支及其新的直接子层。
+    pub branches: Vec<(RefU64, Vec<EleTreeNode>)>,
+    /// 重查失败的分支及原因。一个分支查不动不该让整次取回作废，
+    /// 它那一层就保持原样，失败单独进日志。
+    pub failed: Vec<(RefU64, String)>,
 }
 
 /// 启动序列（连接 + 工程标识 + SITE 根层）的合并产物。
@@ -48,6 +70,13 @@ pub enum Evt {
     ModelUpdatePreview(anyhow::Result<Preview>),
     ModelUpdateExecute(anyhow::Result<Accepted>),
     ModelUpdateTask(String, anyhow::Result<Run>),
+    /// 单元重生成的回执。成功与否只进命令行日志——终态摘要是服务端那份，
+    /// 不在本端就地改写它。
+    EnsureModel(String, anyhow::Result<crate::model_update_api::Ensured>),
+    /// 取回工作的整批结果。根层查不动就是整次失败——根层没了树无从谈起。
+    GetWork(anyhow::Result<GetWork>),
+    /// 设计库水位。查不动就不显示那行提示，不值得为它报错。
+    PendingSessions(anyhow::Result<u32>),
     /// 执行期的逐行明细。走 WebSocket，不经数据线程（见 `model_update_ws`）。
     ModelUpdateProgress(ProgressEvent),
     ModelUpdateFeedLive,
@@ -60,6 +89,28 @@ pub struct Bridge {
     /// 给数据线程之外的生产者用（现在只有那条 WebSocket）。UI 每帧只认一个收端，
     /// 长连接自己另开一条 channel 的话就得在 `pump_events` 里再轮询一次。
     pub evt_tx: mpsc::Sender<Evt>,
+}
+
+/// 取回工作：先丢本进程的查询缓存，再把根层与这些分支重查一遍。
+///
+/// 缓存必须先丢。重查 SITE 根层走的是带 memoize 的那条查询，缓存还在的话它会
+/// 原样把旧的那份还回来，界面看着刷新过了、内容一个字没变。
+async fn get_work(branches: &[RefU64]) -> anyhow::Result<GetWork> {
+    plant_ui_data::invalidate_all().await;
+    let sites = plant_ui_data::site_nodes().await?;
+    let mut loaded = Vec::with_capacity(branches.len());
+    let mut failed = Vec::new();
+    for refno in branches {
+        match plant_ui_data::child_nodes((*refno).into()).await {
+            Ok(kids) => loaded.push((*refno, kids)),
+            Err(error) => failed.push((*refno, crate::logs::error_chain(&error))),
+        }
+    }
+    Ok(GetWork {
+        sites,
+        branches: loaded,
+        failed,
+    })
 }
 
 /// 启动序列：连库、抓工程标识、抓 SITE 根层。三步任一失败都算没连上。
@@ -138,6 +189,26 @@ pub fn spawn(ctx: egui::Context) -> Bridge {
                             std::thread::spawn(move || {
                                 let result = crate::model_update_api::task(&base, &run_id);
                                 let _ = tx.send(Evt::ModelUpdateTask(run_id, result));
+                                repaint.request_repaint();
+                            });
+                        }
+                        Req::GetWork { branches } => {
+                            let result = get_work(&branches).await;
+                            let _ = evt_tx.send(Evt::GetWork(result));
+                            ctx.request_repaint();
+                        }
+                        Req::PendingSessions => {
+                            let result = plant_ui_data::pending_sessions().await;
+                            let _ = evt_tx.send(Evt::PendingSessions(result));
+                            ctx.request_repaint();
+                        }
+                        Req::EnsureModel { base, root_refno } => {
+                            let tx = evt_tx.clone();
+                            let repaint = ctx.clone();
+                            std::thread::spawn(move || {
+                                let result =
+                                    crate::model_update_api::ensure_model(&base, &root_refno);
+                                let _ = tx.send(Evt::EnsureModel(root_refno, result));
                                 repaint.request_repaint();
                             });
                         }

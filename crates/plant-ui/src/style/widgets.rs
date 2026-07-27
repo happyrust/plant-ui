@@ -412,6 +412,18 @@ pub struct RowTag<'a> {
     pub tone: Status,
 }
 
+/// 行内可见性眼睛的画法。
+///
+/// 组件层不认识 `vm::RowVisibility`（这里只依赖 egui 与令牌），所以另立一个说法，
+/// 由调用点映射。三档而不是开关的理由在 ADR-0010。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Eye {
+    /// 从没显示过。槽位照占，但只有整行悬停时才浮出来。
+    Unloaded,
+    Shown,
+    Hidden,
+}
+
 pub struct TreeRow<'a> {
     pub depth: usize,
     pub icon: RowIcon<'a>,
@@ -422,6 +434,9 @@ pub struct TreeRow<'a> {
     /// 不额外标一下的话，用户看不出属性栏在说这几行里的哪一行。
     pub primary: bool,
     pub expandable: Option<bool>,
+    /// 行内可见性眼睛。`None` = 这一列**压根不存在**，一格宽度都不占——
+    /// 没有实时渲染器时按不动，摆着就是假控件。
+    pub eye: Option<Eye>,
     pub tone: Status,
     pub tags: &'a [RowTag<'a>],
 }
@@ -431,6 +446,9 @@ pub struct TreeRowOut {
     /// 展开箭头的位置。整行只有一个 Response，调用点靠它把「点箭头折叠」从
     /// 「点整行选中」里区分出来；不可展开的行是 `None`。
     pub caret_rect: Option<Rect>,
+    /// 眼睛的位置，用途同 `caret_rect`：把「点眼睛切可见性」从「点整行选中」
+    /// 里分出来。没有这一列时是 `None`。
+    pub eye_rect: Option<Rect>,
 }
 
 pub fn tree_row_ui(ui: &mut Ui, t: &Tokens, d: Density, row: TreeRow<'_>) -> TreeRowOut {
@@ -440,6 +458,7 @@ pub fn tree_row_ui(ui: &mut Ui, t: &Tokens, d: Density, row: TreeRow<'_>) -> Tre
         return TreeRowOut {
             response: resp,
             caret_rect: None,
+            eye_rect: None,
         };
     }
     let bg = if row.selected {
@@ -521,6 +540,40 @@ pub fn tree_row_ui(ui: &mut Ui, t: &Tokens, d: Density, row: TreeRow<'_>) -> Tre
         );
         right -= gap;
     }
+
+    // 眼睛的宽度**恒定**参与这轮丈量，未加载时只是不画。让位置跟着悬停走的话，
+    // 长 PDMS 名的裁剪点会随鼠标进出而变，鼠标扫过一列就是一列抖动。
+    let mut eye_rect = None;
+    if let Some(eye) = row.eye {
+        let sz = d.px(13.0);
+        right -= sz;
+        let tint = match eye {
+            // 开机时整棵树都是未加载。这一档常驻画出来，满屏都是「默认就是这样」的图标。
+            Eye::Unloaded if !resp.hovered() => None,
+            Eye::Unloaded => Some(t.text_muted),
+            Eye::Shown | Eye::Hidden => Some(t.text_secondary),
+        };
+        if let Some(tint) = tint {
+            let glyph = if eye == Eye::Hidden {
+                egui_phosphor::regular::EYE_SLASH
+            } else {
+                egui_phosphor::regular::EYE
+            };
+            let g = lay(ui, glyph, FontId::new(sz, FontFamily::Proportional));
+            let pos = pos2(
+                right + (sz - g.size().x) / 2.0,
+                rect.center().y - g.size().y / 2.0,
+            );
+            draw_galley(ui, pos, g, tint);
+        }
+        // 命中区同箭头，按整行高给足：13px 的字形本身很难点中。
+        eye_rect = Some(Rect::from_min_size(
+            pos2(right - gap / 2.0, rect.top()),
+            vec2(sz + gap, h),
+        ));
+        right -= gap;
+    }
+
     for tag in row.tags.iter().rev() {
         let pad = d.px(7.0);
         let tg = lay(ui, tag.text, Font::mono_micro(d));
@@ -555,8 +608,13 @@ pub fn tree_row_ui(ui: &mut Ui, t: &Tokens, d: Density, row: TreeRow<'_>) -> Tre
             Font::label(d)
         },
     );
+    // 已隐藏的行整行弱化。一枚 13px 的图标在万行列表里扫不出来，而「哪些被我藏了」
+    // 恰恰是开了这一列之后最想一眼看到的事。选中优先于弱化：选中是更急的信号，
+    // 而那一行的眼睛仍然是斜杠的，说得清楚。
     let fg = if row.selected {
         t.accent_strong
+    } else if row.eye == Some(Eye::Hidden) {
+        t.text_muted
     } else {
         t.text_primary
     };
@@ -570,6 +628,7 @@ pub fn tree_row_ui(ui: &mut Ui, t: &Tokens, d: Density, row: TreeRow<'_>) -> Tre
     TreeRowOut {
         response: resp,
         caret_rect,
+        eye_rect,
     }
 }
 

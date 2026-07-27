@@ -28,7 +28,7 @@ use plant_ui::style::theme_tokens::{self, set_weight_families_ready};
 use plant_ui::style::tokens::{Density, Tokens};
 use plant_ui::vm::{
     CommandLineKind, CommandLineVm, LogElement, PropKind, PropRowVm, PropsDataVm, PropsVm,
-    Selection, TreeRowVm, TreeVm, View3dVm, WorkbenchVm,
+    RowVisibility, Selection, TreeRowVm, TreeVm, View3dVm, WorkbenchVm,
 };
 use plant_ui::workbench::{self, WorkbenchState};
 use plant_ui_data::{EleTreeNode, RefU64};
@@ -87,6 +87,9 @@ impl TreeModel {
                     noun: n.noun.clone(),
                     expandable,
                     loading: model.loading.contains(&refno),
+                    // 独立壳没有渲染器，可见性无从谈起。这一格恒为未加载，
+                    // 而绘制层在 `live == false` 时整列不画，读不到它。
+                    visibility: RowVisibility::Unloaded,
                 });
                 if expandable == Some(true)
                     && let Some(kids) = model.children.get(&refno)
@@ -127,10 +130,35 @@ impl TreeModel {
         self.roots.iter().any(|n| n.refno.refno() == refno)
     }
 
+    /// 取回工作之后的清扫：把从根层已经走不到的条目摘掉。
+    ///
+    /// 一次重查可以让整条分支消失——元素被删了，或者挪到了别的 OWNER 底下——
+    /// 而它底下那些子层、`parent` 指向、展开标记还留在表里。不摘掉的话
+    /// `ancestors` 会顺着 `parent` 走进一串已经不存在的祖先，状态栏的元素计数
+    /// 也会一直虚高。
+    fn prune_unreachable(&mut self) {
+        let mut alive: HashSet<RefU64> = HashSet::new();
+        let mut stack: Vec<RefU64> = self.roots.iter().map(|n| n.refno.refno()).collect();
+        while let Some(refno) = stack.pop() {
+            // 数据异常造出环时这里靠 `alive` 收敛，不会转不出去。
+            if !alive.insert(refno) {
+                continue;
+            }
+            if let Some(kids) = self.children.get(&refno) {
+                stack.extend(kids.iter().map(|n| n.refno.refno()));
+            }
+        }
+        self.children.retain(|refno, _| alive.contains(refno));
+        self.parent.retain(|refno, _| alive.contains(refno));
+        self.expanded.retain(|refno| alive.contains(refno));
+        self.loading.retain(|refno| alive.contains(refno));
+    }
+
     /// 从最近的父到 SITE 根的祖先链；不在已加载的树里就是 None。
     ///
     /// 不必为此发查询：能被日志提到的元素都是从某个父层查回来的，那一层连同它上面
-    /// 每一层都还在缓存里（缓存只增不减）。
+    /// 每一层通常都还在缓存里。取回工作会摘掉已经不存在的分支，所以老日志行指到
+    /// 一个被删掉的元素时这里给 None，定位那边退化成「只切了属性」。
     fn ancestors(&self, refno: RefU64) -> Option<Vec<RefU64>> {
         if self.is_root(refno) {
             return Some(Vec::new());
@@ -164,6 +192,8 @@ struct App {
     model_feed: Option<model_update_ws::Feed>,
     last_model_poll: Instant,
     pending_model_polls: HashSet<String>,
+    /// 已经发出去还没回来的那次取回工作。菜单点快了不该排成一串重查。
+    get_work_pending: bool,
     bridge: data::Bridge,
     tree: TreeModel,
     logs: logs::LogBuffer,
@@ -197,6 +227,7 @@ impl App {
             model_feed: None,
             last_model_poll: Instant::now(),
             pending_model_polls: HashSet::new(),
+            get_work_pending: false,
             bridge: data::spawn(ctx.clone()),
             tree: TreeModel::default(),
             logs: logs::LogBuffer::default(),
@@ -240,6 +271,7 @@ impl App {
                     self.vm.project = info.project;
                     self.vm.db = db_label(&info.ns, &info.db_nums);
                     self.tree.roots = info.sites;
+                    let _ = self.bridge.req.send(data::Req::PendingSessions);
                     dirty = true;
                 }
                 data::Evt::Ready(Err(e)) => {
@@ -311,6 +343,10 @@ impl App {
                         self.command_error(format!("名称查询失败：{}", logs::error_chain(&error)))
                     }
                 },
+                // 预览是长请求，用户可能中途放弃等待（Vm 回到 Idle）。晚到的结果
+                // 不许把界面拽回来——那一下会覆盖掉用户刚做出的选择。
+                data::Evt::ModelUpdatePreview(_)
+                    if !matches!(self.model_update, ModelUpdateVm::Loading) => {}
                 data::Evt::ModelUpdatePreview(result) => match result {
                     Ok(preview) => {
                         self.logs.info(
@@ -323,10 +359,10 @@ impl App {
                         self.model_update = ModelUpdateVm::Ready(preview);
                     }
                     Err(error) => {
-                        let detail = logs::error_chain(&error);
+                        let failure = model_update_api::failure_of(&error);
                         self.logs
                             .error(&mut self.vm.logs, "模型更新预览失败", &error, None);
-                        self.model_update = ModelUpdateVm::Failed(detail);
+                        self.model_update = ModelUpdateVm::Failed(failure);
                     }
                 },
                 data::Evt::ModelUpdateExecute(result) => match result {
@@ -355,18 +391,22 @@ impl App {
                         }));
                     }
                     Err(error) => {
-                        let detail = logs::error_chain(&error);
+                        let failure = model_update_api::failure_of(&error);
                         self.logs
                             .error(&mut self.vm.logs, "提交模型增量更新失败", &error, None);
-                        self.model_update = ModelUpdateVm::Failed(detail);
+                        self.model_update = ModelUpdateVm::Failed(failure);
                     }
                 },
                 data::Evt::ModelUpdateTask(run_id, result) => {
                     self.pending_model_polls.remove(&run_id);
+                    // 只认「这一轮刚跨进终态」这一次。终态之后轮询还会再来几拍，
+                    // 每拍都取一次的话就是反复拆装同一批几何。
+                    let mut just_finished = false;
                     if let ModelUpdateVm::Running(session) = &mut self.model_update {
                         match result {
                             Ok(latest) => {
                                 if latest.task_id == run_id {
+                                    just_finished = !session.run.terminal() && latest.terminal();
                                     session.run = latest;
                                 }
                                 session.poll_error = None;
@@ -374,6 +414,75 @@ impl App {
                             Err(error) => {
                                 session.poll_error = Some(logs::error_chain(&error));
                             }
+                        }
+                    }
+                    if just_finished {
+                        self.refresh_after_update();
+                    }
+                }
+                // 「生成跑完了但一条都画不出来」是 200，不是失败——照实说，
+                // 别把它混进「已重新生成」里让人以为三维上该看得见东西了。
+                data::Evt::EnsureModel(root_refno, result) => match result {
+                    Ok(ensured) if ensured.model_instance_count == 0 => self.logs.warn(
+                        &mut self.vm.logs,
+                        format!(
+                            "交付单元 {root_refno} 生成完成，但 {} 个实例都没有几何，三维上仍看不见",
+                            ensured.generated_instance_count
+                        ),
+                    ),
+                    Ok(_) => self.logs.info(
+                        &mut self.vm.logs,
+                        format!("交付单元 {root_refno} 已重新生成"),
+                    ),
+                    Err(error) => self.logs.error(
+                        &mut self.vm.logs,
+                        format!("交付单元 {root_refno} 重新生成失败"),
+                        &error,
+                        None,
+                    ),
+                },
+                // 查不动就把那行提示收起来，不为它报错——它本来就只是提示。
+                data::Evt::PendingSessions(result) => {
+                    self.vm.pending_sessions = result.ok();
+                }
+                data::Evt::GetWork(result) => {
+                    self.set_get_work_busy(false);
+                    let _ = self.bridge.req.send(data::Req::PendingSessions);
+                    match result {
+                        Ok(fresh) => {
+                            let before = self.tree.element_count();
+                            self.tree.roots = fresh.sites;
+                            for (refno, kids) in fresh.branches {
+                                for kid in &kids {
+                                    self.tree.parent.insert(kid.refno.refno(), refno);
+                                }
+                                self.tree.children.insert(refno, kids);
+                            }
+                            // 摘掉失败的分支之前先把话说完：`element` 要在树还
+                            // 认得这个 refno 的时候取名字。
+                            for (refno, reason) in &fresh.failed {
+                                let el = self.tree.element(*refno);
+                                self.logs.warn_of(
+                                    &mut self.vm.logs,
+                                    el,
+                                    format!("子层重查失败，这一层保持原样：{reason}"),
+                                );
+                            }
+                            self.tree.prune_unreachable();
+                            let after = self.tree.element_count();
+                            self.logs.info(
+                                &mut self.vm.logs,
+                                format!("取回工作完成：已加载元素 {before} → {after}"),
+                            );
+                            // 缓存刚被丢干净，面板上摆着的那份属性已经是旧的。
+                            if let Some(refno) = self.vm.selection.primary() {
+                                self.refetch_props(refno);
+                            }
+                            dirty = true;
+                        }
+                        Err(error) => {
+                            self.logs
+                                .error(&mut self.vm.logs, "取回工作失败", &error, None);
                         }
                     }
                 }
@@ -401,7 +510,7 @@ impl App {
         }
     }
 
-    fn handle_cmds(&mut self, cmds: Vec<Cmd>) {
+    fn handle_cmds(&mut self, ctx: &egui::Context, cmds: Vec<Cmd>) {
         let mut dirty = false;
         for cmd in cmds {
             match cmd {
@@ -438,6 +547,7 @@ impl App {
                     let msg = format!("{attr} = {value}（仅改内存，未写回数据库）");
                     self.logs.warn_of(&mut self.vm.logs, el, msg);
                 }
+                Cmd::GetWork => self.get_work(),
                 // 面板错误态上的「重试」，与命令行那条走同一段处置逻辑。
                 Cmd::Reconnect => self.reconnect(),
                 Cmd::RetryProps(refno) if self.vm.selection.primary() == Some(refno) => {
@@ -487,12 +597,31 @@ impl App {
                     }
                 }
                 Cmd::RefreshModelUpdate => self.refresh_model_update(),
+                // 只放弃客户端等待：服务端没有 cancel 接口，扫描照跑完。
+                Cmd::CancelModelUpdatePreview => {
+                    self.model_update = ModelUpdateVm::Idle;
+                    self.logs.info(
+                        &mut self.vm.logs,
+                        "已放弃等待预览结果；服务端的扫描不受影响，重新预览即可",
+                    );
+                }
                 Cmd::ExecuteModelUpdate => {
                     self.model_update = ModelUpdateVm::Starting;
                     let _ = self.bridge.req.send(data::Req::ModelUpdateExecute {
                         base: self.model_api_url.clone(),
                         project: self.vm.project.clone(),
                     });
+                }
+                Cmd::ReconnectModelUpdateFeed => self.reopen_model_feed(ctx),
+                Cmd::RetryModelUnit { root_refno } => {
+                    let _ = self.bridge.req.send(data::Req::EnsureModel {
+                        base: self.model_api_url.clone(),
+                        root_refno: root_refno.clone(),
+                    });
+                    self.logs.info(
+                        &mut self.vm.logs,
+                        format!("已请求重新生成交付单元 {root_refno}"),
+                    );
                 }
                 // 独立壳没有渲染器，`view3d.live` 恒为 false，树菜单、视口工具栏、
                 // 相机手势与渲染目标改尺寸都不会露头（占位图是磁盘上那张，改不得）。
@@ -635,6 +764,78 @@ impl App {
         let _ = self.bridge.req.send(data::Req::Props(refno));
     }
 
+    /// 取回工作：把库里此刻的样子取到界面上来。
+    ///
+    /// 刷新范围只到「当前看得见的那些」——已展开、且子层已经在手里的分支，加上
+    /// 根层。没展开的分支不预取：那是把一次刷新做成一次全量拉库，而它们下次展开
+    /// 时本来就会现查。
+    ///
+    /// 与 `reconnect` 的分别在这里：重连从空缓存重来，展开状态、选中、属性一起
+    /// 清掉；取回工作要的恰恰是这些都留着，只换里面的内容。
+    fn get_work(&mut self) {
+        let branches: Vec<RefU64> = self
+            .tree
+            .expanded
+            .iter()
+            .filter(|refno| self.tree.children.contains_key(refno))
+            .copied()
+            .collect();
+        self.start_get_work(branches);
+    }
+
+    /// 发一次取回工作。`branches` 是要重查子层的分支，由调用方按自己掌握的线索
+    /// 算好——菜单点进来的算不出线索、只能把已展开的全给上，更新跑完那条路则
+    /// 有一份确切的清单。
+    fn start_get_work(&mut self, branches: Vec<RefU64>) {
+        if !self.vm.data_source_ok || self.get_work_pending {
+            return;
+        }
+        self.set_get_work_busy(true);
+        self.logs.info(
+            &mut self.vm.logs,
+            format!("正在取回工作：重查根层与 {} 个分支…", branches.len()),
+        );
+        let _ = self.bridge.req.send(data::Req::GetWork { branches });
+    }
+
+    /// 增量更新跑完之后自动取回一次，人不用记得再去点一下菜单。
+    ///
+    /// 与菜单点进来的那次不同：这里手上有一份确切的清单，所以只重查真正会变的
+    /// 分支——单元自己、它的原 OWNER、新 OWNER，外加树里记着的当前父节点
+    /// （元素被移走时后端的 `old_owner` 未必解得出来，本端的缓存却还留着移动前
+    /// 那一头）。一个单元都没生成成功时整件事跳过：界面上不会有任何东西变。
+    fn refresh_after_update(&mut self) {
+        let units = match &self.model_update {
+            ModelUpdateVm::Running(session) => session
+                .run
+                .result
+                .as_ref()
+                .map(model_update::Outcome::refresh_units)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        if units.is_empty() {
+            return;
+        }
+        let mut branches: HashSet<RefU64> = HashSet::new();
+        for unit in &units {
+            branches.extend(unit.old_owner);
+            branches.extend(unit.new_owner);
+            branches.extend(self.tree.parent.get(&unit.root).copied());
+            branches.insert(unit.root);
+        }
+        // 只留子层已经在手里的分支。没展开过的下次展开时本来就会现查，现在去拉
+        // 就是把一次精确刷新做成一次预取。
+        branches.retain(|refno| self.tree.children.contains_key(refno));
+        self.start_get_work(branches.into_iter().collect());
+    }
+
+    /// 重入闸门与界面上那句「正在取回工作…」共用一个真值，两者不许分开走。
+    fn set_get_work_busy(&mut self, busy: bool) {
+        self.get_work_pending = busy;
+        self.vm.get_work_busy = busy;
+    }
+
     fn reconnect(&mut self) {
         // 新连接必须从空缓存开始：否则失败时状态栏和属性仍在说旧模型已经就绪。
         self.tree = TreeModel::default();
@@ -656,6 +857,25 @@ impl App {
             base: self.model_api_url.clone(),
             project: self.vm.project.clone(),
         });
+    }
+
+    /// 重开明细长连接。断线期间的事件不会补发，所以重连只让后续的行重新流进来，
+    /// 已经缺掉的那些补不回，界面上那句「落后 N 条」照旧成立。
+    fn reopen_model_feed(&mut self, ctx: &egui::Context) {
+        let ModelUpdateVm::Running(session) = &mut self.model_update else {
+            return;
+        };
+        if session.run.terminal() {
+            return;
+        }
+        session.progress.feed = ModelUpdateFeed::Connecting;
+        let task_id = session.run.task_id.clone();
+        self.model_feed = Some(model_update_ws::Feed::open(
+            &self.model_api_url,
+            task_id,
+            self.bridge.evt_tx.clone(),
+            ctx.clone(),
+        ));
     }
 
     fn poll_model_update(&mut self, ctx: &egui::Context) {
@@ -809,7 +1029,7 @@ impl eframe::App for App {
         }
         // 定位请求只管一帧：树刚才已经滚过去了，绘制层只读、消费不掉自己。
         self.vm.tree_reveal = None;
-        self.handle_cmds(cmds);
+        self.handle_cmds(ui.ctx(), cmds);
         self.poll_model_update(ui.ctx());
         // 这一帧才记下的定位要等下一帧才画得出来，别让界面停在这儿等下一次输入。
         if self.vm.tree_reveal.is_some() {

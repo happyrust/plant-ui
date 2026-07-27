@@ -35,6 +35,7 @@ enum Tool {
     Show,
     Hide,
     HideAll,
+    ShowAll,
     Focus,
     Fit,
 }
@@ -44,10 +45,11 @@ impl Tool {
     ///
     /// 距离测量不在这里：它得宿主给出精确的表面命中才算数，拿世界 AABB 的交点
     /// 冒充就是假测量。等那条链路接通再进这张表，不先摆一枚按不动的尺子。
-    const BAR: [Tool; 5] = [
+    const BAR: [Tool; 6] = [
         Tool::Show,
         Tool::Hide,
         Tool::HideAll,
+        Tool::ShowAll,
         Tool::Focus,
         Tool::Fit,
     ];
@@ -57,6 +59,8 @@ impl Tool {
             Tool::Show => ph::EYE,
             Tool::Hide => ph::EYE_SLASH,
             Tool::HideAll => ph::EYE_CLOSED,
+            // 复数的眼睛对闭着的眼睛：这一对读作「全部」，与上面单数那一对分开。
+            Tool::ShowAll => ph::EYES,
             Tool::Focus => ph::CROSSHAIR_SIMPLE,
             Tool::Fit => ph::CORNERS_OUT,
         }
@@ -68,6 +72,8 @@ impl Tool {
             Tool::Show => "显示所选 (S)",
             Tool::Hide => "隐藏所选 (H)",
             Tool::HideAll => "隐藏全部 (Shift+H)",
+            // 不写「显示所有元素」：它只把已加载的显示回来，不替用户加载没加载过的。
+            Tool::ShowAll => "显示全部 (Shift+S)",
             // 不写「定位所选」：多选时它只带相机去主选中那一个，见 `ModelAction::Focus`。
             Tool::Focus => "定位到当前元素 (F)",
             Tool::Fit => "视图适应 (Home)",
@@ -79,6 +85,7 @@ impl Tool {
             Tool::Show => KeyboardShortcut::new(Modifiers::NONE, Key::S),
             Tool::Hide => KeyboardShortcut::new(Modifiers::NONE, Key::H),
             Tool::HideAll => KeyboardShortcut::new(Modifiers::SHIFT, Key::H),
+            Tool::ShowAll => KeyboardShortcut::new(Modifiers::SHIFT, Key::S),
             Tool::Focus => KeyboardShortcut::new(Modifiers::NONE, Key::F),
             Tool::Fit => KeyboardShortcut::new(Modifiers::NONE, Key::Home),
         }
@@ -99,6 +106,10 @@ impl Tool {
                 visible: false,
             },
             Tool::HideAll => ModelAction::HideAll,
+            // 不按「有没有东西被藏着」置灰：绘制层手上没有这个数，Vm 里也没有，
+            // 为一枚按钮的启用态往 Vm 上加一个全局标志不划算。按下去无事发生，
+            // 与 `HideAll` 在空场景里按下去是同一种无害。
+            Tool::ShowAll => ModelAction::ShowAll,
             Tool::Focus => ModelAction::Focus(selection.primary()?),
             Tool::Fit => ModelAction::FitAll,
         })
@@ -757,6 +768,7 @@ mod tests {
                     visible: false
                 }),
                 Some(ModelAction::HideAll),
+                Some(ModelAction::ShowAll),
                 Some(ModelAction::Focus(refno)),
                 Some(ModelAction::FitAll),
             ]
@@ -784,6 +796,9 @@ mod tests {
 
     /// 空选择集时，依赖选中的三件事必须自己说「做不了」——
     /// 按钮的禁用态就是照这个来的，两边不能各判各的。
+    ///
+    /// 反过来，`HideAll` / `ShowAll` / `FitAll` 三个全局动作在空选择集下照样成立：
+    /// 它们作用于整个场景，跟选中什么没关系。
     #[test]
     fn per_element_tools_need_a_selection() {
         assert_eq!(
@@ -792,17 +807,28 @@ mod tests {
                 None,
                 None,
                 Some(ModelAction::HideAll),
+                Some(ModelAction::ShowAll),
                 None,
                 Some(ModelAction::FitAll),
             ]
         );
     }
 
-    /// 隐藏所选与隐藏全部只差一个 Shift，键位表里必须是两条互不相等的记录。
+    /// 所选与全部只差一个 Shift，键位表里必须是两两互不相等的记录。
+    ///
+    /// 按整表查而不是只查那一对：撞键的后果是按下去两条命令一起发，而 egui 的
+    /// `consume_shortcut` 谁先问谁得手，光看键位表看不出来。加第七枚工具时这条
+    /// 会替你发现撞车。
     #[test]
-    fn hide_and_hide_all_are_distinct_shortcuts() {
-        assert_ne!(Tool::Hide.shortcut(), Tool::HideAll.shortcut());
+    fn every_tool_has_its_own_shortcut() {
+        for (i, a) in Tool::BAR.iter().enumerate() {
+            for b in &Tool::BAR[i + 1..] {
+                assert_ne!(a.shortcut(), b.shortcut(), "{a:?} 与 {b:?} 撞键了");
+            }
+        }
         assert!(Tool::HideAll.shortcut().modifiers.shift);
         assert!(!Tool::Hide.shortcut().modifiers.shift);
+        assert!(Tool::ShowAll.shortcut().modifiers.shift);
+        assert!(!Tool::Show.shortcut().modifiers.shift);
     }
 }

@@ -17,6 +17,14 @@ pub struct WorkbenchVm {
     pub user: String,
     /// 数据源是否就绪（状态栏指示点）。
     pub data_source_ok: bool,
+    /// 有一次取回工作正在跑。菜单据此置灰，免得连点堆出几轮全量重载。
+    pub get_work_busy: bool,
+    /// 设计库里还没被应用到模型的会话数；`None` = 还没读到，那一行整个不画。
+    ///
+    /// 摆在取回工作旁边，是为了把两个入口的分工说清楚：取回工作只取界面，
+    /// 真要把这些会话应用进模型得走「模型更新」。它是提示不是判据——
+    /// 数据侧的 `file_latest_sesno` 只有上一次扫描时那么新。
+    pub pending_sessions: Option<u32>,
     /// 已加载元素计数（状态栏右侧）。
     pub element_count: usize,
     /// 当前选择集（状态栏 + 属性视图跟随其 `primary`）。
@@ -282,6 +290,27 @@ pub enum TreeVm {
     Failed(String),
 }
 
+/// 一行在三维里的可见性。
+///
+/// 三态而不是 `bool`：宿主开机时可见性台账是空的，每一行都既不是显示也不是隐藏，
+/// 而是从没被显示指令提到过。二态在这里必然说谎，理由与台账本身见 ADR-0010。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RowVisibility {
+    /// 从没被显示指令提到过——三维里压根没有它的实体。
+    #[default]
+    Unloaded,
+    Shown,
+    Hidden,
+}
+
+impl RowVisibility {
+    /// 点这一行的眼睛之后，`SetVisible` 该带什么方向。
+    /// 未加载与已隐藏都是「让它出来」，只有显示中才是「藏起来」。
+    pub fn on_click(self) -> bool {
+        self != Self::Shown
+    }
+}
+
 /// 模型树的一个可见行。
 ///
 /// 树的展平由 App 侧在结构变化（展开 / 折叠 / 子层到达）时做一次，
@@ -299,6 +328,11 @@ pub struct TreeRowVm {
     pub expandable: Option<bool>,
     /// 子层查询在途（行尾以「加载中…」提示）。
     pub loading: bool,
+    /// 这一行在三维里的可见性。真值在宿主的可见性台账上，绘制层只读。
+    ///
+    /// 容器行（SITE / ZONE / PIPE）自己没有 mesh 实体，它这一格说的是
+    /// **对这一行下过的指令**，不是子树此刻的实际状态。
+    pub visibility: RowVisibility,
 }
 
 /// 属性视图数据状态（跟随 `WorkbenchVm::selected`）。
@@ -445,6 +479,15 @@ mod tests {
         s.range(&order, r(5));
         assert_eq!(s.to_vec(), vec![r(4), r(5)]);
         assert_eq!(s.primary(), Some(r(5)));
+    }
+
+    /// 未加载与已隐藏都是「让它出来」。把这两档合并成 `!visible` 是最容易写错的
+    /// 一处：开机时整棵树都是未加载，那一版点下去会把元素**隐藏**掉。
+    #[test]
+    fn clicking_the_eye_shows_everything_that_is_not_already_shown() {
+        assert!(RowVisibility::Unloaded.on_click());
+        assert!(RowVisibility::Hidden.on_click());
+        assert!(!RowVisibility::Shown.on_click());
     }
 
     #[test]
