@@ -76,7 +76,7 @@ pub fn show(
         .exact_size(d.command_bar_h() + 1.0)
         .frame(egui::Frame::NONE)
         .show_separator_line(false)
-        .show(ui, |ui| chrome::command_bar(ui, t, d, vm));
+        .show(ui, |ui| chrome::command_bar(ui, t, d, vm, &mut cmds));
     egui::Panel::bottom("wb-status")
         .exact_size(d.status_bar_h() + 1.0)
         .frame(egui::Frame::NONE)

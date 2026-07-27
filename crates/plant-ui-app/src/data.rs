@@ -6,6 +6,7 @@
 
 use std::sync::mpsc;
 
+use plant_ui::model_update::{Accepted, Preview, Run};
 use plant_ui_data::{EleTreeNode, RefU64};
 
 pub enum Req {
@@ -15,6 +16,19 @@ pub enum Req {
     Props(RefU64),
     /// 重跑启动序列。连库失败后命令行上的「重试」走这条，结果仍走 `Evt::Ready`。
     Reconnect,
+    ModelUpdatePreview {
+        base: String,
+        project: String,
+    },
+    ModelUpdateExecute {
+        base: String,
+        project: String,
+        dbnums: Vec<u32>,
+    },
+    ModelUpdateTask {
+        base: String,
+        run_id: String,
+    },
 }
 
 /// 启动序列（连接 + 工程标识 + SITE 根层）的合并产物。
@@ -29,6 +43,9 @@ pub enum Evt {
     Ready(anyhow::Result<ReadyInfo>),
     Children(RefU64, anyhow::Result<Vec<EleTreeNode>>),
     Props(RefU64, anyhow::Result<Vec<plant_ui_data::Attr>>),
+    ModelUpdatePreview(anyhow::Result<Preview>),
+    ModelUpdateExecute(anyhow::Result<Accepted>),
+    ModelUpdateTask(String, anyhow::Result<Run>),
 }
 
 pub struct Bridge {
@@ -79,6 +96,39 @@ pub fn spawn(ctx: egui::Context) -> Bridge {
                             let r = plant_ui_data::element_props(refno.into()).await;
                             let _ = evt_tx.send(Evt::Props(refno, r));
                             ctx.request_repaint();
+                        }
+                        Req::ModelUpdatePreview { base, project } => {
+                            let tx = evt_tx.clone();
+                            let repaint = ctx.clone();
+                            std::thread::spawn(move || {
+                                let _ = tx.send(Evt::ModelUpdatePreview(
+                                    crate::model_update_api::preview(&base, &project),
+                                ));
+                                repaint.request_repaint();
+                            });
+                        }
+                        Req::ModelUpdateExecute {
+                            base,
+                            project,
+                            dbnums,
+                        } => {
+                            let tx = evt_tx.clone();
+                            let repaint = ctx.clone();
+                            std::thread::spawn(move || {
+                                let _ = tx.send(Evt::ModelUpdateExecute(
+                                    crate::model_update_api::execute(&base, &project, &dbnums),
+                                ));
+                                repaint.request_repaint();
+                            });
+                        }
+                        Req::ModelUpdateTask { base, run_id } => {
+                            let tx = evt_tx.clone();
+                            let repaint = ctx.clone();
+                            std::thread::spawn(move || {
+                                let result = crate::model_update_api::task(&base, &run_id);
+                                let _ = tx.send(Evt::ModelUpdateTask(run_id, result));
+                                repaint.request_repaint();
+                            });
                         }
                     }
                 }

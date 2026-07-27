@@ -2,6 +2,7 @@
 //! 不认识数据库、不认识 Bevy：输入 &Vm，输出 Vec<Cmd>。
 
 pub mod fonts;
+pub mod model_update;
 pub mod style;
 pub mod vm;
 pub mod workbench;
@@ -32,4 +33,10 @@ pub enum Cmd {
     RetryProps(aios_core::RefU64),
     /// 清空命令行缓冲。
     ClearConsole,
+    /// 打开并刷新模型增量更新预览。
+    OpenModelUpdate,
+    /// 重新读取当前项目的增量范围。
+    RefreshModelUpdate,
+    /// 按 dbnum 执行；sesno 范围由服务端的 Committed Watermark 决定。
+    ExecuteModelUpdate(Vec<u32>),
 }

@@ -7,6 +7,7 @@
 use egui::{Align, Color32, CornerRadius, Layout, Margin, RichText, Sense, Stroke, Ui, pos2, vec2};
 use egui_phosphor::regular as ph;
 
+use crate::Cmd;
 use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Status, Tokens, radius, space};
 use crate::style::widgets;
@@ -56,7 +57,7 @@ pub fn title_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
     hairline(ui, t);
 }
 
-pub fn command_bar(ui: &mut Ui, t: &Tokens, d: Density, _vm: &WorkbenchVm) {
+pub fn command_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Vec<Cmd>) {
     ui.spacing_mut().item_spacing.y = 0.0;
     egui::Frame::new()
         .fill(t.bg_panel)
@@ -85,14 +86,19 @@ pub fn command_bar(ui: &mut Ui, t: &Tokens, d: Density, _vm: &WorkbenchVm) {
                 }
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    // 同一屏只有一个 accent 主操作：模型更新（S2/S4 任务窗，M4 接线）。
                     let _ = ui.add(widgets::button(t, d, "生成模型").icon(ph::PLAY));
                     ui.add_space(space::S1);
-                    let _ = ui.add(
-                        widgets::button(t, d, "模型更新")
-                            .icon(ph::ARROWS_CLOCKWISE)
-                            .primary(),
-                    );
+                    if ui
+                        .add_enabled(
+                            vm.data_source_ok,
+                            widgets::button(t, d, "模型更新")
+                                .icon(ph::ARROWS_CLOCKWISE)
+                                .primary(),
+                        )
+                        .clicked()
+                    {
+                        cmds.push(Cmd::OpenModelUpdate);
+                    }
                 });
             });
         });

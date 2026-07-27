@@ -4,14 +4,19 @@
 mod console;
 mod data;
 mod gallery;
+mod model_update_api;
 mod textures;
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use console::Retry;
 use eframe::egui;
 use plant_ui::Cmd;
 use plant_ui::fonts;
+use plant_ui::model_update::{
+    self, Run as ModelUpdateRun, State as ModelUpdateState, Vm as ModelUpdateVm,
+};
 use plant_ui::style::theme_tokens::{self, set_weight_families_ready};
 use plant_ui::style::tokens::{Density, Tokens};
 use plant_ui::vm::{
@@ -36,7 +41,7 @@ fn main() -> eframe::Result {
             let weights_ready = defs.font_data.contains_key(fonts::MEDIUM);
             cc.egui_ctx.set_fonts(defs);
             set_weight_families_ready(weights_ready);
-            theme_tokens::apply(&cc.egui_ctx, &Tokens::dark(), Density::Standard);
+            theme_tokens::apply(&cc.egui_ctx, &Tokens::light(), Density::Standard);
             if gallery {
                 Ok(Box::new(gallery::GalleryApp::default()))
             } else {
@@ -141,6 +146,11 @@ impl TreeModel {
 struct App {
     vm: WorkbenchVm,
     state: WorkbenchState,
+    model_update: ModelUpdateVm,
+    model_update_state: ModelUpdateState,
+    model_api_url: String,
+    last_model_poll: Instant,
+    pending_model_polls: HashSet<String>,
     bridge: data::Bridge,
     tree: TreeModel,
     console: console::Console,
@@ -157,6 +167,11 @@ impl App {
                 ..Default::default()
             },
             state: WorkbenchState::default(),
+            model_update: ModelUpdateVm::default(),
+            model_update_state: ModelUpdateState::default(),
+            model_api_url: model_update_api::base_url(),
+            last_model_poll: Instant::now(),
+            pending_model_polls: HashSet::new(),
             bridge: data::spawn(ctx.clone()),
             tree: TreeModel::default(),
             console: console::Console::default(),
@@ -254,6 +269,84 @@ impl App {
                     };
                 }
                 data::Evt::Props(..) => {}
+                data::Evt::ModelUpdatePreview(result) => match result {
+                    Ok(preview) => {
+                        self.model_update_state.select_defaults(&preview);
+                        self.console.info(
+                            &mut self.vm.console,
+                            format!(
+                                "模型更新预览完成：{} 个设计库，执行范围 dbnum + sesno",
+                                preview.dbnums.len()
+                            ),
+                        );
+                        self.model_update = ModelUpdateVm::Ready(preview);
+                    }
+                    Err(error) => {
+                        let detail = console::error_chain(&error);
+                        self.console
+                            .error(&mut self.vm.console, "模型更新预览失败", &error, None);
+                        self.model_update = ModelUpdateVm::Failed(detail);
+                    }
+                },
+                data::Evt::ModelUpdateExecute(result) => match result {
+                    Ok(accepted) => {
+                        let runs = accepted
+                            .run_ids
+                            .into_iter()
+                            .zip(accepted.dbnums)
+                            .map(|(run_id, dbnum)| ModelUpdateRun {
+                                run_id,
+                                dbnum,
+                                state: "queued".into(),
+                                ..Default::default()
+                            })
+                            .collect::<Vec<_>>();
+                        let warnings = accepted
+                            .skipped
+                            .into_iter()
+                            .chain(accepted.excluded)
+                            .map(|item| format!("DB {} 已跳过：{}", item.dbnum, item.reason))
+                            .collect();
+                        self.console.info(
+                            &mut self.vm.console,
+                            format!("已提交 {} 个模型增量更新任务", runs.len()),
+                        );
+                        self.last_model_poll = Instant::now() - Duration::from_secs(1);
+                        self.model_update = ModelUpdateVm::Running {
+                            runs,
+                            warnings,
+                            poll_error: None,
+                        };
+                    }
+                    Err(error) => {
+                        let detail = console::error_chain(&error);
+                        self.console.error(
+                            &mut self.vm.console,
+                            "提交模型增量更新失败",
+                            &error,
+                            None,
+                        );
+                        self.model_update = ModelUpdateVm::Failed(detail);
+                    }
+                },
+                data::Evt::ModelUpdateTask(run_id, result) => {
+                    self.pending_model_polls.remove(&run_id);
+                    if let ModelUpdateVm::Running {
+                        runs, poll_error, ..
+                    } = &mut self.model_update
+                    {
+                        match result {
+                            Ok(run) => {
+                                if let Some(slot) = runs.iter_mut().find(|run| run.run_id == run_id)
+                                {
+                                    *slot = run;
+                                }
+                                *poll_error = None;
+                            }
+                            Err(error) => *poll_error = Some(console::error_chain(&error)),
+                        }
+                    }
+                }
             }
         }
         if dirty {
@@ -350,6 +443,29 @@ impl App {
                     _ => {}
                 },
                 Cmd::ClearConsole => self.console.clear(&mut self.vm.console),
+                Cmd::OpenModelUpdate => {
+                    self.model_update_state.open = true;
+                    if !matches!(
+                        self.model_update,
+                        ModelUpdateVm::Loading
+                            | ModelUpdateVm::Starting
+                            | ModelUpdateVm::Running { .. }
+                    ) {
+                        self.refresh_model_update();
+                    }
+                }
+                Cmd::RefreshModelUpdate => self.refresh_model_update(),
+                Cmd::ExecuteModelUpdate(dbnums) => {
+                    if dbnums.is_empty() {
+                        continue;
+                    }
+                    self.model_update = ModelUpdateVm::Starting;
+                    let _ = self.bridge.req.send(data::Req::ModelUpdateExecute {
+                        base: self.model_api_url.clone(),
+                        project: self.vm.project.clone(),
+                        dbnums,
+                    });
+                }
             }
         }
         if dirty {
@@ -384,6 +500,40 @@ impl App {
         self.vm.props = PropsVm::Uninit;
         self.console.info(&mut self.vm.console, "正在重连数据源…");
         let _ = self.bridge.req.send(data::Req::Reconnect);
+    }
+
+    fn refresh_model_update(&mut self) {
+        self.model_update = ModelUpdateVm::Loading;
+        let _ = self.bridge.req.send(data::Req::ModelUpdatePreview {
+            base: self.model_api_url.clone(),
+            project: self.vm.project.clone(),
+        });
+    }
+
+    fn poll_model_update(&mut self, ctx: &egui::Context) {
+        let ModelUpdateVm::Running { runs, .. } = &self.model_update else {
+            return;
+        };
+        if runs.iter().all(ModelUpdateRun::terminal) {
+            return;
+        }
+        ctx.request_repaint_after(Duration::from_secs(1));
+        if self.last_model_poll.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.last_model_poll = Instant::now();
+        for run_id in runs
+            .iter()
+            .filter(|run| !run.terminal() && !self.pending_model_polls.contains(&run.run_id))
+            .map(|run| run.run_id.clone())
+            .collect::<Vec<_>>()
+        {
+            self.pending_model_polls.insert(run_id.clone());
+            let _ = self.bridge.req.send(data::Req::ModelUpdateTask {
+                base: self.model_api_url.clone(),
+                run_id,
+            });
+        }
     }
 
     fn rebuild_tree(&mut self) {
@@ -483,10 +633,19 @@ impl eframe::App for App {
         self.pump_events();
         let t = theme_tokens::current();
         let d = Density::Standard;
-        let cmds = workbench::show(ui, &t, d, &self.vm, &mut self.state);
+        let mut cmds = workbench::show(ui, &t, d, &self.vm, &mut self.state);
+        cmds.extend(model_update::show(
+            ui.ctx(),
+            &t,
+            d,
+            &self.model_api_url,
+            &self.model_update,
+            &mut self.model_update_state,
+        ));
         // 定位请求只管一帧：树刚才已经滚过去了，绘制层只读、消费不掉自己。
         self.vm.tree_reveal = None;
         self.handle_cmds(cmds);
+        self.poll_model_update(ui.ctx());
         // 这一帧才记下的定位要等下一帧才画得出来，别让界面停在这儿等下一次输入。
         if self.vm.tree_reveal.is_some() {
             ui.ctx().request_repaint();

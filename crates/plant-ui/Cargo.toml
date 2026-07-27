@@ -9,3 +9,4 @@ egui_extras.workspace = true
 egui_dock.workspace = true
 egui-phosphor.workspace = true
 aios_core.workspace = true
+serde.workspace = true
