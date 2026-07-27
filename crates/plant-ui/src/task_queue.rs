@@ -218,6 +218,12 @@ pub struct UnitLine {
 pub struct Vm {
     /// 当前项目。快照里 `project` 与它不一致的条目直接不显示，**但过滤要出声**。
     pub project: String,
+    /// 当前 MDB 名。空 = 还没连上数据源，取不到本期执行范围的口径。
+    ///
+    /// 队列面板只靠 HTTP 服务活着，数据源断着它照样能显示队列；但「立刻扫一遍」
+    /// 打的是 execute，那个请求要带 MDB。没有 MDB 就发出去，服务端解不出范围会
+    /// 一律报错（ADR-0013），人只能在日志里看到一条说不清缘由的失败。
+    pub mdb: String,
     pub queue: QueueSnapshot,
     pub tasks: Vec<TaskEntry>,
     pub health: Option<Health>,
@@ -1025,8 +1031,12 @@ fn summary_bar(
             cmds.push(Cmd::SetQueuePaused(true));
         }
         if ui
-            .add(widgets::button(t, d, "立刻扫一遍").icon(ph::ARROWS_CLOCKWISE))
+            .add_enabled(
+                !vm.mdb.is_empty(),
+                widgets::button(t, d, "立刻扫一遍").icon(ph::ARROWS_CLOCKWISE),
+            )
             .on_hover_text("不插队，只是别等下一个 30 秒轮询")
+            .on_disabled_hover_text("还没连上数据源，取不到当前 MDB；本期执行范围由它定")
             .clicked()
         {
             cmds.push(Cmd::ScanNow);

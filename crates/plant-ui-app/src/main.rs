@@ -546,6 +546,7 @@ impl App {
                         Ok(poll) => {
                             let fresh = self.newly_finished(&poll);
                             self.queue.project = self.vm.project.clone();
+                            self.queue.mdb = self.mdb.clone();
                             self.queue.adopt(poll);
                             self.refresh_for_units(fresh);
                         }
@@ -949,6 +950,9 @@ impl App {
         self.vm.data_source_ok = false;
         self.vm.project.clear();
         self.mdb.clear();
+        // 队列面板那份跟着一起清。它平时随轮询回填，而轮询可能几秒才来一拍——
+        // 那几秒里「立刻扫一遍」还亮着，按下去带的是上一次连接的 MDB。
+        self.queue.mdb.clear();
         self.vm.db.clear();
         self.vm.element_count = 0;
         self.vm.selection.clear();
