@@ -76,19 +76,22 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                                 },
                             );
                             // 点箭头只折叠 / 展开；点行其他区域选中；双击整行也展开。
-                            if out.response.clicked() {
-                                let on_caret = out.caret_rect.is_some_and(|r| {
-                                    out.response
-                                        .interact_pointer_pos()
-                                        .is_some_and(|p| r.contains(p))
-                                });
-                                if on_caret {
+                            let on_caret = out.caret_rect.is_some_and(|r| {
+                                out.response
+                                    .interact_pointer_pos()
+                                    .is_some_and(|p| r.contains(p))
+                            });
+                            if out.response.double_clicked()
+                                && row.expandable.is_some()
+                                && !on_caret
+                            {
+                                cmds.push(Cmd::ToggleExpand(row.refno));
+                            } else if out.response.clicked() {
+                                if on_caret && !out.response.double_clicked() {
                                     cmds.push(Cmd::ToggleExpand(row.refno));
-                                } else {
+                                } else if !out.response.double_clicked() {
                                     cmds.push(Cmd::SelectElement(row.refno));
                                 }
-                            } else if out.response.double_clicked() && row.expandable.is_some() {
-                                cmds.push(Cmd::ToggleExpand(row.refno));
                             }
                         }
                     });

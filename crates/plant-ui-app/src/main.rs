@@ -436,6 +436,7 @@ impl App {
                         project: self.vm.project.clone(),
                     });
                 }
+                Cmd::PickViewport(_) => {}
             }
         }
         if dirty {

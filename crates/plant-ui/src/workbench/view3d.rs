@@ -9,20 +9,27 @@
 //! 四个假数字加一排点不动的按钮。按外壳一贯的「宁可少一格」，只留一块讲清楚这是
 //! 占位的 HUD，其余等 M3 接回 Bevy 有了真数据再补。
 
-use egui::{Color32, Mesh, Rect, RichText, Sense, Shape, Stroke, Ui, pos2, vec2};
+use egui::{Color32, Mesh, Rect, RichText, Sense, Shape, Stroke, Ui, Vec2, pos2, vec2};
 use egui_phosphor::regular as ph;
 
 use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Tokens, radius};
 use crate::style::widgets;
 use crate::vm::WorkbenchVm;
+use crate::Cmd;
 
 /// 占位纹理的不透明度，取自 S1 的「模型场景」矩形。压这么一点让渐变底透上来，
 /// 图与视口连成一片，不像贴上去的一张照片。
 const PLACEHOLDER_ALPHA: u8 = 235;
 
-pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
-    let (rect, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
+pub fn show(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    vm: &WorkbenchVm,
+    cmds: &mut Vec<Cmd>,
+) {
+    let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
     ui.painter()
         .add(gradient(rect, t.viewport_top, t.viewport_bottom));
 
@@ -31,17 +38,34 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
         return;
     };
 
+    let uv = cover_uv(rect.size(), view.size);
     ui.painter().image(
         view.texture,
         rect,
-        cover_uv(rect.size(), view.size),
+        uv,
         if view.live {
             Color32::WHITE
         } else {
             Color32::from_white_alpha(PLACEHOLDER_ALPHA)
         },
     );
+    if view.live
+        && response.clicked_by(egui::PointerButton::Primary)
+        && let Some(pointer) = response.interact_pointer_pos()
+    {
+        cmds.push(Cmd::PickViewport(pointer_texture_uv(
+            rect.size(),
+            view.size,
+            pointer - rect.min,
+        )));
+    }
     hud(ui, t, d, rect, view.live);
+}
+
+fn pointer_texture_uv(viewport: Vec2, texture: Vec2, pointer: Vec2) -> [f32; 2] {
+    let uv = cover_uv(viewport, texture);
+    let texture_uv = uv.min + pointer / viewport * uv.size();
+    [texture_uv.x, texture_uv.y]
 }
 
 /// 竖直渐变。egui 没有渐变笔刷，四个顶点各自带色的三角网格就是标准做法。
@@ -143,4 +167,17 @@ fn note(ui: &mut Ui, t: &Tokens, d: Density, view: Rect) {
             retry: false,
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pointer_uv_includes_cover_crop() {
+        assert_eq!(
+            pointer_texture_uv(vec2(200.0, 100.0), vec2(100.0, 100.0), Vec2::ZERO),
+            [0.0, 0.25]
+        );
+    }
 }

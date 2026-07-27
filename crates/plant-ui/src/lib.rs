@@ -47,4 +47,6 @@ pub enum Cmd {
     RefreshModelUpdate,
     /// 执行当前项目的全部待更新库；范围由服务端的 Committed Watermark 决定。
     ExecuteModelUpdate,
+    /// 点击三维视口；坐标是离屏渲染纹理的归一化 UV。
+    PickViewport([f32; 2]),
 }

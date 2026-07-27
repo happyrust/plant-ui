@@ -104,7 +104,7 @@ impl TabViewer for Viewer<'_> {
             Pane::ModelTree => super::tree::show(ui, self.t, self.d, self.vm, self.cmds),
             Pane::Properties => super::props::show(ui, self.t, self.d, self.vm, self.cmds),
             Pane::Console => super::console::show(ui, self.t, self.d, self.vm, self.cmds),
-            Pane::View3d => super::view3d::show(ui, self.t, self.d, self.vm),
+            Pane::View3d => super::view3d::show(ui, self.t, self.d, self.vm, self.cmds),
         }
     }
 
