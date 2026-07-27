@@ -1,18 +1,22 @@
 # 布置平台 UI 设计系统 · 落地说明
 
-设计源文件：`design/rs-plant3d-ui.pen`（Pencil 打开，勿用文本编辑器）
+设计源文件：`design/plant-ui.pen`（Pencil 打开，勿用文本编辑器；原名 `rs-plant3d-ui.pen`，2026-07-27 已 rename 归位，见 `docs/plans/task-queue-rollout.md` 第九节第 3 条）
 HTML 参照：`design/export/*.html`（离线可看，含精确尺寸与颜色）
-字段对照：`design/MODEL-UPDATE-FIELD-MAP.md`（模型更新七张画板每个元素的出处，实现的验收基准）
+字段对照：`design/MODEL-UPDATE-FIELD-MAP.md`（模型更新八张画板）与 `design/QUEUE-FIELD-MAP.md`（任务队列视图），都是实现的验收基准
 
 ---
 
 ## 1. 画板索引
 
-这是**规划**，不是 `.pen` 的现状：截至 2026-07-27，文件里有 S1–S4 加后补的 S2-A、S2-B、S2-D、S2-E、S4-B、S4-C，
-再加 6 个组件（C/Tab、C/TreeRow、C/PropRow、C/LogRow、C/ToolBtn、C/Button），S5 往后一张都没画。
+这是**规划**，不是 `.pen` 的现状：截至 2026-07-27 晚，文件里有 S1–S4 加后补的 S2-A、S2-B、S2-D、S2-E、S4-B、S4-C，
+再加 S11（模型树行内可见性眼睛）与 S12 / S12-B（任务队列），
+组件 7 个（C/Tab、C/TreeRow、C/PropRow、C/LogRow、C/ToolBtn、C/Button、C/QueueRow），S5–S10 一张都没画。
 「已画」一列就是为此加的——查过 `old\rs-plant3-d\design\rs-plant3d-ui.pen` 那份原始文件，
 体积是本项目这份的三倍，顶层节点却完全一样，所以不是迁移时漏拷。
 下游要照着某张画板做之前，先看这一列。
+
+**编号注意**：S11 / S12 两个号在 07-27 被新画板占用，原规划的「模糊查询」「保存 / 搜索记录」
+顺延为 S13 / S14（仍未画）。
 
 | 画板 | 尺寸 | 已画 | 对应代码 |
 |---|---|---|---|
@@ -32,8 +36,11 @@ HTML 参照：`design/export/*.html`（离线可看，含精确尺寸与颜色�
 | S8 状态词汇 | 1240×560 | 否 | 所有数据面板通用；M1-7 已改按设计令牌收敛，不等它 |
 | S9 创建元件 | 900×680 | 否 | `plugins/pipe_plugin/component_creation_ui.rs` |
 | S10 元件库 | 1400×860 | 否 | `UiOption::ComponentWarehouseUI` |
-| S11 模糊查询 | 1240×820 | 否 | `ui/fuzzy_search/` |
-| S12 保存 / 搜索记录 | 1280×560 | 否 | `fuzzy_search/save_ui.rs`、`import_ui.rs` |
+| S11 模型树 · 行内可见性眼睛 | 自适应 | 是 | `workbench/tree.rs` 眼睛列 + `vm.rs` 的 `RowVisibility` 三态，见 ADR-0010 |
+| S12 任务队列 · 常态 | 1040×720 | 是 | 尚无实现；常驻 dock 队列视图，见 ADR-0011，验收基准 `QUEUE-FIELD-MAP.md` |
+| S12-B 任务队列 · 暂停 / 重建 / 断线降级 | 1040×720 | 是 | 同 S12 的三种降级形态 |
+| S13 模糊查询（原编号 S11） | 1240×820 | 否 | `ui/fuzzy_search/` |
+| S14 保存 / 搜索记录（原编号 S12） | 1280×560 | 否 | `fuzzy_search/save_ui.rs`、`import_ui.rs` |
 
 ### 三步向导：预览 → 确认执行 → 执行进度
 

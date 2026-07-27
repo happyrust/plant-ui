@@ -300,6 +300,12 @@ PANE 这一层。是哪个库，需要对着 E3D 项目的 MDB 结构查，本�
    C/QueueRow `smhp5`），其余 17 个顶层节点两文件逐 id 一致、旧 `plant-ui.pen`
    是纯子集；已 `git mv` 旧名为 `plant-ui.pen`，17:24 那份留了
    `plant-ui.pen.stale-20260727-1724.bak`（git 历史 `504d4c1` 里也有），可删。
+   **去重收尾（ZhiMoAll-4，同晚）**：rename 落地前，ZhiMoAll-4 会话按「画板已丢」的
+   误判从 `QUEUE-FIELD-MAP.md` 并行重建过一套 S12 / S12-B / C/QueueRow，两套一度同
+   处一个文件。已按原版为准删掉重建版三节点，原版三件套逐板截图完好；顺带留下一条
+   画板标注：S1 命令栏「生成模型」按钮代码侧已摘（第八节第 4 条），链路落地时按板上
+   形态重接。`.bak` 已删。**教训**：两个会话共用一个 Pencil 编辑器时，后动手的一方
+   看到的顶层清单可能是对方会话的合并态，「在不在」要对着磁盘文件与 git 各验一遍。
 4. `TaskRegistry` 搬出 `web_service` 到 feature 无关层；队列真身单一，
    不随编译形态分叉（详见第三节第一条）。
 5. worker 无条件 spawn：一个进程一个消费者，不分 sync_live（详见第三节）。
