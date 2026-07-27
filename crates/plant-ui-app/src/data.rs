@@ -22,10 +22,12 @@ pub enum Req {
     ModelUpdatePreview {
         base: String,
         project: String,
+        mdb: String,
     },
     ModelUpdateExecute {
         base: String,
         project: String,
+        mdb: String,
     },
     ModelUpdateTask {
         base: String,
@@ -62,6 +64,8 @@ pub struct GetWork {
 /// 启动序列（连接 + 工程标识 + SITE 根层）的合并产物。
 pub struct ReadyInfo {
     pub project: String,
+    /// 当前 MDB 名（带前导 `/`）。模型更新用它定本期执行范围。
+    pub mdb: String,
     pub ns: String,
     pub db_nums: Vec<u32>,
     pub sites: Vec<EleTreeNode>,
@@ -132,10 +136,11 @@ async fn get_work(branches: &[RefU64]) -> anyhow::Result<GetWork> {
 /// 启动序列：连库、抓工程标识、抓 SITE 根层。三步任一失败都算没连上。
 async fn ready() -> anyhow::Result<ReadyInfo> {
     plant_ui_data::connect().await?;
-    let (project, ns, db_nums) = plant_ui_data::project_identity().await?;
+    let (project, mdb, ns, db_nums) = plant_ui_data::project_identity().await?;
     let sites = plant_ui_data::site_nodes().await?;
     Ok(ReadyInfo {
         project,
+        mdb,
         ns,
         db_nums,
         sites,
@@ -179,22 +184,22 @@ pub fn spawn(ctx: egui::Context) -> Bridge {
                             let _ = evt_tx.send(Evt::ResolvedName(name, result));
                             ctx.request_repaint();
                         }
-                        Req::ModelUpdatePreview { base, project } => {
+                        Req::ModelUpdatePreview { base, project, mdb } => {
                             let tx = evt_tx.clone();
                             let repaint = ctx.clone();
                             std::thread::spawn(move || {
                                 let _ = tx.send(Evt::ModelUpdatePreview(
-                                    crate::model_update_api::preview(&base, &project),
+                                    crate::model_update_api::preview(&base, &project, &mdb),
                                 ));
                                 repaint.request_repaint();
                             });
                         }
-                        Req::ModelUpdateExecute { base, project } => {
+                        Req::ModelUpdateExecute { base, project, mdb } => {
                             let tx = evt_tx.clone();
                             let repaint = ctx.clone();
                             std::thread::spawn(move || {
                                 let _ = tx.send(Evt::ModelUpdateExecute(
-                                    crate::model_update_api::execute(&base, &project),
+                                    crate::model_update_api::execute(&base, &project, &mdb),
                                 ));
                                 repaint.request_repaint();
                             });

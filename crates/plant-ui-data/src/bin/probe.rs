@@ -7,8 +7,8 @@ use plant_ui_data::AttrKind;
 async fn main() -> anyhow::Result<()> {
     plant_ui_data::connect().await?;
 
-    let (project, ns, db_nums) = plant_ui_data::project_identity().await?;
-    println!("project={project} ns={ns} desi_dbs={db_nums:?}");
+    let (project, mdb, ns, db_nums) = plant_ui_data::project_identity().await?;
+    println!("project={project} mdb={mdb} ns={ns} desi_dbs={db_nums:?}");
 
     let rows = plant_ui_data::sample_named_elements(20).await?;
     println!("sample_named_elements -> {} rows", rows.len());

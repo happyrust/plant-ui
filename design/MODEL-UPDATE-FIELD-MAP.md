@@ -24,6 +24,7 @@
 | 元素 | 示例 | 来源 | 出处 |
 |---|---|---|---|
 | 项目名 | `AMS-8009` | 契约 | `ManualUpdatePreview.project` / `ManualUpdateResult.project` |
+| MDB 名 | `/ALL` | 契约 | `ManualUpdatePreview.mdb`——服务端回显它照哪个 MDB 解的范围。**请求要带 `mdb`**：范围由 MDB 定，两侧各有一份 `mdb_name` 配置，不回显的话错开是静默的 |
 | 执行任务号 | `mu-3c81` | 契约 | execute 返回体的 `task_id` |
 | 预览任务号 | `pv-7f31` | **待新增** | ADR-0006：预览改 202 + `task_id` |
 | 步骤条三步 | 更新预览 / 确认执行 / 执行进度 | 界面自有 | 无契约来源，是本仓库定义的流程 |
@@ -62,6 +63,7 @@
 | 分布条三段 | 85 / 228 / 11 px | 契约 | 上面三数的比例 |
 | 受影响交付单元 | `23` | 契约 | `Σ DbnumPreview.units.len()`，`DeliveryUnitSummary` 已按 refno 去重 |
 | 其中影响模型的变化 | `361` | 契约 | `Σ DbnumPreview.model_affecting` |
+| 范围行 | `20 个 DESI 设计库在范围内 · 9 个 MDB 声明但项目内无文件` | 契约 | 三个理由分三个数，不许合成一个：`desi` 是当前 MDB 声明且项目里有文件的，`not_in_project` 是声明了够不着的，`excluded` 是非 DESI。**MDB 之外的设计库连行都没有**——那正是「287 行」收成「29 行」的地方 |
 | 树行库标识 | `db8000 · DESI` | 契约 | `dbnum` + `db_type` |
 | 树行会话区间 | `sesno 1 024 → 1 031` | 契约 | `applied_sesno + 1` → `file_latest_sesno` |
 | ~~ZONE 分组行~~ | | | **已删**。ZONE 分桶全局退役，树从 dbnum → ZONE → 交付单元三层改为 dbnum → 交付单元两层；分组一律按 dbnum（`docs/adr/0011`）|
@@ -82,6 +84,7 @@
 | 会执行 · 库行 | `11 个会话 · 487 项变化` | 契约 | `sessions.len()` + `net_*` 之和 |
 | 不会执行 · 阻断 | `已阻断 · 水位不变` | 契约 | `blocked = true` + `anomaly` |
 | 不会执行 · 排除 | `非 DESI，本期不处理` | 契约 | 排除发生在扫描之前，**与阻断不是一回事，界面上不许合成一行** |
+| 不会执行 · 够不着 | `MDB 声明了它，当前项目目录里没有这个文件` | 契约 | `DbnumPreview.not_in_project`。与「文件缺失」隔开：缺失是登记过的文件不见了（阻断），这个从没登记过、多半在别的项目目录里 |
 | 不会执行 · no_generation | `计入 no_generation 并告警` | 契约 | `Σ no_generation` |
 | 会一并处理 | `1 个待重试单元` | 契约 | `pending_model_retries[]` |
 | 重扫提示 | 开始时重新扫描，新会话自动并入 | 契约 | 结果里的 `merged_sesnos` 就是这句话的兑现 |
@@ -174,7 +177,9 @@
 | 同号重复 | `anomaly.kind = duplicate` | 阻断 | 契约明写 block, do not pick —— 要把 `paths[]` 都列出来交给人挑 |
 | 文件缺失 | `anomaly.kind = missing` | 阻断 | 出路二选一：补回文件，或注销这条登记 |
 
-> 「排除」（非 DESI）不在这张表里 —— 它压根不进扫描，与「阻断」来自契约的不同位置。
+> 「排除」不在这张表里 —— 它压根不进扫描，与「阻断」来自契约的不同位置。排除现在有两个理由：
+> 非 DESI，以及不在当前 MDB 声明的 DESI 名单里（后者连行都不出）。「够不着」（`not_in_project`）
+> 是第三种不执行：MDB 声明了、当前项目目录里没有这个文件，有行但不阻断。
 
 ---
 

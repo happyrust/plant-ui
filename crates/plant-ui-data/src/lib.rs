@@ -77,12 +77,28 @@ pub async fn resolve_name(name: &str) -> Result<Option<RefU64>> {
         .map(|refno| refno.refno()))
 }
 
-/// 连接后的工程标识：项目名、SurrealDB 命名空间、当前 MDB（DESI）库编号列表。
-/// 外壳原则是不摆假数字，这些都取自真实配置与真实查询。
-pub async fn project_identity() -> Result<(String, String, Vec<u32>)> {
+/// 连接后的工程标识：项目名、当前 MDB 名、SurrealDB 命名空间、当前 MDB（DESI）
+/// 库编号列表。外壳原则是不摆假数字，这些都取自真实配置与真实查询。
+///
+/// MDB 名带前导 `/`：模型更新把它发给 gen-model 当本期执行范围的口径，
+/// 而库里 `MDB.NAME` 存的就是 `/ALL` 这种形态。
+///
+/// `mdb_name` 配空时回空串，不回 `to_e3d_name` 那个 `"/"`。摆一个 `MDB /` 出去，
+/// 界面会照着它说本期范围、请求也会照着它发，而它谁都不是——空串至少让上面
+/// 那几处的空值分支有机会接住。
+pub async fn project_identity() -> Result<(String, String, String, Vec<u32>)> {
     let opt = aios_core::get_db_option();
+    let mdb = match opt.mdb_name.trim() {
+        "" => String::new(),
+        name => aios_core::helper::to_e3d_name(name).into_owned(),
+    };
     let db_nums = aios_core::query_mdb_db_nums(DBType::DESI).await?;
-    Ok((opt.project_name.clone(), opt.surreal_ns.clone(), db_nums))
+    Ok((
+        opt.project_name.clone(),
+        mdb,
+        opt.surreal_ns.clone(),
+        db_nums,
+    ))
 }
 
 /// 属性值的可编辑形态。旧壳靠 `bevy_reflect` 下转拿到这个信息来决定给什么控件，

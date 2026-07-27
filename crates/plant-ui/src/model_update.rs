@@ -31,6 +31,12 @@ use crate::style::widgets;
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Preview {
     pub project: String,
+    /// 本期执行范围是照哪个 MDB 解的（服务端回显，带前导 `/`）。
+    ///
+    /// 范围由 MDB 定，界面就得说得出自己看的是哪个 MDB 的范围。服务端与客户端
+    /// 各有一份 `mdb_name` 配置，不回显的话两边错开是静默的。
+    #[serde(default)]
+    pub mdb: String,
     pub dbnums: Vec<DbPreview>,
     #[serde(default)]
     pub pending_model_retries: Vec<PendingModelUnit>,
@@ -60,6 +66,14 @@ pub struct DbPreview {
     pub anomaly: Option<FileAnomaly>,
     #[serde(default)]
     pub initialization_required: bool,
+    /// 当前 MDB 声明了这个库，但当前项目目录里没有它的文件。
+    ///
+    /// 与「文件缺失」隔开：那是登记过、文件后来找不到了，阻断，等人补文件或注销
+    /// 登记；这一条是从没登记过，文件多半在别的项目目录里——`/ALL` 声明的 29 个
+    /// DESI 里有 9 个是 AvevaCatalogue 的模板与标准库，而扫描按契约只走当前项目。
+    /// 它不阻断也不执行，摆出来只为回答「MDB 说 29 个，范围表怎么只有 20 个」。
+    #[serde(default)]
+    pub not_in_project: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -195,7 +209,7 @@ impl std::fmt::Display for FileAnomaly {
     }
 }
 
-/// S2-E 的七种设计库行形态，外加「非 DESI 排除」与「无变化」。
+/// S2-E 的七种设计库行形态，外加两种「不在范围内」与「无变化」。
 ///
 /// `blocked` 不是随 `anomaly` 一起来的，是算出来的：`preview_dbnum` 里只把
 /// `Rollback | TypeChanged` 判为阻断，项目扫描器再把 `Duplicate` / `Missing`
@@ -204,6 +218,11 @@ impl std::fmt::Display for FileAnomaly {
 pub enum DbForm {
     /// 非 DESI：压根不进本期扫描，与「阻断」来自契约的不同位置，不许合成一行。
     Excluded,
+    /// 当前 MDB 声明了它，但当前项目目录里没有它的文件——多半在别的项目里
+    /// （AvevaCatalogue 的模板与标准库就是这样）。它与「文件缺失」的分别是
+    /// **有没有人登记过**：缺失是登记过的文件不见了，得阻断；这个从没登记过，
+    /// 本期扫描只是够不着它。
+    NotInProject,
     /// 从未导入过，还没有权威水位。契约不为它解会话区间，`net_*` 全是 0，
     /// **但它确实会跑**，绝不能显示成「无变化」。
     Initialize,
@@ -228,6 +247,7 @@ impl DbForm {
     pub fn label(self) -> &'static str {
         match self {
             Self::Excluded => "",
+            Self::NotInProject => "MDB 声明",
             Self::Initialize => "需初始化",
             Self::PathMigrated => "路径迁移",
             Self::Pending => "正常待更新",
@@ -244,6 +264,7 @@ impl DbForm {
     pub fn note(self) -> &'static str {
         match self {
             Self::Excluded => "非 DESI · 不在本期执行范围",
+            Self::NotInProject => "不在当前项目目录 · 本期够不着",
             Self::Initialize => "首次导入 · 会执行",
             Self::PathMigrated => "登记路径自动跟新 · 会执行",
             Self::Pending => "",
@@ -254,7 +275,7 @@ impl DbForm {
 
     pub fn tone(self) -> Status {
         match self {
-            Self::Excluded | Self::UpToDate => Status::Neutral,
+            Self::Excluded | Self::NotInProject | Self::UpToDate => Status::Neutral,
             Self::Initialize | Self::PathMigrated => Status::Warn,
             Self::Pending => Status::Success,
             _ => Status::Error,
@@ -264,6 +285,7 @@ impl DbForm {
     pub fn icon(self) -> &'static str {
         match self {
             Self::Excluded => ph::PROHIBIT,
+            Self::NotInProject => ph::FILE_DASHED,
             Self::Initialize => ph::SEAL_WARNING,
             Self::PathMigrated => ph::GIT_MERGE,
             Self::Pending | Self::UpToDate => ph::FILE,
@@ -282,8 +304,13 @@ impl DbPreview {
 
     /// 会不会产生数据批次。阻断的库在执行范围之内、只是这次不跑；
     /// 非 DESI 压根不在范围内——两回事，但都落在「不产生批次」这一边。
+    ///
+    /// 「够不着」也在这一边，而且它是唯一会**看起来该跑**的一种：MDB 声明了、
+    /// 从没导入过，于是契约给的是 `initialization_required = true`。少了这道判断，
+    /// 同一行会同时落进确认页的「会执行」与「不会执行」两张卡。
     pub fn will_run(&self) -> bool {
         self.is_desi()
+            && !self.not_in_project
             && !self.blocked
             && (!self.sessions.is_empty() || self.initialization_required)
     }
@@ -295,6 +322,9 @@ impl DbPreview {
     pub fn form(&self) -> DbForm {
         if !self.is_desi() {
             return DbForm::Excluded;
+        }
+        if self.not_in_project {
+            return DbForm::NotInProject;
         }
         match &self.anomaly {
             Some(FileAnomaly::Rollback { .. }) => DbForm::Rollback,
@@ -333,8 +363,13 @@ pub struct Totals {
     pub units: usize,
     /// 会产生数据批次的 dbnum 数。
     pub batches: usize,
+    /// 在本期执行范围之内的 DESI 库数（当前 MDB 声明、且当前项目目录里有文件）。
     pub desi: usize,
+    /// 非 DESI 而被排除的库数。
     pub excluded: usize,
+    /// MDB 声明了、但当前项目目录里没有文件的库数。它不算在 `desi` 里——
+    /// 两个数摆在一起才回答得了「MDB 说 29 个，这里怎么只有 20 个」。
+    pub not_in_project: usize,
     pub blocked: usize,
 }
 
@@ -349,11 +384,13 @@ impl Preview {
             t.no_generation += db.no_generation;
             t.units += db.units.len();
             t.batches += usize::from(db.will_run());
-            if db.is_desi() {
+            if !db.is_desi() {
+                t.excluded += 1;
+            } else if db.not_in_project {
+                t.not_in_project += 1;
+            } else {
                 t.desi += 1;
                 t.blocked += usize::from(db.blocked);
-            } else {
-                t.excluded += 1;
             }
         }
         t
@@ -1201,9 +1238,14 @@ fn header_text(vm: &Vm, state: &State) -> (String, String, Status, &'static str)
             Status::Warn,
             ph::SEAL_WARNING,
         ),
-        Vm::Ready(_) => (
+        // 范围由 MDB 定，副标题就得把 MDB 说出来——服务端与客户端各有一份
+        // `mdb_name`，只说「仅扫描当前项目」的话，两边错开时界面一声不响。
+        Vm::Ready(preview) => (
             "模型更新".into(),
-            format!("{project} · 仅扫描当前项目"),
+            match preview.mdb.as_str() {
+                "" => format!("{project} · 仅扫描当前项目"),
+                mdb => format!("{project} · MDB {mdb} · 仅扫描当前项目"),
+            },
             Status::Info,
             ph::ARROWS_CLOCKWISE,
         ),
@@ -1653,13 +1695,23 @@ fn tree_toolbar(ui: &mut Ui, t: &Tokens, d: Density, totals: &Totals, state: &mu
             .font(Font::strong(d))
             .color(t.text_primary),
     );
+    // 排除的理由现在有三条，得分开数：非 DESI、MDB 声明但项目里没有文件，
+    // 以及压根不在 MDB 里（那些库连行都没有，靠 desi 这个数与 MDB 一对就知道）。
+    // 合成一个数的话，人看到自己知道的某个设计库不见了只会以为是 bug。
+    let mut scope = format!("{} 个 DESI 设计库在范围内", totals.desi);
+    if totals.not_in_project > 0 {
+        scope.push_str(&format!(
+            " · {} 个 MDB 声明但项目内无文件",
+            totals.not_in_project
+        ));
+    }
+    if totals.excluded > 0 {
+        scope.push_str(&format!(" · {} 个非 DESI 已排除", totals.excluded));
+    }
     ui.label(
-        RichText::new(format!(
-            "{} 个 DESI 设计库 · {} 个非 DESI 已排除",
-            totals.desi, totals.excluded
-        ))
-        .font(Font::mono_meta(d))
-        .color(t.text_muted),
+        RichText::new(scope)
+            .font(Font::mono_meta(d))
+            .color(t.text_muted),
     );
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         if ui
@@ -1706,7 +1758,10 @@ fn db_rows(ui: &mut Ui, t: &Tokens, d: Density, db: &DbPreview, state: &mut Stat
         strong: true,
         tag: form.label(),
         tag_color: tone_fg,
-        meta: if form == DbForm::Excluded {
+        // 不在范围内的库没有会话区间可说。`NotInProject` 尤其不能摆：它连文件都
+        // 不在这个项目里，`window()` 要么算出 `sesno 1 → 0`，要么说「首次导入 ·
+        // 尚无权威水位」——后者与同一行的「本期够不着」直接打架。
+        meta: if form == DbForm::Excluded || form == DbForm::NotInProject {
             String::new()
         } else {
             db.window()
@@ -1983,7 +2038,7 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
                     Dot::Glyph(ph::STACK, t.accent),
                     &format!("{} 个最小交付单元将重新生成", totals.units),
                     "",
-                    "执行范围是项目内的 dbnum + sesno",
+                    "本期执行范围：当前 MDB 声明的 DESI 库 + sesno",
                     t.text_muted,
                 );
                 ui.add_space(d.px(6.0));
@@ -2000,8 +2055,10 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
             },
         );
 
-        let excluded = totals.excluded;
-        let not_running = totals.blocked + excluded + usize::from(totals.no_generation > 0);
+        let not_running = totals.blocked
+            + totals.excluded
+            + totals.not_in_project
+            + usize::from(totals.no_generation > 0);
         card_titled(
             ui,
             t,
@@ -2036,6 +2093,22 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
                         &format!("db{} · {}", db.dbnum, db.db_type),
                         "非 DESI，本期不处理",
                         "不在执行范围",
+                        t.text_muted,
+                    );
+                }
+                for db in preview
+                    .dbnums
+                    .iter()
+                    .filter(|db| db.form() == DbForm::NotInProject)
+                {
+                    line(
+                        ui,
+                        t,
+                        d,
+                        Dot::Tone(t.text_muted),
+                        &format!("db{} · {}", db.dbnum, db.db_type),
+                        "MDB 声明了它，当前项目目录里没有这个文件",
+                        "本期扫描够不着",
                         t.text_muted,
                     );
                 }
@@ -3233,6 +3306,21 @@ mod tests {
         }
     }
 
+    /// 一个「够不着」的库，**带 `initialization_required`**。
+    ///
+    /// 这个标志是这条 fixture 的全部意义所在：够不着的库正是从没导入过的那些
+    /// （`/ALL` 的 29 个里 10 个没导入，除去磁盘上有文件的 1112，剩下 9 个就是它们），
+    /// 没有权威水位，契约给的就是 `initialization_required = true`。少了它，
+    /// 一个默认 `DbPreview` 本来就 `!will_run()`——用它去断言「够不着的不跑」，
+    /// 断言会通过，但通过的理由与 `not_in_project` 毫无关系。
+    fn unreachable_db(dbnum: u32) -> DbPreview {
+        DbPreview {
+            not_in_project: true,
+            initialization_required: true,
+            ..db(dbnum, "DESI")
+        }
+    }
+
     #[test]
     fn events_pair_up_into_rows() {
         let mut progress = Progress::default();
@@ -3366,6 +3454,41 @@ mod tests {
         let excluded = db(8191, "CATA");
         assert_eq!(excluded.form(), DbForm::Excluded);
         assert!(!excluded.will_run());
+    }
+
+    /// 「够不着」与「文件缺失」是两回事，最要紧的是**它不阻断**：MDB 声明了
+    /// 一个库、当前项目目录里没有它的文件，这不是异常，只是本期扫描碰不到它。
+    /// 合成一行的话，AvevaCatalogue 那 9 个模板库会顶着「已阻断」出现在界面上，
+    /// 人会去找根本不存在的故障。
+    #[test]
+    fn declared_by_mdb_but_absent_from_the_project_is_not_a_missing_file() {
+        let unreachable = unreachable_db(7015);
+
+        assert_eq!(unreachable.form(), DbForm::NotInProject);
+        assert!(!DbForm::NotInProject.blocks(), "够不着不是阻断");
+        assert!(!unreachable.will_run());
+
+        let mut missing = db(7016, "DESI");
+        missing.anomaly = Some(FileAnomaly::Missing { path: "a".into() });
+        missing.blocked = true;
+        assert_ne!(missing.form(), unreachable.form());
+    }
+
+    /// 「够不着」的行每次预览都在，算进待办的话「已是最新」永远到不了。
+    /// 它也不许并进 `desi`——那个数要跟 MDB 声明数一对才说得清差在哪儿。
+    #[test]
+    fn unreachable_rows_are_counted_apart_and_never_block_up_to_date() {
+        let preview = Preview {
+            dbnums: vec![db(8000, "DESI"), unreachable_db(7015), db(8191, "CATA")],
+            ..Default::default()
+        };
+
+        let totals = preview.totals();
+        assert_eq!(totals.desi, 1, "够不着的库不算在范围内的设计库里");
+        assert_eq!(totals.not_in_project, 1);
+        assert_eq!(totals.excluded, 1);
+        assert_eq!(totals.batches, 0);
+        assert!(!preview.executable());
     }
 
     /// 「排除」与「阻断」来自契约的不同位置，汇总里也得分开数。

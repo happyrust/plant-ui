@@ -39,22 +39,26 @@ pub fn base_url() -> String {
         .to_owned()
 }
 
-pub fn preview(base: &str, project: &str) -> anyhow::Result<Preview> {
+/// 预览。`mdb` 决定本期执行范围——服务端照它解出「当前 MDB 声明的 DESI 库号」
+/// 作为扫描白名单。**由客户端给**：范围既然由 MDB 定，界面显示的范围与服务端
+/// 真跑的范围就必须同源；让服务端读自己那份 `DbOption.toml`，两边配置一错开
+/// 就是静默的。
+pub fn preview(base: &str, project: &str, mdb: &str) -> anyhow::Result<Preview> {
     post(
         base,
         "/api/v1/update/preview",
-        serde_json::json!({ "project": project }).to_string(),
+        serde_json::json!({ "project": project, "mdb": mdb }).to_string(),
         Duration::from_secs(600),
     )
 }
 
 /// 扫描 + 入队。合流之后它**一律入队**，回执是入队的批次数组而不是单个 task_id
-/// ——进度去任务队列视图看（ADR-0011）。
-pub fn execute(base: &str, project: &str) -> anyhow::Result<Enqueued> {
+/// ——进度去任务队列视图看（ADR-0011）。范围口径与 [`preview`] 同源。
+pub fn execute(base: &str, project: &str, mdb: &str) -> anyhow::Result<Enqueued> {
     post(
         base,
         "/api/v1/update/execute",
-        serde_json::json!({ "project": project }).to_string(),
+        serde_json::json!({ "project": project, "mdb": mdb }).to_string(),
         Duration::from_secs(60),
     )
 }
@@ -222,6 +226,7 @@ mod tests {
         let preview: Preview = serde_json::from_str(
             r#"{
                 "project":"ProjAMS",
+                "mdb":"/ALL",
                 "dbnums":[{
                     "dbnum":7997,
                     "db_type":"DESI",
@@ -242,6 +247,24 @@ mod tests {
                     "blocked":false,
                     "anomaly":null,
                     "initialization_required":false
+                },{
+                    "dbnum":7015,
+                    "db_type":"DESI",
+                    "file_name":"",
+                    "file_path":"",
+                    "applied_sesno":0,
+                    "file_latest_sesno":0,
+                    "sessions":[],
+                    "net_added":0,
+                    "net_modified":0,
+                    "net_deleted":0,
+                    "model_affecting":0,
+                    "units":[],
+                    "no_generation":0,
+                    "blocked":false,
+                    "anomaly":null,
+                    "initialization_required":true,
+                    "not_in_project":true
                 }],
                 "pending_model_retries":[],
                 "warnings":[],
@@ -250,6 +273,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(preview.dbnums[0].zones[0].units[0].noun, "BRAN");
+        // 范围口径那两个字段：它们都带 `serde(default)`，服务端换个名字不会报错、
+        // 只会静默给假值，所以这里断的是「真解出来了」而不是「解得动」。
+        assert_eq!(preview.mdb, "/ALL");
+        assert!(preview.dbnums[1].not_in_project);
+        // 够不着的库带着 `initialization_required`——`not_in_project` 一旦没解出来，
+        // 它立刻变成一个「需初始化 · 会执行」的批次。这条断言守的就是那一步。
+        assert!(!preview.dbnums[1].will_run());
 
         let run: Run = serde_json::from_str(
             r#"{
