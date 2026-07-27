@@ -132,8 +132,6 @@ pub fn command_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: 
                 }
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let _ = ui.add(widgets::button(t, d, "生成模型").icon(ph::PLAY));
-                    ui.add_space(space::S1);
                     if ui
                         .add_enabled(
                             vm.data_source_ok,
