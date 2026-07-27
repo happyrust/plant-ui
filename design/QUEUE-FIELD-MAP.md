@@ -38,7 +38,7 @@
 | ~~阶段一进度~~ | ~~`2 / 3 个数据批次`~~ | | **这一格没有了。** 队列行本身就是一个数据批次，`total_batches` / `batches_done` 随「运行」一并退役（ADR-011 §1 / §3）|
 | 并入会话 | `1 032 – 1 034 已并入` | 契约 | `DataBatchResult.merged_sesnos`——契约明写结果摘要必须逐条列出 |
 | 冻结提示 | `上一批已冻结，这是之后新存的会话` | 本地 | 同一 dbnum 同时存在 running 行与 queued 行时，写在下面那一行的说明位上（ADR-011 §5）。**不许把两行渲染成重复项** |
-| 欠 N 个单元 | `欠 2 个单元` | 契约 | `GET /update/pending-units` 按 dbnum 过滤计数。它走持久表，**不依赖任务历史**（ADR-011 §11）|
+| 欠 N 个单元 | `欠 2 个单元` | 契约 + **待修** | `GET /update/pending-units` 按 dbnum 过滤计数。它走持久表，**不依赖任务历史**（ADR-011 §11）。但那张表今天会残留，见表下那段 |
 | 失败单元标识 | `EQUI /P-1201B` | 契约 | `ModelUnitResult.noun` + `root_refno`，或 `PendingModelUnit` 同名字段 |
 | 尝试次数 | `第 3 次尝试` | 契约 | `ModelUnitResult.attempts` / `PendingModelUnit.attempts`（跨重试累计）|
 | 「重试」按钮 | | 契约 + **待修** | `POST /api/v1/model/ensure { refno }`，幂等。**「无需后端改动」这句已经不成立**——空单元回 500，见表下那段 |
@@ -55,6 +55,17 @@
 `NoRenderableGeometry`（200，`model_available = false`），并给 `OnDemandModelResult`
 加 `empty_unit: bool`。**界面等这个字段**——「画不出来」与「本来就没东西」是两句话，
 在拿到它之前这一格只能照旧说「生成失败 · 待重试」，那是错的，但比自己猜一个更错。
+
+**「欠 N 个单元」今天会显假账**（rollout 六之六 G9）：`ensure_model_generated` 成功之后
+不清 `model_update_pending` 里对应的 regen_root 行，凡是绕过队列生成过的根，行就永久
+留在表上。8000 上实测有 4 条 SITE regen_root 躺了 4 小时以上——面板照它算就会一直报一个
+已经不欠的欠账；更糟的是**任何后续 `execute_manual_update` 都会照着这些残留行把整个库
+重新生成一遍**（对 7997 是 20 小时级）。
+
+服务端修法：`ensure_model_generated` 的成功分支顺带 `clear_regen_work(dbnum, root)`，
+让旁路生成也能收敛队列。在那之前，这一格只在「从没被旁路生成碰过的库」上准，
+而那件事**界面判断不了**。所以这里**不加任何「可能偏大」的标注**——本表第 4 节给预览
+加标注是因为那个 N 由快照本地算得出；这里算不出偏大多少，一句说不清来路的提示比不提更差。
 
 ---
 
