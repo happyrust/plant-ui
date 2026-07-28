@@ -9,7 +9,7 @@
 //!   inspect tree [关键字]         列控件：角色 / 文本 / 逻辑坐标包围盒，给了关键字就只列匹配的
 //!   inspect click <x> <y> [键]    在逻辑坐标点一下；键为 left（默认）或 right，
 //!                                 可带 ctrl+ / shift+ 前缀点出多选
-//!   inspect drag <x0> <y0> <x1> <y1>  按住左键从一点拖到另一点（选文本、拖分隔条）
+//!   inspect drag <x0> <y0> <x1> <y1> [键]  按住指定键拖拽；键为 left（默认）或 right
 //!   inspect copy                  发一次复制事件，选中的文本进系统剪贴板
 //!   inspect scroll <x> <y> <dy>   在逻辑坐标滚一下（dy 正值内容下移）
 //!   inspect type <文本>           往当前焦点控件敲一段文本
@@ -48,10 +48,15 @@ fn main() -> anyhow::Result<()> {
                 },
             ])
         }
-        "drag" => drag(
-            pos2(num(&args, 1)?, num(&args, 2)?),
-            pos2(num(&args, 3)?, num(&args, 4)?),
-        ),
+        "drag" => {
+            let (button, modifiers) = parse_button(args.get(5).map(String::as_str))?;
+            drag(
+                pos2(num(&args, 1)?, num(&args, 2)?),
+                pos2(num(&args, 3)?, num(&args, 4)?),
+                button,
+                modifiers,
+            )
+        }
         "copy" => apply(vec![egui::Event::Copy]),
         "scroll" => {
             let (x, y, dy) = (num(&args, 1)?, num(&args, 2)?, num(&args, 3)?);
@@ -177,17 +182,17 @@ fn apply(events: Vec<egui::Event>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 按住左键从 `from` 拖到 `to`。拆成三次请求发：拖动在 egui 里是跨帧状态机，
+/// 按住指定键从 `from` 拖到 `to`。拆成三次请求发：拖动在 egui 里是跨帧状态机，
 /// 按下 / 移动 / 松开挤进同一帧只会被当成一次点击，选不出文本。
-fn drag(from: Pos2, to: Pos2) -> anyhow::Result<()> {
+fn drag(from: Pos2, to: Pos2, button: PointerButton, modifiers: Modifiers) -> anyhow::Result<()> {
     request(&Request::ApplyEvents {
         events: vec![
             egui::Event::PointerMoved(from),
             egui::Event::PointerButton {
                 pos: from,
-                button: PointerButton::Primary,
+                button,
                 pressed: true,
-                modifiers: Modifiers::NONE,
+                modifiers,
             },
         ],
     })?;
@@ -197,9 +202,9 @@ fn drag(from: Pos2, to: Pos2) -> anyhow::Result<()> {
     request(&Request::ApplyEvents {
         events: vec![egui::Event::PointerButton {
             pos: to,
-            button: PointerButton::Primary,
+            button,
             pressed: false,
-            modifiers: Modifiers::NONE,
+            modifiers,
         }],
     })?;
     println!("ok");

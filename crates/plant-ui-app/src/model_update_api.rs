@@ -205,6 +205,47 @@ struct ErrorResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plant_ui::model_update::FailForm;
+
+    /// 错误包封按 `code` 分型；`code` 缺席时才按状态码兜底。
+    ///
+    /// 422 的兜底给的是已退役的 `precondition`，它落到 `Internal`——**这是有意的**。
+    /// 别把它「顺手修」成 `identity_mismatch`：一个说不清来路的拒绝，把原始 message
+    /// 摊进详情比替它编一个「范围对不上」诚实（S2-D），后者会让人去查一处并不存在
+    /// 的配置错位。真的范围不符时服务端是带着 code 来的，走的是上面第一条。
+    #[test]
+    fn error_packets_fall_back_by_status_only_when_the_code_is_missing() {
+        let tagged = error_packet(
+            422,
+            r#"{"code":"identity_mismatch","message":"mdb=/SAMPLE 与服务 mdb=/ALL 不一致"}"#,
+        );
+        assert_eq!(tagged.form(), FailForm::IdentityMismatch);
+
+        assert_eq!(error_packet(504, "{}").form(), FailForm::Timeout);
+        assert_eq!(error_packet(422, "{}").form(), FailForm::Internal);
+
+        // 解不动的响应体不许把详情页留成一片空白：状态码与原文都要带上。
+        let bare = error_packet(500, "not json at all");
+        assert_eq!(bare.form(), FailForm::Internal);
+        assert!(
+            bare.message.contains("500") && bare.message.contains("not json at all"),
+            "{}",
+            bare.message
+        );
+    }
+
+    /// 连不上、超时、握手不成对用的人是同一件事：服务够不着，没有任何数据被改动，
+    /// 直接重试即可。统一归 `timeout`，界面才给得出「可以直接重试」那句话。
+    #[test]
+    fn transport_failures_are_all_timeouts() {
+        let failure = failure_of(&transport("Connection refused (os error 10061)".into()));
+        assert_eq!(failure.form(), FailForm::Timeout);
+        assert!(
+            failure.message.contains("Connection refused"),
+            "{}",
+            failure.message
+        );
+    }
 
     #[test]
     fn decodes_preview_payload_and_enqueue_receipt() {

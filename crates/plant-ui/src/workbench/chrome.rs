@@ -259,6 +259,14 @@ fn queue_count(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
                 .color(t.text_muted),
         );
     }
+    // 契约破损也不许无声：它往往不是「别的项目」，而是服务端给的历史行缺了 dbnum。
+    if queue.malformed > 0 {
+        ui.label(
+            RichText::new(format!("{} 条历史行缺 dbnum 未显示", queue.malformed))
+                .font(Font::micro(d))
+                .color(t.warn),
+        );
+    }
 }
 
 // ---------------------------------------------------------------- 小零件

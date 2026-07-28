@@ -694,7 +694,7 @@ clamp、搜索不受筛选芯片限制。下面六条按能不能自己了结分
 | ~~Q1~~ | ~~**终态行会摆出 `sesno 0 → 0`**~~ | **已修**。`rows()` 原先拿 `entry.start_sesno.unwrap_or_default()` 填历史行的会话区间。`TaskEntry` 上这两个字段是 `Option<i32>` 正因为它们可能缺席（队列快照那侧的 `QueueRow.start_sesno` 是必填、不是 Option）。这是这个文件唯一一处摆假数字的地方，与 `model_update.rs` 里同一轮修掉的 `NotInProject` 行 meta 列同源。现在缺一个就整格不画，配了一条单测——撤掉修复它会报 `left: "sesno 0 → 0"` |
 | ~~Q2~~ | ~~**两处注释还写着 `manual_db_nums`**~~ | **已修**。`DbnumStatus.excluded` 的字段文档与 `excluded_row` 的内联注释，而 `manual_db_nums` 正是 ADR-0013 干掉的东西。界面上那句也从「DESI，但不在本期执行范围内」改成「DESI，但不在当前 MDB 声明的名单里」——原句字面成立，但读不出该去哪儿改 |
 | Q3 | **「本期不执行」那一格不报总数** | 防护本身到位（84px 封顶 + `ScrollArea` + `is_rect_visible` 剪枝 + 阻断排前面，布局炸不了）。但 ADR-0013 之后 `/dbnums` 的 `excluded` 覆盖面从「几个非 DESI」变成「MDB 之外的所有设计库」——AvevaMarineSample 上是 258 个 DESI。一个 84px 的框里滚 260 行而不报总数，跟这个文件自己在 `filtered_out` 上坚持的「过滤不许无声」是同一条原则的反面。加个 `N 项` 就够 |
-| Q4 | **`rows()` 在积压态是 O(队列行 × 任务行)，而它每帧都跑** | `vm.task()` 是 `iter().find()`、`vm.owed()` 又扫一遍 `pending`。本文件自己写着「287 行是积压态不是稳态，但面板得扛得住那一天」——那一天就是 287 × 200 ≈ 5.7 万次字符串比较/帧，而且 `show()` 里 `rows()` 一次、`visible()` 两次（自己一次、`toolbar` 里又一次），旁边还挂着实时三维视口。修法很小：`rows()` 开头建一个 `HashMap<&str, &TaskEntry>` |
+| ~~Q4~~ | ~~**`rows()` 在积压态是 O(队列行 × 任务行)，而它每帧都跑**~~ | **已修**。`rows()` 开头建 `index_tasks`（`HashMap<&str, &TaskEntry>`），欠账与「上一批在跑」也先收成 `HashMap<u32, usize>` / `HashSet<u32>` 索引；`seen` 从 `Vec` 换 `HashSet`。同一套索引接进 `filtered_out` / `applying` / `rebuilt`——它们也每帧跑。行为不变，纯性能修复，积压态从 5.7 万次字符串比较/帧降到几次哈希查表 |
 
 ### 要 gen-model 先动的一条
 
@@ -707,10 +707,16 @@ clamp、搜索不受筛选芯片限制。下面六条按能不能自己了结分
 
 ### 低优先级的一条
 
-**Q6 ·** `Vm::adopt` 的 `details.retain` 拿 `/tasks`（服务端钳到 200）当存活判据，而本文件
-自己定的分工是「排队与运行中以 `/queue` 为准，那一份不封顶」。实际影响很小——串行 FIFO，
-正在跑的那条一定在 200 窗口内——但判据用错了来源。另：终态行 `entry.dbnum` 为 `None` 时
-直接 `continue`，既不显示也不计入 `filtered_out()`，是一次无声丢弃。
+~~**Q6 ·**~~ **已修（2026-07-28）**，两半都是。`Vm::adopt` 的 `details.retain` 原拿
+`/tasks`（服务端钳到 200）当存活判据，而本文件自己定的分工是「排队与运行中以 `/queue`
+为准，那一份不封顶」——实际影响很小（串行 FIFO，正在跑的那条一定在 200 窗口内），但
+判据用错了来源；现在存活判据改成「在 `/queue` 或在 `/tasks`」，排队中但还没轮到进任务
+窗口的批次明细不再被误收（`details_of_a_queued_row_survive_outside_the_task_window`
+守着）。另：终态行 `entry.dbnum` 为 `None` 时直接 `continue`，既不显示也不计入
+`filtered_out()`，是一次无声丢弃；现在单独立一个 `malformed()` 计数（本项目的缺号
+终态行），经 `QueueStatusVm.malformed` 摆上状态栏（「N 条历史行缺 dbnum 未显示」）——
+缺号是契约破损，与跨项目过滤是两回事，不许混进 `filtered_out`
+（`a_history_row_without_dbnum_is_dropped_but_counted` 守着两边不串）。
 
 ### Q3 / Q4 为什么先记不改
 
@@ -719,6 +725,10 @@ clamp、搜索不受筛选芯片限制。下面六条按能不能自己了结分
 旧服务）。在拿到真实行数之前动手调，等于对着一个猜出来的数字优化。
 
 Q1 与 Q2 不依赖这个数，同一轮里已经单独收掉了。
+
+**补记（2026-07-28）**：Q4 已按本节原定的修法收掉——它本来就不依赖那个行数
+（O(n²) 在任何行数下都是错的，只是行数决定疼不疼），上一版记录把它与 Q3 并列押后
+是口径误并。Q3 仍押后：报不报总数取决于真实行数，等实机验收。
 
 ---
 
@@ -754,3 +764,127 @@ Q1 与 Q2 不依赖这个数，同一轮里已经单独收掉了。
 （warn 调、link-2-off 图标、Raw 行示例 message 点名哪一项错开），internal 说明行与板头副标题
 改口为「四种形态；互斥与冲突两形态已随合流退役」。S4 执行进度板（`XajQ8`）保留作迁移史，
 词表已标「已迁」。
+
+---
+
+## 十三、下一步施工顺序（2026-07-28 · plant-ui-162 会话代决）
+
+与第七、八、九、十节同一性质：**要推翻只需一句话。** 本节只排顺序，不改代码。
+
+**先说结论：功能实现这一层，施工单上列的项目已经全部落地了**——服务端九项、客户端四项、
+第五节第 6 步（生成根改细颗粒，G1）都能在代码里指到落点；G4 / G9 / H1 / H2 止血 / H3 也都
+有对应改动。**差的是最后两格：入库与实机验收。** 排序依据只有一条：哪些事不做，后面所有事
+都是空转。
+
+### P0-A · gen-model 未提交改动分片入库（**已完成**，2026-07-28 本会话）
+
+三笔已入库，顺序即下表的 ② → ① → ③：`d6ba53d5`（队列层，4 文件 258+/58-）、
+`d27d3cda`（身份闸门，6 文件 278+/30-）、`b61982c6`（G4，2 文件 317+/62-）。
+入库前工作树验过：`cargo check --lib --features http_api` 与 `--bins` 都过，
+`cargo test --lib` **269 passed / 0 failed / 57 ignored**。留在工作树里的
+`cata_closure.rs` / `mesh_manager.rs` / `sync_publisher.rs` 按下面说的没动。
+
+一处**没能验的**：`vendor/`（`occt-rs` / `aios-parse-pdms`）未被跟踪，而 `Cargo.toml`
+的 `[patch]` 指进那里——所以「干净 clone 能不能编译」这件事在本机无从验证，
+本节只逐条核到 HEAD 上「调用方与定义都在」。这本身是另一笔账。
+
+**先记一条本轮查出来的硬伤：`master` 当时编译不过。** gen-model HEAD（`51a4481b`）的
+`batch_worker.rs:267` 调 `scheduler.record_frozen_end(...)`，而这个方法**只存在于未提交的
+`batch_scheduler.rs` 里**——`git grep record_frozen_end HEAD -- src` 只有那一处调用、
+没有任何定义，`set_frozen_range` 同理。也就是说第十节第 5 条的冻结回写，**调用方随
+`51a4481b` 入了库、实现留在工作树**。今天在工作树上 `cargo check` 是过的（本轮实测
+1m41s），所以这件事在本机看不出来；换一台机器 clone 下来必定 E0599。
+
+这把 P0-A 从「把成果入库」改成了「**先修好一个编译不过的 master**」，下面第 ② 片因此
+是最急的一片，不是三选一。
+
+逐文件读过 `git diff`（不是照 `git status` 数行）。与队列 / 接口相关的是九个文件，
+分成三片：
+
+| 片 | 文件 | 内容 |
+|---|---|---|
+| ① 身份闸门 + MDB 贯穿 | `web_service/mod.rs`(+113)、`web_service/handlers.rs`(+144)、`bin/manual_scan_probe.rs`(+16)、`bin/manual_exec_probe.rs`(+8)、`Cargo.toml`（tower-http 加 `fs`）| 新增 `ServiceIdentity { project, mdb, namespace }` 与 `validate`，对不上回 422 `identity_mismatch`；`ProjectReq` 加 `mdb` / `namespace`，preview / execute / dbnums 三个端点改走 identity；`/health` 回显三项；`ManualEnqueueReceipt` 带 `mdb` / `namespace`；`model_ensure` 加 `await_background_without_cancelling`（HTTP 超时不取消后台生成，对齐 spec §4.5 那句「超时不取消」）；挂 `ServeDir`。**客户端已经在消费这一片**——`FailForm::IdentityMismatch` 与 `task_queue::Vm::can_mutate` 就是它的对面，第十二节记的那个 422 今天只有它会回 |
+| ② 队列层第三轮修复 | `task_registry.rs`(+96)、`batch_scheduler.rs`(+166)、`batch_queue.rs`(+46)、`lib.rs`(+8) | H1：task_id 后缀 `rand::<u16>` → `AtomicU64` `{:06}`，撞键改打 `log::error!` 列新旧两行而不是静默覆盖；H3：两把锁的 `unwrap()` 换成中毒恢复，三处 `expect` 降级成告警（持锁 panic 会毒掉锁，把「一个批次挂了」放大成看门狗 / 面板 / worker 连坐）；第十节第 5 条落地：`record_frozen_end` + `set_frozen_range` 把冻结点重扫的真实上界回写队列行与任务行；`batch_queue::covers` 拦掉 `1039..=1038` 那种倒挂幽灵行；`lib.rs` 启动时恢复持久化的暂停标志 |
+| ③ G4 空交付单元契约 | `on_demand_model.rs`(+377) | `post_generation_status`：生成跑完 `written == 0` 归 `NoRenderableGeometry`，不再回 500。六之六 G4 那条「界面把『本来就是空的』当服务故障，让人反复重试」到此为止 |
+
+**不进这三片的，留给各自的工作流**：`cata_closure.rs`(+358，ADR-004 按需解析元件库)、
+`mesh_manager.rs`(+40)、`sync_publisher.rs`(+4)，以及 `fast_model/` / `gui/` /
+`versioned_db/` / `test_performance.rs` 与整片 `xkt_generator/` 删除。理由同第一节：
+别的工作流的中间态，一锅烩会把别人没完成的改动卷进来——`2026-07-27_increment-update-backlog-reaudit`
+第 8 节已经因为这件事吃过一次亏（`database.rs` 在本会话之外被改）。
+
+**三片之间有一处耦合，决定了顺序**：`ManualEnqueueReceipt` 的 `mdb` / `namespace`
+两个字段声明在 `batch_scheduler.rs`（第 ② 片的文件），却由 `handlers.rs`（第 ① 片）
+填值。两条出路：把那一个 hunk 单独 stage 进第 ① 片，或者干脆 **② → ① → ③** 顺着来
+——后者中间态是「回执多了两个恒为空的字段」，两个字段都带 `#[serde(default)]`，编译与
+反序列化都不受影响。按「先修编译」的优先级，取后者。
+
+两条施工纪律：
+
+- **`.cargo/config.toml` 别顺手提交。** 那里的 `jobs = 8` 与 `LIBCLANG_PATH` 是本机构建前提
+  （19 个 bin 目标 × 前端 8 线程会耗尽句柄，报 `could not create 8 threads (os error 1450)`
+  并留下半成品 rlib，表现为 std/Vec 找不到），它是环境不是成果。
+- **CRLF 幻影脏还在**（第十节记过，无 `.gitattributes`）：分片以 `git diff` 为准，
+  不看 `git status` 的 M。
+
+判据：`cargo check --lib --features http_api` 本轮已过（1m41s）；`cargo test --lib` 242。
+
+### P0-B · AABB 回归先定位（今天新出的，现场还在）
+
+`gen-model/docs/2026-07-28_bran-24381-145018-ensure-aabb-regression.md`：同一个根、同一条
+ensure 链路、水位未动，02:54 的二进制写出紧盒、13:35 的写出一个没有任何几何支撑的松盒
+（体积约 2 倍）。局部坐标下 maxZ 恰是 5 号 p-point 的 z、maxX 恰是 3 号 p-point 加管径
+——**指纹很清楚：生成期的解析包络被当成世界 AABB 写库了。**
+
+它该排在实机验收前面，三条理由：
+
+1. 房间归属的候选查询与 viewer 的取景 / 拾取都吃这个盒子，而 ADR-010 里 AABB 变更集又是
+   房间任务的**唯一触发源**——盒子错了，房间那条泳道验出来的东西不作数。
+2. 定向重生成跑的是 `replace_exist = false`（随 `replace_mesh = false`），**只补缺失、
+   不纠正已有值**，脏值会一直错到下一次全量重建。
+3. 而启动期 `sync_aabb_tree_with_db` 的全量紧致重刷会把现场抹掉——**重启一次就不好复现了。**
+
+顺带把报告第 6.2 条落下：定向重生成收尾对本次范围做一次 `replace_exist = true` 的网格口径
+刷新，把「单一权威 = 网格口径」钉死，不再依赖启动期全量重建兜底。
+
+判据：`cargo test -p plant-ui-data --test bran_24381_145018_geometry` 转绿
+（当前红，`relative_error = 0.00296`，阈值 1e-3），且 `aabb:⟨12450518991627078186⟩`
+不再被任何边引用。
+
+### P1 · 真服务实机验收
+
+手册已经写好了（`queue-live-acceptance.md`），这一步只是执行。它一次性解锁四样东西：
+Q3 的真实行数、第十一节那两条押后项的前提数字、rollout 一句话现状、ADR-011 状态段里
+那一排「欠实机」。**验收不通过的每一条按「先记后改」写回本文件新开一节，不当场改代码。**
+
+### P2 · 验收直接带出的三笔
+
+1. **Q5 —— `/dbnums` 补 `not_in_project`（后端先动）。** `DbnumStatus` 今天只有
+   `blocked` / `excluded` 两档，而 `DbPreview` 那边已经三档、字段现成，把
+   `dbnum_statuses` 里同一份判定接过来即可。前端「本期不执行」跟着改成三档，
+   不再把「够不着」讲成「MDB 没声明它」——那正好是相反的意思。
+2. **Q3 —— 「本期不执行」报总数。** 加个 `N 项` 就够，但要等 P1 告诉我们 `excluded`
+   到底多少行。
+3. **文档账。** `QUEUE-REVIEW-CHECKLIST` 第四节那句「提交信息要写未经实机」失效。
+
+### P3 · 结构性欠账（验收之后再排）
+
+- **G5 / G6 的跨进程互斥只做了一半。** 现在靠 `settle_regen_work` 的 revision CAS 收口，
+  `model_update_pending` 行上仍没有 `claimed_by` / `claimed_at` + 超时回收。
+  「单 worker 就是互斥」只在**一个进程内**成立，而探针类二进制合流之后仍然存在。
+- **H2 的自愈半边**，有意押后（第十节第 4 条）：验收阶段需要的是分得清四种形态，
+  自动重启会把可复现的 panic 变成噪音。
+- **取回工作那次 88 秒冷查询。** 本轮新发现，与队列直接相关：`model_instances` 在
+  AvevaMarineSample / MDB ALL 上冷启动 88 秒（19 个根、53 373 个可见 refno、38 048 个实例），
+  而**自动取回工作的 `reload_models = true` 分支每次批次收官都会踩它一次**，且调用前刚
+  `invalidate_all` 过、必定是冷的。七成时间在 `query_deep_visible_inst_refnos`，19 次调用
+  串行——要改就改那一层（并发发起，或查询侧一次解多个根），减少这里的调用次数没用
+  （`plant-ui-data/src/lib.rs` 的实测表已经记在函数头上）。
+
+### P4 · 前端工作树收口
+
+`plant-ui` 还挂着 11 个文件未提交：wasm 迁移（view3d）、ADR-0014 树定位祖先链
+（`Req/Evt::Ancestors`、`tree_reveal` 从「只活一帧」改成结算式）、Q6 的 `malformed` 计数。
+**建议在 P1 之前提交**，理由与 P0-A 一样：验收出了问题，分不清是服务端还是这批改动。
+顺带核一下 `cargo test -p plant-ui --lib` 从第十二节记的 65 掉到现在 62 的那三条去哪了
+——不排除是 wasm 迁移顺手带走的，但没记账。

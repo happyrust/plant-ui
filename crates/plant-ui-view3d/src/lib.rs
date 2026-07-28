@@ -7,10 +7,13 @@
 //! viewcube 模块头上：中文面标、悬停高亮、26 区命中在 egui 里是二十行投影，
 //! 在场景里是字体栅格化加射线拾取一整套。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::f32::consts::FRAC_PI_2;
 use web_time::{Duration, Instant};
 
+use std::str::FromStr;
+
+use aios_core::pdms_types::PdmsGenericType;
 use aios_core::shape::pdms_shape::PlantMesh;
 use aios_core::{GeomInstQuery, RefU64};
 use bevy::asset::io::Reader;
@@ -55,6 +58,14 @@ const AXIS_COLORS: [Color; 3] = [
 ];
 /// 背景面片的专用渲染层：背景相机只看它，主相机看不见它。
 const BACKGROUND_LAYER: usize = 7;
+/// 模型 PBR 参数：管道厂里的构件多是漆过的金属与混凝土，低金属度、偏粗糙，
+/// 高光收敛一点才不至于每根管子都糊成一片镜面。金属度全交给贴图时代之前，
+/// 这一档定死是从 rs-plant3-d 的观感里对出来的。
+const MODEL_METALLIC: f32 = 0.1;
+const MODEL_ROUGHNESS: f32 = 0.7;
+/// 选中高亮色：橙红描不上边框（无 outline 依赖），直接换 base_color 最稳。
+/// 与 rs-plant3-d outline 的 ORANGE_RED 同源。
+const SELECT_COLOR: Color = Color::srgb(1.0, 0.27, 0.0);
 /// 开机默认配色（深色主题的 viewport tokens：#232F3A / #0E1318 / #46586A）。
 /// 首帧 App 就会按当前主题发 `SetViewportBackground` 盖掉，这里只求
 /// 「主题命令到达前别闪白」。
@@ -74,6 +85,7 @@ impl Plugin for View3dPlugin {
                     load_models,
                     apply_resize,
                     apply_commands,
+                    apply_selection,
                     animate_snap,
                     update_grid,
                 )
@@ -103,6 +115,8 @@ pub struct View3d {
     pending_models: Option<Vec<GeomInstQuery>>,
     pending_resize: Option<(UVec2, Instant)>,
     picked: Option<RefU64>,
+    selected: HashSet<RefU64>,
+    selection_dirty: bool,
     bounds: HashMap<RefU64, (Vec3, Vec3)>,
 }
 
@@ -132,6 +146,16 @@ impl View3d {
         // TODO(诊断): 拾取排查完删除。
         diag(format!("[诊断] UI 发出拾取 uv={uv:?}"));
         self.commands.push_back(ViewCommand::Pick(uv));
+    }
+
+    /// 下发当前选择集。传空集即取消全部高亮。宿主每次选择变更都发一遍整集，
+    /// 视口无状态地照它重刷——不发「加了谁减了谁」，跟树侧 `SetSelection` 同理。
+    pub fn set_selection(&mut self, refnos: Vec<RefU64>) {
+        let selected: HashSet<_> = refnos.into_iter().collect();
+        if self.selected != selected {
+            self.selected = selected;
+            self.selection_dirty = true;
+        }
     }
 
     /// 主题下发的视口配色：渐变上下两色进背景面片，网格色进网格重建。
@@ -205,8 +229,18 @@ struct ModelRoot {
     owner: RefU64,
 }
 
-#[derive(Component, Clone, Copy)]
-struct ModelMesh(RefU64);
+#[derive(Component, Clone)]
+struct ModelMesh {
+    refno: RefU64,
+    owner: RefU64,
+    /// 该网格按类型算出的常态材质。选中高亮换成 [`HighlightMaterial`]，
+    /// 取消选中时靠它还原——不存的话就得重算颜色，还得重新走一遍类型解析。
+    base: Handle<StandardMaterial>,
+}
+
+/// 选中高亮共用的一枚材质句柄；换选择集只改各网格指向哪枚材质，不新建材质。
+#[derive(Resource)]
+struct HighlightMaterial(Handle<StandardMaterial>);
 
 /// 原点三轴的挂点；网格换级时改它的 scale，轴跟着格距伸缩。
 #[derive(Component)]
@@ -312,6 +346,8 @@ fn setup(
         pending_models: None,
         pending_resize: None,
         picked: None,
+        selected: HashSet::new(),
+        selection_dirty: false,
         bounds: HashMap::new(),
     });
     commands.insert_resource(OrbitCamera::default());
@@ -375,6 +411,16 @@ fn setup(
         },
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.8, -0.7, 0.0)),
         Headlight,
+    ));
+    // 环境光：PBR 下背光面若全黑，模型会看着像剪影。给一档柔和环境把暗部提起来，
+    // 之前 unlit 时不需要它，这次开 PBR 才补上。
+    commands.insert_resource(AmbientLight {
+        color: Color::WHITE,
+        brightness: 220.0,
+        affects_lightmapped_meshes: false,
+    });
+    commands.insert_resource(HighlightMaterial(
+        materials.add(model_material(SELECT_COLOR)),
     ));
 
     // 地面网格（PDMS Z=0，过装载旋转即世界 y=0 面）与原点三色轴。
@@ -554,6 +600,45 @@ fn publish_camera(
     }
 }
 
+/// 构件类型 -> 基色。原样搬 rs-plant3-d 的 `default_color_rules`：
+/// 管道亮黄、结构天蓝、设备金黄、墙灰、房间/楼板米色……CE（当前元素）本是
+/// 半透明蓝。查不到的类型落到 UNKOWN 的米色。
+fn type_color(generic: &str) -> Color {
+    let ty = PdmsGenericType::from_str(generic).unwrap_or(PdmsGenericType::UNKOWN);
+    match ty {
+        PdmsGenericType::PIPE => Color::srgb_u8(250, 250, 30),
+        PdmsGenericType::STRU => Color::srgb_u8(25, 184, 241),
+        PdmsGenericType::EQUI => Color::srgb_u8(255, 190, 0),
+        PdmsGenericType::CE => Color::srgba_u8(44, 84, 220, 200),
+        PdmsGenericType::SCTN | PdmsGenericType::GENSEC => Color::srgb_u8(188, 141, 125),
+        PdmsGenericType::HANG => Color::srgb_u8(255, 126, 0),
+        PdmsGenericType::WALL | PdmsGenericType::STWALL | PdmsGenericType::GWALL => {
+            Color::srgb_u8(150, 150, 150)
+        }
+        // ROOM / PANE / FLOOR / HVAC 及其余一律米色（rs-plant3-d 的 UNKOWN 取值）。
+        _ => Color::srgb_u8(213, 191, 169),
+    }
+}
+
+/// 一个类型的 PBR 材质。双面 + 关背面剔除保留原壳
+/// 「管壁两面都画」的行为——PDMS 网格法线不保证朝外，剔一面会漏。
+fn model_material(color: Color) -> StandardMaterial {
+    StandardMaterial {
+        base_color: color,
+        alpha_mode: if color.alpha() < 1.0 {
+            AlphaMode::Blend
+        } else {
+            AlphaMode::Opaque
+        },
+        metallic: MODEL_METALLIC,
+        perceptual_roughness: MODEL_ROUGHNESS,
+        double_sided: true,
+        cull_mode: None,
+        ..default()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn load_models(
     mut commands: Commands,
     mut view: ResMut<View3d>,
@@ -562,6 +647,7 @@ fn load_models(
     roots: Query<Entity, With<SceneRoot>>,
     assets: Res<AssetServer>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    highlight: Res<HighlightMaterial>,
 ) {
     let Some(models) = view.pending_models.take() else {
         return;
@@ -604,34 +690,44 @@ fn load_models(
     for entity in &roots {
         commands.entity(entity).despawn();
     }
-    let material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.54, 0.68, 0.78),
-        unlit: true,
-        double_sided: true,
-        cull_mode: None,
-        ..default()
-    });
+    // 一类一枚材质：同类构件成千上万，逐网格建材质既费显存也断批。按基色缓存，
+    // 同色（含 UNKOWN 兜底）只落一枚。
+    let mut material_cache: HashMap<[u8; 4], Handle<StandardMaterial>> = HashMap::new();
     commands
         .spawn((scene_transform, Visibility::Visible, SceneRoot))
         .with_children(|scene| {
             for model in models {
                 let refno = model.refno.refno();
+                let owner = model.owner.refno();
+                let color = type_color(&model.generic);
+                let key = color.to_srgba().to_u8_array();
+                let material = material_cache
+                    .entry(key)
+                    .or_insert_with(|| materials.add(model_material(color)))
+                    .clone();
+                let shown_material =
+                    if view.selected.contains(&refno) || view.selected.contains(&owner) {
+                        highlight.0.clone()
+                    } else {
+                        material.clone()
+                    };
                 scene
                     .spawn((
                         model.world_trans,
                         Visibility::Visible,
-                        ModelRoot {
-                            refno,
-                            owner: model.owner.refno(),
-                        },
+                        ModelRoot { refno, owner },
                     ))
                     .with_children(|element| {
                         for inst in model.insts {
                             element.spawn((
                                 Mesh3d(assets.load(format!("meshes/{}.mesh", inst.geo_hash))),
-                                MeshMaterial3d(material.clone()),
+                                MeshMaterial3d(shown_material.clone()),
                                 inst.transform,
-                                ModelMesh(refno),
+                                ModelMesh {
+                                    refno,
+                                    owner,
+                                    base: material.clone(),
+                                },
                             ));
                         }
                     });
@@ -798,12 +894,7 @@ fn apply_commands(
                     }
                     CameraGesture::Drag([x, y]) => match orbit.motion {
                         Some(CameraMotion::Orbit) => {
-                            let offset = camera_transform.translation - orbit.focus;
-                            let yaw = Quat::from_rotation_y(-x * 0.005);
-                            let right = camera_transform.rotation * Vec3::X;
-                            let pitch = Quat::from_axis_angle(right, -y * 0.005);
-                            camera_transform.translation = orbit.focus + yaw * pitch * offset;
-                            camera_transform.look_at(orbit.focus, Vec3::Y);
+                            orbit_camera(&mut camera_transform, orbit.focus, x, y);
                         }
                         Some(CameraMotion::Pan) => {
                             let distance = camera_transform.translation.distance(orbit.focus);
@@ -835,6 +926,31 @@ fn apply_commands(
                 }
             }
         }
+    }
+}
+
+fn orbit_camera(camera: &mut Transform, focus: Vec3, x: f32, y: f32) {
+    let yaw = Quat::from_rotation_y(-x * 0.005);
+    let right = camera.rotation * Vec3::X;
+    let pitch = Quat::from_axis_angle(right, -y * 0.005);
+    camera.rotate_around(focus, yaw * pitch);
+}
+
+fn apply_selection(
+    mut view: ResMut<View3d>,
+    highlight: Res<HighlightMaterial>,
+    mut meshes: Query<(&ModelMesh, &mut MeshMaterial3d<StandardMaterial>)>,
+) {
+    if !view.selection_dirty {
+        return;
+    }
+    view.selection_dirty = false;
+    for (mesh, mut material) in &mut meshes {
+        material.0 = if view.selected.contains(&mesh.refno) || view.selected.contains(&mesh.owner) {
+            highlight.0.clone()
+        } else {
+            mesh.base.clone()
+        };
     }
 }
 
@@ -964,7 +1080,7 @@ fn surface_hit(
         hits.len()
     ));
     let (entity, hit) = hits.first()?;
-    Some((meshes.get(*entity).ok()?.0, hit.point))
+    Some((meshes.get(*entity).ok()?.refno, hit.point))
 }
 
 #[cfg(test)]
@@ -1033,6 +1149,8 @@ mod tests {
             pending_models: None,
             pending_resize: None,
             picked: None,
+            selected: HashSet::new(),
+            selection_dirty: false,
             bounds: HashMap::new(),
         };
         let first_asked_at = Instant::now() - Duration::from_secs(1);
@@ -1044,6 +1162,70 @@ mod tests {
             view.pending_resize,
             Some((UVec2::new(1000, 600), first_asked_at)),
             "逐帧重复请求同一尺寸不应把防抖计时归零"
+        );
+    }
+
+    #[test]
+    fn selection_highlight_replaces_and_restores_the_type_material() {
+        let refno = RefU64::from(42);
+        let owner = RefU64::from(7);
+        let mut materials = Assets::<StandardMaterial>::default();
+        let base = materials.add(model_material(type_color("PIPE")));
+        let highlight = materials.add(model_material(SELECT_COLOR));
+        assert_eq!(type_color("CE").to_srgba().to_u8_array()[3], 200);
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(HighlightMaterial(highlight.clone()))
+            .insert_resource(View3d {
+                texture: egui::TextureId::Managed(0),
+                size: UVec2::new(16, 16),
+                camera_rot: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                axis_labels: [None; 3],
+                image: Handle::default(),
+                commands: VecDeque::new(),
+                pending_models: None,
+                pending_resize: None,
+                picked: None,
+                selected: HashSet::from([owner]),
+                selection_dirty: true,
+                bounds: HashMap::new(),
+            })
+            .add_systems(Update, apply_selection);
+        let entity = app
+            .world_mut()
+            .spawn((
+                ModelMesh {
+                    refno,
+                    owner,
+                    base: base.clone(),
+                },
+                MeshMaterial3d(base.clone()),
+            ))
+            .id();
+
+        app.update();
+        assert_eq!(
+            app.world()
+                .entity(entity)
+                .get::<MeshMaterial3d<StandardMaterial>>()
+                .unwrap()
+                .0,
+            highlight
+        );
+
+        {
+            let mut view = app.world_mut().resource_mut::<View3d>();
+            view.selected.clear();
+            view.selection_dirty = true;
+        }
+        app.update();
+        assert_eq!(
+            app.world()
+                .entity(entity)
+                .get::<MeshMaterial3d<StandardMaterial>>()
+                .unwrap()
+                .0,
+            base
         );
     }
 
@@ -1092,6 +1274,25 @@ mod tests {
         assert_eq!(
             light.get::<DirectionalLight>().unwrap().illuminance,
             1_600.0
+        );
+    }
+
+    #[test]
+    fn orbit_keeps_an_off_center_anchor_stable() {
+        let focus = Vec3::new(2.0, 0.0, 0.0);
+        let mut camera = Transform::from_xyz(0.0, 0.0, 10.0).looking_at(Vec3::ZERO, Vec3::Y);
+        let anchor_angle = camera
+            .forward()
+            .angle_between((focus - camera.translation).normalize());
+
+        orbit_camera(&mut camera, focus, 1.0, 0.0);
+
+        let moved_anchor_angle = camera
+            .forward()
+            .angle_between((focus - camera.translation).normalize());
+        assert!(
+            (moved_anchor_angle - anchor_angle).abs() < 1e-4,
+            "旋转起手把指针锚点瞬间拉到了画面中心"
         );
     }
 

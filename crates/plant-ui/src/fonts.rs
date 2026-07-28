@@ -11,7 +11,7 @@ const REGULAR_KEY: &str = "puhui-regular";
 
 #[cfg(not(target_arch = "wasm32"))]
 fn font_dir() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/fonts")
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web/public/assets/fonts")
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -32,7 +32,7 @@ fn load(file: &str, warnings: &mut Vec<String>) -> Option<Arc<FontData>> {
 #[cfg(target_arch = "wasm32")]
 fn load(_file: &str, _warnings: &mut Vec<String>) -> Option<Arc<FontData>> {
     Some(Arc::new(FontData::from_static(include_bytes!(
-        "../../../assets/fonts/AlibabaPuHuiTi-2-55-Regular.ttf"
+        "../../../web/public/assets/fonts/AlibabaPuHuiTi-2-55-Regular.ttf"
     ))))
 }
 

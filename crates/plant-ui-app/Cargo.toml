@@ -11,6 +11,8 @@ aios_core.workspace = true
 egui.workspace = true
 eframe.workspace = true
 egui-phosphor.workspace = true
+# 验收探针的两半都用它：`inspect` 那个 bin 用它的线协议（可移植），主程序用它的
+# `attach_from_env` 起服务（只有原生端有，见 `attach_inspection`）。
 egui_inspection.workspace = true
 anyhow.workspace = true
 serde.workspace = true

@@ -9,7 +9,7 @@
 //! 比例尺仍留白——它们是另一类 HUD 信息件，拷问定案第 1 题把范围钉在
 //! 背景 / 坐标系 / ViewCube 三件，其余另轮。
 //!
-//! 鼠标：左键拾取、中键平移、右键旋转、滚轮缩放。左键不碰相机，理由见 [`camera`]。
+//! 鼠标：左键点击拾取、左键 / 中键拖拽平移、右键拖拽旋转、滚轮缩放。
 
 use egui::{
     Align, Align2, Color32, Id, Key, KeyboardShortcut, Layout, Margin, Mesh, Modifiers, Rect,
@@ -161,6 +161,13 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
     if response.clicked_by(egui::PointerButton::Primary)
         && let Some(pointer) = response.interact_pointer_pos()
     {
+        // TODO(诊断): 拾取排查完删除。
+        #[cfg(not(target_arch = "wasm32"))]
+        eprintln!(
+            "[诊断] 视口收到左键点击 pointer={pointer:?} rect={rect:?} 落在工具栏={} 落在立方体={}",
+            bar.contains(pointer),
+            cube.contains(pointer)
+        );
         // 点过视口，键盘就归视口。快捷键的开关是焦点，不是「鼠标在不在上面」。
         ui.memory_mut(|m| m.request_focus(response.id));
         if !bar.contains(pointer) && !cube.contains(pointer) {
@@ -184,18 +191,15 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
     }
 }
 
-/// 相机手势用哪个键。**左键不在这张表里**，理由见 [`camera`]。
-const CAMERA_BUTTONS: [(egui::PointerButton, CameraMotion); 2] = [
+/// 相机手势用哪个键。左键未越过拖拽门槛时仍由拾取处理。
+const CAMERA_BUTTONS: [(egui::PointerButton, CameraMotion); 3] = [
+    (egui::PointerButton::Primary, CameraMotion::Pan),
     (egui::PointerButton::Middle, CameraMotion::Pan),
     (egui::PointerButton::Secondary, CameraMotion::Orbit),
 ];
 
-/// 把 egui 的拖拽与滚轮翻成相机手势：中键平移、右键旋转、滚轮缩放。
-///
-/// **左键只拾取，不碰相机。** 一开始是照 `bevy_editor_cam` 默认的左键平移接的，
-/// 真机上立刻付了代价：左键的点与拖只隔着 egui 那 6 点位移门槛，而 150% 缩放下
-/// 那只有九个物理像素——瞄准细管子时手一抹就越过去，于是「点了没选中，视角还
-/// 挪了一下」。拾取是这块视口最要紧的交互，不该跟相机抢同一个键。
+/// 把 egui 的拖拽与滚轮翻成相机手势：左键 / 中键平移、右键旋转、滚轮缩放。
+/// 左键未越过 egui 的拖拽门槛时仍是一次普通拾取。
 ///
 /// 起手落在工具栏上的不算。`tool_btn` 只 `Sense::click()`，从按钮上按下再拖会
 /// 穿到底下这块背景来——那是一次按废了的按键，不该顺势把相机拽走。反过来，
@@ -217,7 +221,7 @@ fn camera(
         .into_iter()
         .find(|(button, _)| response.drag_started_by(*button));
     if let Some((_, motion)) = started
-        && let Some(pointer) = response.interact_pointer_pos()
+        && let Some(pointer) = ui.input(|i| i.pointer.press_origin())
         && !on_overlay(pointer)
     {
         // 操作过视口，键盘就归视口——转完直接敲 H 隐藏，不必再补一下点击。
@@ -228,8 +232,7 @@ fn camera(
         }));
     }
 
-    // 只有按着相机键的那段拖拽才算数。左键拖拽在这儿是彻底的空动作——
-    // 一次按废了的点击，视角不该跟着动。
+    // 只有按着相机键的那段拖拽才算数。
     let holding_camera_button = CAMERA_BUTTONS
         .into_iter()
         .any(|(button, _)| response.dragged_by(button));
@@ -652,42 +655,9 @@ mod tests {
         );
     }
 
-    /// 左键抖过门槛之后，什么都不做——尤其**不许把相机挪走**。
-    ///
-    /// 这条钉的是左键与相机解绑那件事。先前左键兼着平移，抖一下就变成「没选中、
-    /// 视角还挪了」；现在最差也只是这一下白点，再点一次就是了。
+    /// 左键 / 中键拖 = 平移，右键拖 = 旋转。
     #[test]
-    fn a_shaky_left_click_neither_picks_nor_moves_the_camera() {
-        let from = pos2(600.0, 350.0);
-        let to = pos2(612.0, 350.0);
-        let button = |pos, pressed| {
-            vec![egui::Event::PointerButton {
-                pos,
-                button: egui::PointerButton::Primary,
-                pressed,
-                modifiers: Modifiers::NONE,
-            }]
-        };
-        let cmds = viewport_cmds(vec![
-            vec![egui::Event::PointerMoved(from)],
-            button(from, true),
-            vec![egui::Event::PointerMoved(to)],
-            button(to, false),
-        ]);
-
-        assert!(
-            !cmds.iter().any(|cmd| matches!(cmd, Cmd::PickViewport(_))),
-            "手抖之后仍然发出了拾取，说明门槛变了：{cmds:?}"
-        );
-        assert!(
-            !cmds.iter().any(|cmd| matches!(cmd, Cmd::Camera(_))),
-            "左键抖一下把相机带走了，正是要根除的那件事：{cmds:?}"
-        );
-    }
-
-    /// 中键拖 = 平移，右键拖 = 旋转。两个键位对调过一次，用例把它钉住。
-    #[test]
-    fn middle_pans_and_right_orbits() {
+    fn left_and_middle_pan_while_right_orbits() {
         let motion_of = |button| {
             let from = pos2(600.0, 350.0);
             let to = pos2(640.0, 350.0);
@@ -712,6 +682,10 @@ mod tests {
             })
         };
 
+        assert_eq!(
+            motion_of(egui::PointerButton::Primary),
+            Some(CameraMotion::Pan)
+        );
         assert_eq!(
             motion_of(egui::PointerButton::Middle),
             Some(CameraMotion::Pan)

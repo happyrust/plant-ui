@@ -278,9 +278,13 @@ impl Vm {
         {
             self.project = health.project.clone();
         }
-        // 已经不在队列、也不在任务窗口里的明细留着只会越积越多。
-        self.details
-            .retain(|task_id, _| self.tasks.iter().any(|t| &t.task_id == task_id));
+        // 已经不在队列、也不在任务窗口里的明细留着只会越积越多。判据以 `/queue`
+        // 为准：那一份不封顶，而 `/tasks` 钳到 200——一个排了几百行的批次还没轮到
+        // 进任务窗口，它的明细不该被当成垃圾收掉。
+        self.details.retain(|task_id, _| {
+            self.queue.rows.iter().any(|r| &r.task_id == task_id)
+                || self.tasks.iter().any(|t| &t.task_id == task_id)
+        });
     }
 
     pub fn apply(&mut self, task_id: &str, event: ProgressEvent) {
@@ -375,10 +379,11 @@ impl Vm {
     /// 「待应用」——预览页拿这个数标注「N 个库正在应用，数字可能偏大」
     /// （ADR-0011）。单 worker 下它是 0 或 1，这里不写死这个假设。
     pub fn applying(&self) -> usize {
+        let tasks = index_tasks(self);
         self.queue
             .rows
             .iter()
-            .filter(|row| row.state == "running" && self.mine(&row.task_id))
+            .filter(|row| row.state == "running" && mine(&tasks, &self.project, &row.task_id))
             .count()
     }
 
@@ -406,22 +411,6 @@ impl Vm {
 
     fn task(&self, task_id: &str) -> Option<&TaskEntry> {
         self.tasks.iter().find(|t| t.task_id == task_id)
-    }
-
-    /// 这个 dbnum 欠着几个交付单元（持久表口径，跨重启仍然算数）。
-    fn owed(&self, dbnum: u32) -> usize {
-        self.pending.iter().filter(|u| u.dbnum == dbnum).count()
-    }
-
-    /// 属于本项目吗。任务行没进 `/tasks` 那 200 条窗口时项目未知——**未知按显示处理**：
-    /// 一个 gen-model 进程只服务一个项目，把一条说不清出身的活动行藏掉比混排更糟。
-    fn mine(&self, task_id: &str) -> bool {
-        match self.task(task_id) {
-            Some(entry) if !entry.project.is_empty() && !self.project.is_empty() => {
-                entry.project == self.project
-            }
-            _ => true,
-        }
     }
 }
 
@@ -573,21 +562,57 @@ impl Filter {
     }
 }
 
+/// 任务表按 task_id 建的索引。[`rows`] / [`filtered_out`] / [`Vm::applying`] /
+/// [`rebuilt`] 每帧都跑（面板一次、状态栏一次），积压态下逐行 `iter().find`
+/// 就是每帧几万次字符串比较（287 行 × 200 条任务），旁边还挂着实时三维视口。
+fn index_tasks(vm: &Vm) -> HashMap<&str, &TaskEntry> {
+    vm.tasks
+        .iter()
+        .map(|entry| (entry.task_id.as_str(), entry))
+        .collect()
+}
+
+/// 「属于本项目吗」的索引版：任务行没进 `/tasks` 那 200 条窗口时项目未知，
+/// **未知按显示处理**——一个 gen-model 进程只服务一个项目，把一条说不清出身的
+/// 活动行藏掉比混排更糟。
+fn mine(indexed: &HashMap<&str, &TaskEntry>, project: &str, task_id: &str) -> bool {
+    match indexed.get(task_id) {
+        Some(entry) if !entry.project.is_empty() && !project.is_empty() => entry.project == project,
+        _ => true,
+    }
+}
+
 /// 把快照、任务表与持久表拼成界面上的行。
 ///
 /// 两个来源分工固定：**排队与运行中的行以队列快照为准**（那一份不封顶，287 行也全在），
 /// 任务表只补计时、单元计数与终态历史。同一个 dbnum 至多两行——一行运行中、一行排队中，
 /// 下面那行要说清自己是「上一批冻结之后新存的会话」，不能让人以为是重复项。
 pub fn rows(vm: &Vm) -> Vec<RowVm> {
+    let tasks = index_tasks(vm);
+    // 欠账与「上一批在跑」也先收成索引：逐行扫 `pending` / `queue.rows` 同样是
+    // 积压态的平方项。
+    let mut owed: HashMap<u32, usize> = HashMap::new();
+    for unit in &vm.pending {
+        *owed.entry(unit.dbnum).or_default() += 1;
+    }
+    let running: std::collections::HashSet<u32> = vm
+        .queue
+        .rows
+        .iter()
+        .filter(|row| row.state == "running")
+        .map(|row| row.dbnum)
+        .collect();
+    let owed = |dbnum: u32| owed.get(&dbnum).copied().unwrap_or_default();
+
     let mut out = Vec::new();
-    let mut seen = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut position = 0usize;
 
     for row in &vm.queue.rows {
-        if !vm.mine(&row.task_id) {
+        if !mine(&tasks, &vm.project, &row.task_id) {
             continue;
         }
-        let entry = vm.task(&row.task_id);
+        let entry = tasks.get(row.task_id.as_str()).copied();
         let detail = vm.details.get(&row.task_id);
         let units = detail.map(|d| d.units.as_slice()).unwrap_or_default();
         let total_units = entry.and_then(|e| e.total_units);
@@ -607,13 +632,8 @@ pub fn rows(vm: &Vm) -> Vec<RowVm> {
         if queued {
             position += 1;
         }
-        let behind_frozen = queued
-            && vm
-                .queue
-                .rows
-                .iter()
-                .any(|other| other.dbnum == row.dbnum && other.state == "running");
-        seen.push(row.task_id.clone());
+        let behind_frozen = queued && running.contains(&row.dbnum);
+        seen.insert(row.task_id.as_str());
         out.push(RowVm {
             task_id: row.task_id.clone(),
             dbnum: row.dbnum,
@@ -635,7 +655,7 @@ pub fn rows(vm: &Vm) -> Vec<RowVm> {
             },
             note_tone: Status::Neutral,
             behind_frozen,
-            owed: vm.owed(row.dbnum),
+            owed: owed(row.dbnum),
             behind_events: entry
                 .map(|e| e.events_seen)
                 .unwrap_or_default()
@@ -644,7 +664,10 @@ pub fn rows(vm: &Vm) -> Vec<RowVm> {
     }
 
     for entry in &vm.tasks {
-        if entry.kind != KIND_DATA_BATCH || !entry.terminal() || seen.contains(&entry.task_id) {
+        if entry.kind != KIND_DATA_BATCH
+            || !entry.terminal()
+            || seen.contains(entry.task_id.as_str())
+        {
             continue;
         }
         if !entry.project.is_empty() && !vm.project.is_empty() && entry.project != vm.project {
@@ -696,7 +719,7 @@ pub fn rows(vm: &Vm) -> Vec<RowVm> {
                 Status::Warn
             },
             behind_frozen: false,
-            owed: vm.owed(dbnum),
+            owed: owed(dbnum),
             behind_events: 0,
         });
     }
@@ -704,14 +727,30 @@ pub fn rows(vm: &Vm) -> Vec<RowVm> {
     out
 }
 
+/// 本项目的历史行里缺 dbnum、因此连行都拼不出来的条数。终态数据批次按契约
+/// 必带 dbnum，缺了就是契约破损——**丢弃不许无声**，但它与「别的项目」是两回事，
+/// 各数各的。
+pub fn malformed(vm: &Vm) -> usize {
+    vm.tasks
+        .iter()
+        .filter(|t| {
+            t.kind == KIND_DATA_BATCH
+                && t.terminal()
+                && t.dbnum.is_none()
+                && (t.project.is_empty() || vm.project.is_empty() || t.project == vm.project)
+        })
+        .count()
+}
+
 /// 快照里属于别的项目、因此没有画上去的条目数。**过滤不许无声**——不然人会
 /// 对着一块空面板怀疑服务没连上。
 pub fn filtered_out(vm: &Vm) -> usize {
+    let tasks = index_tasks(vm);
     let active = vm
         .queue
         .rows
         .iter()
-        .filter(|row| !vm.mine(&row.task_id))
+        .filter(|row| !mine(&tasks, &vm.project, &row.task_id))
         .count();
     let history = vm
         .tasks
@@ -735,6 +774,7 @@ pub fn status(vm: &Vm) -> crate::vm::QueueStatusVm {
         active: all.iter().filter(|row| row.phase.active()).count(),
         paused: vm.paused(),
         filtered_out: filtered_out(vm),
+        malformed: malformed(vm),
         known: vm.loaded,
     }
 }
@@ -1076,8 +1116,10 @@ fn rebuilt(vm: &Vm) -> bool {
     let Some(started) = parse(&health.started_at) else {
         return false;
     };
+    let tasks = index_tasks(vm);
     vm.queue.rows.iter().any(|row| {
-        vm.task(&row.task_id)
+        tasks
+            .get(row.task_id.as_str())
             .and_then(|entry| parse(&entry.created_at))
             .is_some_and(|at| {
                 let gap = at.signed_duration_since(started);
@@ -2470,5 +2512,54 @@ mod tests {
         let all = rows(&vm(Vec::new(), vec![bare, full]));
         assert_eq!(all[0].window, "", "缺一个就整格不画，不许摆 sesno 0 → 0");
         assert_eq!(all[1].window, "sesno 1 024 → 1 038");
+    }
+
+    /// 明细的存活判据以 `/queue` 为准：一个还排着、却被挤到 `/tasks` 那 200 条
+    /// 窗口之外的批次，它的逐单元明细不许被当成垃圾收掉——它还等着被画出来。
+    #[test]
+    fn details_of_a_queued_row_survive_outside_the_task_window() {
+        let mut model = vm(vec![queued("db-2-1", 2, 0, 5)], Vec::new());
+        model.apply(
+            "db-2-1",
+            serde_json::from_str(
+                r#"{"kind":"model_unit_started","dbnum":2,"root_refno":"24384/1","noun":"BRAN"}"#,
+            )
+            .unwrap(),
+        );
+        model.adopt(Poll {
+            queue: QueueSnapshot {
+                paused: false,
+                rows: vec![queued("db-2-1", 2, 0, 5)],
+            },
+            ..Default::default()
+        });
+        assert!(
+            model.details.contains_key("db-2-1"),
+            "还在排队的行不在任务窗口里，明细也得留着"
+        );
+
+        // 队列与任务窗口里都没有了，才轮到回收。
+        model.adopt(Poll::default());
+        assert!(model.details.is_empty());
+    }
+
+    /// 终态历史行缺 dbnum 是契约破损：拼不出行，但**丢弃不许无声**。
+    /// 它与「别的项目」分开数——混进 `filtered_out` 会把破损讲成跨项目。
+    #[test]
+    fn a_history_row_without_dbnum_is_dropped_but_counted() {
+        let mut broken = entry("db-x-1", 0, "succeeded");
+        broken.dbnum = None;
+        let model = vm(Vec::new(), vec![entry("db-2-9", 2, "succeeded"), broken]);
+        assert_eq!(rows(&model).len(), 1);
+        assert_eq!(malformed(&model), 1);
+        assert_eq!(filtered_out(&model), 0, "缺号不是跨项目，不许混进那个计数");
+
+        // 别的项目的缺号行只进 `filtered_out`，不两边都数。
+        let mut theirs = entry("db-x-2", 0, "succeeded");
+        theirs.dbnum = None;
+        theirs.project = "OtherProj".into();
+        let model = vm(Vec::new(), vec![theirs]);
+        assert_eq!(malformed(&model), 0);
+        assert_eq!(filtered_out(&model), 1);
     }
 }

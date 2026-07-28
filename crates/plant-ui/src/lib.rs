@@ -49,8 +49,8 @@ pub enum ModelAction {
     ToggleMeasure,
 }
 
-/// 三维视口里的一次相机运动。键位见 `view3d::camera`：中键平移、右键旋转、
-/// 滚轮缩放，左键留给拾取。
+/// 三维视口里的一次相机运动。键位见 `view3d::camera`：左键 / 中键平移、
+/// 右键旋转、滚轮缩放；未形成拖拽的左键点击仍用于拾取。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CameraMotion {
     Orbit,

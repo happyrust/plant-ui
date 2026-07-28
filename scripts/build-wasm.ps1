@@ -37,7 +37,7 @@ if (-not (Get-Command wasm-bindgen -ErrorAction SilentlyContinue)) {
 }
 wasm-bindgen `
   --target web `
-  --out-dir web/pkg `
+  --out-dir web/public/pkg `
   --out-name plant_ui_app `
   $wasm
 exit $LASTEXITCODE

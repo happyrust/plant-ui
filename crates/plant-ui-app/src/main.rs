@@ -20,6 +20,7 @@ use bevy::prelude::{
 use bevy_egui35::{
     EguiContexts, EguiGlobalSettings, EguiPlugin, EguiPrimaryContextPass, PrimaryEguiContext,
 };
+use chrono::{DateTime, Utc};
 use command::ParsedCommand;
 use eframe::egui;
 use logs::Retry;
@@ -183,7 +184,7 @@ fn run(canvas: &str) {
 #[cfg(not(target_arch = "wasm32"))]
 fn asset_root() -> String {
     std::env::var("PLANT_ASSET_ROOT")
-        .unwrap_or_else(|_| format!("{}/../../../gen-model/assets", env!("CARGO_MANIFEST_DIR")))
+        .unwrap_or_else(|_| format!("{}/../../web/public/assets", env!("CARGO_MANIFEST_DIR")))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -244,7 +245,7 @@ fn show_app(
         );
     }
     if let Some(refno) = view3d.take_picked() {
-        app.select(refno);
+        app.handle_cmds(ctx, vec![Cmd::LocateElement(refno)]);
     }
     app.vm.view3d = Some(View3dVm {
         texture: view3d.texture,
@@ -263,6 +264,7 @@ fn show_app(
             ui.set_max_size(size);
             app.ui(ui);
         });
+    view3d.set_selection(app.vm.selection.to_vec());
     if let Some(models) = app.pending_models.take() {
         view3d.load(models);
     }
@@ -280,6 +282,31 @@ fn show_app(
         }
     }
     Ok(())
+}
+
+/// 一次还没落地的树定位（ADR-0014）。
+///
+/// 「落地」= 目标那一行真的出现在展平后的可见行里。在那之前 `vm.tree_reveal`
+/// 得一直挂着：祖先的子层是异步回来的，滚动请求只活一帧的话，它会在行还不存在时
+/// 就被消费掉，然后树停在原地。
+struct PendingLocate {
+    target: RefU64,
+    /// 目标在当前 MDB 内的祖先，由近到远。祖先链还在查的时候是空的。
+    /// 用户手动折叠其中任何一节就等于放弃这次定位。
+    path: Vec<RefU64>,
+    /// 由命令行发起。回执要写回命令会话，树上点日志过来的那些不写。
+    from_command: bool,
+    /// 命令会话里已经报过这次定位的结果。发起时就能展开到位的那种当场就报了，
+    /// 等祖先链的那种得等真滚过去才报，两者不许都报一遍。
+    announced: bool,
+}
+
+/// 一次树定位的去向。
+enum Locate {
+    /// 祖先链已在手上，这一帧就展开到位（缺的子层另走异步）。
+    Ready,
+    /// 目标还没物化，正在查祖先链，滚动等它回来。
+    Resolving,
 }
 
 /// App 侧的树结构缓存与展开状态；`vm.tree` 是它按展开状态展平后的产物。
@@ -382,9 +409,10 @@ impl TreeModel {
 
     /// 从最近的父到 SITE 根的祖先链；不在已加载的树里就是 None。
     ///
-    /// 不必为此发查询：能被日志提到的元素都是从某个父层查回来的，那一层连同它上面
-    /// 每一层通常都还在缓存里。取回工作会摘掉已经不存在的分支，所以老日志行指到
-    /// 一个被删掉的元素时这里给 None，定位那边退化成「只切了属性」。
+    /// 只读缓存，不打库。命中的是常见那一半：能被日志提到的元素都是从某个父层查
+    /// 回来的，那一层连同它上面每一层通常都还在缓存里。命令行里直接敲一个参考号、
+    /// 或者取回工作刚把某条分支摘掉时会落空，那时定位改走 `Req::Ancestors` 现查
+    /// 一条（ADR-0014）。
     fn ancestors(&self, refno: RefU64) -> Option<Vec<RefU64>> {
         if self.is_root(refno) {
             return Some(Vec::new());
@@ -429,6 +457,10 @@ struct App {
     /// 已经见过终态的数据批次。轮询靠它认出「这一拍新跑完了哪几个」——
     /// 终态之后快照还会带着它们好几拍，每拍都刷一次就是反复拆装同一批几何。
     queue_finished: HashSet<String>,
+    /// 根层快照开始读取的时刻。首次队列快照只补这之后完成的批次。
+    data_observed_at: Option<DateTime<Utc>>,
+    /// 首份可与根层快照比较的队列快照是否已经登记。
+    queue_refresh_baselined: bool,
     /// 已经发出去还没回来的那次取回工作。菜单点快了不该排成一串重查。
     get_work_pending: bool,
     /// 忙时又来的刷新只合并成下一次；`true` 表示至少有一次模型已生成完成，
@@ -442,6 +474,8 @@ struct App {
     model_reload_in_flight: bool,
     bridge: data::Bridge,
     tree: TreeModel,
+    /// 还没落地的那一次树定位。同时只留一个：连续定位只完成最后一次。
+    pending_locate: Option<PendingLocate>,
     logs: logs::LogBuffer,
     pending_models: Option<Vec<aios_core::GeomInstQuery>>,
     view3d_commands: Vec<Cmd>,
@@ -466,6 +500,29 @@ fn begin_get_work(pending: bool, reload_models: bool, deferred: &mut Option<bool
     } else {
         true
     }
+}
+
+fn task_matches_project(task_project: &str, project: &str) -> bool {
+    task_project.is_empty() || project.is_empty() || task_project == project
+}
+
+fn finished_after(finished_at: Option<&str>, observed_at: DateTime<Utc>) -> bool {
+    finished_at
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map_or(true, |finished| finished.with_timezone(&Utc) >= observed_at)
+}
+
+/// 祖先链里属于当前 MDB 模型树的那一段，由近到远，**不含目标本人**。
+///
+/// `chain` 是查询侧给的「自己 -> 上级 -> …」序（`fn::ancestor`，第 0 项是目标）。
+/// 从里面找第一个 SITE 根当落脚点，根之上的层属于别的 MDB，一律截掉——树定位
+/// 不切换 MDB。
+///
+/// `None` = 链里没有落脚点，目标是树外元素。目标自己就是 SITE 根时返回空路径：
+/// 它那一行本来就在，不用展开谁。
+fn in_mdb_path(chain: &[RefU64], is_root: impl Fn(RefU64) -> bool) -> Option<Vec<RefU64>> {
+    let anchor = chain.iter().position(|ancestor| is_root(*ancestor))?;
+    Some(chain[1..=anchor].to_vec())
 }
 
 fn background_models_settled(pending_known: bool, pending_empty: bool, queue_empty: bool) -> bool {
@@ -544,6 +601,8 @@ impl App {
                 .unwrap_or_else(Instant::now),
             queue_poll_pending: false,
             queue_finished: HashSet::new(),
+            data_observed_at: None,
+            queue_refresh_baselined: false,
             get_work_pending: false,
             get_work_again: None,
             model_reload_ready: false,
@@ -551,6 +610,7 @@ impl App {
             model_reload_in_flight: false,
             bridge: data::spawn(ctx.clone(), tasks),
             tree: TreeModel::default(),
+            pending_locate: None,
             logs: logs::LogBuffer::default(),
             pending_models: None,
             view3d_commands: Vec::new(),
@@ -586,6 +646,9 @@ impl App {
                     self.vm.project = info.project;
                     self.mdb = info.mdb;
                     self.namespace = info.ns.clone();
+                    self.data_observed_at = Some(info.observed_at);
+                    self.queue_refresh_baselined = false;
+                    self.queue_finished.clear();
                     self.queue.project = self.vm.project.clone();
                     self.queue.mdb = self.mdb.clone();
                     self.queue.namespace = self.namespace.clone();
@@ -621,6 +684,8 @@ impl App {
                     // 展开失败就收回箭头，别让行卡在「加载中」。
                     self.tree.loading.remove(&refno);
                     self.tree.expanded.remove(&refno);
+                    // 这一层正挡在定位目标前面的话，那次定位到不了了。
+                    self.end_locate_on_failure(refno);
                     let el = self.tree.element(refno);
                     self.logs.error_of(
                         &mut self.vm.logs,
@@ -696,21 +761,41 @@ impl App {
                     }
                 }
                 data::Evt::ResolvedName(name, result) => match result {
+                    // `/名称` 与 `=参考号` 之后走的是同一条定位路径，只有回执文案不同。
                     Ok(Some(refno)) => {
-                        let revealed = self.locate(refno);
-                        let suffix = if revealed {
-                            ""
-                        } else {
-                            "（不在已加载的模型树中，只切换了属性）"
+                        let located = self.locate(refno, true);
+                        let suffix = match located {
+                            Locate::Ready => "",
+                            Locate::Resolving => "（正在展开它所在的路径…）",
                         };
                         self.command_output(format!("/{name} = {refno}{suffix}"));
-                        dirty |= revealed;
+                        dirty |= matches!(located, Locate::Ready);
                     }
                     Ok(None) => self.command_error(format!("未找到元素：/{name}")),
                     Err(error) => {
                         self.command_error(format!("名称查询失败：{}", logs::error_chain(&error)))
                     }
                 },
+                data::Evt::Ancestors(refno, Ok(chain)) => {
+                    dirty |= self.apply_ancestors(refno, chain);
+                }
+                data::Evt::Ancestors(refno, Err(error)) => {
+                    // 链查不动就没法展开，待滚动到此为止；选中与属性仍然留着。
+                    let from_command = self
+                        .pending_locate
+                        .as_ref()
+                        .is_some_and(|p| p.target == refno && p.from_command);
+                    self.end_locate_on_failure(refno);
+                    let el = self.tree.element(refno);
+                    self.logs
+                        .error_of(&mut self.vm.logs, el, "祖先路径查询失败", &error, None);
+                    if from_command {
+                        self.command_error(format!(
+                            "祖先路径查询失败：{}",
+                            logs::error_chain(&error)
+                        ));
+                    }
+                }
                 // 预览是长请求，用户可能中途放弃等待（Vm 回到 Idle）。晚到的结果
                 // 不许把界面拽回来——那一下会覆盖掉用户刚做出的选择。
                 data::Evt::ModelUpdatePreview(_)
@@ -815,6 +900,9 @@ impl App {
                                 );
                             }
                             self.tree.prune_unreachable();
+                            // 清扫可以把待滚动路径上的某一节摘掉（元素被删或挪了
+                            // OWNER）。那条路径已经通不到目标，待滚动跟着结束。
+                            self.drop_locate_off_the_tree();
                             let after = self.tree.element_count();
                             self.logs.info(
                                 &mut self.vm.logs,
@@ -947,20 +1035,15 @@ impl App {
             match cmd {
                 Cmd::SelectElement(refno) => self.select(refno),
                 Cmd::SetSelection(selection) => self.set_selection(selection),
+                // 日志行上点元素名过来的定位。祖先链要现查时这一帧还没什么可展平的，
+                // 但选中与属性已经换过去了，界面不会看着像没反应。
                 Cmd::LocateElement(refno) => {
-                    if self.locate(refno) {
-                        dirty = true;
-                    } else {
-                        let el = self.tree.element(refno);
-                        self.logs.warn_of(
-                            &mut self.vm.logs,
-                            el,
-                            "不在已加载的模型树里，只切了属性",
-                        );
-                    }
+                    dirty |= matches!(self.locate(refno, false), Locate::Ready);
                 }
                 Cmd::ToggleExpand(refno) => {
-                    if !self.tree.expanded.remove(&refno) {
+                    if self.tree.expanded.remove(&refno) {
+                        self.end_locate_on_collapse(refno);
+                    } else {
                         self.tree.expanded.insert(refno);
                         if !self.tree.children.contains_key(&refno)
                             && self.tree.loading.insert(refno)
@@ -1140,14 +1223,18 @@ impl App {
                 false
             }
             ParsedCommand::LocateRef(refno) => {
-                let revealed = self.locate(refno);
-                let suffix = if revealed {
-                    ""
-                } else {
-                    "（不在已加载的模型树中，只切换了属性）"
-                };
-                self.command_output(format!("已定位 {refno}{suffix}"));
-                revealed
+                // 目标还没物化时这条只报「已选中」：能不能滚到要等祖先链回来，
+                // 那时候再补一句。先报成功再改口比晚报一拍难解释得多。
+                match self.locate(refno, true) {
+                    Locate::Ready => {
+                        self.command_output(format!("已定位 {refno}"));
+                        true
+                    }
+                    Locate::Resolving => {
+                        self.command_output(format!("已选中 {refno}，正在展开它所在的路径…"));
+                        false
+                    }
+                }
             }
             ParsedCommand::Error(error) => {
                 self.command_error(error);
@@ -1178,18 +1265,193 @@ impl App {
         Ok(format!("{} = {value}", attr.to_ascii_uppercase()))
     }
 
-    /// 展开已知祖先、请求滚动并选中。返回是否能在当前树缓存中显示该元素。
-    fn locate(&mut self, refno: RefU64) -> bool {
-        let Some(chain) = self.tree.ancestors(refno) else {
-            self.select(refno);
+    /// 树定位：选中目标并让属性跟上，再想办法把它那一行露出来（ADR-0014）。
+    ///
+    /// 祖先链已经在缓存里的话这一帧就能展开到位；不在的话现查一条，滚动留给
+    /// `Evt::Ancestors` 之后的那几层子层。两条路都不切换 MDB、不生成或显示三维、
+    /// 不动相机。
+    fn locate(&mut self, refno: RefU64, from_command: bool) -> Locate {
+        self.select(refno);
+        if let Some(chain) = self.tree.ancestors(refno) {
+            self.expand_path(&chain);
+            self.pending_locate = Some(PendingLocate {
+                target: refno,
+                path: chain,
+                from_command,
+                announced: true,
+            });
+            self.vm.tree_reveal = Some(refno);
+            return Locate::Ready;
+        }
+        // 上一次还没滚到的定位就此作废：连续定位只完成最后一次。
+        self.vm.tree_reveal = None;
+        self.pending_locate = Some(PendingLocate {
+            target: refno,
+            // 路径要等祖先链回来才知道。这期间折叠任何一行都动不到这次定位。
+            path: Vec::new(),
+            from_command,
+            announced: false,
+        });
+        let _ = self.bridge.req.send(data::Req::Ancestors(refno));
+        Locate::Resolving
+    }
+
+    /// 展开这条路径，并把还没有子层的那几节补查回来。
+    ///
+    /// 只补直接子层，不预载整棵树：为一次定位把模型树整个拉下来，代价是几万行
+    /// 无人看的节点。
+    fn expand_path(&mut self, path: &[RefU64]) {
+        for &ancestor in path {
+            self.tree.expanded.insert(ancestor);
+            if !self.tree.children.contains_key(&ancestor) && self.tree.loading.insert(ancestor) {
+                let _ = self.bridge.req.send(data::Req::Children(ancestor));
+            }
+        }
+    }
+
+    /// 祖先链查回来了：把当前 MDB 内的那一段接进树里，剩下的交给子层查询。
+    fn apply_ancestors(&mut self, refno: RefU64, chain: Vec<RefU64>) -> bool {
+        // 连续定位时早先那次的链会晚到，它已经不是当前目标了。
+        if self.pending_locate.as_ref().map(|p| p.target) != Some(refno) {
+            return false;
+        }
+        let in_mdb = in_mdb_path(&chain, |ancestor| self.tree.is_root(ancestor));
+        let Some(path) = in_mdb else {
+            // 根层里找不到落脚点：目标在模型本体里，但不在当前 MDB 的树根范围内。
+            let pending = self.pending_locate.take();
+            let el = self.tree.element(refno);
+            self.logs.warn_of(
+                &mut self.vm.logs,
+                el.clone(),
+                "树外元素：已选中并显示属性，不切换 MDB",
+            );
+            if pending.is_some_and(|p| p.from_command) {
+                self.command_output(format!("{} 是树外元素，只切换了属性", el.label));
+            }
             return false;
         };
-        for ancestor in chain {
-            self.tree.expanded.insert(ancestor);
+        // OWNER 关系顺手记下来。不记的话下一次定位到同一条分支上的元素还要再查一遍，
+        // 而这条链现在已经和 `children` 里的内容一样可靠了。
+        for pair in chain[..=path.len()].windows(2) {
+            self.tree.parent.insert(pair[0], pair[1]);
+        }
+        self.expand_path(&path);
+        if let Some(pending) = &mut self.pending_locate {
+            pending.path = path;
         }
         self.vm.tree_reveal = Some(refno);
-        self.select(refno);
         true
+    }
+
+    /// 用户手动折叠了这一节。它在待滚动的路径上就等于放弃这次定位——他显然不要了，
+    /// 而把行滚过去之后再让它藏在折叠里毫无意义。
+    ///
+    /// 折叠目标自己不算：那只是收起它的子层，它那一行还在，照样滚得到。
+    fn end_locate_on_collapse(&mut self, collapsed: RefU64) {
+        if self
+            .pending_locate
+            .as_ref()
+            .is_some_and(|p| p.path.contains(&collapsed))
+        {
+            self.end_locate();
+        }
+    }
+
+    /// 这一层查不动了。它是目标本身（祖先链失败，路径还没算出来）或者路径上的
+    /// 一节（子层失败，路径断了）时，这次定位到不了目标，别把滚动请求一直挂着。
+    fn end_locate_on_failure(&mut self, failed: RefU64) {
+        if self
+            .pending_locate
+            .as_ref()
+            .is_some_and(|p| p.target == failed || p.path.contains(&failed))
+        {
+            self.end_locate();
+        }
+    }
+
+    fn end_locate(&mut self) {
+        self.pending_locate = None;
+        self.vm.tree_reveal = None;
+    }
+
+    /// 取回工作的清扫之后，待滚动的路径是不是还站在树上。
+    fn drop_locate_off_the_tree(&mut self) {
+        let stale = self.pending_locate.as_ref().is_some_and(|p| {
+            p.path
+                .iter()
+                .any(|ancestor| !self.tree.expanded.contains(ancestor))
+        });
+        if stale {
+            self.end_locate();
+        }
+    }
+
+    /// 目标那一行已经在可见行里——也就是这一帧的滚动真的滚得到。
+    fn tree_reveal_row_ready(&self) -> bool {
+        let Some(refno) = self.vm.tree_reveal else {
+            return false;
+        };
+        matches!(&self.vm.tree, TreeVm::Ready(rows) if rows.iter().any(|r| r.refno == refno))
+    }
+
+    /// 每帧末尾结算待滚动：行已经画出来了就把请求收掉，还没有就留着。
+    ///
+    /// 留着是这条路径的关键（ADR-0014）。祖先的子层是一层层异步回来的，滚动请求
+    /// 只活一帧的话，它会在目标行还不存在时被 `reveal_offset` 空手接走，之后没人
+    /// 再提这件事，树就停在原地。
+    fn settle_tree_reveal(&mut self) {
+        if !self.tree_reveal_row_ready() {
+            // 路径全展开完了、没有子层还在路上，目标那一行却没出现：库里已经没有
+            // 这个元素了（查完祖先链到子层回来之间被删掉，或者挪去了别的 OWNER）。
+            // 不在这里收尾的话滚动请求会一直挂着，永远等一行不会来的行。
+            if self.locate_path_settled() {
+                let target = self.pending_locate.as_ref().map(|p| p.target);
+                let from_command = self
+                    .pending_locate
+                    .as_ref()
+                    .is_some_and(|p| p.from_command && !p.announced);
+                self.end_locate();
+                if let Some(target) = target {
+                    let el = self.tree.element(target);
+                    let label = el.label.clone();
+                    self.logs.warn_of(
+                        &mut self.vm.logs,
+                        el,
+                        "路径已展开完，树上却没有这一行：它已不在这条路径下",
+                    );
+                    if from_command {
+                        self.command_error(format!("{label} 已不在模型树的这条路径上"));
+                    }
+                }
+            }
+            return;
+        }
+        self.vm.tree_reveal = None;
+        let Some(pending) = self.pending_locate.take() else {
+            return;
+        };
+        if pending.from_command && !pending.announced {
+            let label = self.tree.label(pending.target);
+            self.command_output(format!("已定位 {label}"));
+        }
+    }
+
+    /// 待滚动的路径已经无事可等：每一节都展开着、子层都在手上。
+    ///
+    /// 祖先链还在查（`path` 为空但目标不是根）的那段不算——那时候路径还不知道，
+    /// 空的 `path` 会让下面这几个判断一律成立。
+    fn locate_path_settled(&self) -> bool {
+        let Some(pending) = &self.pending_locate else {
+            return false;
+        };
+        if pending.path.is_empty() && !self.tree.is_root(pending.target) {
+            return false;
+        }
+        pending.path.iter().all(|ancestor| {
+            self.tree.expanded.contains(ancestor)
+                && !self.tree.loading.contains(ancestor)
+                && self.tree.children.contains_key(ancestor)
+        })
     }
 
     fn command_output(&mut self, text: impl Into<String>) {
@@ -1245,7 +1507,7 @@ impl App {
     /// 与 `reconnect` 的分别在这里：重连从空缓存重来，展开状态、选中、属性一起
     /// 清掉；取回工作要的恰恰是这些都留着，只换里面的内容。
     fn get_work(&mut self) {
-        self.get_work_with_models(false);
+        self.get_work_with_models(true);
     }
 
     fn get_work_with_models(&mut self, reload_models: bool) {
@@ -1300,20 +1562,28 @@ impl App {
     /// 轮询来发现跃迁——**不发现就等于批次跑完了、树和三维还停在旧模型上**，
     /// 而人只会以为更新没生效。
     ///
-    /// 第一份快照只做登记不触发：那时手上这些终态是历史，不是刚发生的事，
-    /// 照它们刷一遍等于开机就把整棵树重查一次。
+    /// 第一份可比较快照里，根层开始读取前结束的是历史，只登记；之后结束的批次
+    /// 必须刷新，否则它可能刚好落在根层读取与首次队列轮询之间而永久漏掉。
     fn newly_finished(
         &mut self,
         poll: &plant_ui::task_queue::Poll,
     ) -> (bool, Vec<model_update::RefreshUnit>) {
-        let first = !self.queue.loaded;
+        let Some(observed_at) = self.data_observed_at else {
+            return (false, Vec::new());
+        };
+        let first = !self.queue_refresh_baselined;
         let mut data_applied = false;
         let mut units = Vec::new();
         for task in &poll.tasks {
-            if task.kind != plant_ui::task_queue::KIND_DATA_BATCH || !task.terminal() {
+            if task.kind != plant_ui::task_queue::KIND_DATA_BATCH
+                || !task.terminal()
+                || !task_matches_project(&task.project, &self.vm.project)
+            {
                 continue;
             }
-            if !self.queue_finished.insert(task.task_id.clone()) || first {
+            if !self.queue_finished.insert(task.task_id.clone())
+                || (first && !finished_after(task.finished_at.as_deref(), observed_at))
+            {
                 continue;
             }
             if let Some(outcome) = task.result.as_ref() {
@@ -1321,6 +1591,7 @@ impl App {
                 units.extend(outcome.refresh_units());
             }
         }
+        self.queue_refresh_baselined = true;
         (data_applied, units)
     }
 
@@ -1370,6 +1641,9 @@ impl App {
         // 那几秒里「立刻扫一遍」还亮着，按下去带的是上一次连接的 MDB。
         self.queue.mdb.clear();
         self.queue.namespace.clear();
+        self.queue_finished.clear();
+        self.data_observed_at = None;
+        self.queue_refresh_baselined = false;
         self.get_work_again = None;
         self.model_reload_ready = false;
         self.model_reload_owed = false;
@@ -1378,6 +1652,8 @@ impl App {
         self.vm.element_count = 0;
         self.vm.selection.clear();
         self.vm.tree_reveal = None;
+        // 待滚动的目标属于旧树。新连接的根层还没到，留着它只会让第一帧的树乱滚一下。
+        self.pending_locate = None;
         self.vm.tree = TreeVm::Loading;
         self.vm.props = PropsVm::Uninit;
         self.logs.info(&mut self.vm.logs, "正在重连数据源…");
@@ -1520,10 +1796,46 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{
-        RefU64, background_models_settled, begin_get_work, model_reload_due, restore_model_reload,
-        settled_pending_roots,
+        RefU64, background_models_settled, begin_get_work, finished_after, in_mdb_path,
+        model_reload_due, restore_model_reload, settled_pending_roots, task_matches_project,
     };
+    use chrono::{TimeZone, Utc};
     use plant_ui::model_update::PendingModelUnit;
+
+    fn refs(raw: &[&str]) -> Vec<RefU64> {
+        raw.iter().map(|s| s.parse().unwrap()).collect()
+    }
+
+    #[test]
+    fn the_ancestor_path_stops_at_the_site_root() {
+        // `fn::ancestor` 给的是「自己 -> 上级 -> …」，末尾那些层在 WORLD 一侧，
+        // 属于别的 MDB。树定位不切换 MDB，所以路径到 SITE 根为止。
+        let chain = refs(&[
+            "24381/100677",
+            "24381/100600",
+            "24381/100500",
+            "24381/1",
+            "24381/0",
+        ]);
+        let site = chain[3];
+        let path = in_mdb_path(&chain, |r| r == site).unwrap();
+        assert_eq!(path, refs(&["24381/100600", "24381/100500", "24381/1"]));
+    }
+
+    #[test]
+    fn a_target_outside_the_current_mdb_has_no_path() {
+        // 链上一个都不是当前根：树外元素，选中并显示属性，但没有可展开的路径。
+        let chain = refs(&["24381/100677", "24381/100600"]);
+        assert!(in_mdb_path(&chain, |_| false).is_none());
+    }
+
+    #[test]
+    fn a_site_root_target_needs_no_expansion() {
+        // 目标自己就是根，路径为空——它那一行本来就在，别去展开它自己。
+        let chain = refs(&["24381/1", "24381/0"]);
+        let site = chain[0];
+        assert!(in_mdb_path(&chain, |r| r == site).unwrap().is_empty());
+    }
 
     #[test]
     fn refresh_requests_preserve_models_until_generation_finishes() {
@@ -1533,6 +1845,23 @@ mod tests {
         assert_eq!(deferred, Some(false));
         assert!(!begin_get_work(true, true, &mut deferred));
         assert_eq!(deferred, Some(true));
+    }
+
+    #[test]
+    fn initial_queue_snapshot_only_refreshes_current_project_work_after_the_data_snapshot() {
+        let observed = Utc.with_ymd_and_hms(2026, 7, 29, 3, 0, 0).unwrap();
+        assert!(!finished_after(Some("2026-07-29T02:59:59Z"), observed));
+        assert!(finished_after(Some("2026-07-29T03:00:01Z"), observed));
+        // 缺时间戳时宁可多刷一次，也不能静默漏掉已经完成的数据批次。
+        assert!(finished_after(None, observed));
+
+        assert!(task_matches_project(
+            "AvevaMarineSample",
+            "AvevaMarineSample"
+        ));
+        assert!(!task_matches_project("OtherProject", "AvevaMarineSample"));
+        // 老服务没带项目字段时保留兼容口径：未知不等于别的项目。
+        assert!(task_matches_project("", "AvevaMarineSample"));
     }
 
     #[test]
@@ -1658,12 +1987,13 @@ impl App {
             }
             ui.ctx().request_repaint();
         }
-        // 定位请求只管一帧：树刚才已经滚过去了，绘制层只读、消费不掉自己。
-        self.vm.tree_reveal = None;
+        // 绘制层只读、消费不掉自己的滚动请求，所以由这里判断它落地没有。
+        self.settle_tree_reveal();
         self.handle_cmds(ui.ctx(), cmds);
         self.poll_queue(ui.ctx());
-        // 这一帧才记下的定位要等下一帧才画得出来，别让界面停在这儿等下一次输入。
-        if self.vm.tree_reveal.is_some() {
+        // 这一帧才展开出来的行要等下一帧才画得到，别让界面停在这儿等下一次输入。
+        // 子层还在路上的那种不在这里空转——祖先链和子层回来时数据线程会叫醒它。
+        if self.tree_reveal_row_ready() {
             ui.ctx().request_repaint();
         }
     }

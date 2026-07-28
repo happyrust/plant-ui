@@ -2746,4 +2746,139 @@ mod tests {
             serde_json::from_str(r#"{"scanned":3,"up_to_date":3}"#).expect("空回执也要解得出来");
         assert!(idle.summary().contains("没有需要入队的批次"));
     }
+
+    /// 会话区间从**水位的下一号**起算。需初始化的库契约不为它解区间，
+    /// 那一行不许摆一个假的 `sesno 1 → 0`——那看起来像「有一条会话待应用」。
+    #[test]
+    fn the_session_window_starts_one_past_the_watermark() {
+        let mut pending = db(8000, "DESI");
+        pending.applied_sesno = 1023;
+        pending.file_latest_sesno = 1031;
+        assert_eq!(pending.window(), "sesno 1024 → 1031");
+
+        pending.initialization_required = true;
+        assert!(
+            !pending.window().contains("sesno"),
+            "首次导入尚无权威水位，不许摆区间：{}",
+            pending.window()
+        );
+    }
+
+    /// `footer_hint` 是 `match vm` 带 guard，而**臂的先后是有意义的**：确认页那一臂
+    /// 比只读那一臂多一个 `state.step == Step::Confirm` 条件，两臂一调位，「任务不可
+    /// 中途取消」就静默消失——而那句话是确认步存在的全部理由（ADR-0011）。编译器
+    /// 不报，界面上也看不出异样。
+    #[test]
+    fn the_confirm_step_must_say_the_button_cannot_be_taken_back() {
+        const API: &str = "http://127.0.0.1:8080";
+        let vm = Vm::Ready(Preview::default());
+        let mut state = State::default();
+
+        state.step = Step::Confirm;
+        let (_, hint, tone) = footer_hint(&vm, &state, API);
+        assert_eq!(tone, Status::Warn);
+        assert!(hint.contains("不可中途取消"), "确认页丢了不可撤销警告：{hint}");
+
+        state.step = Step::Preview;
+        let (_, hint, tone) = footer_hint(&vm, &state, API);
+        assert_eq!(tone, Status::Neutral);
+        assert!(hint.contains("只读"), "{hint}");
+
+        // 已是最新的那一份没有可按的按钮，两臂的 guard 都不该命中。
+        let fresh = Vm::Ready(Preview {
+            up_to_date: true,
+            ..Default::default()
+        });
+        state.step = Step::Confirm;
+        let (_, hint, _) = footer_hint(&fresh, &state, API);
+        assert!(hint.contains(API), "{hint}");
+    }
+
+    /// 副标题必须点名 MDB。范围由 MDB 定，而服务端与客户端各有一份 `mdb_name`
+    /// 配置——不把它说出来，两边错开时界面一声不响。
+    #[test]
+    fn the_header_names_the_mdb_the_scope_was_resolved_against() {
+        let state = State::default();
+        let scoped = Vm::Ready(Preview {
+            project: "AMS-8009".into(),
+            mdb: "/ALL".into(),
+            ..Default::default()
+        });
+        let (_, sub, _, _) = header_text(&scoped, &state);
+        assert!(sub.contains("AMS-8009") && sub.contains("/ALL"), "{sub}");
+
+        // 服务端没回显时不许编一个出来。
+        let bare = Vm::Ready(Preview {
+            project: "AMS-8009".into(),
+            ..Default::default()
+        });
+        let (_, sub, _, _) = header_text(&bare, &state);
+        assert!(!sub.contains("MDB"), "回显缺席时不许摆一个假 MDB：{sub}");
+    }
+
+    /// 「预览一刷新就退回第一步」：确认页上摆的是刚才那份的数字。判定靠相位切换，
+    /// 而 `sync` 是每一帧都在跑的——同一相位内 sync 多少次都不该把人踢回去。
+    #[test]
+    fn a_fresh_preview_drops_the_user_back_to_the_first_step() {
+        let mut state = State::default();
+        let ready = Vm::Ready(Preview {
+            project: "AMS-8009".into(),
+            ..Default::default()
+        });
+
+        state.sync(&ready);
+        assert_eq!(state.step, Step::Preview);
+
+        state.step = Step::Confirm;
+        state.detail_open = true;
+        state.sync(&ready);
+        state.sync(&ready);
+        assert_eq!(
+            state.step,
+            Step::Confirm,
+            "同一相位内反复 sync 不该把人踢回第一步"
+        );
+
+        // 重新预览再回来：这是新的一份，确认页上那些数字已经不作数了。
+        state.sync(&Vm::Loading);
+        state.sync(&ready);
+        assert_eq!(state.step, Step::Preview);
+        assert!(!state.detail_open);
+    }
+
+    /// 预览失败之后标题栏仍要报得出项目名——`Failed` 里没有 project，它靠的是
+    /// 缓存的上一份预览。
+    #[test]
+    fn the_cached_preview_still_names_the_project_after_a_failure() {
+        let mut state = State::default();
+        state.sync(&Vm::Ready(Preview {
+            project: "AMS-8009".into(),
+            ..Default::default()
+        }));
+
+        let failed = Vm::Failed(Failure::new("timeout", "模型服务没有响应"));
+        state.sync(&failed);
+        assert_eq!(project_of(&failed, &state), "AMS-8009");
+
+        // 从没成功过的时候才退到那个占位串。
+        assert_eq!(project_of(&failed, &State::default()), "当前项目");
+    }
+
+    /// `toggled` 记的是「与默认相反」的那些行，判定是异或。写成 `==` 的话有一半
+    /// 的行展开行为会反过来，而两种默认在同一张树上都存在（会跑的库默认摊开、
+    /// 不跑的收起）——只看其中一种是发现不了的。
+    #[test]
+    fn toggling_records_only_the_rows_that_differ_from_their_default() {
+        let mut state = State::default();
+        assert!(state.open_row("db8000", true), "没人动过就是它的默认");
+        assert!(!state.open_row("db8191", false));
+
+        state.toggle_row("db8000");
+        assert!(!state.open_row("db8000", true), "默认展开的行 toggle 一次要收起来");
+        state.toggle_row("db8000");
+        assert!(state.open_row("db8000", true), "再 toggle 一次回到默认");
+
+        state.toggle_row("db8191");
+        assert!(state.open_row("db8191", false), "默认折叠的行 toggle 一次要展开");
+    }
 }

@@ -33,8 +33,39 @@ pub async fn child_nodes(refno: RefnoEnum) -> Result<Vec<EleTreeNode>> {
     aios_core::get_children_ele_nodes(refno).await
 }
 
+/// 元素到库顶的祖先链，顺序是「自己 -> 上级 -> …」（第 0 项就是它本人）。
+///
+/// 树定位专用（ADR-0014）：目标还没被任何一次展开物化时，客户端手上没有它的
+/// OWNER 链，只能现查一条出来。链长由查询侧的 `fn::ancestor` 定死（见
+/// `resource/surreal/common.surql`），比那个层数更深的元素在这里回不出根，
+/// 定位那边会把它当树外元素——真遇到就得先把那个函数放深。
+pub async fn ancestor_refnos(refno: RefnoEnum) -> Result<Vec<RefU64>> {
+    Ok(aios_core::query_ancestor_refnos(refno)
+        .await?
+        .into_iter()
+        .map(|refno| refno.refno())
+        .collect())
+}
+
 /// 当前模型树根下已经生成的几何实例。数据库只给实例与网格 hash，
 /// 网格文件仍由 Bevy AssetServer 从 `assets/meshes` 加载。
+///
+/// **这是整个界面里最贵的一次查询**，而调用点（`Req::Models`）在它之前刚
+/// `invalidate_all` 过，所以每次都是冷的。AvevaMarineSample / MDB ALL 上实测
+/// 一次冷启动 88 秒，构成是：
+///
+/// | 阶段 | 耗时 | 占比 |
+/// |---|---|---|
+/// | `query_deep_visible_inst_refnos` | 69.9 s | 79% |
+/// | `query_insts`（107 批 × 500） | 15.9 s | 18% |
+/// | `query_filter_deep_children` | 2.2 s | 2.5% |
+/// | `query_tubi_insts_by_brans` | 0.2 s | 0.2% |
+/// | `get_self_and_owner_type_name` | ~0 s | 0% |
+///
+/// 19 个根、53373 个可见 refno、38048 个实例。**贵的不是这里的循环结构**：
+/// 「每个 root 多打两次库」那两次合起来占 2.5%，深子树过滤也不是瓶颈；
+/// 八成时间花在按根逐个解可见实例集上，而那 19 次调用是串行的。真要优化就从
+/// 那一层入手（并发发起，或者由查询侧一次解完多个根），改这里的调用次数没用。
 pub async fn model_instances(roots: &[RefU64]) -> Result<Vec<aios_core::GeomInstQuery>> {
     let mut refnos = Vec::new();
     let mut branch_refnos = Vec::new();

@@ -20,6 +20,8 @@ pub enum Req {
     Models(Vec<RefU64>, bool),
     /// 命令行按名称定位元素。
     ResolveName(String),
+    /// 树定位目标的祖先链。目标不在已加载的树里时才发，见 ADR-0014。
+    Ancestors(RefU64),
     /// 重跑启动序列。连库失败后命令行上的「重试」走这条，结果仍走 `Evt::Ready`。
     Reconnect,
     ModelUpdatePreview {
@@ -73,6 +75,8 @@ pub struct ReadyInfo {
     pub mdb: String,
     pub ns: String,
     pub db_nums: Vec<u32>,
+    /// 开始读取根层的时刻。首次队列快照只补这之后完成的批次，避免启动期间漏刷新。
+    pub observed_at: chrono::DateTime<chrono::Utc>,
     pub sites: Vec<EleTreeNode>,
 }
 
@@ -82,6 +86,9 @@ pub enum Evt {
     Props(RefU64, anyhow::Result<Vec<plant_ui_data::Attr>>),
     Models(bool, anyhow::Result<Vec<aios_core::GeomInstQuery>>),
     ResolvedName(String, anyhow::Result<Option<RefU64>>),
+    /// 目标的祖先链，「自己 -> 上级 -> …」序。带上请求时的那个 refno：
+    /// 连续定位只算最后一次，晚到的旧链要认得出来才好丢。
+    Ancestors(RefU64, anyhow::Result<Vec<RefU64>>),
     ModelUpdatePreview(anyhow::Result<Preview>),
     /// 「扫描 + 入队」的回执。合流之后它不再是单个 task_id。
     ModelUpdateExecute(anyhow::Result<Enqueued>),
@@ -143,12 +150,14 @@ async fn get_work(branches: &[RefU64], reload_models: bool) -> anyhow::Result<Ge
 async fn ready() -> anyhow::Result<ReadyInfo> {
     plant_ui_data::connect().await?;
     let (project, mdb, ns, db_nums) = plant_ui_data::project_identity().await?;
+    let observed_at = chrono::Utc::now();
     let sites = plant_ui_data::site_nodes().await?;
     Ok(ReadyInfo {
         project,
         mdb,
         ns,
         db_nums,
+        observed_at,
         sites,
     })
 }
@@ -187,6 +196,11 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
                     Req::ResolveName(name) => {
                         let result = plant_ui_data::resolve_name(&name).await;
                         let _ = evt_tx.send(Evt::ResolvedName(name, result));
+                        ctx.request_repaint();
+                    }
+                    Req::Ancestors(refno) => {
+                        let result = plant_ui_data::ancestor_refnos(refno.into()).await;
+                        let _ = evt_tx.send(Evt::Ancestors(refno, result));
                         ctx.request_repaint();
                     }
                     Req::ModelUpdatePreview {
