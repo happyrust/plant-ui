@@ -1,10 +1,68 @@
 use aios_core::shape::pdms_shape::PlantMesh;
 use glam::Vec3;
 
+fn aabb_gap(a_min: Vec3, a_max: Vec3, b_min: Vec3, b_max: Vec3) -> f32 {
+    (a_min - b_max).max(b_min - a_max).max(Vec3::ZERO).length()
+}
+
 #[tokio::test]
-async fn generated_mesh_bounds_match_database_bounds() {
+async fn generated_branch_is_one_connected_route() {
     std::env::set_current_dir(r"D:\work\plant-code\old\plant-ui").unwrap();
     plant_ui_data::connect().await.unwrap();
+    let root = "24381_145018".parse::<plant_ui_data::RefU64>().unwrap();
+    let models = plant_ui_data::model_instances(&[root]).await.unwrap();
+    let tubi_count = models
+        .iter()
+        .filter(|model| model.insts.iter().any(|inst| inst.is_tubi))
+        .count();
+    assert_eq!(tubi_count, 11, "BRAN 应包含 11 段隐含直管");
+    let bounds = models
+        .iter()
+        .map(|model| {
+            (
+                model.refno,
+                Vec3::from(model.world_aabb.mins),
+                Vec3::from(model.world_aabb.maxs),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert!(!bounds.is_empty(), "BRAN 没有生成任何可显示实例");
+    let mut reached = vec![false; bounds.len()];
+    reached[0] = true;
+    loop {
+        let mut changed = false;
+        for i in 0..bounds.len() {
+            if !reached[i] {
+                continue;
+            }
+            for j in 0..bounds.len() {
+                if !reached[j]
+                    && aabb_gap(bounds[i].1, bounds[i].2, bounds[j].1, bounds[j].2) <= 10.0
+                {
+                    reached[j] = true;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let disconnected = bounds
+        .iter()
+        .zip(reached)
+        .filter_map(|((refno, _, _), reached)| (!reached).then_some(*refno))
+        .collect::<Vec<_>>();
+    assert!(
+        disconnected.is_empty(),
+        "BRAN 生成构件没有连成一条管路，断开的参考号：{disconnected:?}"
+    );
+    assert_generated_mesh_bounds_match_database_bounds().await;
+}
+
+async fn assert_generated_mesh_bounds_match_database_bounds() {
     let root = "24381_145018".into();
     let refnos = aios_core::query_deep_visible_inst_refnos(root)
         .await

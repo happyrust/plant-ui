@@ -182,7 +182,8 @@ fn run(canvas: &str) {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn asset_root() -> String {
-    std::env::var("PLANT_ASSET_ROOT").unwrap_or_else(|_| "../gen-model/assets".into())
+    std::env::var("PLANT_ASSET_ROOT")
+        .unwrap_or_else(|_| format!("{}/../../../gen-model/assets", env!("CARGO_MANIFEST_DIR")))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -196,6 +197,23 @@ fn setup_ui_camera(mut commands: Commands, mut egui: ResMut<EguiGlobalSettings>)
     commands.spawn((Camera2d, PrimaryEguiContext));
 }
 
+/// 挂上验收探针的服务端那一半（`egui_inspection`），由 `EGUI_INSPECTION` 环境变量
+/// 决定开不开——没设就是个空操作。
+///
+/// **只有原生端有**：那个 crate 里 `attach_from_env` 是
+/// `cfg(not(target_arch = "wasm32"))` 导出的，它靠 `TcpListener` 起服务，浏览器里
+/// 压根没有这东西。不门控的话桌面端一切正常、`cargo build --target
+/// wasm32-unknown-unknown` 直接 E0425。
+#[cfg(not(target_arch = "wasm32"))]
+fn attach_inspection(ctx: &egui::Context) {
+    if let Err(error) = egui_inspection::attach_from_env(ctx, Some("plant-ui".into())) {
+        eprintln!("egui inspection unavailable: {error}");
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn attach_inspection(_ctx: &egui::Context) {}
+
 fn show_app(
     mut contexts: EguiContexts,
     mut app: bevy::prelude::Local<Option<App>>,
@@ -204,6 +222,9 @@ fn show_app(
 ) -> bevy::prelude::Result {
     let ctx = contexts.ctx_mut()?;
     let first_frame = app.is_none();
+    if first_frame {
+        attach_inspection(ctx);
+    }
     let app = app.get_or_insert_with(|| {
         let (defs, warnings) = fonts::definitions();
         let weights_ready = defs.font_data.contains_key(fonts::MEDIUM);

@@ -37,12 +37,50 @@ pub async fn child_nodes(refno: RefnoEnum) -> Result<Vec<EleTreeNode>> {
 /// 网格文件仍由 Bevy AssetServer 从 `assets/meshes` 加载。
 pub async fn model_instances(roots: &[RefU64]) -> Result<Vec<aios_core::GeomInstQuery>> {
     let mut refnos = Vec::new();
+    let mut branch_refnos = Vec::new();
     for root in roots {
-        refnos.extend(aios_core::query_deep_visible_inst_refnos((*root).into()).await?);
+        let root = (*root).into();
+        refnos.extend(aios_core::query_deep_visible_inst_refnos(root).await?);
+        let types = aios_core::get_self_and_owner_type_name(root).await?;
+        if types
+            .first()
+            .is_some_and(|noun| noun == "BRAN" || noun == "HANG")
+        {
+            branch_refnos.push(root);
+        } else {
+            branch_refnos
+                .extend(aios_core::query_filter_deep_children(root, &["BRAN", "HANG"]).await?);
+        }
     }
     let mut models = Vec::new();
     for chunk in refnos.chunks(500) {
         models.extend(aios_core::query_insts(chunk.iter(), false).await?);
+    }
+    for chunk in branch_refnos.chunks(500) {
+        models.extend(
+            aios_core::query_tubi_insts_by_brans(chunk)
+                .await?
+                .into_iter()
+                .map(|tubi| {
+                    let refno = tubi.refno;
+                    aios_core::GeomInstQuery {
+                        refno,
+                        old_refno: tubi.old_refno,
+                        owner: refno,
+                        world_aabb: tubi.world_aabb,
+                        world_trans: tubi.world_trans,
+                        insts: vec![aios_core::ModelHashInst {
+                            geo_hash: tubi.geo_hash,
+                            transform: Default::default(),
+                            is_tubi: true,
+                        }],
+                        has_neg: false,
+                        generic: tubi.generic.unwrap_or_else(|| "PIPE".into()),
+                        pts: None,
+                        date: tubi.date,
+                    }
+                }),
+        );
     }
     Ok(models)
 }
