@@ -21,8 +21,11 @@ bevy = { git = "https://gitee.com/happydpc/bevy", default-features = false, feat
     "bevy_pbr", "bevy_picking", "bevy_mesh_picking_backend", "png", "webgl2",
 ] }
 # egui 0.35 + Bevy 0.16 脱离上游支持矩阵，所以以可编辑源码树进 vendor（计划书 M3-1）
+# `manage_clipboard`：两端的复制粘贴。原生走 arboard；浏览器靠 copy/cut/paste 事件
+# + navigator.clipboard，配套的快捷键放行见 vendor 里 web_clipboard.rs 的捕获拦截。
+# 所需依赖（arboard / thread_local / image / crossbeam-channel）全在 lock 与 vendor 里，开关不动 Cargo.lock。
 bevy_egui35 = { path = "vendor/bevy_egui35", default-features = false, features = [
-    "render", "default_fonts",
+    "render", "default_fonts", "manage_clipboard",
 ] }
 # 双端 spawn：原生走 tokio、浏览器走 spawn_local（view3d-migration.md 决定 5）
 bevy-wasm-tasks = { git = "https://gitee.com/happydpc/bevy-wasm-tasks", rev = "51aabcb8124ad80be902fa120c84a2e91d28c9ed" }

@@ -1436,7 +1436,7 @@ impl EguiClipboard {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn get(&self) -> Option<RefMut<Clipboard>> {
+    fn get(&self) -> Option<RefMut<'_, Clipboard>> {
         self.clipboard
             .get_or(|| {
                 Clipboard::new()
@@ -1610,6 +1610,11 @@ struct EventClosure<T> {
 pub struct SubscribedEvents {
     #[cfg(feature = "manage_clipboard")]
     clipboard_event_closures: Vec<EventClosure<web_sys::ClipboardEvent>>,
+    /// 捕获阶段注册的 keydown 监听（见 `web_clipboard::setup_clipboard_shortcut_passthrough`）。
+    /// removeEventListener 必须带上与注册时相同的 `use_capture` 标志才摘得掉，
+    /// 所以不能混进上面按冒泡阶段退订的列表。
+    #[cfg(feature = "manage_clipboard")]
+    capture_keyboard_event_closures: Vec<EventClosure<web_sys::KeyboardEvent>>,
     composition_event_closures: Vec<EventClosure<web_sys::CompositionEvent>>,
     keyboard_event_closures: Vec<EventClosure<web_sys::KeyboardEvent>>,
     input_event_closures: Vec<EventClosure<web_sys::InputEvent>>,
@@ -1623,6 +1628,8 @@ impl SubscribedEvents {
     pub fn unsubscribe_from_all_events(&mut self) {
         #[cfg(feature = "manage_clipboard")]
         Self::unsubscribe_from_events(&mut self.clipboard_event_closures);
+        #[cfg(feature = "manage_clipboard")]
+        Self::unsubscribe_from_capture_events(&mut self.capture_keyboard_event_closures);
         Self::unsubscribe_from_events(&mut self.composition_event_closures);
         Self::unsubscribe_from_events(&mut self.keyboard_event_closures);
         Self::unsubscribe_from_events(&mut self.input_event_closures);
@@ -1643,6 +1650,22 @@ impl SubscribedEvents {
                         string_from_js_value(&err)
                     );
                 }
+            }
+        }
+    }
+
+    #[cfg(feature = "manage_clipboard")]
+    fn unsubscribe_from_capture_events<T>(events: &mut Vec<EventClosure<T>>) {
+        for event in std::mem::take(events) {
+            if let Err(err) = event.target.remove_event_listener_with_callback_and_bool(
+                event.event_name.as_str(),
+                event.closure.as_ref().unchecked_ref(),
+                true,
+            ) {
+                log::error!(
+                    "Failed to unsubscribe from event: {}",
+                    string_from_js_value(&err)
+                );
             }
         }
     }

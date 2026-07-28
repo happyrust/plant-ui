@@ -20,6 +20,69 @@ pub fn startup_setup_web_events_system(
     setup_clipboard_copy(&mut subscribed_events, tx.clone());
     setup_clipboard_cut(&mut subscribed_events, tx.clone());
     setup_clipboard_paste(&mut subscribed_events, tx);
+    setup_clipboard_shortcut_passthrough(&mut subscribed_events);
+}
+
+/// 让 Ctrl/Cmd+C/X/V 绕过 winit 的 `preventDefault()`，否则上面三个监听器一个都不会响。
+///
+/// 浏览器只有在这三组快捷键的 keydown 默认动作没被取消时才会派发 `copy` / `cut` /
+/// `paste` 剪贴板事件；而 winit 的 canvas `keydown` 监听在
+/// `Window::prevent_default_event_handling` 开着时是无条件 `preventDefault()` 的。
+/// egui-web 在 `should_prevent_default_for_key` 里同样把 cmd/ctrl-c/v/x 排除在外，
+/// 理由一致（eframe events.rs："lest we prevent copy/paste/cut events"）。
+///
+/// 做法：在 document 捕获阶段先于 canvas 拿到事件，对剪贴板组合键只
+/// `stop_propagation()`（不是 `prevent_default()`）——浏览器默认动作照常发生，
+/// winit 只是看不见这一下按键。代价是 egui 收不到这几下原始按键事件，与 egui
+/// 只认 `Event::Copy/Cut/Paste` 不认组合键的行为正好互补。
+fn setup_clipboard_shortcut_passthrough(subscribed_events: &mut SubscribedEvents) {
+    let Some(window) = web_sys::window() else {
+        log::error!("Failed to add the clipboard shortcut listener: no window object");
+        return;
+    };
+    let Some(document) = window.document() else {
+        log::error!("Failed to add the clipboard shortcut listener: no document object");
+        return;
+    };
+
+    let closure = Closure::<dyn FnMut(_)>::new(move |event: web_sys::KeyboardEvent| {
+        if is_clipboard_shortcut(&event) {
+            event.stop_propagation();
+        }
+    });
+
+    let listener = closure.as_ref().unchecked_ref();
+
+    if let Err(err) = document.add_event_listener_with_callback_and_bool("keydown", listener, true)
+    {
+        log::error!(
+            "Failed to add the clipboard shortcut listener: {}",
+            string_from_js_value(&err)
+        );
+        drop(closure);
+        return;
+    };
+    subscribed_events
+        .capture_keyboard_event_closures
+        .push(EventClosure {
+            target: <web_sys::Document as std::convert::AsRef<web_sys::EventTarget>>::as_ref(
+                &document,
+            )
+            .clone(),
+            event_name: "keydown".to_owned(),
+            closure,
+        });
+}
+
+/// 浏览器会翻译成剪贴板动作的组合键。Alt 参与时不算：Windows 上 AltGr 就是
+/// Ctrl+Alt，有些键盘布局用 AltGr+C/V 打字符，那是输入不是复制。
+/// `code`（物理键）与 `key`（布局字符）都认，非拉丁布局下 Ctrl+C 照样成立。
+fn is_clipboard_shortcut(event: &web_sys::KeyboardEvent) -> bool {
+    if !(event.ctrl_key() || event.meta_key()) || event.alt_key() {
+        return false;
+    }
+    matches!(event.code().as_str(), "KeyC" | "KeyX" | "KeyV")
+        || matches!(event.key().as_str(), "c" | "C" | "x" | "X" | "v" | "V")
 }
 
 /// Receives web clipboard events and wraps them as [`EguiInputEvent`] events.
