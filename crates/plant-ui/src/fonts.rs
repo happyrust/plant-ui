@@ -9,14 +9,16 @@ pub const SEMIBOLD: &str = "puhui-semibold";
 
 const REGULAR_KEY: &str = "puhui-regular";
 
+#[cfg(not(target_arch = "wasm32"))]
 fn font_dir() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/fonts")
 }
 
-fn load(file: &str, warnings: &mut Vec<String>) -> Option<Vec<u8>> {
+#[cfg(not(target_arch = "wasm32"))]
+fn load(file: &str, warnings: &mut Vec<String>) -> Option<Arc<FontData>> {
     let path = font_dir().join(file);
     match std::fs::read(&path) {
-        Ok(bytes) => Some(bytes),
+        Ok(bytes) => Some(Arc::new(FontData::from_owned(bytes))),
         Err(err) => {
             warnings.push(format!(
                 "字体缺失，回退到 egui 默认字体：{} ({err})",
@@ -27,21 +29,30 @@ fn load(file: &str, warnings: &mut Vec<String>) -> Option<Vec<u8>> {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+fn load(_file: &str, _warnings: &mut Vec<String>) -> Option<Arc<FontData>> {
+    Some(Arc::new(FontData::from_static(include_bytes!(
+        "../../../assets/fonts/AlibabaPuHuiTi-2-55-Regular.ttf"
+    ))))
+}
+
 pub fn definitions() -> (FontDefinitions, Vec<String>) {
     let mut fonts = FontDefinitions::default();
     let mut warnings = Vec::new();
+    #[cfg(not(target_arch = "wasm32"))]
     let faces = [
         (REGULAR_KEY, "AlibabaPuHuiTi-2-55-Regular.ttf"),
         (MEDIUM, "AlibabaPuHuiTi-2-65-Medium.ttf"),
         (SEMIBOLD, "AlibabaPuHuiTi-2-75-SemiBold.ttf"),
     ];
+    // ponytail: WASM 共用常规字重；需要严格视觉字重时再嵌入另外两份约 16 MB 字体。
+    #[cfg(target_arch = "wasm32")]
+    let faces = [(REGULAR_KEY, "AlibabaPuHuiTi-2-55-Regular.ttf")];
 
     let mut loaded = Vec::new();
     for (key, file) in faces {
-        if let Some(bytes) = load(file, &mut warnings) {
-            fonts
-                .font_data
-                .insert(key.to_owned(), Arc::new(FontData::from_owned(bytes)));
+        if let Some(data) = load(file, &mut warnings) {
+            fonts.font_data.insert(key.to_owned(), data);
             loaded.push(key);
         }
     }
