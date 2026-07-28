@@ -1,28 +1,28 @@
-use std::collections::hash_map::DefaultHasher;
-use std::f32::EPSILON;
-use std::hash::Hasher;
-#[cfg(feature = "truck")]
-use truck_modeling::builder::*;
 use crate::parsed_data::geo_params_data::PdmsGeoParam;
-use crate::types::attmap::AttrMap;
 #[cfg(feature = "truck")]
 use crate::shape::pdms_shape::BrepMathTrait;
 use crate::shape::pdms_shape::{BrepShapeTrait, VerifiedShape};
 use crate::tool::float_tool::hash_f32;
+use crate::types::attmap::AttrMap;
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
+use std::f32::EPSILON;
 use std::hash::Hash;
+use std::hash::Hasher;
 #[cfg(feature = "truck")]
 use truck_meshalgo::prelude::*;
 #[cfg(feature = "truck")]
 use truck_modeling::Shell;
+#[cfg(feature = "truck")]
+use truck_modeling::builder::*;
 
-use bevy_ecs::prelude::*;
-#[cfg(feature = "occ")]
-use opencascade::primitives::*;
 use crate::NamedAttrMap;
 #[cfg(feature = "occ")]
 use crate::prim_geo::basic::OccSharedShape;
+use bevy_ecs::prelude::*;
+#[cfg(feature = "occ")]
+use opencascade::primitives::*;
 
 #[derive(
     Component,
@@ -77,7 +77,8 @@ impl VerifiedShape for LSnout {
     #[inline]
     fn check_valid(&self) -> bool {
         //height 必须 >0， 小于0 的情况直接用变换矩阵
-        (self.ptdm >= 0.0 && self.pbdm >= 0.0 && (self.ptdm + self.pbdm) > 0.0) && (self.ptdi - self.pbdi) > f32::EPSILON
+        (self.ptdm >= 0.0 && self.pbdm >= 0.0 && (self.ptdm + self.pbdm) > 0.0)
+            && (self.ptdi - self.pbdi) > f32::EPSILON
     }
 }
 
@@ -119,7 +120,9 @@ impl BrepShapeTrait for LSnout {
             circles.push(circle);
         }
 
-        Ok(OccSharedShape::new(Solid::loft_with_points(circles.iter(), verts.iter())?.into()))
+        Ok(OccSharedShape::new(
+            Solid::loft_with_points(circles.iter(), verts.iter())?.into(),
+        ))
     }
 
     #[cfg(feature = "truck")]
@@ -195,7 +198,7 @@ impl BrepShapeTrait for LSnout {
         if self.poff.abs() > f32::EPSILON {
             Box::new(self.clone())
         } else {
-            if self.ptdm < 0.001{
+            if self.ptdm < 0.001 {
                 Box::new(Self {
                     ptdi: 0.5,
                     pbdi: -0.5,
@@ -203,7 +206,7 @@ impl BrepShapeTrait for LSnout {
                     pbdm: 1.0,
                     ..Default::default()
                 })
-            }else if self.pbdm < 0.001{
+            } else if self.pbdm < 0.001 {
                 Box::new(Self {
                     ptdi: 0.5,
                     pbdi: -0.5,
@@ -211,7 +214,7 @@ impl BrepShapeTrait for LSnout {
                     pbdm: 0.0,
                     ..Default::default()
                 })
-            }else{
+            } else {
                 let ptdm = self.ptdm / self.pbdm;
                 Box::new(Self {
                     ptdi: 0.5,
@@ -231,9 +234,9 @@ impl BrepShapeTrait for LSnout {
         if self.poff.abs() > f32::EPSILON {
             Vec3::ONE
         } else {
-            if self.pbdm < 0.001{
+            if self.pbdm < 0.001 {
                 Vec3::new(self.ptdm, self.ptdm, pheight)
-            }else{
+            } else {
                 Vec3::new(self.pbdm, self.pbdm, pheight)
             }
         }

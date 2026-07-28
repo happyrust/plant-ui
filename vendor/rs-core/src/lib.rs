@@ -139,6 +139,16 @@ pub fn get_db_option() -> &'static DbOption {
     })
 }
 
+/// 读取数据库配置，并把读取失败返回给调用方。
+pub fn try_get_db_option() -> anyhow::Result<&'static DbOption> {
+    DB_OPTION.get_or_try_init(|| {
+        let s = Config::builder()
+            .add_source(File::with_name("DbOption"))
+            .build()?;
+        Ok(s.try_deserialize::<DbOption>()?)
+    })
+}
+
 ///获取默认的数据库属性元数据信息
 pub fn get_default_pdms_db_info() -> &'static PdmsDatabaseInfo {
     static INSTANCE: OnceCell<PdmsDatabaseInfo> = OnceCell::new();
@@ -248,7 +258,7 @@ pub async fn init_test_surreal() -> Result<DbOption, HandleError> {
 }
 
 pub async fn init_surreal() -> anyhow::Result<()> {
-    init_surreal_with(get_db_option()).await
+    init_surreal_with(try_get_db_option()?).await
 }
 
 pub async fn init_surreal_with(db_option: &DbOption) -> anyhow::Result<()> {

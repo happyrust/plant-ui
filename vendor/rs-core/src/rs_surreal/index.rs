@@ -1,4 +1,4 @@
-use crate::{options::DbOption, SUL_DB};
+use crate::{SUL_DB, options::DbOption};
 
 ///创建几何相关索引索引
 pub async fn create_geom_index() -> anyhow::Result<()> {
@@ -63,6 +63,13 @@ pub async fn define_pe_index() -> anyhow::Result<()> {
         DEFINE index pe_cata_hash_index ON TABLE pe COLUMNS cata_hash;
         DEFINE index pe_dbnum_index ON TABLE pe COLUMNS dbnum;
         DEFINE INDEX sesno_index ON TABLE pe COLUMNS sesno;
+        -- pe.owner 字段的索引，与 define_owner_index 建的 pe_owner 边表索引是两回事。
+        -- 缺它时按 owner 过滤是全表扫：200,873 行上 count 一个 50 行的结果要 1.25s。
+        DEFINE INDEX pe_owner_index ON TABLE pe COLUMNS owner;
+        -- 模型树根层（get_mdb_world_site_ele_nodes / query_mdb_db_nums）的 noun+dbnum 过滤。
+        -- 只有上面那条 pe_dbnum_index 时，dbnum 选择性极差（3 个值覆盖全表），规划器却会挑它，
+        -- 结果比全表扫还慢：走 dbnum 索引 2.78s，纯全表扫 0.96s。这条复合索引把它压到 22ms。
+        DEFINE INDEX pe_noun_dbnum_index ON TABLE pe COLUMNS noun, dbnum;
                 "#,
         )
         .await

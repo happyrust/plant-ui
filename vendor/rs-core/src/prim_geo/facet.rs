@@ -98,11 +98,11 @@ impl BrepShapeTrait for Facet {
 //             let v1 = Vec3::from_slice(&pts[1]);
 //             let loc_x = (v1 - v0).normalize();
 //             let n = Vec3::from_slice(&normal).normalize();
-// 
+//
 //             let loc_y = n.cross(loc_x);
 //             x_n = loc_x.normalize();
 //             y_n = loc_y.normalize();
-// 
+//
 //             coord_sys[0] = v0;
 //             coord_sys[1] = x_n;
 //             coord_sys[2] = y_n;
@@ -111,7 +111,7 @@ impl BrepShapeTrait for Facet {
 //             x_n = coord_sys[1];
 //             y_n = coord_sys[2];
 //         }
-// 
+//
 //         for idx in 0..pts.len() {
 //             let to_p = Vec3::from_slice(&pts[idx]) - v0;
 //             polygon2d.push(lyon::math::Point::new(

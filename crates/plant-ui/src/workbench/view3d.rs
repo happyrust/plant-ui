@@ -4,22 +4,24 @@
 //! 矩形等比裁切铺一张占位纹理（0.92 不透明）。等比裁切而不是拉伸：视口的宽高比
 //! 跟着 dock 分隔条走，拉伸的话管子会随手一拖就变成椭圆。
 //!
-//! 视口里的浮层只画两件：左上角 HUD，以及实时渲染时才出现的左侧工具栏。
-//! S1 稿上另有视图立方体、坐标读数、比例尺，它们每一个字都要相机才有真值，
-//! 按外壳一贯的「宁可少一格」继续留白。
+//! 视口里的浮层：左上角 HUD、实时渲染时的左侧工具栏、右上角视图立方体
+//! （[`super::viewcube`]，S1-B 稿），以及三根世界轴的轴端标签。坐标读数与
+//! 比例尺仍留白——它们是另一类 HUD 信息件，拷问定案第 1 题把范围钉在
+//! 背景 / 坐标系 / ViewCube 三件，其余另轮。
 //!
 //! 鼠标：左键拾取、中键平移、右键旋转、滚轮缩放。左键不碰相机，理由见 [`camera`]。
 
 use egui::{
-    Align, Color32, Id, Key, KeyboardShortcut, Layout, Margin, Mesh, Modifiers, Rect, RichText,
-    ScrollArea, Sense, Shape, Stroke, Ui, UiBuilder, Vec2, pos2, vec2,
+    Align, Align2, Color32, Id, Key, KeyboardShortcut, Layout, Margin, Mesh, Modifiers, Rect,
+    RichText, ScrollArea, Sense, Shape, Stroke, Ui, UiBuilder, Vec2, pos2, vec2,
 };
 use egui_phosphor::regular as ph;
 
+use super::viewcube;
 use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Tokens, radius};
 use crate::style::widgets;
-use crate::vm::{Selection, WorkbenchVm};
+use crate::vm::{Selection, View3dVm, WorkbenchVm};
 use crate::{CameraGesture, CameraMotion, Cmd, ModelAction, RefU64};
 
 /// 占位纹理的不透明度，取自 S1 的「模型场景」矩形。压这么一点让渐变底透上来，
@@ -152,14 +154,16 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
         cmds.push(Cmd::ResizeViewport(wanted));
     }
 
-    // 浮层先画完再判拾取：工具栏盖住的那一片是按钮，不是模型。
+    axis_labels(ui, t, d, rect, &view);
+    // 浮层先画完再判拾取：工具栏与立方体盖住的那两片是控件，不是模型。
     let bar = toolbar(ui, t, d, rect, vm, response.id, cmds);
+    let cube = viewcube::show(ui, t, d, &view, rect, response.id, cmds);
     if response.clicked_by(egui::PointerButton::Primary)
         && let Some(pointer) = response.interact_pointer_pos()
     {
         // 点过视口，键盘就归视口。快捷键的开关是焦点，不是「鼠标在不在上面」。
         ui.memory_mut(|m| m.request_focus(response.id));
-        if !bar.contains(pointer) {
+        if !bar.contains(pointer) && !cube.contains(pointer) {
             cmds.push(Cmd::PickViewport(pointer_texture_uv(
                 rect.size(),
                 view.size,
@@ -167,7 +171,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
             )));
         }
     }
-    camera(ui, rect, view.size, bar, &response, cmds);
+    camera(ui, rect, view.size, [bar, cube], &response, cmds);
     // 焦点在命令行或属性输入框里时，敲 s / h / f 是在打字，不是在发命令。
     if response.has_focus() {
         for tool in Tool::BAR {
@@ -200,11 +204,12 @@ fn camera(
     ui: &Ui,
     view: Rect,
     texture: Vec2,
-    bar: Rect,
+    blocked: [Rect; 2],
     response: &egui::Response,
     cmds: &mut Vec<Cmd>,
 ) {
     let uv = |pointer: egui::Pos2| pointer_texture_uv(view.size(), texture, pointer - view.min);
+    let on_overlay = |pointer: egui::Pos2| blocked.iter().any(|r| r.contains(pointer));
 
     // egui 的拖拽不分按键，是 `drag_started_by` 回头看哪个键按着。两个键一起
     // 按下时两支都会报，所以取头一个就收手，别发出两次开始。
@@ -213,7 +218,7 @@ fn camera(
         .find(|(button, _)| response.drag_started_by(*button));
     if let Some((_, motion)) = started
         && let Some(pointer) = response.interact_pointer_pos()
-        && !bar.contains(pointer)
+        && !on_overlay(pointer)
     {
         // 操作过视口，键盘就归视口——转完直接敲 H 隐藏，不必再补一下点击。
         ui.memory_mut(|m| m.request_focus(response.id));
@@ -251,7 +256,7 @@ fn camera(
     if scroll != 0.0
         && response.hovered()
         && let Some(pointer) = ui.input(|i| i.pointer.hover_pos())
-        && !bar.contains(pointer)
+        && !on_overlay(pointer)
     {
         // 这一份已经拿去缩放了，清掉，别让别的容器再消费一次。
         ui.input_mut(|i| i.smooth_scroll_delta.y = 0.0);
@@ -259,6 +264,34 @@ fn camera(
             amount: scroll,
             anchor: uv(pointer),
         }));
+    }
+}
+
+/// 三根世界轴的轴端标签（X 红 / Y 绿 / Z 蓝，S1-B 稿）。
+///
+/// 位置是宿主投影好的**纹理 UV**——世界点到屏幕要过相机，只有宿主算得了；
+/// 这里只补「纹理 UV → 视口点」那一步等比裁切换算，与拾取的换算互为反函数，
+/// truth 都压在 [`cover_uv`] 一处。轴尖被裁掉或在相机身后时宿主给 None，不画。
+fn axis_labels(ui: &mut Ui, t: &Tokens, d: Density, view: Rect, vm3d: &View3dVm) {
+    let uv_rect = cover_uv(view.size(), vm3d.size);
+    for (axis, label) in ["X", "Y", "Z"].into_iter().enumerate() {
+        let Some([u, v]) = vm3d.axis_labels[axis] else {
+            continue;
+        };
+        let rel = vec2(
+            (u - uv_rect.min.x) / uv_rect.width(),
+            (v - uv_rect.min.y) / uv_rect.height(),
+        );
+        if !(0.0..=1.0).contains(&rel.x) || !(0.0..=1.0).contains(&rel.y) {
+            continue;
+        }
+        ui.painter().text(
+            view.min + rel * view.size(),
+            Align2::CENTER_CENTER,
+            label,
+            Font::mono_meta(d),
+            viewcube::axis_color(t, axis),
+        );
     }
 }
 
@@ -545,6 +578,8 @@ mod tests {
                 size: texture,
                 live: true,
                 measurement_active: false,
+                camera_rot: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                axis_labels: [None; 3],
             }),
             ..Default::default()
         };
@@ -696,6 +731,40 @@ mod tests {
             !cmds.iter().any(|cmd| matches!(cmd, Cmd::PickViewport(_))),
             "点在工具栏上却穿成了拾取：{cmds:?}"
         );
+    }
+
+    /// 点在视图立方体上发出的是视角跳转，不是模型拾取。恒等姿态下立方体只露
+    /// 「前」面，点它的中心格 = 请求北向正视（世界系 forward -Z、up +Y）。
+    /// 方向错半个符号，立方体会把人带到背面去，所以连数值一起钉死。
+    #[test]
+    fn clicking_the_viewcube_snaps_the_view_instead_of_picking() {
+        // 立方体占位：距右 14、边长 88，屏幕 1200 宽 → 中心 (1142, 58)。
+        let cmds = viewport_cmds(click_at(pos2(1142.0, 58.0)));
+        assert!(
+            !cmds.iter().any(|cmd| matches!(cmd, Cmd::PickViewport(_))),
+            "点在立方体上却穿成了拾取：{cmds:?}"
+        );
+        let snap = cmds.iter().find_map(|cmd| match cmd {
+            Cmd::SnapView { forward, up, fit } => Some((*forward, *up, *fit)),
+            _ => None,
+        });
+        assert_eq!(
+            snap,
+            Some(([0.0, 0.0, -1.0], [0.0, 1.0, 0.0], false)),
+            "点「前」面中心该请求北向视角：{cmds:?}"
+        );
+    }
+
+    /// Home 键在立方体左上角：点它要求「回等距初始视角 + 拉到全景」，fit 必须为真
+    /// ——这正是它与普通面点击的分别，丢了 fit 它就退化成一枚普通角区。
+    #[test]
+    fn the_home_button_snaps_and_fits() {
+        let cmds = viewport_cmds(click_at(pos2(1106.0, 22.0)));
+        let fit = cmds.iter().find_map(|cmd| match cmd {
+            Cmd::SnapView { fit, .. } => Some(*fit),
+            _ => None,
+        });
+        assert_eq!(fit, Some(true), "Home 键没有带上 fit：{cmds:?}");
     }
 
     /// 报的是物理像素：150% 缩放下要的纹理比点数大一半，不然铺到屏幕上又是一次

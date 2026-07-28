@@ -44,13 +44,13 @@ pub use point::*;
 pub use query::*;
 pub use resolve::*;
 pub use spatial::*;
-pub use uda::*;
 pub use topology::*;
+pub use uda::*;
 
 use once_cell::sync::Lazy;
+use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
 use surrealdb::opt::auth::Root;
-use surrealdb::Surreal;
 
 // pub type SurlValue = surrealdb::Value;
 pub type SurlValue = surrealdb::sql::Value;

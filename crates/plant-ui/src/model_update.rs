@@ -1,7 +1,9 @@
-//! 模型增量更新任务窗：更新预览 → 确认执行 → 执行进度（S2 / S2-B / S4 三步向导）。
+//! 模型增量更新任务窗：更新预览 → 确认执行（S2 / S2-B 两步向导）。
 //!
-//! 另外五张画板都是这三步的形态：S2-A 是第一步的等待态、S2-D 收拢五种不可用与失败态、
-//! S2-E 收拢七种设计库行状态、S4-B 是第三步的断线降级、S4-C 是 `partial` 终态。
+//! 第三步「执行进度」随 ADR-0011 整体迁去常驻的任务队列视图：确认之后是「扫描 +
+//! 入队」，回执进日志、焦点跳到队列面板、本窗关闭——向导不再跟着任何一次运行走。
+//! 其余画板都是这两步的形态：S2-A 是第一步的等待态、S2-D 收拢不可用与失败态、
+//! S2-E 收拢七种设计库行状态。
 //!
 //! 窗口自绘外壳（窗口头 52 / 步骤条 48 / 主体 / 底部操作 56）。不用 egui 的默认标题栏：
 //! 步骤条要贴在标题底下，默认标题栏塞不进去，两条横栏也对不上一套配色。
@@ -12,7 +14,7 @@
 
 use std::collections::HashSet;
 use std::str::FromStr;
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 use egui::{
     Align, Color32, CornerRadius, FontFamily, FontId, Layout, Margin, Rect, RichText, ScrollArea,
@@ -21,10 +23,10 @@ use egui::{
 use egui_phosphor::regular as ph;
 use serde::Deserialize;
 
-use crate::{Cmd, RefU64};
 use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Status, Tokens, radius};
 use crate::style::widgets;
+use crate::{Cmd, RefU64};
 
 // ================================================================ 预览契约
 
@@ -470,7 +472,10 @@ impl Enqueued {
                 .map(|b| format!("db{} 排第 {} 位", b.dbnum, b.position))
                 .collect::<Vec<_>>()
                 .join("、");
-            parts.push(format!("已入队 {} 个数据批次（{list}）", self.enqueued.len()));
+            parts.push(format!(
+                "已入队 {} 个数据批次（{list}）",
+                self.enqueued.len()
+            ));
         }
         if !self.merged.is_empty() {
             let list = self
@@ -479,7 +484,10 @@ impl Enqueued {
                 .map(|b| format!("db{}", b.dbnum))
                 .collect::<Vec<_>>()
                 .join("、");
-            parts.push(format!("{} 个并入已排队的批次（{list}）", self.merged.len()));
+            parts.push(format!(
+                "{} 个并入已排队的批次（{list}）",
+                self.merged.len()
+            ));
         }
         if !self.blocked.is_empty() {
             let list = self
@@ -499,34 +507,6 @@ impl Enqueued {
             );
         }
         format!("扫描 {} 个库；{}", self.scanned, parts.join("；"))
-    }
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct Run {
-    pub task_id: String,
-    pub kind: String,
-    pub state: String,
-    pub project: String,
-    pub created_at: String,
-    pub finished_at: Option<String>,
-    pub events_seen: u64,
-    pub result: Option<Outcome>,
-    /// ADR-0007 的四个权威计数。服务端补上之前一个都取不到，那时进度只报已完成数、
-    /// 不画确定态的条——**分母绝不许拿预览值相加**，那个加法两个方向都会偏。
-    #[serde(default)]
-    pub total_batches: Option<u32>,
-    #[serde(default)]
-    pub batches_done: Option<u32>,
-    #[serde(default)]
-    pub total_units: Option<u32>,
-    #[serde(default)]
-    pub units_done: Option<u32>,
-}
-
-impl Run {
-    pub fn terminal(&self) -> bool {
-        matches!(self.state.as_str(), "succeeded" | "partial" | "failed")
     }
 }
 
@@ -562,6 +542,12 @@ pub struct RefreshUnit {
 }
 
 impl Outcome {
+    pub fn data_applied(&self) -> bool {
+        self.batch
+            .as_ref()
+            .is_some_and(|batch| batch.status == BatchStatus::Applied && batch.changed_elements > 0)
+    }
+
     /// 本次真正生成成功的交付单元及其原 / 新 OWNER。
     ///
     /// 失败单元不进来：它们的模型压根没换，旧显示仍然是对的。解不出参考号的也
@@ -688,28 +674,9 @@ pub enum RowState {
     Unknown,
 }
 
-#[derive(Debug, Clone)]
-pub struct BatchRow {
-    pub dbnum: u32,
-    pub start_sesno: i32,
-    pub end_sesno: i32,
-    pub state: RowState,
-    pub message: Option<String>,
-    pub started: Instant,
-}
-
-#[derive(Debug, Clone)]
-pub struct UnitRow {
-    pub dbnum: u32,
-    pub root_refno: String,
-    pub noun: String,
-    pub state: RowState,
-    pub message: Option<String>,
-    pub started: Instant,
-}
-
-/// WebSocket 那条通道自己的状态。它与运行状态是两件事：连接断了运行照跑，
+/// WebSocket 那条通道自己的状态。它与任务状态是两件事：连接断了任务照跑，
 /// 所以要分开显示，不能拿连接状态去暗示任务出了问题。
+/// 消费者是任务队列视图——向导没有长连接（执行进度不在这儿，ADR-0011）。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Feed {
     #[default]
@@ -717,139 +684,6 @@ pub enum Feed {
     Live,
     /// 断开，附一句能说给人听的原因。
     Down(String),
-}
-
-/// 逐行明细。这里的行数只用来铺行，**不当分母**——权威计数在任务详情里（ADR-0007）。
-#[derive(Debug, Clone, Default)]
-pub struct Progress {
-    pub feed: Feed,
-    pub batches: Vec<BatchRow>,
-    pub units: Vec<UnitRow>,
-    /// 本端实际收到的事件条数。与任务详情的 `events_seen` 相减就是断线期间落后的条数。
-    pub received: u64,
-    /// 阶段一首尾两条事件的时刻，用来算「已完成 · 用时 48 秒」。
-    first_batch_at: Option<Instant>,
-    last_batch_at: Option<Instant>,
-}
-
-impl Progress {
-    /// 明细通道从一开始就不存在的那种进度。
-    ///
-    /// 宿主还没接 WebSocket，给它 `Progress::default()` 的话列表区会停在
-    /// 「连接中」——一个永远不会变的假状态。这里让它一开口就说清没接，
-    /// 人看得懂，也知道少的是什么。计时字段不对外，所以宿主构不出这个形状，
-    /// 得由这一侧给。
-    pub fn feed_down(reason: impl Into<String>) -> Self {
-        Self {
-            feed: Feed::Down(reason.into()),
-            ..Default::default()
-        }
-    }
-
-    pub fn apply(&mut self, event: ProgressEvent) {
-        self.received += 1;
-        let now = Instant::now();
-        match event {
-            ProgressEvent::DataBatchStarted {
-                dbnum,
-                start_sesno,
-                end_sesno,
-            } => {
-                self.first_batch_at.get_or_insert(now);
-                self.batches.push(BatchRow {
-                    dbnum,
-                    start_sesno,
-                    end_sesno,
-                    state: RowState::Running,
-                    message: None,
-                    started: now,
-                });
-            }
-            ProgressEvent::DataBatchFinished {
-                dbnum,
-                success,
-                message,
-            } => {
-                self.last_batch_at = Some(now);
-                if let Some(row) = self.batches.iter_mut().rev().find(|r| r.dbnum == dbnum) {
-                    row.state = if success {
-                        RowState::Done
-                    } else {
-                        RowState::Failed
-                    };
-                    row.message = message;
-                }
-            }
-            ProgressEvent::ModelUnitStarted {
-                dbnum,
-                root_refno,
-                noun,
-            } => self.units.push(UnitRow {
-                dbnum,
-                root_refno,
-                noun,
-                state: RowState::Running,
-                message: None,
-                started: now,
-            }),
-            ProgressEvent::ModelUnitFinished {
-                dbnum,
-                root_refno,
-                success,
-                message,
-            } => {
-                if let Some(row) = self
-                    .units
-                    .iter_mut()
-                    .rev()
-                    .find(|r| r.dbnum == dbnum && r.root_refno == root_refno)
-                {
-                    row.state = if success {
-                        RowState::Done
-                    } else {
-                        RowState::Failed
-                    };
-                    row.message = message;
-                }
-            }
-        }
-    }
-
-    /// 断线时把还没收到收尾事件的行降级。它们可能已经做完了，只是消息没到，
-    /// 继续显示「进行中」是在撒谎。
-    pub fn mark_unknown(&mut self) {
-        for row in &mut self.batches {
-            if row.state == RowState::Running {
-                row.state = RowState::Unknown;
-            }
-        }
-        for row in &mut self.units {
-            if row.state == RowState::Running {
-                row.state = RowState::Unknown;
-            }
-        }
-    }
-
-    /// 服务端已发多少条、本端少收了多少条。断线补不回来，只能把差额说出来。
-    /// **只用来解释明细缺了多少，不许拿它反推进度**（ADR-0007）。
-    pub fn behind(&self, events_seen: u64) -> u64 {
-        events_seen.saturating_sub(self.received)
-    }
-
-    fn units_done(&self) -> usize {
-        self.units
-            .iter()
-            .filter(|u| u.state == RowState::Done)
-            .count()
-    }
-
-    fn batch_phase_done(&self) -> bool {
-        !self.batches.is_empty() && self.batches.iter().all(|b| b.state != RowState::Running)
-    }
-
-    fn batch_elapsed(&self) -> Option<Duration> {
-        Some(self.last_batch_at?.duration_since(self.first_batch_at?))
-    }
 }
 
 // ================================================================ 不可用与失败态
@@ -863,14 +697,19 @@ pub struct Failure {
     pub detail: Option<String>,
 }
 
-/// S2-D 的五种形态，减去「已是最新」（那是 200，走 `up_to_date`）与
+/// S2-D 的失败形态，减去「已是最新」（那是 200，走 `up_to_date`）与
 /// 「数据源未就绪」（那一态连请求都不发，入口按钮已经禁着）。
+///
+/// 「自动同步接管 · 422」与「已有任务在跑 · 409」两种形态随合流退役
+/// （gen-model ADR-011 §12：单飞预检与 `sync_live` 拒绝全部删除，执行请求
+/// 一律 202 入队）。意外冒出来的这两个 code 归 `Internal`——一个说不清来路的
+/// 拒绝，把原始 message 收进详情比替它编一个已不存在的理由诚实。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailForm {
-    /// 422 · precondition：自动同步正在接管，两者互斥。
-    SyncLive,
-    /// 409 · conflict：同项目已有任务在跑。
-    Conflict,
+    /// 422 · identity_mismatch：请求的 project / MDB / namespace 与模型服务的
+    /// 固定范围不一致。服务端 `ServiceIdentity::validate` 会给出它，本地闸门
+    /// （`task_queue::Vm::can_mutate`）拦下时也用同一个 code 合成，两处一个画面。
+    IdentityMismatch,
     /// 504 · timeout：连不上或超时。
     Timeout,
     /// 其余一律 500 · internal——**只有这一类**才需要把原始 message 摊出来。
@@ -880,8 +719,7 @@ pub enum FailForm {
 impl Failure {
     pub fn form(&self) -> FailForm {
         match self.code.as_str() {
-            "precondition" => FailForm::SyncLive,
-            "conflict" => FailForm::Conflict,
+            "identity_mismatch" => FailForm::IdentityMismatch,
             "timeout" => FailForm::Timeout,
             _ => FailForm::Internal,
         }
@@ -899,8 +737,7 @@ impl Failure {
 impl FailForm {
     fn title(self) -> &'static str {
         match self {
-            Self::SyncLive => "自动同步正在接管",
-            Self::Conflict => "本项目已有一个更新在跑",
+            Self::IdentityMismatch => "范围与模型服务对不上",
             Self::Timeout => "连不上模型服务",
             Self::Internal => "模型服务出错",
         }
@@ -908,8 +745,9 @@ impl FailForm {
 
     fn body(self) -> &'static str {
         match self {
-            Self::SyncLive => "服务端开着自动追新，与手动增量更新互斥。要手动更新，得先在服务端关掉它。",
-            Self::Conflict => "同一项目同时只允许一个手动增量更新。等它跑完，或者切过去看它的进度。",
+            Self::IdentityMismatch => {
+                "请求的 project / MDB / namespace 与模型服务的固定范围不一致。确认当前数据源与模型服务连的是同一套项目配置，再重新预览。"
+            }
             Self::Timeout => "模型服务没有响应。没有任何数据被改动，可以直接重试。",
             Self::Internal => "服务端未能完成这次请求。原始信息收在下面的详情里。",
         }
@@ -917,8 +755,7 @@ impl FailForm {
 
     fn icon(self) -> &'static str {
         match self {
-            Self::SyncLive => ph::ARROWS_CLOCKWISE,
-            Self::Conflict => ph::CLOCK_COUNTER_CLOCKWISE,
+            Self::IdentityMismatch => ph::LINK_BREAK,
             Self::Timeout => ph::WARNING,
             Self::Internal => ph::WARNING_CIRCLE,
         }
@@ -926,7 +763,7 @@ impl FailForm {
 
     fn tone(self) -> Status {
         match self {
-            Self::SyncLive | Self::Conflict => Status::Warn,
+            Self::IdentityMismatch => Status::Warn,
             _ => Status::Error,
         }
     }
@@ -942,9 +779,6 @@ pub enum Vm {
     Loading,
     Ready(Preview),
     Starting,
-    /// 装箱是因为它比别的变体大出一截：`Run` 的几个串加上逐行明细，不装箱整个
-    /// `Vm` 都得按它的尺寸走。
-    Running(Box<RunVm>),
     Failed(Failure),
 }
 
@@ -956,29 +790,19 @@ impl Vm {
             Self::Loading => 1,
             Self::Ready(_) => 2,
             Self::Starting => 3,
-            Self::Running(_) => 4,
-            Self::Failed(_) => 5,
+            Self::Failed(_) => 4,
         }
     }
 }
 
-/// 一次运行实例在界面上的全部状态：终态靠轮询（`run` / `poll_error`），
-/// 明细靠 WebSocket（`progress`），两条通道并存（ADR-0005）。
-#[derive(Debug, Clone, Default)]
-pub struct RunVm {
-    pub run: Run,
-    pub poll_error: Option<String>,
-    pub progress: Progress,
-}
-
-/// 向导走到第几步。第三步由 `Vm` 决定（一提交就进执行进度），前两步是纯界面状态：
-/// 「确认执行」不发任何请求，它存在的唯一理由是**按下去的是一个不可取消的按钮**。
+/// 向导走到第几步。两步都是纯界面状态：「确认执行」不发任何请求，它存在的
+/// 唯一理由是**按下去的是一个不可取消的按钮**。确认之后的执行进度在任务队列
+/// 视图（ADR-0011），不在本窗。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Step {
     #[default]
     Preview,
     Confirm,
-    Running,
 }
 
 impl Step {
@@ -986,24 +810,22 @@ impl Step {
         match self {
             Self::Preview => 0,
             Self::Confirm => 1,
-            Self::Running => 2,
         }
     }
 }
 
-/// 缓存的上一份预览。S2-A 摆它的过期摘要，S4 靠它补出阻断 / 排除的库与
-/// no_generation，S4-C 靠它算出「实际 512 项，预览时 487 项」的差额。
+/// 缓存的上一份预览。S2-A 的等待态摆它的过期摘要；标题栏在 Idle / Loading /
+/// Failed 时靠它报项目名。
 struct Cached {
     preview: Preview,
     at: Instant,
 }
 
-/// 相位计时器。「已用 01:12」「耗时 04:38」都是本地量，从相位切换那一刻起算。
+/// 相位计时器。「已用 01:12」是本地量，从相位切换那一刻起算。
 #[derive(Default)]
 struct Clock {
     phase: u8,
     since: Option<Instant>,
-    frozen: Option<Duration>,
 }
 
 impl Clock {
@@ -1011,21 +833,11 @@ impl Clock {
         if self.phase != phase || self.since.is_none() {
             self.phase = phase;
             self.since = Some(Instant::now());
-            self.frozen = None;
         }
     }
 
     fn elapsed(&self) -> Duration {
-        self.frozen
-            .or_else(|| self.since.map(|s| s.elapsed()))
-            .unwrap_or_default()
-    }
-
-    /// 终态到达时把表停住，之后不再往前走。
-    fn freeze(&mut self) {
-        if self.frozen.is_none() {
-            self.frozen = Some(self.since.map(|s| s.elapsed()).unwrap_or_default());
-        }
+        self.since.map(|s| s.elapsed()).unwrap_or_default()
     }
 }
 
@@ -1061,12 +873,6 @@ impl State {
                     self.detail_open = false;
                 }
             }
-            Vm::Running(session) => {
-                self.step = Step::Running;
-                if session.run.terminal() {
-                    self.clock.freeze();
-                }
-            }
             Vm::Failed(_) if switched => self.detail_open = false,
             _ => {}
         }
@@ -1089,11 +895,15 @@ impl State {
 
 // ================================================================ 窗口外壳
 
+/// `applying` 是此刻正在应用的数据批次数（队列快照里本项目 `running` 的行，
+/// 由 `task_queue::Vm::applying` 算出）。预览与批次并发时，正在被应用的会话会被
+/// 算进「待应用」，S2 拿它标注「N 个库正在应用，数字可能偏大」（ADR-0011）。
 pub fn show(
     ctx: &egui::Context,
     t: &Tokens,
     d: Density,
     api_url: &str,
+    applying: usize,
     vm: &Vm,
     state: &mut State,
 ) -> Vec<Cmd> {
@@ -1141,9 +951,8 @@ pub fn show(
                     Vm::Ready(preview) if preview.up_to_date => up_to_date_body(ui, t, d, state),
                     Vm::Ready(preview) => match state.step {
                         Step::Confirm => confirm_body(ui, t, d, preview, state),
-                        _ => preview_body(ui, t, d, preview, state),
+                        _ => preview_body(ui, t, d, applying, preview, state),
                     },
-                    Vm::Running(session) => running_body(ui, t, d, session, state, &mut cmds),
                 }
             });
 
@@ -1177,17 +986,9 @@ fn header(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, state: &mut State) {
         if ui.add(widgets::tool_btn(t, d, ph::X, false)).clicked() {
             state.open = false;
         }
-        // 「已用 / 耗时」只在有表可读的两个相位摆；预览结果页摆一句用不着计时的提示。
+        // 「已用」只在预览扫描在途时摆；其余相位摆一句用不着计时的提示。
         match vm {
             Vm::Loading => stopwatch(ui, t, d, "已用", state.clock.elapsed()),
-            Vm::Running(session) => {
-                let label = if session.run.terminal() {
-                    "耗时"
-                } else {
-                    "已用"
-                };
-                stopwatch(ui, t, d, label, state.clock.elapsed());
-            }
             _ => {
                 ui.label(
                     RichText::new("关闭窗口不会中断任务")
@@ -1249,58 +1050,12 @@ fn header_text(vm: &Vm, state: &State) -> (String, String, Status, &'static str)
             Status::Info,
             ph::ARROWS_CLOCKWISE,
         ),
-        Vm::Running(session) => {
-            let run = &session.run;
-            if !run.terminal() {
-                return (
-                    "模型更新 · 正在执行".into(),
-                    format!("{project} · 任务开始后不可中途取消"),
-                    Status::Info,
-                    ph::ARROWS_CLOCKWISE,
-                );
-            }
-            let outcome = run.result.as_ref();
-            match outcome.map(|o| o.status).unwrap_or_default() {
-                RunStatus::Success => (
-                    "模型更新 · 已完成".into(),
-                    format!("{project} · 数据与模型都已跟上"),
-                    Status::Success,
-                    ph::CHECK_CIRCLE,
-                ),
-                RunStatus::Partial => (
-                    "模型更新 · 部分完成".into(),
-                    format!(
-                        "{project} · 数据已全部写入，{} 个交付单元未能生成",
-                        outcome.map_or(0, |o| o
-                            .units
-                            .iter()
-                            .filter(|u| u.status == UnitStatus::Failed)
-                            .count())
-                    ),
-                    Status::Warn,
-                    ph::WARNING,
-                ),
-                RunStatus::Failed => (
-                    "模型更新 · 未完成".into(),
-                    format!("{project} · 没有任何一件事做成"),
-                    Status::Error,
-                    ph::WARNING_CIRCLE,
-                ),
-                RunStatus::UpToDate => (
-                    "模型更新 · 无事可做".into(),
-                    format!("{project} · 这次运行没有可执行的工作"),
-                    Status::Neutral,
-                    ph::CHECK_CIRCLE,
-                ),
-            }
-        }
     }
 }
 
 fn project_of(vm: &Vm, state: &State) -> String {
     match vm {
         Vm::Ready(preview) if !preview.project.is_empty() => preview.project.clone(),
-        Vm::Running(session) if !session.run.project.is_empty() => session.run.project.clone(),
         _ => state
             .cached()
             .map(|p| p.project.clone())
@@ -1309,20 +1064,22 @@ fn project_of(vm: &Vm, state: &State) -> String {
     }
 }
 
-/// 步骤条。三步是本仓库定义的流程，没有契约来源；六张画板上都有它。
+/// 步骤条。两步是本仓库定义的流程，没有契约来源；执行进度不是一步——
+/// 它在任务队列视图（ADR-0011）。
 fn steps(ui: &mut Ui, t: &Tokens, d: Density, step: Step) {
-    const NAMES: [&str; 3] = ["更新预览", "确认执行", "执行进度"];
+    const NAMES: [&str; 2] = ["更新预览", "确认执行"];
     let rect = bar(ui, d.px(48.0), t.bg_panel, Corner::None);
     let mut ui = child(ui, rect.shrink2(vec2(d.px(20.0), 0.0)), Align::Center);
     ui.spacing_mut().item_spacing.x = d.px(8.0);
 
     let current = step.index();
-    // 连接线各占剩下的一半。先量总宽再分，边量边分的话第二条会比第一条短一截。
+    // 连接线均分标签之外的剩余宽度。先量总宽再分，边量边分的话后一条会比前一条短一截。
     let labels: f32 = NAMES
         .iter()
         .map(|n| layout(&ui, n, Font::strong(d)).size().x + d.px(28.0))
         .sum();
-    let connector = ((ui.available_width() - labels) / 2.0 - d.px(24.0)).max(d.px(24.0));
+    let connector =
+        ((ui.available_width() - labels) / (NAMES.len() - 1) as f32 - d.px(24.0)).max(d.px(24.0));
 
     for (i, name) in NAMES.into_iter().enumerate() {
         if i > 0 {
@@ -1416,16 +1173,6 @@ fn footer_hint(vm: &Vm, state: &State, api_url: &str) -> (&'static str, String, 
             "预览为只读：不修改元素数据、模型或已应用会话号".into(),
             Status::Neutral,
         ),
-        Vm::Running(session) if session.run.terminal() => (
-            ph::INFO,
-            "失败单元已登记为待重试，下次更新自动并入；已写入的数据不受影响".into(),
-            Status::Neutral,
-        ),
-        Vm::Running(_) => (
-            ph::INFO,
-            "关闭窗口只隐藏进度，任务继续运行；再次打开入口恢复本窗口".into(),
-            Status::Neutral,
-        ),
         _ => (ph::PLUGS, format!("服务 {api_url}"), Status::Neutral),
     }
 }
@@ -1502,30 +1249,6 @@ fn footer_actions(
                     state.step = Step::Confirm;
                 }
                 if ui.add(widgets::button(t, d, "取消")).clicked() {
-                    state.open = false;
-                }
-            }
-        }
-        Vm::Running(session) => {
-            let done = session.run.terminal();
-            if done {
-                if ui
-                    .add(widgets::button(t, d, "重新预览").icon(ph::ARROWS_CLOCKWISE))
-                    .clicked()
-                {
-                    cmds.push(Cmd::RefreshModelUpdate);
-                }
-                if ui.add(widgets::button(t, d, "关闭")).clicked() {
-                    state.open = false;
-                }
-            } else {
-                if ui.add_enabled(false, widgets::button(t, d, "完成")).clicked() {
-                    state.open = false;
-                }
-                if ui
-                    .add(widgets::button(t, d, "转入后台").icon(ph::ARROWS_IN_SIMPLE))
-                    .clicked()
-                {
                     state.open = false;
                 }
             }
@@ -1629,15 +1352,20 @@ fn up_to_date_body(ui: &mut Ui, t: &Tokens, d: Density, state: &State) {
             Status::Success,
             ph::CHECK_CIRCLE,
             "已是最新，没有可更新的内容",
-            &format!(
-                "没有待应用的会话，也没有待重试的交付单元。这是正常结果，不是错误。{since}"
-            ),
+            &format!("没有待应用的会话，也没有待重试的交付单元。这是正常结果，不是错误。{since}"),
         );
     });
 }
 
 /// S2 预览结果：左边变化树，右边 360 宽的汇总列。
-fn preview_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &mut State) {
+fn preview_body(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    applying: usize,
+    preview: &Preview,
+    state: &mut State,
+) {
     let totals = preview.totals();
     let rail_w = d.px(360.0);
     let full = ui.available_rect_before_wrap();
@@ -1667,7 +1395,8 @@ fn preview_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
 
     // 右：本次范围 + 阻断与提示
     let rail = Rect::from_min_max(pos2(split, full.top()), full.right_bottom());
-    ui.painter().rect_filled(rail, CornerRadius::ZERO, t.bg_header);
+    ui.painter()
+        .rect_filled(rail, CornerRadius::ZERO, t.bg_header);
     ui.painter().rect_filled(
         Rect::from_min_size(rail.left_top(), vec2(1.0, rail.height())),
         CornerRadius::ZERO,
@@ -1679,15 +1408,14 @@ fn preview_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
         .id_salt("model-update-summary-rail")
         .auto_shrink([false, false])
         .show(&mut ui, |ui| {
-            summary_block(ui, t, d, &totals);
+            summary_block(ui, t, d, applying, &totals);
             ui.add_space(d.px(20.0));
             hints_block(ui, t, d, preview, &totals);
         });
 }
 
 fn tree_toolbar(ui: &mut Ui, t: &Tokens, d: Density, totals: &Totals, state: &mut State) {
-    let (rect, _) =
-        ui.allocate_exact_size(vec2(ui.available_width(), d.px(38.0)), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), d.px(38.0)), Sense::hover());
     let mut ui = child(ui, rect.shrink2(vec2(d.px(16.0), 0.0)), Align::Center);
     ui.spacing_mut().item_spacing.x = d.px(8.0);
     ui.label(
@@ -1767,12 +1495,12 @@ fn db_rows(ui: &mut Ui, t: &Tokens, d: Density, db: &DbPreview, state: &mut Stat
             db.window()
         },
         note: form.note(),
-        note_color: if form.blocks() { t.danger } else { t.text_muted },
-        fill: if form.blocks() {
-            tone_bg
+        note_color: if form.blocks() {
+            t.danger
         } else {
-            t.bg_header
+            t.text_muted
         },
+        fill: if form.blocks() { tone_bg } else { t.bg_header },
     };
     if row(ui, t, d, head).clicked() && expandable {
         state.toggle_row(&key);
@@ -1808,7 +1536,11 @@ fn db_rows(ui: &mut Ui, t: &Tokens, d: Density, db: &DbPreview, state: &mut Stat
             tag: unit.name.as_str(),
             tag_color: t.text_muted,
             meta: moved,
-            note: if unit.will_generate { "待生成" } else { "不生成" },
+            note: if unit.will_generate {
+                "待生成"
+            } else {
+                "不生成"
+            },
             note_color: if unit.will_generate {
                 t.warn
             } else {
@@ -1820,7 +1552,7 @@ fn db_rows(ui: &mut Ui, t: &Tokens, d: Density, db: &DbPreview, state: &mut Stat
     }
 }
 
-fn summary_block(ui: &mut Ui, t: &Tokens, d: Density, totals: &Totals) {
+fn summary_block(ui: &mut Ui, t: &Tokens, d: Density, applying: usize, totals: &Totals) {
     section(ui, t, d, "本次范围");
     ui.add_space(d.px(10.0));
     ui.horizontal(|ui| {
@@ -1884,6 +1616,19 @@ fn summary_block(ui: &mut Ui, t: &Tokens, d: Density, totals: &Totals) {
         &totals.model_affecting.to_string(),
         false,
     );
+    // 预览与数据批次并发（合流后没有单飞预检）：正在被应用的会话也会被算进
+    // 「待应用」。数字说不清来路就把来路说出来——为 0 时整条不画，不摆空话。
+    if applying > 0 {
+        ui.add_space(d.px(10.0));
+        strip(
+            ui,
+            t,
+            d,
+            Status::Warn,
+            ph::ARROWS_CLOCKWISE,
+            &format!("{applying} 个库正在应用，以上数字可能偏大；应用完成后重新预览即为准确值"),
+        );
+    }
 }
 
 fn hints_block(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, totals: &Totals) {
@@ -1949,12 +1694,7 @@ fn hints_block(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, totals: &
         let list = preview
             .pending_model_retries
             .iter()
-            .map(|u| {
-                format!(
-                    "{} {}（已尝试 {} 次）",
-                    u.noun, u.root_refno, u.attempts
-                )
-            })
+            .map(|u| format!("{} {}（已尝试 {} 次）", u.noun, u.root_refno, u.attempts))
             .collect::<Vec<_>>()
             .join("；");
         note_card(
@@ -1963,10 +1703,7 @@ fn hints_block(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, totals: &
             d,
             Status::Info,
             ph::ARROW_COUNTER_CLOCKWISE,
-            &format!(
-                "{} 个待重试单元将合并",
-                preview.pending_model_retries.len()
-            ),
+            &format!("{} 个待重试单元将合并", preview.pending_model_retries.len()),
             &format!("{list}。上次生成失败，本次按最新状态只生成一次。"),
         );
         ui.add_space(d.px(10.0));
@@ -2009,7 +1746,10 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
             ph::PLAY,
             t.accent,
             "本次会执行",
-            &format!("{} 个数据批次 · {} 个交付单元", totals.batches, totals.units),
+            &format!(
+                "{} 个数据批次 · {} 个交付单元",
+                totals.batches, totals.units
+            ),
             |ui| {
                 for db in preview.dbnums.iter().filter(|db| db.will_run()) {
                     line(
@@ -2022,11 +1762,7 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
                         &if db.initialization_required {
                             "首次导入 · 全量建立水位".to_owned()
                         } else {
-                            format!(
-                                "{} 个会话 · {} 项变化",
-                                db.sessions.len(),
-                                db.changes()
-                            )
+                            format!("{} 个会话 · {} 项变化", db.sessions.len(), db.changes())
                         },
                         t.text_secondary,
                     );
@@ -2175,463 +1911,6 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
     });
 }
 
-// ================================================================ 第三步：执行进度
-
-fn running_body(
-    ui: &mut Ui,
-    t: &Tokens,
-    d: Density,
-    session: &RunVm,
-    state: &State,
-    cmds: &mut Vec<Cmd>,
-) {
-    if session.run.terminal() {
-        return outcome_body(ui, t, d, session, state, cmds);
-    }
-    let progress = &session.progress;
-
-    // S4-B：连接状态与运行状态分开说。连接断了运行照跑，混成一句会让人以为任务出了问题。
-    if let Feed::Down(reason) = &progress.feed {
-        let behind = progress.behind(session.run.events_seen);
-        feed_banner(
-            ui,
-            t,
-            d,
-            &format!(
-                "服务端已发 {} 条进度事件，本端落后 {behind} 条（{reason}）· 断开期间的逐单元事件不会补发",
-                session.run.events_seen
-            ),
-            cmds,
-        );
-    }
-    if let Some(error) = session.poll_error.as_deref() {
-        pad_h(ui, d, |ui| {
-            strip(
-                ui,
-                t,
-                d,
-                Status::Warn,
-                ph::WARNING,
-                &format!("任务状态查询暂时失败：{error}"),
-            );
-        });
-    }
-
-    scroll_pad(ui, d, "model-update-progress", |ui| {
-        ui.spacing_mut().item_spacing.y = d.px(12.0);
-        let cached = state.cached();
-
-        let phase1_note = if progress.batch_phase_done() {
-            match progress.batch_elapsed() {
-                Some(elapsed) => format!("已完成 · 用时 {}", secs(elapsed)),
-                None => "已完成".into(),
-            }
-        } else {
-            counted(session.run.batches_done, session.run.total_batches, "数据批次")
-                .unwrap_or_else(|| format!("已完成 {} 个批次", done_batches(progress)))
-        };
-        card_titled(
-            ui,
-            t,
-            d,
-            ph::CHECK_CIRCLE,
-            if progress.batch_phase_done() {
-                t.success
-            } else {
-                t.accent
-            },
-            "阶段一 · 数据更新",
-            &phase1_note,
-            |ui| {
-                if progress.batches.is_empty() {
-                    ui.label(
-                        RichText::new("还没有收到数据批次事件。")
-                            .font(Font::meta(d))
-                            .color(t.text_muted),
-                    );
-                }
-                for b in &progress.batches {
-                    let (note, color) = match b.state {
-                        RowState::Done => ("已应用，水位已推进", t.success),
-                        RowState::Failed => ("失败 · 水位不变", t.danger),
-                        RowState::Unknown => ("状态未知", t.text_muted),
-                        RowState::Running => ("进行中", t.accent),
-                    };
-                    line(
-                        ui,
-                        t,
-                        d,
-                        Dot::state(b.state, t),
-                        &format!("db{}", b.dbnum),
-                        &format!("sesno {} → {}", b.start_sesno, b.end_sesno),
-                        note,
-                        color,
-                    );
-                    if let Some(message) = b.message.as_deref() {
-                        sub_line(ui, t, d, message, b.state == RowState::Failed);
-                    }
-                }
-                // 阻断与排除的库不发事件，它们的去向要从预览那份里补出来，
-                // 否则「这库怎么没动静」只能靠猜。
-                if let Some(preview) = cached {
-                    for db in preview
-                        .dbnums
-                        .iter()
-                        .filter(|db| db.form().blocks() || db.form() == DbForm::Excluded)
-                    {
-                        let blocked = db.form().blocks();
-                        line(
-                            ui,
-                            t,
-                            d,
-                            Dot::Glyph(
-                                if blocked { ph::WARNING_CIRCLE } else { ph::PROHIBIT },
-                                if blocked { t.danger } else { t.text_muted },
-                            ),
-                            &format!("db{} · {}", db.dbnum, db.db_type),
-                            if blocked {
-                                db.form().label()
-                            } else {
-                                "非 DESI，不产生数据批次"
-                            },
-                            db.form().note(),
-                            if blocked { t.danger } else { t.text_muted },
-                        );
-                    }
-                }
-            },
-        );
-
-        // 断线降级的是列表区，不是这个计数——它走轮询通道，连接断了照样准
-        //（ADR-0007 推翻了 ADR-0005 里「条冻结在最后已知值」的设想）。
-        let units_note = counted(session.run.units_done, session.run.total_units, "交付单元")
-            .unwrap_or_else(|| format!("本端已见 {} 个交付单元生成完成", progress.units_done()));
-        card_titled(
-            ui,
-            t,
-            d,
-            ph::SHAPES,
-            t.accent,
-            "阶段二 · 模型生成",
-            &units_note,
-            |ui| {
-                // 有权威分母才画确定态的条；没有就只报已完成数（ADR-0007）。
-                if let (Some(done), Some(total)) =
-                    (session.run.units_done, session.run.total_units)
-                    && total > 0
-                {
-                    let failed = progress
-                        .units
-                        .iter()
-                        .filter(|u| u.state == RowState::Failed)
-                        .count() as u32;
-                    ratio_bar(
-                        ui,
-                        t,
-                        d,
-                        &[
-                            (done.saturating_sub(failed), t.accent),
-                            (failed.min(done), t.danger),
-                            (total.saturating_sub(done), Color32::TRANSPARENT),
-                        ],
-                    );
-                    ui.add_space(d.px(6.0));
-                    ui.label(
-                        RichText::new("这是单元数进度，不是时间进度——一个 BRAN 和一个 EQUI 的生成耗时差一个数量级。")
-                            .font(Font::micro(d))
-                            .color(t.text_muted),
-                    );
-                    ui.add_space(d.px(6.0));
-                }
-                if let Some(preview) = cached {
-                    let no_gen = preview.totals().no_generation;
-                    if no_gen > 0 {
-                        strip(
-                            ui,
-                            t,
-                            d,
-                            Status::Neutral,
-                            ph::INFO,
-                            &format!(
-                                "预览时另有 {no_gen} 处变化找不到可生成的交付单元（no_generation），不会出现在下方列表"
-                            ),
-                        );
-                        ui.add_space(d.px(6.0));
-                    }
-                }
-                if progress.units.is_empty() {
-                    ui.label(
-                        RichText::new("还没有交付单元开始生成。")
-                            .font(Font::meta(d))
-                            .color(t.text_muted),
-                    );
-                }
-                for u in &progress.units {
-                    let (note, color) = match u.state {
-                        RowState::Done => ("生成成功".to_owned(), t.success),
-                        RowState::Failed => ("生成失败 · 待重试".to_owned(), t.danger),
-                        RowState::Unknown => ("状态未知".to_owned(), t.text_muted),
-                        // 跑满 10 秒才报用时：短单元上那个数字每帧都在跳，只会晃眼。
-                        RowState::Running if u.started.elapsed() >= Duration::from_secs(10) => {
-                            (format!("生成中 · 已用 {}", secs(u.started.elapsed())), t.accent)
-                        }
-                        RowState::Running => ("生成中".to_owned(), t.accent),
-                    };
-                    line(
-                        ui,
-                        t,
-                        d,
-                        Dot::state(u.state, t),
-                        &format!("{} {}", u.noun, u.root_refno),
-                        &format!("db{}", u.dbnum),
-                        &note,
-                        color,
-                    );
-                    if let Some(message) = u.message.as_deref() {
-                        sub_line(ui, t, d, message, u.state == RowState::Failed);
-                    }
-                }
-            },
-        );
-    });
-}
-
-/// S4-C 终态。`partial` 是常态：数据批次一旦 `Applied`，水位不因后面的模型生成失败而回退。
-fn outcome_body(
-    ui: &mut Ui,
-    t: &Tokens,
-    d: Density,
-    session: &RunVm,
-    state: &State,
-    cmds: &mut Vec<Cmd>,
-) {
-    let run = &session.run;
-    let Some(outcome) = run.result.as_ref() else {
-        return pad(ui, d, |ui| {
-            note_card(
-                ui,
-                t,
-                d,
-                Status::Warn,
-                ph::WARNING,
-                &format!("任务已结束（{}），但还没拿到结果摘要", run.state),
-                "任务详情里没有 result。稍后重新预览可以看到最新水位。",
-            );
-        });
-    };
-    let applied = outcome
-        .batch
-        .iter()
-        .filter(|b| b.status == BatchStatus::Applied)
-        .count();
-    let failed_batches = outcome
-        .batch
-        .iter()
-        .filter(|b| b.status == BatchStatus::Failed)
-        .count();
-    let skipped = outcome.batch.iter().count() - applied - failed_batches;
-    let failed_units: Vec<&UnitResult> = outcome
-        .units
-        .iter()
-        .filter(|u| u.status == UnitStatus::Failed)
-        .collect();
-    let ok_units = outcome.units.len() - failed_units.len();
-
-    scroll_pad(ui, d, "model-update-outcome", |ui| {
-        ui.spacing_mut().item_spacing.y = d.px(12.0);
-
-        let (tone, icon, title, body) = match outcome.status {
-            RunStatus::Partial => (
-                Status::Warn,
-                ph::WARNING,
-                format!("部分完成：数据全部落库，模型少了 {} 个交付单元", failed_units.len()),
-                "服务端按「有成功也有失败」判定为 partial。已应用的水位不因模型失败而回退，未生成的单元单独登记为待重试。".to_owned(),
-            ),
-            RunStatus::Success => (
-                Status::Success,
-                ph::CHECK_CIRCLE,
-                "全部完成".to_owned(),
-                "数据批次与模型交付单元都成功了，水位已推进。".to_owned(),
-            ),
-            RunStatus::Failed => (
-                Status::Error,
-                ph::WARNING_CIRCLE,
-                "未完成：没有任何一件事做成".to_owned(),
-                "有可执行的工作，但一件都没成功。水位没有推进。".to_owned(),
-            ),
-            RunStatus::UpToDate => (
-                Status::Neutral,
-                ph::CHECK_CIRCLE,
-                "无事可做".to_owned(),
-                "这次运行开始时已经没有可执行的数据批次与待重试单元。".to_owned(),
-            ),
-        };
-        note_card(ui, t, d, tone, icon, &title, &body);
-
-        card_titled(
-            ui,
-            t,
-            d,
-            ph::CHECK_CIRCLE,
-            if failed_batches > 0 { t.danger } else { t.success },
-            "阶段一 · 数据批次",
-            &format!("{applied} 已应用 · {skipped} 阻断 · {failed_batches} 失败"),
-            |ui| {
-                if outcome.batch.is_none() {
-                    ui.label(
-                        RichText::new("这次没有数据批次（只跑了模型重试）。")
-                            .font(Font::meta(d))
-                            .color(t.text_muted),
-                    );
-                }
-                if let Some(b) = &outcome.batch {
-                    let (dot, note, color) = match b.status {
-                        BatchStatus::Applied => (
-                            Dot::Tone(t.success),
-                            format!("已应用 · 水位推进至 {}", b.end_sesno),
-                            t.success,
-                        ),
-                        BatchStatus::Failed => (
-                            Dot::Tone(t.danger),
-                            "失败 · 水位不变".to_owned(),
-                            t.danger,
-                        ),
-                        BatchStatus::Skipped => (
-                            Dot::Glyph(ph::PROHIBIT, t.text_muted),
-                            "未执行 · 水位不变".to_owned(),
-                            t.text_muted,
-                        ),
-                    };
-                    let window = if b.status == BatchStatus::Skipped {
-                        b.message.clone().unwrap_or_else(|| "本期不执行".into())
-                    } else {
-                        format!("sesno {} → {}", b.start_sesno, b.end_sesno)
-                    };
-                    line(
-                        ui,
-                        t,
-                        d,
-                        dot,
-                        &format!("db{} · {}", b.dbnum, b.db_type),
-                        &window,
-                        &note,
-                        color,
-                    );
-                    // 契约明写结果摘要必须逐条列出并入的会话——这是「执行范围 ≠ 预览列表」
-                    // 在终态上的最后一次交代。
-                    if !b.merged_sesnos.is_empty() {
-                        let listed = b
-                            .merged_sesnos
-                            .iter()
-                            .map(u32::to_string)
-                            .collect::<Vec<_>>()
-                            .join(" / ");
-                        let diff = state
-                            .cached()
-                            .and_then(|p| p.dbnums.iter().find(|db| db.dbnum == b.dbnum))
-                            .map(|db| {
-                                format!(
-                                    " —— 实际执行 {} 项变化，预览时为 {} 项",
-                                    b.changed_elements,
-                                    db.changes()
-                                )
-                            })
-                            .unwrap_or_default();
-                        strip(
-                            ui,
-                            t,
-                            d,
-                            Status::Info,
-                            ph::GIT_MERGE,
-                            &format!(
-                                "预览后并入 {} 个会话：{listed}{diff}",
-                                b.merged_sesnos.len()
-                            ),
-                        );
-                    }
-                    if let Some(message) = b.message.as_deref()
-                        && b.status == BatchStatus::Failed
-                    {
-                        sub_line(ui, t, d, message, true);
-                    }
-                }
-            },
-        );
-
-        card_titled(
-            ui,
-            t,
-            d,
-            if failed_units.is_empty() {
-                ph::CHECK_CIRCLE
-            } else {
-                ph::WARNING
-            },
-            if failed_units.is_empty() {
-                t.success
-            } else {
-                t.warn
-            },
-            "阶段二 · 模型交付单元",
-            &format!("{ok_units} 成功 · {} 失败", failed_units.len()),
-            |ui| {
-                for u in &failed_units {
-                    let attempts = format!("第 {} 次尝试", u.attempts);
-                    if line_with_retry(
-                        ui,
-                        t,
-                        d,
-                        &format!("{} {}", u.noun, u.root_refno),
-                        &format!(
-                            "db{}  {}",
-                            u.dbnum,
-                            u.message.as_deref().unwrap_or("生成失败")
-                        ),
-                        &attempts,
-                    ) {
-                        cmds.push(Cmd::RetryModelUnit {
-                            root_refno: u.root_refno.clone(),
-                        });
-                    }
-                }
-                if ok_units > 0 {
-                    let owners = outcome
-                        .units
-                        .iter()
-                        .filter(|u| u.status == UnitStatus::Generated)
-                        .filter(|u| u.old_owner.is_some() || u.new_owner.is_some())
-                        .count();
-                    line(
-                        ui,
-                        t,
-                        d,
-                        Dot::Glyph(ph::CHECK_CIRCLE, t.success),
-                        &format!("其余 {ok_units} 个单元已生成"),
-                        "",
-                        &if owners > 0 {
-                            format!("{owners} 个单元换了归属，模型树需要刷新")
-                        } else {
-                            String::new()
-                        },
-                        t.text_muted,
-                    );
-                }
-                if outcome.units.is_empty() {
-                    ui.label(
-                        RichText::new("这次没有交付单元需要生成。")
-                            .font(Font::meta(d))
-                            .color(t.text_muted),
-                    );
-                }
-            },
-        );
-
-        for warning in &outcome.warnings {
-            strip(ui, t, d, Status::Warn, ph::WARNING, warning);
-        }
-    });
-}
-
 // ================================================================ 失败态
 
 /// S2-D。按 `code` 分型给出「原因 / 影响 / 一个出路」；
@@ -2640,7 +1919,15 @@ fn failure_body(ui: &mut Ui, t: &Tokens, d: Density, failure: &Failure, state: &
     let form = failure.form();
     pad(ui, d, |ui| {
         ui.spacing_mut().item_spacing.y = d.px(12.0);
-        note_card(ui, t, d, form.tone(), form.icon(), form.title(), form.body());
+        note_card(
+            ui,
+            t,
+            d,
+            form.tone(),
+            form.icon(),
+            form.title(),
+            form.body(),
+        );
 
         if form == FailForm::Internal {
             let label = if state.detail_open {
@@ -2648,7 +1935,10 @@ fn failure_body(ui: &mut Ui, t: &Tokens, d: Density, failure: &Failure, state: &
             } else {
                 "详情"
             };
-            if ui.add(widgets::chip(t, d, label, state.detail_open)).clicked() {
+            if ui
+                .add(widgets::chip(t, d, label, state.detail_open))
+                .clicked()
+            {
                 state.detail_open = !state.detail_open;
             }
             if state.detail_open {
@@ -2669,8 +1959,9 @@ fn failure_body(ui: &mut Ui, t: &Tokens, d: Density, failure: &Failure, state: &
                     }
                 });
             }
-        } else if form == FailForm::Conflict && !failure.message.is_empty() {
-            // conflict 的 message 里带着那个 task_id，它是人接下来唯一用得上的东西。
+        } else if form == FailForm::IdentityMismatch && !failure.message.is_empty() {
+            // 服务端的 message 会点名是 project / mdb / namespace 里哪一项错开
+            // （本地闸门合成的那条则说明身份尚未就绪），它是人接下来唯一用得上的东西。
             ui.label(
                 RichText::new(&failure.message)
                     .font(Font::mono_meta(d))
@@ -2713,7 +2004,10 @@ fn bar(ui: &mut Ui, h: f32, fill: Color32, corner: Corner) -> Rect {
 
 fn hairline(painter: &egui::Painter, rect: Rect, color: Color32) {
     painter.rect_filled(
-        Rect::from_min_size(pos2(rect.left(), rect.bottom() - 1.0), vec2(rect.width(), 1.0)),
+        Rect::from_min_size(
+            pos2(rect.left(), rect.bottom() - 1.0),
+            vec2(rect.width(), 1.0),
+        ),
         CornerRadius::ZERO,
         color,
     );
@@ -2737,16 +2031,6 @@ fn pad<R>(ui: &mut Ui, d: Density, add: impl FnOnce(&mut Ui) -> R) -> R {
         .inner
 }
 
-fn pad_h<R>(ui: &mut Ui, d: Density, add: impl FnOnce(&mut Ui) -> R) -> R {
-    egui::Frame::new()
-        .inner_margin(Margin::symmetric(d.px(16.0) as i8, d.px(8.0) as i8))
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            add(ui)
-        })
-        .inner
-}
-
 fn scroll_pad(ui: &mut Ui, d: Density, salt: &str, add: impl FnOnce(&mut Ui)) {
     ScrollArea::vertical()
         .id_salt(salt)
@@ -2754,14 +2038,7 @@ fn scroll_pad(ui: &mut Ui, d: Density, salt: &str, add: impl FnOnce(&mut Ui)) {
         .show(ui, |ui| pad(ui, d, add));
 }
 
-fn center_note(
-    ui: &mut Ui,
-    t: &Tokens,
-    d: Density,
-    icon: Option<&str>,
-    title: &str,
-    detail: &str,
-) {
+fn center_note(ui: &mut Ui, t: &Tokens, d: Density, icon: Option<&str>, title: &str, detail: &str) {
     ui.vertical_centered(|ui| {
         ui.add_space((ui.available_height() / 2.0 - d.px(56.0)).max(d.px(40.0)));
         ui.spacing_mut().item_spacing.y = d.px(8.0);
@@ -2778,7 +2055,11 @@ fn center_note(
                 .font(Font::strong(d))
                 .color(t.text_secondary),
         );
-        ui.label(RichText::new(detail).font(Font::meta(d)).color(t.text_muted));
+        ui.label(
+            RichText::new(detail)
+                .font(Font::meta(d))
+                .color(t.text_muted),
+        );
     });
 }
 
@@ -2975,18 +2256,6 @@ enum Dot {
     Glyph(&'static str, Color32),
 }
 
-impl Dot {
-    fn state(state: RowState, t: &Tokens) -> Self {
-        match state {
-            RowState::Done => Self::Glyph(ph::CHECK_CIRCLE, t.success),
-            RowState::Failed => Self::Glyph(ph::X_CIRCLE, t.danger),
-            // 没收到事件就不知道它开没开始，画一个空圈，不许画成「排队中」。
-            RowState::Unknown => Self::Glyph(ph::CIRCLE, t.text_muted),
-            RowState::Running => Self::Glyph(ph::ARROWS_CLOCKWISE, t.accent),
-        }
-    }
-}
-
 /// 卡片里的一条明细行：标记 + 等宽标识 + 次要说明 + 右对齐的状态词。
 fn line(
     ui: &mut Ui,
@@ -2998,8 +2267,7 @@ fn line(
     note: &str,
     note_color: Color32,
 ) {
-    let (rect, _) =
-        ui.allocate_exact_size(vec2(ui.available_width(), d.px(28.0)), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), d.px(28.0)), Sense::hover());
     let mut ui = child(ui, rect, Align::Center);
     ui.spacing_mut().item_spacing.x = d.px(8.0);
     let (mark, _) = ui.allocate_exact_size(vec2(d.px(14.0), d.px(14.0)), Sense::hover());
@@ -3026,57 +2294,6 @@ fn line(
             ui.label(RichText::new(note).font(Font::meta(d)).color(note_color));
         });
     }
-}
-
-/// 带「重试」按钮的失败行。返回按钮是否被按下。
-fn line_with_retry(
-    ui: &mut Ui,
-    t: &Tokens,
-    d: Density,
-    label: &str,
-    detail: &str,
-    attempts: &str,
-) -> bool {
-    let (rect, _) =
-        ui.allocate_exact_size(vec2(ui.available_width(), d.px(34.0)), Sense::hover());
-    let mut ui = child(ui, rect, Align::Center);
-    ui.spacing_mut().item_spacing.x = d.px(8.0);
-    let (mark, _) = ui.allocate_exact_size(vec2(d.px(14.0), d.px(14.0)), Sense::hover());
-    glyph(&ui, mark.center(), ph::X_CIRCLE, d.px(13.0), t.danger);
-    ui.label(
-        RichText::new(label)
-            .font(Font::mono(d))
-            .color(t.text_primary),
-    );
-    ui.label(
-        RichText::new(detail)
-            .font(Font::mono_meta(d))
-            .color(t.text_muted),
-    );
-    let mut clicked = false;
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        clicked = ui
-            .add(widgets::button(t, d, "重试").icon(ph::ARROW_COUNTER_CLOCKWISE))
-            .on_hover_text("重新生成这个交付单元；幂等，可以反复按")
-            .clicked();
-        ui.label(
-            RichText::new(attempts)
-                .font(Font::mono_meta(d))
-                .color(t.danger),
-        );
-    });
-    clicked
-}
-
-fn sub_line(ui: &mut Ui, t: &Tokens, d: Density, text: &str, danger: bool) {
-    let (rect, _) =
-        ui.allocate_exact_size(vec2(ui.available_width(), d.px(20.0)), Sense::hover());
-    let mut ui = child(ui, rect.shrink2(vec2(d.px(22.0), 0.0)), Align::Center);
-    ui.label(
-        RichText::new(text)
-            .font(Font::micro(d))
-            .color(if danger { t.danger } else { t.text_muted }),
-    );
 }
 
 /// 变化树的一行。设计稿上它比通用 `tree_row` 多一段「行尾状态词」，
@@ -3117,7 +2334,11 @@ fn row(ui: &mut Ui, t: &Tokens, d: Density, r: Row<'_>) -> egui::Response {
     let gap = d.px(6.0);
     let mut x = rect.left() + d.px(10.0) + r.depth as f32 * d.px(16.0);
     if let Some(open) = r.caret {
-        let icon = if open { ph::CARET_DOWN } else { ph::CARET_RIGHT };
+        let icon = if open {
+            ph::CARET_DOWN
+        } else {
+            ph::CARET_RIGHT
+        };
         glyph(
             ui,
             pos2(x + d.px(6.0), rect.center().y),
@@ -3184,36 +2405,6 @@ fn row(ui: &mut Ui, t: &Tokens, d: Density, r: Row<'_>) -> egui::Response {
     resp
 }
 
-fn feed_banner(ui: &mut Ui, t: &Tokens, d: Density, detail: &str, cmds: &mut Vec<Cmd>) {
-    let (rect, _) =
-        ui.allocate_exact_size(vec2(ui.available_width(), d.px(40.0)), Sense::hover());
-    let (fg, bg) = t.status(Status::Warn);
-    ui.painter().rect_filled(rect, CornerRadius::ZERO, bg);
-    hairline(ui.painter(), rect, t.border);
-    let mut ui = child(ui, rect.shrink2(vec2(d.px(16.0), 0.0)), Align::Center);
-    ui.spacing_mut().item_spacing.x = d.px(8.0);
-    let (mark, _) = ui.allocate_exact_size(vec2(d.px(14.0), d.px(14.0)), Sense::hover());
-    glyph(&ui, mark.center(), ph::PLUGS, d.px(14.0), fg);
-    ui.label(
-        RichText::new("实时进度已断开，已改为每秒轮询任务状态")
-            .font(Font::strong(d))
-            .color(fg),
-    );
-    ui.label(
-        RichText::new(detail)
-            .font(Font::meta(d))
-            .color(t.text_secondary),
-    );
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        if ui
-            .add(widgets::button(t, d, "重连").icon(ph::ARROW_COUNTER_CLOCKWISE))
-            .clicked()
-        {
-            cmds.push(Cmd::ReconnectModelUpdateFeed);
-        }
-    });
-}
-
 fn stopwatch(ui: &mut Ui, t: &Tokens, d: Density, label: &str, elapsed: Duration) {
     ui.label(
         RichText::new(format!("{label} {}", clock(elapsed)))
@@ -3258,15 +2449,6 @@ fn clock(elapsed: Duration) -> String {
     format!("{:02}:{:02}", s / 60, s % 60)
 }
 
-fn secs(elapsed: Duration) -> String {
-    let s = elapsed.as_secs();
-    if s < 60 {
-        format!("{s} 秒")
-    } else {
-        format!("{} 分 {} 秒", s / 60, s % 60)
-    }
-}
-
 fn ago(elapsed: Duration) -> String {
     let s = elapsed.as_secs();
     match s {
@@ -3276,26 +2458,24 @@ fn ago(elapsed: Duration) -> String {
     }
 }
 
-fn done_batches(progress: &Progress) -> usize {
-    progress
-        .batches
-        .iter()
-        .filter(|b| b.state == RowState::Done)
-        .count()
-}
-
-/// 有权威分子分母才给「14 / 24」。缺任何一个就返回 None，让调用点退回只报已完成数
-/// ——分母不许自己算（ADR-0007）。
-fn counted(done: Option<u32>, total: Option<u32>, unit: &str) -> Option<String> {
-    Some(format!("{} / {} 个{unit}", done?, total?))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn event(json: &str) -> ProgressEvent {
-        serde_json::from_str(json).expect("契约 payload 应当能解出来")
+    #[test]
+    fn applied_data_triggers_refresh_even_when_every_model_unit_failed() {
+        let outcome: Outcome = serde_json::from_str(
+            r#"{
+                "batch":{"dbnum":7997,"start_sesno":41,"end_sesno":42,
+                    "status":"applied","changed_elements":3},
+                "units":[{"dbnum":7997,"root_refno":"24384/12","noun":"EQUI",
+                    "status":"failed","attempts":1}]
+            }"#,
+        )
+        .unwrap();
+
+        assert!(outcome.data_applied());
+        assert!(outcome.refresh_units().is_empty());
     }
 
     fn db(dbnum: u32, db_type: &str) -> DbPreview {
@@ -3319,77 +2499,6 @@ mod tests {
             initialization_required: true,
             ..db(dbnum, "DESI")
         }
-    }
-
-    #[test]
-    fn events_pair_up_into_rows() {
-        let mut progress = Progress::default();
-        progress.apply(event(
-            r#"{"kind":"data_batch_started","dbnum":7997,"start_sesno":41,"end_sesno":42}"#,
-        ));
-        progress.apply(event(
-            r#"{"kind":"model_unit_started","dbnum":7997,"root_refno":"24381/1","noun":"BRAN"}"#,
-        ));
-        progress.apply(event(
-            r#"{"kind":"model_unit_finished","dbnum":7997,"root_refno":"24381/1",
-                "success":false,"message":"生成失败"}"#,
-        ));
-
-        assert_eq!(progress.batches[0].state, RowState::Running);
-        assert_eq!(progress.units[0].state, RowState::Failed);
-        assert_eq!(progress.units[0].message.as_deref(), Some("生成失败"));
-        assert_eq!(progress.received, 3);
-    }
-
-    /// 收尾事件按 `(dbnum, root_refno)` 回填。同一个 dbnum 下多个单元同时在跑时，
-    /// 只按 dbnum 找会把状态写到错误的那一行上。
-    #[test]
-    fn finish_lands_on_the_matching_unit_not_the_latest_one() {
-        let mut progress = Progress::default();
-        for refno in ["24381/1", "24381/2"] {
-            progress.apply(event(&format!(
-                r#"{{"kind":"model_unit_started","dbnum":7997,"root_refno":"{refno}","noun":"BRAN"}}"#
-            )));
-        }
-        progress.apply(event(
-            r#"{"kind":"model_unit_finished","dbnum":7997,"root_refno":"24381/1",
-                "success":true,"message":null}"#,
-        ));
-
-        assert_eq!(progress.units[0].state, RowState::Done);
-        assert_eq!(progress.units[1].state, RowState::Running);
-    }
-
-    /// 断线之后没收尾的行只能说「状态未知」，不许继续显示「进行中」；
-    /// 已经收过尾的行不受影响（ADR-0005）。
-    #[test]
-    fn disconnect_degrades_only_the_unfinished_rows() {
-        let mut progress = Progress::default();
-        progress.apply(event(
-            r#"{"kind":"model_unit_started","dbnum":7997,"root_refno":"24381/1","noun":"BRAN"}"#,
-        ));
-        progress.apply(event(
-            r#"{"kind":"model_unit_finished","dbnum":7997,"root_refno":"24381/1",
-                "success":true,"message":null}"#,
-        ));
-        progress.apply(event(
-            r#"{"kind":"model_unit_started","dbnum":7997,"root_refno":"24381/2","noun":"EQUI"}"#,
-        ));
-        progress.mark_unknown();
-
-        assert_eq!(progress.units[0].state, RowState::Done);
-        assert_eq!(progress.units[1].state, RowState::Unknown);
-    }
-
-    #[test]
-    fn behind_never_goes_negative_when_the_client_is_ahead() {
-        let mut progress = Progress::default();
-        progress.apply(event(
-            r#"{"kind":"data_batch_started","dbnum":1,"start_sesno":0,"end_sesno":1}"#,
-        ));
-        // 轮询与 WS 是两条通道，任务详情有可能比本端收到的还旧。
-        assert_eq!(progress.behind(0), 0);
-        assert_eq!(progress.behind(9), 8);
     }
 
     /// S2-E 的七种行形态。最要紧的两条：`PathMigrated` 是五种异常里唯一不阻断的，
@@ -3441,7 +2550,11 @@ mod tests {
                 },
                 DbForm::Duplicate,
             ),
-            (8163, FileAnomaly::Missing { path: "a".into() }, DbForm::Missing),
+            (
+                8163,
+                FileAnomaly::Missing { path: "a".into() },
+                DbForm::Missing,
+            ),
         ] {
             let mut blocked = db(dbnum, "DESI");
             blocked.anomaly = Some(anomaly);
@@ -3517,7 +2630,10 @@ mod tests {
         };
         let totals = preview.totals();
 
-        assert_eq!((totals.added, totals.modified, totals.deleted), (128, 342, 17));
+        assert_eq!(
+            (totals.added, totals.modified, totals.deleted),
+            (128, 342, 17)
+        );
         assert_eq!(totals.units, 23);
         assert_eq!(totals.model_affecting, 361);
         assert_eq!(totals.no_generation, 14);
@@ -3546,30 +2662,30 @@ mod tests {
         assert!(preview.executable());
     }
 
-    /// 分母缺一个就整条不给。**不许拿预览值相加凑一个**——那个加法两个方向都会偏。
-    #[test]
-    fn progress_counter_needs_both_ends_from_the_task_record() {
-        assert_eq!(
-            counted(Some(14), Some(24), "交付单元").as_deref(),
-            Some("14 / 24 个交付单元")
-        );
-        assert_eq!(counted(Some(14), None, "交付单元"), None);
-        assert_eq!(counted(None, Some(24), "交付单元"), None);
-    }
-
     /// 失败按 `code` 分型，不解析 message 字符串。
     #[test]
     fn failures_are_classified_by_code_only() {
         assert_eq!(
-            Failure::new("precondition", "sync_live=true 时不允许手动更新").form(),
-            FailForm::SyncLive
-        );
-        assert_eq!(
-            Failure::new("conflict", "项目 AMS-8009 已有手动更新任务正在执行: mu-3c81").form(),
-            FailForm::Conflict
+            Failure::new(
+                "identity_mismatch",
+                "请求的 mdb=/SAMPLE 与模型服务 mdb=/ALL 不一致"
+            )
+            .form(),
+            FailForm::IdentityMismatch
         );
         assert_eq!(Failure::new("timeout", "").form(), FailForm::Timeout);
         assert_eq!(Failure::new("internal", "").form(), FailForm::Internal);
+        // 「自动同步接管 · 422」与「已有任务在跑 · 409」随合流退役
+        // （gen-model ADR-011 §12）：这两个 code 若意外出现，不再有专属画面，
+        // 归 internal，原始 message 收进详情。
+        assert_eq!(
+            Failure::new("precondition", "sync_live=true 时不允许手动更新").form(),
+            FailForm::Internal
+        );
+        assert_eq!(
+            Failure::new("conflict", "已有任务正在执行: mu-3c81").form(),
+            FailForm::Internal
+        );
         // message 里带 sync_live 但 code 是 internal 的，仍然归 internal。
         assert_eq!(
             Failure::new("internal", "sync_live").form(),
@@ -3579,37 +2695,29 @@ mod tests {
 
     /// 结果摘要按契约字段名解。`status` 是 snake_case 的串，不是数字；
     /// **`batch` 是单数**——合流之后一个任务就是一个数据批次。
+    /// 消费者是任务队列视图（`TaskEntry.result`），向导不再跟任何一次运行。
     #[test]
     fn outcome_decodes_the_partial_terminal_contract() {
-        let run: Run = serde_json::from_str(
+        let outcome: Outcome = serde_json::from_str(
             r#"{
-                "task_id":"db-8000-7","kind":"data_batch","state":"partial",
-                "project":"AMS-8009","created_at":"2026-07-27T10:00:00+08:00",
-                "finished_at":"2026-07-27T10:04:38+08:00","events_seen":31,
-                "result":{
-                    "project":"AMS-8009","status":"partial",
-                    "batch":{"dbnum":8000,"db_type":"DESI","file_path":"a",
-                        "start_sesno":1024,"end_sesno":1034,"status":"applied",
-                        "message":null,"merged_sesnos":[1032,1033,1034],
-                        "changed_elements":512},
-                    "units":[{"dbnum":8000,"root_refno":"24381/2","noun":"EQUI",
-                        "status":"failed","attempts":3,"message":"写入生成结果失败"}],
-                    "warnings":["14 个变更无法解析合法生成根，跳过模型生成"]
-                }
+                "project":"AMS-8009","status":"partial",
+                "batch":{"dbnum":8000,"db_type":"DESI","file_path":"a",
+                    "start_sesno":1024,"end_sesno":1034,"status":"applied",
+                    "message":null,"merged_sesnos":[1032,1033,1034],
+                    "changed_elements":512},
+                "units":[{"dbnum":8000,"root_refno":"24381/2","noun":"EQUI",
+                    "status":"failed","attempts":3,"message":"写入生成结果失败"}],
+                "warnings":["14 个变更无法解析合法生成根，跳过模型生成"]
             }"#,
         )
         .expect("契约 payload 应当能解出来");
 
-        assert!(run.terminal());
-        let outcome = run.result.expect("终态必须带结果摘要");
         assert_eq!(outcome.status, RunStatus::Partial);
         let batch = outcome.batch.expect("数据批次摘要必须解得出来");
         assert_eq!(batch.status, BatchStatus::Applied);
         assert_eq!(batch.merged_sesnos, vec![1032, 1033, 1034]);
         assert_eq!(outcome.units[0].status, UnitStatus::Failed);
         assert_eq!(outcome.units[0].attempts, 3);
-        // ADR-0007 的四个计数还没有，缺了不该让整个任务详情解不出来。
-        assert_eq!(run.total_units, None);
     }
 
     /// 入队回执是数组不是单个 task_id：一次扫描可能排下好几个库，也可能一行都没排。

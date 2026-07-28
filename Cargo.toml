@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/plant-ui", "crates/plant-ui-data", "crates/plant-ui-app"]
+members = [
+    "crates/plant-ui",
+    "crates/plant-ui-data",
+    "crates/plant-ui-view3d",
+    "crates/plant-ui-app",
+]
 # vendor path deps must NOT be auto-absorbed as workspace members (would build with their own default features)
 exclude = ["vendor"]
 
@@ -11,6 +16,7 @@ edition = "2024"
 [workspace.dependencies]
 plant-ui = { path = "crates/plant-ui" }
 plant-ui-data = { path = "crates/plant-ui-data" }
+plant-ui-view3d = { path = "crates/plant-ui-view3d" }
 # vendored from rs-core-pin (= git rev 5667b70 + get_world fallthrough fix), editable
 # `render` 开着 bevy_render：三维搬进来之后几何侧要它（view3d-migration.md 决定 1）
 aios_core = { path = "vendor/rs-core", default-features = false, features = ["render"] }
@@ -55,9 +61,8 @@ wasm-bindgen = "=0.2.126"
 tungstenite = "0.23.0"
 # 命令行视图的本地时钟时间戳。aios_core 链上已经带进来了，不新增下载
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-# 三维视口的占位纹理。只开这两种编码，够读 assets/textures 下的图；
-# 包本身与两个解码器链上都已有，vendor 里不新增
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# std::time::Instant 在 wasm32-unknown-unknown 会 panic；此包在原生端保持同一 API。
+web-time = "1.1"
 
 # 上游 gpu-allocator 绑的 `windows` 版本与 wgpu-hal 的对不上，直接编不过：
 # `expected ID3D12Device, found a different ID3D12Device`（两份 windows crate）。

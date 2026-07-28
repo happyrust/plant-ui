@@ -63,6 +63,7 @@
 | 分布条三段 | 85 / 228 / 11 px | 契约 | 上面三数的比例 |
 | 受影响交付单元 | `23` | 契约 | `Σ DbnumPreview.units.len()`，`DeliveryUnitSummary` 已按 refno 去重 |
 | 其中影响模型的变化 | `361` | 契约 | `Σ DbnumPreview.model_affecting` |
+| 并发标注 | `1 个库正在应用，以上数字可能偏大` | 本地 | 队列快照里本项目 `state = running` 的行数（`task_queue::Vm::applying`）。合流删掉单飞预检后预览与数据批次可以并发，正在被应用的会话会被算进「待应用」（ADR-0011；gen-model ADR-011 §12）。为 0 时整行不画 |
 | 范围行 | `20 个 DESI 设计库在范围内 · 9 个 MDB 声明但项目内无文件` | 契约 | 三个理由分三个数，不许合成一个：`desi` 是当前 MDB 声明且项目里有文件的，`not_in_project` 是声明了够不着的，`excluded` 是非 DESI。**MDB 之外的设计库连行都没有**——那正是「287 行」收成「29 行」的地方 |
 | 树行库标识 | `db8000 · DESI` | 契约 | `dbnum` + `db_type` |
 | 树行会话区间 | `sesno 1 024 → 1 031` | 契约 | `applied_sesno + 1` → `file_latest_sesno` |
@@ -153,11 +154,15 @@
 | 形态 | 状态码 · code | 来源 | 出处 |
 |---|---|---|---|
 | 数据源未就绪 | 不发请求 | 本地 | `vm.data_source_ok = false`；`workbench/chrome.rs:106` 据此禁用入口按钮 |
-| 自动同步接管 | 422 · `precondition` | 契约 | `ApiError::from_domain` 里 message 含 `sync_live` 的分支 |
-| 已有任务在跑 | 409 · `conflict` | 契约 | `tasks.running_for_project` 命中；message 带着那个 `task_id` |
+| 范围不一致 | 422 · `identity_mismatch` | 契约 + 本地 | 服务端 `ServiceIdentity::validate`（显式 project / mdb / namespace 与服务不符，message 点名是哪一项）；本地闸门 `task_queue::Vm::can_mutate` 拦下时同码合成、不发请求。两处一个画面 |
 | 已是最新 | 200 | 契约 | `ManualUpdatePreview.up_to_date = true` |
 | 连不上 / 超时 | 504 · `timeout` | 契约 | `ApiError::timeout`，或客户端 600 秒上限到点 |
 | 其余 | 500 · `internal` | 契约 | **只有这一类**才需要把原始 message 摊出来，且收进「详情」默认折起 |
+
+> ~~「自动同步接管 · 422 · precondition」与「已有任务在跑 · 409 · conflict」~~ 随合流退役
+> （gen-model ADR-011 §12：单飞预检、`sync_live` 拒绝与 `ProjectExecGuard` 四处守卫全部删除，
+> 执行请求一律 202 入队；plant-ui ADR-0011 把 409 那一格改成入队回执「已入队，排在第 N 位」，
+> 回执现在进日志并跳转任务队列视图）。这两个 code 若意外出现，没有专属画面，归 `internal`。
 
 ---
 

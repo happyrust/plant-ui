@@ -1,16 +1,30 @@
-use std::io::Read;
-use std::path::PathBuf;
-use crate::{NamedAttrMap, RefU64, SurlValue, SUL_DB};
+use crate::{NamedAttrMap, RefU64, SUL_DB, SurlValue};
 use cached::proc_macro::cached;
+#[cfg(not(target_arch = "wasm32"))]
+use std::io::Read;
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::PathBuf;
 
+#[cfg(target_arch = "wasm32")]
 pub async fn define_common_functions() -> anyhow::Result<()> {
-    let target_dir = std::fs::read_dir("resource/surreal")?.into_iter()
+    // ponytail: 浏览器只消费服务端已初始化的库；浏览器需要建库时再把 SQL 编译进 WASM。
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn define_common_functions() -> anyhow::Result<()> {
+    let target_dir = std::fs::read_dir("resource/surreal")?
+        .into_iter()
         .map(|entry| {
             let entry = entry.unwrap();
             entry.path()
-        }).collect::<Vec<PathBuf>>();
+        })
+        .collect::<Vec<PathBuf>>();
     for file in target_dir {
-        println!("载入surreal {}",file.file_name().unwrap().to_str().unwrap().to_string());
+        println!(
+            "载入surreal {}",
+            file.file_name().unwrap().to_str().unwrap().to_string()
+        );
         let mut file = std::fs::File::open(file)?;
         let mut content = String::new();
         file.read_to_string(&mut content)?;
@@ -20,11 +34,11 @@ pub async fn define_common_functions() -> anyhow::Result<()> {
 }
 
 /// 定义数据库编号事件
-/// 
+///
 /// 当创建新的 pe 记录时,会触发此事件来更新 dbnum_info_table 表中的信息
-/// 
+///
 /// # 错误
-/// 
+///
 /// 如果数据库操作失败,将返回错误
 pub async fn define_dbnum_event() -> anyhow::Result<()> {
     SUL_DB

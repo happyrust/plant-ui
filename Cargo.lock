@@ -1413,6 +1413,7 @@ dependencies = [
 name = "bevy_egui35"
 version = "0.35.1"
 dependencies = [
+ "arboard",
  "bevy_app",
  "bevy_asset",
  "bevy_core_pipeline",
@@ -1435,6 +1436,7 @@ dependencies = [
  "encase",
  "image",
  "js-sys",
+ "thread_local",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
@@ -4894,8 +4896,6 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
- "zune-core",
- "zune-jpeg",
 ]
 
 [[package]]
@@ -6750,6 +6750,7 @@ dependencies = [
  "egui_extras",
  "serde",
  "serde_json",
+ "web-time",
 ]
 
 [[package]]
@@ -6769,13 +6770,14 @@ dependencies = [
  "ehttp",
  "ewebsock",
  "getrandom 0.3.4",
- "image",
  "plant-ui",
  "plant-ui-data",
+ "plant-ui-view3d",
  "ring",
  "serde",
  "serde_json",
  "wasm-bindgen",
+ "web-time",
 ]
 
 [[package]]
@@ -6784,7 +6786,23 @@ version = "0.1.0"
 dependencies = [
  "aios_core",
  "anyhow",
+ "glam",
  "tokio",
+]
+
+[[package]]
+name = "plant-ui-view3d"
+version = "0.1.0"
+dependencies = [
+ "aios_core",
+ "anyhow",
+ "bevy",
+ "bevy_egui35",
+ "getrandom 0.3.4",
+ "plant-ui",
+ "ring",
+ "web-sys",
+ "web-time",
 ]
 
 [[package]]

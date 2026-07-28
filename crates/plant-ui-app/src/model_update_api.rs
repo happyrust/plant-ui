@@ -3,7 +3,7 @@ use serde::de::DeserializeOwned;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use plant_ui::model_update::{Enqueued, Failure, Preview, Run};
+use plant_ui::model_update::{Enqueued, Failure, Preview};
 use plant_ui::task_queue::{DbnumReport, Health, PendingUnits, Poll, QueueSnapshot, TaskList};
 
 /// 服务端的统一错误包封 `{ code, message, detail }`（`web_service/mod.rs` 的 `ApiError`）。
@@ -55,11 +55,16 @@ pub fn set_base_url(base: String) -> anyhow::Result<()> {
 /// 作为扫描白名单。**由客户端给**：范围既然由 MDB 定，界面显示的范围与服务端
 /// 真跑的范围就必须同源；让服务端读自己那份 `DbOption.toml`，两边配置一错开
 /// 就是静默的。
-pub async fn preview(base: &str, project: &str, mdb: &str) -> anyhow::Result<Preview> {
+pub async fn preview(
+    base: &str,
+    project: &str,
+    mdb: &str,
+    namespace: &str,
+) -> anyhow::Result<Preview> {
     post(
         base,
         "/api/v1/update/preview",
-        serde_json::json!({ "project": project, "mdb": mdb }).to_string(),
+        serde_json::json!({ "project": project, "mdb": mdb, "namespace": namespace }).to_string(),
         Duration::from_secs(600),
     )
     .await
@@ -67,18 +72,19 @@ pub async fn preview(base: &str, project: &str, mdb: &str) -> anyhow::Result<Pre
 
 /// 扫描 + 入队。合流之后它**一律入队**，回执是入队的批次数组而不是单个 task_id
 /// ——进度去任务队列视图看（ADR-0011）。范围口径与 [`preview`] 同源。
-pub async fn execute(base: &str, project: &str, mdb: &str) -> anyhow::Result<Enqueued> {
+pub async fn execute(
+    base: &str,
+    project: &str,
+    mdb: &str,
+    namespace: &str,
+) -> anyhow::Result<Enqueued> {
     post(
         base,
         "/api/v1/update/execute",
-        serde_json::json!({ "project": project, "mdb": mdb }).to_string(),
+        serde_json::json!({ "project": project, "mdb": mdb, "namespace": namespace }).to_string(),
         Duration::from_secs(60),
     )
     .await
-}
-
-pub async fn task(base: &str, run_id: &str) -> anyhow::Result<Run> {
-    get(base, &format!("/api/v1/tasks/{run_id}")).await
 }
 
 /// 队列面板的一次轮询。
@@ -94,10 +100,9 @@ pub async fn poll_queue(base: &str) -> anyhow::Result<Poll> {
     // 后两份取不到不该让整次轮询作废：队列行已经在手上了，缺的只是「队列已重建」
     // 横幅与「欠 N 个单元」，各自缺席时那一格不画就是了。
     let health = get::<Health>(base, "/api/v1/health").await.ok();
-    let pending = get::<PendingUnits>(base, "/api/v1/update/pending-units")
-        .await
-        .map(|p| p.units)
-        .unwrap_or_default();
+    let pending = get::<PendingUnits>(base, "/api/v1/update/pending-units").await;
+    let pending_known = pending.is_ok();
+    let pending = pending.map(|p| p.units).unwrap_or_default();
     // `/dbnums` 要重扫项目目录，是这四个里最慢的一个；取不到就少画「本期不执行」
     // 那一格，不该拖垮整次轮询。
     let dbnums = get::<DbnumReport>(base, "/api/v1/dbnums")
@@ -109,6 +114,7 @@ pub async fn poll_queue(base: &str) -> anyhow::Result<Poll> {
         tasks: tasks.tasks,
         health,
         pending,
+        pending_known,
         dbnums,
     })
 }
@@ -132,34 +138,6 @@ async fn get<T: DeserializeOwned>(base: &str, path: &str) -> anyhow::Result<T> {
         .map_err(transport)
         .context("请求模型服务失败")?;
     request(response)
-}
-
-/// `POST /api/v1/model/ensure` 的回执里本端用得上的那两个数。
-///
-/// 不收 `status`：带 `force` 发出去的请求不会回 `AlreadyAvailable`，剩下的两种终态
-/// 「画得出来」与「画不出来」这两个计数就分得干净，没必要再跟服务端的枚举名对齐。
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct Ensured {
-    /// 画得出来的实例数。
-    #[serde(default)]
-    pub model_instance_count: usize,
-    /// 生成写出的实例数，含画不出来的。两者不等就是生成跑过但缺几何。
-    #[serde(default)]
-    pub generated_instance_count: usize,
-}
-
-/// 重新生成一个交付单元——S4-C 上那枚「重试」就是它。
-///
-/// 带 `force`：人按下重试就是要它重跑一遍。不带的话，服务端对「已经生成过、
-/// 只是画不出来」的生成根会直接回状态，那正是这枚按钮不该有的行为。
-pub async fn ensure_model(base: &str, root_refno: &str) -> anyhow::Result<Ensured> {
-    post(
-        base,
-        "/api/v1/model/ensure",
-        serde_json::json!({ "refno": root_refno, "force": true }).to_string(),
-        Duration::from_secs(120),
-    )
-    .await
 }
 
 async fn post<T: DeserializeOwned>(
@@ -229,7 +207,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decodes_preview_payload_and_terminal_task_contract() {
+    fn decodes_preview_payload_and_enqueue_receipt() {
         let preview: Preview = serde_json::from_str(
             r#"{
                 "project":"ProjAMS",
@@ -288,23 +266,8 @@ mod tests {
         // 它立刻变成一个「需初始化 · 会执行」的批次。这条断言守的就是那一步。
         assert!(!preview.dbnums[1].will_run());
 
-        let run: Run = serde_json::from_str(
-            r#"{
-                "task_id":"mu-1",
-                "kind":"manual_update",
-                "project":"ProjAMS",
-                "state":"partial",
-                "created_at":"2026-07-27T10:00:00+08:00",
-                "finished_at":"2026-07-27T10:01:00+08:00",
-                "events_seen":3,
-                "result":{"batches":[],"units":[],"warnings":[]}
-            }"#,
-        )
-        .unwrap();
-        assert!(run.terminal());
         assert!(serde_json::from_str::<Preview>("{}").is_err());
-        assert!(serde_json::from_str::<Run>("{}").is_err());
-        // 入队回执与上面两个不同：**空回执是合法的**——一次扫描完全可能一行都不用排
+        // 入队回执与预览不同：**空回执是合法的**——一次扫描完全可能一行都不用排
         // （都并进了既有排队行，或者水位本来就最新），那不是契约缺字段。
         let idle = serde_json::from_str::<Enqueued>("{}").expect("空回执合法");
         assert!(idle.enqueued.is_empty());

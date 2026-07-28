@@ -49,7 +49,11 @@ fn vm(running: Option<&str>) -> Vm {
         .iter()
         .zip([2u32, 3, 4])
         .map(|(id, dbnum)| {
-            let state = if running == Some(*id) { "running" } else { "queued" };
+            let state = if running == Some(*id) {
+                "running"
+            } else {
+                "queued"
+            };
             queue_row(id, dbnum, state)
         })
         .collect();
@@ -57,7 +61,11 @@ fn vm(running: Option<&str>) -> Vm {
         .iter()
         .zip([2u32, 3, 4])
         .map(|(id, dbnum)| {
-            let state = if running == Some(*id) { "running" } else { "queued" };
+            let state = if running == Some(*id) {
+                "running"
+            } else {
+                "queued"
+            };
             task(id, dbnum, state)
         })
         .collect();
@@ -131,10 +139,7 @@ fn row_ids_follow_the_task_not_the_position() {
         after[2].top() < after[0].top() && after[2].top() < after[1].top(),
         "运行中那一行要置顶，且拿到的仍是 t-4 自己的矩形而不是原位置上那一行的"
     );
-    assert!(
-        after[0].top() < after[1].top(),
-        "剩下两行的先后不变"
-    );
+    assert!(after[0].top() < after[1].top(), "剩下两行的先后不变");
     // 位置号那一版在这里也能「过」——因为它压根取不到 id，上面第一条断言就先红了。
     assert_ne!(
         before[2], after[2],

@@ -73,7 +73,12 @@ impl eframe::App for GalleryApp {
                     egui_phosphor::regular::EYE_CLOSED,
                     false,
                 ));
-                let _ = ui.add(widgets::tool_btn(&t, d, egui_phosphor::regular::EYES, false));
+                let _ = ui.add(widgets::tool_btn(
+                    &t,
+                    d,
+                    egui_phosphor::regular::EYES,
+                    false,
+                ));
             });
 
             ui.add_space(12.0);
@@ -85,7 +90,14 @@ impl eframe::App for GalleryApp {
             // 才画得出来——但那一格的宽度**任何时候都占着**，`24381/100060` 的
             // 位置不该随悬停移动。
             let rows: [(usize, &str, Option<bool>, bool, bool, Eye); 4] = [
-                (0, "SITE /-RX-CSV-OLD", Some(false), false, false, Eye::Hidden),
+                (
+                    0,
+                    "SITE /-RX-CSV-OLD",
+                    Some(false),
+                    false,
+                    false,
+                    Eye::Hidden,
+                ),
                 (0, "SITE /-RX-CSV", Some(true), false, false, Eye::Shown),
                 (
                     1,

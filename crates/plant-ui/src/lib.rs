@@ -142,12 +142,6 @@ pub enum Cmd {
     CancelModelUpdatePreview,
     /// 执行当前项目的全部待更新库；范围由服务端的 Committed Watermark 决定。
     ExecuteModelUpdate,
-    /// 重开执行期的明细长连接。断线降级的是列表区，进度计数走轮询不受影响，
-    /// 所以这条只补明细，不影响任务本身。
-    ReconnectModelUpdateFeed,
-    /// 重新生成一个交付单元（`POST /api/v1/model/ensure`，带 `force`）。可以反复按，
-    /// 但每按一次服务端就真的重跑一遍生成——它不是一次免费的查询。
-    RetryModelUnit { root_refno: String },
     /// 任务队列上的「立刻扫一遍」。它**不插队**，作用只是别等服务端下一个 30 秒轮询。
     ScanNow,
     /// 暂停 / 恢复队列出队。暂停**只挡出队**，正在跑的那一批会跑完为止——
@@ -173,4 +167,25 @@ pub enum Cmd {
     ResizeViewport([u32; 2]),
     /// 对模型的显示 / 定位类动作。
     Model(ModelAction),
+    /// 主题下发的三维视口配色：渐变背景上下两色与地面网格线色。
+    ///
+    /// 背景渐变画在宿主的全屏背景面片上（拷问定案第 2 题，用户点名 Bevy 内画），
+    /// 而主题只有绘制层认识，所以切主题的当帧由 App 把三个颜色送下去；宿主无状态，
+    /// 不认识「主题」，只认颜色。
+    SetViewportBackground {
+        top: egui::Color32,
+        bottom: egui::Color32,
+        grid: egui::Color32,
+    },
+    /// ViewCube 触发的一次视角跳转。
+    ///
+    /// `forward` / `up` 是**宿主世界系**（场景已含 PDMS Z-up → Bevy Y-up 那次旋转）
+    /// 的单位向量——PDMS 语义到世界系的换算只有绘制层的立方体模块知道，宿主拿来
+    /// 直接用。`fit = true`（Home 键）时同时把距离拉到能装下全部可见模型。
+    /// 跳转带 0.3s 插值动画，动画期间来任何相机手势立即让位。
+    SnapView {
+        forward: [f32; 3],
+        up: [f32; 3],
+        fit: bool,
+    },
 }

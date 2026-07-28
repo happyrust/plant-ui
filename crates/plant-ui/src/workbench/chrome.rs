@@ -88,10 +88,7 @@ pub fn command_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: 
                                 "取回工作 GET WORK"
                             };
                             if ui
-                                .add_enabled(
-                                    vm.data_source_ok && !busy,
-                                    egui::Button::new(label),
-                                )
+                                .add_enabled(vm.data_source_ok && !busy, egui::Button::new(label))
                                 .clicked()
                             {
                                 cmds.push(Cmd::GetWork);

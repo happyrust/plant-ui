@@ -1527,15 +1527,21 @@ pub fn update_egui_textures_system(
             ));
             if let Some(pos) = image_delta.pos {
                 // Partial update.
-                if let Some(managed_texture) = egui_managed_textures.get_mut(&(entity, texture_id))
-                {
-                    // TODO: when bevy supports it, only update the part of the texture that changes.
-                    update_image_rect(&mut managed_texture.color_image, pos, &color_image);
-                    let image =
-                        render::color_image_as_bevy_image(&managed_texture.color_image, sampler);
-                    managed_texture.handle = image_assets.add(image);
-                } else {
+                let Some(managed_texture) = egui_managed_textures.get_mut(&(entity, texture_id))
+                else {
                     log::warn!("Partial update of a missing texture (id: {:?})", texture_id);
+                    continue;
+                };
+                let Some(image) = image_assets.get_mut(&managed_texture.handle) else {
+                    log::warn!("Partial update of a missing texture (id: {:?})", texture_id);
+                    continue;
+                };
+                update_image_rect(&mut managed_texture.color_image, pos, &color_image);
+                if !update_bevy_image_rect(image, pos, &color_image) {
+                    log::error!(
+                        "Failed to write into texture (id: {:?}) for partial update",
+                        texture_id
+                    );
                 }
             } else {
                 // Full update.
@@ -1559,6 +1565,25 @@ pub fn update_egui_textures_system(
             }
         }
     }
+}
+
+#[cfg(feature = "render")]
+fn update_bevy_image_rect(dest: &mut Image, [x, y]: [usize; 2], src: &egui::ColorImage) -> bool {
+    let width = dest.width() as usize;
+    let height = dest.height() as usize;
+    if x + src.width() > width || y + src.height() > height {
+        return false;
+    }
+    let Some(data) = dest.data.as_mut() else {
+        return false;
+    };
+    for sy in 0..src.height() {
+        for sx in 0..src.width() {
+            let offset = ((y + sy) * width + x + sx) * 4;
+            data[offset..offset + 4].copy_from_slice(&src[(sx, sy)].to_srgba_unmultiplied());
+        }
+    }
+    true
 }
 
 /// This system is responsible for deleting image assets of freed Egui-managed textures and deleting Egui user textures of removed Bevy image assets.

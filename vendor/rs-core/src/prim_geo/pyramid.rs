@@ -12,10 +12,10 @@ use truck_modeling::builder::try_attach_plane;
 #[cfg(feature = "truck")]
 use truck_modeling::builder::*;
 
+use crate::NamedAttrMap;
 #[cfg(feature = "occ")]
 use crate::prim_geo::basic::OccSharedShape;
 use crate::shape::pdms_shape::{BrepShapeTrait, VerifiedShape};
-use crate::NamedAttrMap;
 use bevy_ecs::prelude::*;
 #[cfg(feature = "occ")]
 use opencascade::primitives::*;
@@ -180,7 +180,7 @@ impl BrepShapeTrait for Pyramid {
         // }
         if tx + ty < 0.001 {
             verts.push(Vertex::new(DVec3::new(ox, oy, h2)));
-        } 
+        }
         //todo use line to generate
         // else if tx < 0.001 {
         //     let mut pts = vec![
@@ -196,7 +196,7 @@ impl BrepShapeTrait for Pyramid {
         //     ];
         //     dbg!(&pts);
         //     polys.push(Wire::from_ordered_points(pts)?);
-        // } 
+        // }
         else {
             let mut pts = vec![
                 DVec3::new(-tx + ox, -ty + oy, h2),
@@ -210,7 +210,7 @@ impl BrepShapeTrait for Pyramid {
         // dbg!(bx, by);
         if bx + by < 0.001 {
             verts.push(Vertex::new(DVec3::new(-ox, -oy, -h2)));
-        } 
+        }
         // else if bx < 0.001 {
         //     let mut pts = vec![
         //         DVec3::new(bx - ox, -by - oy, -h2),
@@ -225,7 +225,7 @@ impl BrepShapeTrait for Pyramid {
         //     ];
         //     dbg!(&pts);
         //     polys.push(Wire::from_ordered_points(pts)?);
-        // } 
+        // }
         else {
             let mut pts = vec![
                 DVec3::new(-bx - ox, -by - oy, -h2),

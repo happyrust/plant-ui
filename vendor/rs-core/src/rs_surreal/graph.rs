@@ -1,13 +1,14 @@
 use crate::aios_db_mgr::aios_mgr::AiosDBMgr;
-use crate::error::{init_deserialize_error, init_query_error, HandleError};
+use crate::error::{HandleError, init_deserialize_error, init_query_error};
 use crate::noun_graph::*;
 use crate::pdms_types::{EleTreeNode, PdmsElement};
 use crate::pe::SPdmsElement;
+use crate::query_ancestor_refnos;
 use crate::ssc_setting::PbsElement;
 use crate::three_dimensional_review::ModelDataIndex;
 use crate::types::*;
-use crate::{query_types, rs_surreal, NamedAttrMap, RefU64};
-use crate::{SurlValue, SUL_DB};
+use crate::{NamedAttrMap, RefU64, query_types, rs_surreal};
+use crate::{SUL_DB, SurlValue};
 use anyhow::anyhow;
 use cached::proc_macro::cached;
 use indexmap::IndexMap;
@@ -21,7 +22,6 @@ use std::fs::{File, OpenOptions};
 use std::str::FromStr;
 use surrealdb::method::Stats;
 use surrealdb::sql::Thing;
-use crate::query_ancestor_refnos;
 
 #[inline]
 #[cached(result = true)]
@@ -414,14 +414,14 @@ pub async fn query_multi_deep_children_filter_spre(
 }
 
 /// 查询指定refno的祖先节点中符合指定类型的节点
-/// 
+///
 /// # 参数
 /// * `refno` - 要查询的refno
 /// * `nouns` - 要过滤的祖先节点类型列表
-/// 
+///
 /// # 返回值
 /// * `Vec<RefnoEnum>` - 符合指定类型的祖先节点refno列表
-/// 
+///
 /// # 错误
 /// * 如果查询失败会返回错误
 pub async fn query_filter_ancestors(
@@ -509,7 +509,9 @@ struct WallDoorResult {
 }
 
 /// 根据选择节点找到下面的wall和wall上的门
-pub async fn query_wall_doors(refno: RefU64) -> anyhow::Result<HashMap<RefU64, Vec<WallContainsDoor>>> {
+pub async fn query_wall_doors(
+    refno: RefU64,
+) -> anyhow::Result<HashMap<RefU64, Vec<WallContainsDoor>>> {
     // 找到墙
     let mut walls_q = SUL_DB
         .query(format!(

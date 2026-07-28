@@ -12,6 +12,8 @@ use crate::style::widgets;
 /// （见 gen-model/DbOption.toml 的注释）。指向 8020 不会干净地连不上，
 /// 而是打进那个实例、拿回一个看着像模像样的 HTTP 错误。
 pub const DEFAULT_MODEL_API_URL: &str = "http://127.0.0.1:8021";
+/// 数据中心服务地址。它与模型更新服务是两个独立进程，不能复用 8021。
+pub const DEFAULT_DATA_API_URL: &str = "http://127.0.0.1:9099";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Theme {
@@ -33,6 +35,7 @@ pub struct Settings {
     pub theme: Theme,
     pub density: Density,
     pub model_api_url: String,
+    pub data_api_url: String,
 }
 
 impl Default for Settings {
@@ -41,6 +44,7 @@ impl Default for Settings {
             theme: Theme::Light,
             density: Density::Standard,
             model_api_url: DEFAULT_MODEL_API_URL.to_owned(),
+            data_api_url: DEFAULT_DATA_API_URL.to_owned(),
         }
     }
 }
@@ -122,6 +126,20 @@ pub fn show(ctx: &egui::Context, t: &Tokens, d: Density, state: &mut State) -> O
                     );
                 },
             );
+            setting_row(
+                ui,
+                t,
+                "数据服务地址",
+                "数据中心与房间查询接口，保存后下一次提交生效",
+                |ui| {
+                    ui.add(
+                        TextEdit::singleline(&mut state.draft.data_api_url)
+                            .desired_width(300.0)
+                            .font(Font::mono(d))
+                            .hint_text(DEFAULT_DATA_API_URL),
+                    );
+                },
+            );
 
             ui.add_space(12.0);
             ui.label(RichText::new("服务").strong().color(t.text_secondary));
@@ -161,6 +179,7 @@ pub fn show(ctx: &egui::Context, t: &Tokens, d: Density, state: &mut State) -> O
     }
     if save {
         state.draft.model_api_url = normalize_api_url(&state.draft.model_api_url);
+        state.draft.data_api_url = normalize_data_api_url(&state.draft.data_api_url);
         state.saved = state.draft.clone();
         state.open = false;
         return Some(state.saved.clone());
@@ -174,6 +193,15 @@ fn normalize_api_url(raw: &str) -> String {
     let url = raw.trim().trim_end_matches('/');
     if url.is_empty() {
         DEFAULT_MODEL_API_URL.to_owned()
+    } else {
+        url.to_owned()
+    }
+}
+
+fn normalize_data_api_url(raw: &str) -> String {
+    let url = raw.trim().trim_end_matches('/');
+    if url.is_empty() {
+        DEFAULT_DATA_API_URL.to_owned()
     } else {
         url.to_owned()
     }
@@ -210,6 +238,7 @@ mod tests {
     fn default_api_url_avoids_the_surreal_port() {
         assert_eq!(Settings::default().model_api_url, DEFAULT_MODEL_API_URL);
         assert!(!DEFAULT_MODEL_API_URL.ends_with(":8020"));
+        assert_eq!(Settings::default().data_api_url, DEFAULT_DATA_API_URL);
     }
 
     #[test]
@@ -219,6 +248,10 @@ mod tests {
             "http://10.0.0.9:8021"
         );
         assert_eq!(normalize_api_url("   "), DEFAULT_MODEL_API_URL);
+        assert_eq!(
+            normalize_data_api_url("  http://10.0.0.9:9099/  "),
+            "http://10.0.0.9:9099"
+        );
     }
 
     #[test]
@@ -226,9 +259,11 @@ mod tests {
         let mut state = State::default();
         state.adopt(Settings {
             model_api_url: "http://10.0.0.9:8021".into(),
+            data_api_url: "http://10.0.0.9:9099".into(),
             ..Settings::default()
         });
         state.open();
         assert_eq!(state.saved.model_api_url, "http://10.0.0.9:8021");
+        assert_eq!(state.saved.data_api_url, "http://10.0.0.9:9099");
     }
 }

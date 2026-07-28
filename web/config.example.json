@@ -5,8 +5,10 @@
     "secure": false,
     "namespace": "plant",
     "database": "project",
+    "mdb": "/ALL",
     "username": "root",
     "password": "root"
   },
-  "model_api_url": "http://127.0.0.1:8021"
+  "model_api_url": "http://127.0.0.1:8021",
+  "data_api_url": "http://127.0.0.1:9099"
 }

@@ -4,7 +4,7 @@
 //! 这里用 `show_rows` 只画视口内的行；行内文字裁剪由 `tree_row_ui` 保证，
 //! 长 PDMS 名不会撑破行。
 
-use egui::{ScrollArea, Ui};
+use egui::{Id, ScrollArea, Ui, UiBuilder};
 use egui_phosphor::regular as ph;
 
 use crate::style::tokens::{Density, Status, Tokens, space};
@@ -63,10 +63,17 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                             } else {
                                 row.noun.as_str()
                             };
-                            // 行 id 按 refno 定：虚拟滚动下自动 id 是「视野内第几行」，
-                            // 滚一下同一个 id 就落到另一个元素上，右键菜单会跟着串行。
+                            // 行 id 按 refno 定死：虚拟滚动下自动 id 是「第几行」，
+                            // 行序一变同一个 id 就落到另一个元素上，右键菜单会跟着串行。
+                            //
+                            // 这里要的是 `UiBuilder::id` 而不是 `push_id`：`push_id` 只
+                            // 定住子 Ui 的 `id`，它内部控件仍从 `unique_id` 取号，而
+                            // `unique_id = id.with(父 Ui 的自动计数)` 又把行序混了回来。
+                            // 展开 / 折叠会让下方每一行都换号，egui 的
+                            // `warn_if_rect_changes_id` 逐行描红框（调试构建默认开）。
+                            let id = Id::new(("wb-tree-row", row.refno));
                             let out = ui
-                                .push_id(row.refno, |ui| {
+                                .scope_builder(UiBuilder::new().id(id), |ui| {
                                     widgets::tree_row_ui(
                                         ui,
                                         t,
@@ -129,14 +136,12 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                             // 右键落在选择集**外**才重设选中；落在集内保持整批，
                             // 否则「选中三个再右键其中一个」会把批量选择打散，
                             // 菜单上那句「隐藏所选 3 项」也就无从谈起。
-                            if out.response.secondary_clicked()
-                                && !vm.selection.contains(row.refno)
+                            if out.response.secondary_clicked() && !vm.selection.contains(row.refno)
                             {
                                 cmds.push(Cmd::SelectElement(row.refno));
                             }
-                            out.response.context_menu(|ui| {
-                                row_menu(ui, row, &vm.selection, live, cmds)
-                            });
+                            out.response
+                                .context_menu(|ui| row_menu(ui, row, &vm.selection, live, cmds));
                         }
                     });
                 });
@@ -187,13 +192,7 @@ fn click_selection(
 ///
 /// 「隐藏全部」是全局动作，只在工具栏出现：每个节点的菜单里重复一遍，看着像
 /// 「隐藏这一支的全部」，其实不是。
-fn row_menu(
-    ui: &mut Ui,
-    row: &TreeRowVm,
-    selection: &Selection,
-    live: bool,
-    cmds: &mut Vec<Cmd>,
-) {
+fn row_menu(ui: &mut Ui, row: &TreeRowVm, selection: &Selection, live: bool, cmds: &mut Vec<Cmd>) {
     // 右键落在集内 = 对整批操作；落在集外 = 只对这一行。
     let targets: Vec<_> = if selection.contains(row.refno) {
         selection.to_vec()

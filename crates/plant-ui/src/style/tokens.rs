@@ -41,6 +41,9 @@ pub struct Tokens {
 
     pub viewport_top: Color32,
     pub viewport_bottom: Color32,
+    /// 三维视口地面网格线。底色是 `viewport_top/bottom` 渐变，网格要在两套主题的
+    /// 渐变上都退得够远、又不至于消失，所以是独立令牌而不是 `border` 一物两用。
+    pub viewport_grid: Color32,
 }
 
 impl Tokens {
@@ -71,6 +74,7 @@ impl Tokens {
             success_bg: rgb(0x16, 0x30, 0x1F),
             viewport_top: rgb(0x23, 0x2F, 0x3A),
             viewport_bottom: rgb(0x0E, 0x13, 0x18),
+            viewport_grid: rgb(0x46, 0x58, 0x6A),
         }
     }
 
@@ -101,6 +105,7 @@ impl Tokens {
             success_bg: rgb(0xE1, 0xF2, 0xE7),
             viewport_top: rgb(0xDC, 0xE7, 0xF2),
             viewport_bottom: rgb(0xF4, 0xF7, 0xFA),
+            viewport_grid: rgb(0x7E, 0x93, 0xA6),
         }
     }
 

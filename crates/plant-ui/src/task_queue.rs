@@ -140,6 +140,10 @@ pub struct Health {
     #[serde(default)]
     pub project: String,
     #[serde(default)]
+    pub mdb: Option<String>,
+    #[serde(default)]
+    pub namespace: Option<String>,
+    #[serde(default)]
     pub sync_live: bool,
     #[serde(default)]
     pub started_at: String,
@@ -147,6 +151,10 @@ pub struct Health {
     pub gen_spatial_tree: bool,
     #[serde(default)]
     pub queue_paused: bool,
+    #[serde(default)]
+    pub worker_alive: Option<bool>,
+    #[serde(default)]
+    pub worker_idle_secs: Option<u64>,
 }
 
 /// `GET /api/v1/update/pending-units`。走持久表，**不依赖任务历史**——一个库
@@ -193,6 +201,8 @@ pub struct Poll {
     pub tasks: Vec<TaskEntry>,
     pub health: Option<Health>,
     pub pending: Vec<PendingModelUnit>,
+    /// pending 接口是否成功。失败不能冒充“欠账清零”，否则会过早替换旧三维。
+    pub pending_known: bool,
     pub dbnums: Vec<DbnumStatus>,
 }
 
@@ -225,6 +235,8 @@ pub struct Vm {
     /// 打的是 execute，那个请求要带 MDB。没有 MDB 就发出去，服务端解不出范围会
     /// 一律报错（ADR-0013），人只能在日志里看到一条说不清缘由的失败。
     pub mdb: String,
+    /// 当前数据源的 Surreal namespace。与项目、MDB 一起构成 gen-model 固定服务范围。
+    pub namespace: String,
     pub queue: QueueSnapshot,
     pub tasks: Vec<TaskEntry>,
     pub health: Option<Health>,
@@ -241,12 +253,21 @@ pub struct Vm {
     pub loaded: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityStatus {
+    Match,
+    Legacy,
+    Mismatch,
+}
+
 impl Vm {
     pub fn adopt(&mut self, poll: Poll) {
         self.queue = poll.queue;
         self.tasks = poll.tasks;
         self.health = poll.health;
-        self.pending = poll.pending;
+        if poll.pending_known {
+            self.pending = poll.pending;
+        }
         self.dbnums = poll.dbnums;
         self.error = None;
         self.loaded = true;
@@ -316,6 +337,51 @@ impl Vm {
         self.queue.paused
     }
 
+    pub fn identity_status(&self) -> IdentityStatus {
+        let Some(health) = &self.health else {
+            return IdentityStatus::Legacy;
+        };
+        let (Some(service_mdb), Some(service_namespace)) =
+            (health.mdb.as_deref(), health.namespace.as_deref())
+        else {
+            return IdentityStatus::Legacy;
+        };
+        if self.project.trim().is_empty()
+            || self.mdb.trim().is_empty()
+            || self.namespace.trim().is_empty()
+        {
+            return IdentityStatus::Legacy;
+        }
+        if (!health.project.is_empty() && health.project.trim() != self.project.trim())
+            || normalize_mdb(service_mdb) != normalize_mdb(&self.mdb)
+            || service_namespace.trim() != self.namespace.trim()
+        {
+            IdentityStatus::Mismatch
+        } else {
+            IdentityStatus::Match
+        }
+    }
+
+    pub fn can_mutate(&self) -> bool {
+        !self.project.trim().is_empty()
+            && !self.mdb.trim().is_empty()
+            && !self.namespace.trim().is_empty()
+            && self.identity_status() != IdentityStatus::Mismatch
+    }
+
+    /// 此刻正在应用的数据批次数（本项目、`state == "running"` 的队列行）。
+    ///
+    /// 合流删掉单飞预检之后预览与批次可以并发，正在被应用的会话会被算进
+    /// 「待应用」——预览页拿这个数标注「N 个库正在应用，数字可能偏大」
+    /// （ADR-0011）。单 worker 下它是 0 或 1，这里不写死这个假设。
+    pub fn applying(&self) -> usize {
+        self.queue
+            .rows
+            .iter()
+            .filter(|row| row.state == "running" && self.mine(&row.task_id))
+            .count()
+    }
+
     /// 房间轮：最近那条 `room_recalc` 任务。泳道本身是客户端第 4 项，这里只取
     /// 顶栏摘要要用的那个数。
     fn room_task(&self) -> Option<&TaskEntry> {
@@ -356,6 +422,15 @@ impl Vm {
             }
             _ => true,
         }
+    }
+}
+
+fn normalize_mdb(mdb: &str) -> String {
+    let mdb = mdb.trim();
+    if mdb.is_empty() || mdb.starts_with('/') {
+        mdb.to_owned()
+    } else {
+        format!("/{mdb}")
     }
 }
 
@@ -472,7 +547,12 @@ pub enum Filter {
 }
 
 impl Filter {
-    const ALL: [Filter; 4] = [Filter::Changed, Filter::All, Filter::Running, Filter::Failed];
+    const ALL: [Filter; 4] = [
+        Filter::Changed,
+        Filter::All,
+        Filter::Running,
+        Filter::Failed,
+    ];
 
     fn label(self) -> &'static str {
         match self {
@@ -712,9 +792,7 @@ pub fn lane(vm: &Vm) -> Option<Lane> {
     let task = vm.room_task();
     let counts = task.and_then(|t| t.detail).unwrap_or_default();
     let running = task.is_some_and(|t| t.state == "running");
-    let waited = task
-        .and_then(|t| t.finished_at.as_deref())
-        .and_then(since);
+    let waited = task.and_then(|t| t.finished_at.as_deref()).and_then(since);
     let live = counts.panels + counts.elements;
     let state = if running {
         LaneState::Converging
@@ -806,8 +884,9 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, state: &mut State, cmd
             return not_connected(ui, t, d, vm);
         }
 
+        service_status_banners(ui, t, d, vm);
         if vm.paused() {
-            paused_banner(ui, t, d, cmds);
+            paused_banner(ui, t, d, vm, cmds);
         }
         if rebuilt(vm) {
             rebuilt_banner(ui, t, d, vm);
@@ -855,13 +934,64 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, state: &mut State, cmd
                         ui.scope_builder(
                             egui::UiBuilder::new()
                                 .id(egui::Id::new(("task-queue-detail", row.task_id.as_str()))),
-                            |ui| row_detail(ui, t, d, vm, row, cmds),
+                            |ui| row_detail(ui, t, d, vm, row),
                         );
                     }
                 }
                 ui.add_space(d.px(8.0));
             });
     });
+}
+
+fn service_status_banners(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm) {
+    match vm.identity_status() {
+        IdentityStatus::Match => {}
+        IdentityStatus::Legacy => hint_banner(
+            ui,
+            t,
+            d,
+            Status::Warn,
+            ph::WARNING,
+            "当前数据源或模型服务未返回完整身份，无法校验固定服务范围；旧服务仍按兼容模式运行。",
+        ),
+        IdentityStatus::Mismatch => {
+            let service = vm.health.as_ref().unwrap();
+            hint_banner(
+                ui,
+                t,
+                d,
+                Status::Error,
+                ph::X_CIRCLE,
+                &format!(
+                    "模型服务范围不匹配，写操作已禁用。本地：{} {} {}；服务：{} {} {}。",
+                    vm.project,
+                    normalize_mdb(&vm.mdb),
+                    vm.namespace,
+                    service.project,
+                    normalize_mdb(service.mdb.as_deref().unwrap_or_default()),
+                    service.namespace.as_deref().unwrap_or_default()
+                ),
+            );
+        }
+    }
+    if let Some(health) = vm
+        .health
+        .as_ref()
+        .filter(|health| health.worker_alive == Some(false))
+    {
+        let idle = health
+            .worker_idle_secs
+            .map(|seconds| format!("，最后心跳距今 {seconds} 秒"))
+            .unwrap_or_default();
+        hint_banner(
+            ui,
+            t,
+            d,
+            Status::Error,
+            ph::X_CIRCLE,
+            &format!("增量 worker 未存活{idle}：队列可以查看，但新批次不会被处理。"),
+        );
+    }
 }
 
 /// 还没取到过一次快照。**不画一个空队列**——空队列和连不上服务是两件事。
@@ -881,11 +1011,7 @@ fn not_connected(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm) {
                         .font(Font::strong(d))
                         .color(t.text_secondary),
                 );
-                ui.label(
-                    RichText::new(error)
-                        .font(Font::meta(d))
-                        .color(t.text_muted),
-                );
+                ui.label(RichText::new(error).font(Font::meta(d)).color(t.text_muted));
             }
             None => {
                 ui.add(egui::Spinner::new().size(d.px(22.0)).color(t.accent));
@@ -914,7 +1040,7 @@ fn empty_note(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, state: &State) {
 }
 
 /// 暂停横幅。**文案只能说「不再出队」**——正在跑的那条停不了，服务端没有中止接口。
-fn paused_banner(ui: &mut Ui, t: &Tokens, d: Density, cmds: &mut Vec<Cmd>) {
+fn paused_banner(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, cmds: &mut Vec<Cmd>) {
     let (fg, bg) = t.status(Status::Warn);
     let rect = strip_rect(ui, t, d.px(40.0), bg);
     let mut ui = child(ui, rect.shrink2(vec2(d.px(14.0), 0.0)), Align::Center);
@@ -928,7 +1054,10 @@ fn paused_banner(ui: &mut Ui, t: &Tokens, d: Density, cmds: &mut Vec<Cmd>) {
     );
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         if ui
-            .add(widgets::button(t, d, "恢复队列").icon(ph::PLAY))
+            .add_enabled(
+                vm.can_mutate(),
+                widgets::button(t, d, "恢复队列").icon(ph::PLAY),
+            )
             .clicked()
         {
             cmds.push(Cmd::SetQueuePaused(false));
@@ -991,14 +1120,7 @@ fn hint_banner(ui: &mut Ui, t: &Tokens, d: Density, tone: Status, icon: &str, te
 }
 
 /// 顶栏：三个计数 + 断线提示 + 两枚控制按钮。
-fn summary_bar(
-    ui: &mut Ui,
-    t: &Tokens,
-    d: Density,
-    vm: &Vm,
-    all: &[RowVm],
-    cmds: &mut Vec<Cmd>,
-) {
+fn summary_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, all: &[RowVm], cmds: &mut Vec<Cmd>) {
     let running = all.iter().filter(|r| r.phase.running()).count();
     let queued = all.iter().filter(|r| r.phase == Phase::Queued).count();
     let rect = strip_rect(ui, t, d.px(38.0), t.bg_panel);
@@ -1013,6 +1135,15 @@ fn summary_bar(
         (t.text_muted, format!("排队 {queued}"))
     };
     count_dot(&mut ui, t, d, queued_color, &queued_label);
+    if let Some(health) = &vm.health {
+        let (color, label) = if health.sync_live {
+            (t.success, "自动监听中")
+        } else {
+            (t.warn, "仅手动扫描")
+        };
+        ui.add_space(d.px(8.0));
+        count_dot(&mut ui, t, d, color, label);
+    }
     if let Some(rooms) = vm.rooms_pending() {
         ui.add_space(d.px(8.0));
         count_dot(&mut ui, t, d, t.warn, &format!("房间待收敛 {rooms}"));
@@ -1021,13 +1152,19 @@ fn summary_bar(
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         if vm.paused() {
             if ui
-                .add(widgets::button(t, d, "恢复队列").icon(ph::PLAY))
+                .add_enabled(
+                    vm.can_mutate(),
+                    widgets::button(t, d, "恢复队列").icon(ph::PLAY),
+                )
                 .clicked()
             {
                 cmds.push(Cmd::SetQueuePaused(false));
             }
         } else if ui
-            .add(widgets::button(t, d, "暂停队列").icon(ph::PAUSE))
+            .add_enabled(
+                vm.can_mutate(),
+                widgets::button(t, d, "暂停队列").icon(ph::PAUSE),
+            )
             .on_hover_text("只挡出队；正在跑的那一批会跑完为止")
             .clicked()
         {
@@ -1035,11 +1172,11 @@ fn summary_bar(
         }
         if ui
             .add_enabled(
-                !vm.mdb.is_empty(),
+                vm.can_mutate(),
                 widgets::button(t, d, "立刻扫一遍").icon(ph::ARROWS_CLOCKWISE),
             )
             .on_hover_text("不插队，只是别等下一个 30 秒轮询")
-            .on_disabled_hover_text("还没连上数据源，取不到当前 MDB；本期执行范围由它定")
+            .on_disabled_hover_text("当前数据源身份未就绪，或与模型服务固定范围不一致")
             .clicked()
         {
             cmds.push(Cmd::ScanNow);
@@ -1065,8 +1202,7 @@ fn summary_bar(
 
 fn count_dot(ui: &mut Ui, t: &Tokens, d: Density, color: Color32, text: &str) {
     let (mark, _) = ui.allocate_exact_size(vec2(d.px(8.0), d.px(8.0)), Sense::hover());
-    ui.painter()
-        .circle_filled(mark.center(), d.px(3.5), color);
+    ui.painter().circle_filled(mark.center(), d.px(3.5), color);
     ui.label(
         RichText::new(text)
             .font(Font::meta(d))
@@ -1134,12 +1270,22 @@ fn footer(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm) {
 }
 
 fn room_lane(ui: &mut Ui, t: &Tokens, d: Density, lane: &Lane) {
-    let fill = if lane.starving { t.danger_bg } else { t.bg_header };
+    let fill = if lane.starving {
+        t.danger_bg
+    } else {
+        t.bg_header
+    };
     let head = strip_rect(ui, t, d.px(26.0), fill);
     let mut row = child(ui, head.shrink2(vec2(d.px(14.0), 0.0)), Align::Center);
     row.spacing_mut().item_spacing.x = d.px(8.0);
     let (mark, _) = row.allocate_exact_size(vec2(d.px(13.0), d.px(13.0)), Sense::hover());
-    glyph(&row, mark.center(), ph::SELECTION_ALL, d.px(13.0), t.text_muted);
+    glyph(
+        &row,
+        mark.center(),
+        ph::SELECTION_ALL,
+        d.px(13.0),
+        t.text_muted,
+    );
     row.label(
         RichText::new("房间归属重算")
             .font(Font::strong(d))
@@ -1156,7 +1302,11 @@ fn room_lane(ui: &mut Ui, t: &Tokens, d: Density, lane: &Lane) {
             ui.label(
                 RichText::new(format!("已等待 {}", minutes(waited)))
                     .font(Font::mono_meta(d))
-                    .color(if lane.starving { t.danger } else { t.text_muted }),
+                    .color(if lane.starving {
+                        t.danger
+                    } else {
+                        t.text_muted
+                    }),
             );
         }
         if let (Some(done), Some(total)) = (lane.done, lane.total)
@@ -1261,7 +1411,8 @@ fn excluded_row(ui: &mut Ui, t: &Tokens, d: Density, db: &DbnumStatus) {
         return;
     }
     if resp.hovered() {
-        ui.painter().rect_filled(rect, CornerRadius::ZERO, t.bg_hover);
+        ui.painter()
+            .rect_filled(rect, CornerRadius::ZERO, t.bg_hover);
     }
     let blocked = db.blocked;
     let tone = if blocked { t.danger } else { t.text_muted };
@@ -1297,17 +1448,21 @@ fn excluded_row(ui: &mut Ui, t: &Tokens, d: Density, db: &DbnumStatus) {
     let g = layout(ui, tag, Font::mono_micro(d));
     let pad = d.px(6.0);
     let box_rect = Rect::from_min_size(
-        pos2(rect.right() - d.px(14.0) - g.size().x - pad * 2.0, mid - d.px(9.0)),
+        pos2(
+            rect.right() - d.px(14.0) - g.size().x - pad * 2.0,
+            mid - d.px(9.0),
+        ),
         vec2(g.size().x + pad * 2.0, d.px(18.0)),
     );
-    let (fg, bg) = t.status(if blocked { Status::Error } else { Status::Neutral });
+    let (fg, bg) = t.status(if blocked {
+        Status::Error
+    } else {
+        Status::Neutral
+    });
     ui.painter()
         .rect_filled(box_rect, CornerRadius::same(radius::SM), bg);
-    ui.painter().galley(
-        pos2(box_rect.left() + pad, mid - g.size().y / 2.0),
-        g,
-        fg,
-    );
+    ui.painter()
+        .galley(pos2(box_rect.left() + pad, mid - g.size().y / 2.0), g, fg);
     // 出路（同号重复要列出 paths[] 交给人挑、文件缺失是补回文件或注销登记）
     // 与预览那边 S2-E 用的是同一段文案，两处不许各说各话。
     if let Some(anomaly) = &db.anomaly {
@@ -1340,7 +1495,8 @@ fn anomaly_brief(anomaly: &FileAnomaly) -> String {
 /// 表头。七个列位与 [`queue_row`] 共用 [`cols`] 算出来的那一组 x，两处不许各排各的。
 fn header(ui: &mut Ui, t: &Tokens, d: Density) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), d.px(26.0)), Sense::hover());
-    ui.painter().rect_filled(rect, CornerRadius::ZERO, t.bg_panel);
+    ui.painter()
+        .rect_filled(rect, CornerRadius::ZERO, t.bg_panel);
     hairline(ui.painter(), rect, t.border);
     let c = cols(rect, d);
     for (x, name) in [
@@ -1351,11 +1507,8 @@ fn header(ui: &mut Ui, t: &Tokens, d: Density) {
         (c.note, "进度 / 说明"),
     ] {
         let g = layout(ui, name, Font::micro(d));
-        ui.painter().galley(
-            pos2(x, rect.center().y - g.size().y / 2.0),
-            g,
-            t.text_muted,
-        );
+        ui.painter()
+            .galley(pos2(x, rect.center().y - g.size().y / 2.0), g, t.text_muted);
     }
     let g = layout(ui, "计时 / 结果", Font::micro(d));
     ui.painter().galley(
@@ -1438,16 +1591,23 @@ fn queue_row(
     }
     let tone = row.phase.tone(t);
     if row.phase.running() {
-        ui.painter().rect_filled(rect, CornerRadius::ZERO, t.bg_header);
+        ui.painter()
+            .rect_filled(rect, CornerRadius::ZERO, t.bg_header);
     } else if resp.hovered() {
-        ui.painter().rect_filled(rect, CornerRadius::ZERO, t.bg_hover);
+        ui.painter()
+            .rect_filled(rect, CornerRadius::ZERO, t.bg_hover);
     }
     let c = cols(rect, d);
     let mid = rect.center().y;
 
-    ui.painter().circle_filled(pos2(c.dot, mid), d.px(4.0), tone);
+    ui.painter()
+        .circle_filled(pos2(c.dot, mid), d.px(4.0), tone);
     // 每一行都能展开：终态行摊开来看的是并入会话与欠着的单元，不比运行中那行少。
-    let caret = if open { ph::CARET_DOWN } else { ph::CARET_RIGHT };
+    let caret = if open {
+        ph::CARET_DOWN
+    } else {
+        ph::CARET_RIGHT
+    };
     glyph(
         ui,
         pos2(c.dot - d.px(10.0), mid),
@@ -1456,7 +1616,13 @@ fn queue_row(
         t.text_muted,
     );
 
-    text_at(ui, pos2(c.db, mid), &format!("db{}", row.dbnum), Font::mono(d), t.text_primary);
+    text_at(
+        ui,
+        pos2(c.db, mid),
+        &format!("db{}", row.dbnum),
+        Font::mono(d),
+        t.text_primary,
+    );
     if !row.db_type.is_empty() {
         let g = layout(ui, &row.db_type, Font::mono_micro(d));
         let tag = Rect::from_min_size(
@@ -1471,7 +1637,13 @@ fn queue_row(
             t.text_secondary,
         );
     }
-    text_at(ui, pos2(c.window, mid), &row.window, Font::mono_meta(d), t.text_muted);
+    text_at(
+        ui,
+        pos2(c.window, mid),
+        &row.window,
+        Font::mono_meta(d),
+        t.text_muted,
+    );
     {
         let g = layout(ui, &row.state_text(paused), Font::body(d));
         ui.painter()
@@ -1540,14 +1712,7 @@ fn queue_row(
 }
 
 /// 行内明细：逐单元事件、并入会话、欠着的单元、断线时缺了多少条。
-fn row_detail(
-    ui: &mut Ui,
-    t: &Tokens,
-    d: Density,
-    vm: &Vm,
-    row: &RowVm,
-    cmds: &mut Vec<Cmd>,
-) {
+fn row_detail(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, row: &RowVm) {
     let indent = d.px(28.0);
     egui::Frame::new()
         .inner_margin(Margin {
@@ -1629,17 +1794,10 @@ fn row_detail(
             }
 
             // 欠着的单元走持久表，跨重启仍在；它与上面那批本次事件不是一回事。
-            let owed: Vec<&PendingModelUnit> = vm
-                .pending
-                .iter()
-                .filter(|u| u.dbnum == row.dbnum)
-                .collect();
+            let owed: Vec<&PendingModelUnit> =
+                vm.pending.iter().filter(|u| u.dbnum == row.dbnum).collect();
             for unit in &owed {
-                if retry_line(ui, t, d, unit) {
-                    cmds.push(Cmd::RetryModelUnit {
-                        root_refno: unit.root_refno.clone(),
-                    });
-                }
+                pending_line(ui, t, d, unit);
             }
 
             if detail.is_none_or(|x| x.units.is_empty()) && owed.is_empty() {
@@ -1685,13 +1843,19 @@ fn detail_line(ui: &mut Ui, t: &Tokens, d: Density, line: DetailLine<'_>) {
     }
 }
 
-/// 欠着的一个交付单元，行尾给「重试」。幂等，但每按一次服务端就真的重跑一遍生成。
-fn retry_line(ui: &mut Ui, t: &Tokens, d: Density, unit: &PendingModelUnit) -> bool {
+/// 欠着的交付单元由后台 worker 自动重试；界面只展示状态，不另起生成链。
+fn pending_line(ui: &mut Ui, t: &Tokens, d: Density, unit: &PendingModelUnit) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), d.px(30.0)), Sense::hover());
     let mut ui = child(ui, rect, Align::Center);
     ui.spacing_mut().item_spacing.x = d.px(8.0);
     let (mark, _) = ui.allocate_exact_size(vec2(d.px(13.0), d.px(13.0)), Sense::hover());
-    glyph(&ui, mark.center(), ph::ARROW_COUNTER_CLOCKWISE, d.px(12.0), t.warn);
+    glyph(
+        &ui,
+        mark.center(),
+        ph::ARROW_COUNTER_CLOCKWISE,
+        d.px(12.0),
+        t.warn,
+    );
     ui.label(
         RichText::new(format!("{} {}", unit.noun, unit.root_refno))
             .font(Font::mono_meta(d))
@@ -1702,31 +1866,23 @@ fn retry_line(ui: &mut Ui, t: &Tokens, d: Density, unit: &PendingModelUnit) -> b
             .font(Font::micro(d))
             .color(t.warn),
     );
-    let mut clicked = false;
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        // 按下去真的会重跑一遍生成，但**上面那个欠账数不会跟着减**：服务端
-        // `ensure_model_generated` 成功后不清 `model_update_pending` 里对应的
-        // regen_root 行（QUEUE-FIELD-MAP §1 那段「今天会显假账」）。不把这句说出来，
-        // 这枚按钮看着就是按了没反应。
-        clicked = ui
-            .add(widgets::button(t, d, "重试"))
-            .on_hover_text(
-                "重新生成这个交付单元；幂等，可以反复按。\
-                 注意：服务端成功后不清这条欠账记录（已知问题），所以上面的「欠 N 个单元」不会立刻减少。",
-            )
-            .clicked();
+        ui.label(
+            RichText::new("后台自动重试")
+                .font(Font::micro(d))
+                .color(t.text_muted),
+        );
     });
-    clicked
 }
 
 fn sub_line(ui: &mut Ui, t: &Tokens, d: Density, text: &str, danger: bool) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), d.px(18.0)), Sense::hover());
     let mut ui = child(ui, rect.shrink2(vec2(d.px(21.0), 0.0)), Align::Center);
-    ui.label(
-        RichText::new(text)
-            .font(Font::micro(d))
-            .color(if danger { t.danger } else { t.text_muted }),
-    );
+    ui.label(RichText::new(text).font(Font::micro(d)).color(if danger {
+        t.danger
+    } else {
+        t.text_muted
+    }));
 }
 
 // ---------------------------------------------------------------- 绘制小工具
@@ -1740,7 +1896,10 @@ fn strip_rect(ui: &mut Ui, t: &Tokens, h: f32, fill: Color32) -> Rect {
 
 fn hairline(painter: &egui::Painter, rect: Rect, color: Color32) {
     painter.rect_filled(
-        Rect::from_min_size(pos2(rect.left(), rect.bottom() - 1.0), vec2(rect.width(), 1.0)),
+        Rect::from_min_size(
+            pos2(rect.left(), rect.bottom() - 1.0),
+            vec2(rect.width(), 1.0),
+        ),
         CornerRadius::ZERO,
         color,
     );
@@ -1861,6 +2020,8 @@ mod tests {
     fn vm(queue: Vec<QueueRow>, tasks: Vec<TaskEntry>) -> Vm {
         Vm {
             project: "ProjAMS".into(),
+            mdb: "/ALL".into(),
+            namespace: "plant".into(),
             queue: QueueSnapshot {
                 paused: false,
                 rows: queue,
@@ -1868,6 +2029,47 @@ mod tests {
             tasks,
             loaded: true,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn service_identity_distinguishes_match_legacy_and_each_mismatch() {
+        let mut model = vm(Vec::new(), Vec::new());
+        model.health = Some(Health {
+            project: "ProjAMS".into(),
+            mdb: Some("ALL".into()),
+            namespace: Some("plant".into()),
+            ..Default::default()
+        });
+        assert_eq!(model.identity_status(), IdentityStatus::Match);
+        assert!(model.can_mutate());
+
+        model.health.as_mut().unwrap().mdb = None;
+        model.health.as_mut().unwrap().namespace = None;
+        assert_eq!(model.identity_status(), IdentityStatus::Legacy);
+        assert!(model.can_mutate(), "老服务缺少身份字段时保持兼容");
+
+        model.health.as_mut().unwrap().mdb = Some(String::new());
+        model.health.as_mut().unwrap().namespace = Some(String::new());
+        assert_eq!(
+            model.identity_status(),
+            IdentityStatus::Mismatch,
+            "新服务显式返回空身份不是旧服务兼容场景"
+        );
+
+        for (project, mdb, namespace) in [
+            ("Other", "/ALL", "plant"),
+            ("ProjAMS", "/OTHER", "plant"),
+            ("ProjAMS", "/ALL", "other"),
+        ] {
+            model.health = Some(Health {
+                project: project.into(),
+                mdb: Some(mdb.into()),
+                namespace: Some(namespace.into()),
+                ..Default::default()
+            });
+            assert_eq!(model.identity_status(), IdentityStatus::Mismatch);
+            assert!(!model.can_mutate());
         }
     }
 
@@ -1927,7 +2129,10 @@ mod tests {
         running.state = "running".into();
         let model = vm(
             vec![running, queued("db-7997-2", 7997, 1039, 1041)],
-            vec![entry("db-7997-1", 7997, "running"), entry("db-7997-2", 7997, "queued")],
+            vec![
+                entry("db-7997-1", 7997, "running"),
+                entry("db-7997-2", 7997, "queued"),
+            ],
         );
         let out = rows(&model);
         assert_eq!(out.len(), 2);
@@ -1953,6 +2158,27 @@ mod tests {
         assert_eq!(out[0].position, None);
         assert_eq!(out[1].position, Some(1));
         assert_eq!(out[2].position, Some(2));
+    }
+
+    /// 预览页的「N 个库正在应用」只数本项目 `running` 的队列行：排队中的不算
+    /// （它们的会话本来就该算进「待应用」，不是重复计数），别的项目的也不算。
+    #[test]
+    fn applying_counts_only_this_projects_running_rows() {
+        let mut running = queued("db-7997-1", 7997, 1024, 1038);
+        running.state = "running".into();
+        let mut theirs_row = queued("db-5-1", 5, 0, 5);
+        theirs_row.state = "running".into();
+        let mut theirs = entry("db-5-1", 5, "running");
+        theirs.project = "OtherProj".into();
+        let model = vm(
+            vec![running, theirs_row, queued("db-2", 2, 0, 5)],
+            vec![
+                entry("db-7997-1", 7997, "running"),
+                theirs,
+                entry("db-2", 2, "queued"),
+            ],
+        );
+        assert_eq!(model.applying(), 1);
     }
 
     /// 「应用中」与「生成中」的分界由两阶段给：有了单元分母或收到第一条单元事件
@@ -2055,10 +2281,7 @@ mod tests {
             .unwrap(),
         );
         model.mark_unknown();
-        assert_eq!(
-            model.details["db-7997-1"].units[0].state,
-            RowState::Unknown
-        );
+        assert_eq!(model.details["db-7997-1"].units[0].state, RowState::Unknown);
         assert_eq!(rows(&model)[0].behind_events, 30);
     }
 
@@ -2079,13 +2302,16 @@ mod tests {
     /// 房间增量没开时顶栏那一格整个不画——画出来必然是个永远不动的 0。
     #[test]
     fn the_room_count_stays_hidden_while_the_feature_is_off() {
-        let mut model = vm(Vec::new(), vec![TaskEntry {
-            task_id: "room-1".into(),
-            kind: KIND_ROOM_RECALC.into(),
-            state: "running".into(),
-            total_units: Some(30),
-            ..Default::default()
-        }]);
+        let mut model = vm(
+            Vec::new(),
+            vec![TaskEntry {
+                task_id: "room-1".into(),
+                kind: KIND_ROOM_RECALC.into(),
+                state: "running".into(),
+                total_units: Some(30),
+                ..Default::default()
+            }],
+        );
         model.health = Some(Health {
             gen_spatial_tree: false,
             ..Default::default()
@@ -2120,7 +2346,18 @@ mod tests {
     /// 全空，画一条永远是 0 的泳道比不画更糟。
     #[test]
     fn the_lane_says_only_that_the_feature_is_off() {
-        let mut model = vm(Vec::new(), vec![room("running", RoomCounts { panels: 3, elements: 27, dead_letters: 2 }, None)]);
+        let mut model = vm(
+            Vec::new(),
+            vec![room(
+                "running",
+                RoomCounts {
+                    panels: 3,
+                    elements: 27,
+                    dead_letters: 2,
+                },
+                None,
+            )],
+        );
         model.health = Some(health(false));
         let off = lane(&model).expect("读到 health 就说得出开没开");
         assert_eq!(off.state, LaneState::Off);
@@ -2146,7 +2383,15 @@ mod tests {
         let long_ago = (Local::now() - chrono::Duration::minutes(47)).to_rfc3339();
         let mut model = vm(
             Vec::new(),
-            vec![room("succeeded", RoomCounts { panels: 5, elements: 63, dead_letters: 2 }, Some(&long_ago))],
+            vec![room(
+                "succeeded",
+                RoomCounts {
+                    panels: 5,
+                    elements: 63,
+                    dead_letters: 2,
+                },
+                Some(&long_ago),
+            )],
         );
         model.health = Some(health(true));
         let waiting = lane(&model).unwrap();
@@ -2165,16 +2410,28 @@ mod tests {
     fn blocked_and_excluded_stay_two_different_things() {
         let mut model = vm(Vec::new(), Vec::new());
         model.dbnums = vec![
-            DbnumStatus { dbnum: 7995, db_type: "CATA".into(), excluded: true, ..Default::default() },
+            DbnumStatus {
+                dbnum: 7995,
+                db_type: "CATA".into(),
+                excluded: true,
+                ..Default::default()
+            },
             DbnumStatus {
                 dbnum: 8003,
                 db_type: "DESI".into(),
                 blocked: true,
-                anomaly: Some(FileAnomaly::Rollback { file_latest_sesno: 812, applied_sesno: 1005 }),
+                anomaly: Some(FileAnomaly::Rollback {
+                    file_latest_sesno: 812,
+                    applied_sesno: 1005,
+                }),
                 ..Default::default()
             },
             // 正常入队的库不进这一格。
-            DbnumStatus { dbnum: 7997, db_type: "DESI".into(), ..Default::default() },
+            DbnumStatus {
+                dbnum: 7997,
+                db_type: "DESI".into(),
+                ..Default::default()
+            },
         ];
         let rows = not_running(&model);
         assert_eq!(rows.len(), 2);

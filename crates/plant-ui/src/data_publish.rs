@@ -45,7 +45,7 @@ impl PublishCategory {
             Self::Electrical => "/get_dq_bran_data",
             Self::Instrumentation => "/get_yk_bran_data",
             Self::Ventilation => "/get_tf_bran_data",
-            Self::Room => "/get_bran_data_room_code",
+            Self::Room => "/get_pipe_room_code",
         }
     }
 }
@@ -170,21 +170,6 @@ pub fn show(
                             }
                         });
                     ui.end_row();
-
-                    form_label(ui, tokens, density, "设计阶段：");
-                    ComboBox::from_id_salt("data-publish-design-phase")
-                        .selected_text(state.request.design_phase.label())
-                        .width(field_width)
-                        .show_ui(ui, |ui| {
-                            for phase in DesignPhase::ALL {
-                                ui.selectable_value(
-                                    &mut state.request.design_phase,
-                                    phase,
-                                    phase.label(),
-                                );
-                            }
-                        });
-                    ui.end_row();
                 });
 
             ui.add_space(space::S1);
@@ -276,10 +261,13 @@ pub fn show(
             });
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui
-                    .add(widgets::button(tokens, density, "提交").primary())
-                    .clicked()
-                {
+                let submit = ui
+                    .add_enabled(
+                        !state.request.elements.is_empty(),
+                        widgets::button(tokens, density, "提交").primary(),
+                    )
+                    .on_disabled_hover_text("请至少添加一个元素");
+                if submit.clicked() {
                     commands.push(Cmd::SubmitDataPublish(state.request.clone()));
                 }
                 if ui.add(widgets::button(tokens, density, "预览")).clicked() {
@@ -494,7 +482,7 @@ mod tests {
         assert_eq!(submitted.design_phase, DesignPhase::Detailed);
         assert_eq!(PublishCategory::ALL.len(), 5);
         assert_eq!(PublishCategory::Room.label(), "房间数据发布");
-        assert_eq!(PublishCategory::Room.endpoint(), "/get_bran_data_room_code");
+        assert_eq!(PublishCategory::Room.endpoint(), "/get_pipe_room_code");
         assert_eq!(
             submitted.elements,
             vec![

@@ -719,3 +719,38 @@ clamp、搜索不受筛选芯片限制。下面六条按能不能自己了结分
 旧服务）。在拿到真实行数之前动手调，等于对着一个猜出来的数字优化。
 
 Q1 与 Q2 不依赖这个数，同一轮里已经单独收掉了。
+
+---
+
+## 十二、S2-D 退役品提前收掉 + 预览并发标注落地（2026-07-28 · plant-ui-104 会话）
+
+**推翻第八节第 6 条的一半**：`FailForm::SyncLive / Conflict` 不再等「砍第三步」，本轮先退。
+那条决定的理由链在六之四已经断了（「今天的服务端还真会回 422/409」自 `796b50b4` 与六之四
+起不成立），剩下的只是「随队列视图一起走」的打包偏好；而这两段文案在等待期间是**主动说谎
+的**——SyncLive 那格教人「先在服务端关掉自动追新」，指挥人去关一个已经与手动不互斥的开关。
+「半截形态」的顾虑核实过不成立：S2-D 表面与 Running 表面互不引用，删这两个分型不牵动第三步；
+`Run` / `RunVm` / 词表「运行」仍按原时机随砍第三步一起退。
+
+| 项 | 落点 |
+|---|---|
+| `FailForm` 收成三分型 | `IdentityMismatch`（422 · `identity_mismatch`，向导两端点今天唯一真实的 422——服务端 `ServiceIdentity::validate` 与本地 `can_mutate` 闸门同码同画面，message 直排点名是哪一项错开）/ `Timeout` / `Internal`。意外的 `precondition` / `conflict` 归 `Internal`，原始 message 收进详情 |
+| 六之四硬约束第 3 条 | S2 汇总列末尾按 `task_queue::Vm::applying()`（队列快照里本项目 `running` 行数，跨项目行不算）标注「N 个库正在应用，以上数字可能偏大」，为 0 整条不画。`model_update::show` 多一个 `applying` 入参，`main.rs` 传 `self.queue.applying()` |
+| 文档同步 | `MODEL-UPDATE-FIELD-MAP.md` §2 加并发标注行；§6 删两种退役形态、补 `identity_mismatch` 行并注明出处 |
+| 验证 | `cargo test -p plant-ui --lib` 65 通过（含新增 `applying_counts_only_this_projects_running_rows` 与改写的 `failures_are_classified_by_code_only`）；`cargo check -p plant-ui-app` 干净 |
+
+**补记（同日下一轮）：第三步已砍。** 第八节第 6 条的退役品在同一会话内全部收掉：
+`Vm::Running` / `RunVm` / `Run` / `Progress`（含 `BatchRow` / `UnitRow`）、`Step::Running`
+与步骤条第三格、`running_body` / `outcome_body` 及其专属零件（`feed_banner` / `sub_line` /
+`counted` / `secs` / `done_batches` / `Dot::state` / `pad_h`）、`Cmd::ReconnectModelUpdateFeed`、
+`Req/Evt::ModelUpdateTask` 与 `ModelUpdateProgress / FeedLive / FeedDown` 三个 per-run 事件、
+`model_update_api::task()`、`model_update_ws::Scope`（长连接只剩队列一种订阅）、宿主的
+`model_feed / last_model_poll / pending_model_polls / poll_model_update / reopen_model_feed`。
+`model_update.rs` 由 3385 行收到 2749 行；向导确认后唯一的进度画面就是队列视图，
+「两处进度真相」自此不存在。`ProgressEvent` / `RowState` / `Feed` / `Outcome` 一族留在
+`model_update.rs`——它们是队列视图在消费的契约与共享词汇，不是第三步的遗物。
+`.teach/reference/model-update-flow.html` 的 S2-D 表、`/tasks/{id}`、WS 订阅与进度口径四节
+已同步改口。**画板也已跟上**（同日，Pencil）：S2-D 板（`lwtEA`）删「态-自动同步正在接管」
+「态-本项目已有一个更新在跑」两卡，原位补「态-范围与模型服务对不上 · 422 · identity_mismatch」
+（warn 调、link-2-off 图标、Raw 行示例 message 点名哪一项错开），internal 说明行与板头副标题
+改口为「四种形态；互斥与冲突两形态已随合流退役」。S4 执行进度板（`XajQ8`）保留作迁移史，
+词表已标「已迁」。

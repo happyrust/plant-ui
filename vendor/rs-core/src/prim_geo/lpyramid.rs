@@ -1,20 +1,20 @@
 use std::collections::hash_map::DefaultHasher;
-#[cfg(feature = "truck")]
-use truck_modeling::builder::*;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+#[cfg(feature = "truck")]
+use truck_modeling::builder::*;
 
+use crate::parsed_data::geo_params_data::PdmsGeoParam;
+#[cfg(feature = "occ")]
+use crate::prim_geo::basic::OccSharedShape;
+use crate::shape::pdms_shape::{BrepShapeTrait, VerifiedShape};
+use bevy_ecs::prelude::*;
 use glam::{DVec3, Vec3};
+#[cfg(feature = "occ")]
+use opencascade::primitives::*;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "truck")]
 use truck_meshalgo::prelude::*;
-use crate::parsed_data::geo_params_data::PdmsGeoParam;
-use crate::shape::pdms_shape::{BrepShapeTrait, VerifiedShape};
-use bevy_ecs::prelude::*;
-#[cfg(feature = "occ")]
-use opencascade::primitives::*;
-#[cfg(feature = "occ")]
-use crate::prim_geo::basic::OccSharedShape;
 
 #[derive(
     Component,
@@ -72,12 +72,13 @@ impl Default for LPyramid {
 
 impl VerifiedShape for LPyramid {
     fn check_valid(&self) -> bool {
-        let size_flag = self.pbtp * self.pctp >= f32::EPSILON || self.pbbt * self.pcbt >= f32::EPSILON;
+        let size_flag =
+            self.pbtp * self.pctp >= f32::EPSILON || self.pbbt * self.pcbt >= f32::EPSILON;
         if !size_flag {
             return false;
         }
-        (self.pbtp >= 0.0 && self.pctp >= 0.0 && self.pbbt >= 0.0 && self.pcbt >= 0.0) &&
-            ((self.pbtp + self.pctp) > f32::EPSILON || (self.pbbt + self.pcbt) > f32::EPSILON)
+        (self.pbtp >= 0.0 && self.pctp >= 0.0 && self.pbbt >= 0.0 && self.pcbt >= 0.0)
+            && ((self.pbtp + self.pctp) > f32::EPSILON || (self.pbbt + self.pcbt) > f32::EPSILON)
     }
 }
 
@@ -90,7 +91,6 @@ impl BrepShapeTrait for LPyramid {
     //涵盖的情况，需要考虑，上边只有一条边，和退化成点的情况
     #[cfg(feature = "truck")]
     fn gen_brep_shell(&self) -> Option<truck_modeling::Shell> {
-
         //todo 需要解决这里的homotopy问题，能兼容point 和 line的情况
         let tx = (self.pbtp as f64 / 2.0).max(0.001);
         let ty = (self.pctp as f64 / 2.0).max(0.001);
@@ -114,7 +114,6 @@ impl BrepShapeTrait for LPyramid {
             builder::line(&pts[2], &pts[3]),
             builder::line(&pts[3], &pts[0]),
         ];
-
 
         let pts = vec![
             builder::vertex(Point3::new(-bx, -by, -h2)),
@@ -177,10 +176,10 @@ impl BrepShapeTrait for LPyramid {
         }
 
         let pts = vec![
-            DVec3::new(-bx, -by, -h2) ,
-            DVec3::new(bx, -by, -h2) ,
-            DVec3::new(bx, by, -h2) ,
-            DVec3::new(-bx, by, -h2) ,
+            DVec3::new(-bx, -by, -h2),
+            DVec3::new(bx, -by, -h2),
+            DVec3::new(bx, by, -h2),
+            DVec3::new(-bx, by, -h2),
         ];
         if bx + by < f64::EPSILON {
             verts.push(Vertex::new(DVec3::new(-offset_3d.x, -offset_3d.y, -h2)));
@@ -188,7 +187,9 @@ impl BrepShapeTrait for LPyramid {
             polys.push(Wire::from_ordered_points(pts)?);
         }
 
-        Ok(OccSharedShape::new(Solid::loft_with_points(polys.iter(), verts.iter())?.into_shape()))
+        Ok(OccSharedShape::new(
+            Solid::loft_with_points(polys.iter(), verts.iter())?.into_shape(),
+        ))
     }
 
     fn hash_unit_mesh_params(&self) -> u64 {

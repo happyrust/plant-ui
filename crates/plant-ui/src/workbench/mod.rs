@@ -10,6 +10,7 @@ pub mod panes;
 pub mod props;
 pub mod tree;
 pub mod view3d;
+pub mod viewcube;
 
 pub use panes::Pane;
 

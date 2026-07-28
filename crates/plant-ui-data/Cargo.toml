@@ -9,3 +9,7 @@ anyhow.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio.workspace = true
+
+[dev-dependencies]
+# 临时：winding_probe 诊断测试用，与 rs-core 的 glam 同版本。诊断完随测试一起删。
+glam = "0.29"

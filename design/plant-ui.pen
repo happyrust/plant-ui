@@ -15201,7 +15201,7 @@
                   "id": "HUj94",
                   "name": "Sub",
                   "fill": "$text-muted",
-                  "content": "五种形态各自的原因、影响与出路",
+                  "content": "四种形态各自的原因、影响与出路；互斥与冲突两形态已随合流退役",
                   "fontFamily": "$font-ui",
                   "fontSize": 11,
                   "fontWeight": "normal"
@@ -15412,8 +15412,8 @@
             },
             {
               "type": "frame",
-              "id": "xMUoM",
-              "name": "态-自动同步正在接管",
+              "id": "h7keoH",
+              "name": "态-范围与模型服务对不上",
               "width": "fill_container",
               "fill": "$bg-header",
               "cornerRadius": "$r-md",
@@ -15429,7 +15429,7 @@
               "children": [
                 {
                   "type": "frame",
-                  "id": "Gd02t",
+                  "id": "TCCHl",
                   "name": "Icon",
                   "width": 28,
                   "height": 28,
@@ -15440,11 +15440,11 @@
                   "children": [
                     {
                       "type": "icon",
-                      "id": "dcXmv",
+                      "id": "bjIwa",
                       "name": "I",
                       "width": 15,
                       "height": 15,
-                      "icon": "refresh-cw",
+                      "icon": "link-2-off",
                       "library": "lucide",
                       "fill": "$warn"
                     }
@@ -15452,7 +15452,7 @@
                 },
                 {
                   "type": "frame",
-                  "id": "O0mdm",
+                  "id": "YEytA",
                   "name": "V",
                   "width": "fill_container",
                   "layout": "vertical",
@@ -15460,7 +15460,7 @@
                   "children": [
                     {
                       "type": "frame",
-                      "id": "XznPk",
+                      "id": "H5UvX",
                       "name": "标题行",
                       "width": "fill_container",
                       "gap": 8,
@@ -15468,17 +15468,17 @@
                       "children": [
                         {
                           "type": "text",
-                          "id": "avUH3",
+                          "id": "J7JB8",
                           "name": "T",
                           "fill": "$text-primary",
-                          "content": "自动同步正在接管",
+                          "content": "范围与模型服务对不上",
                           "fontFamily": "$font-ui",
                           "fontSize": 13,
                           "fontWeight": "600"
                         },
                         {
                           "type": "frame",
-                          "id": "a2d5QV",
+                          "id": "A3Cdw",
                           "name": "S",
                           "width": "fill_container",
                           "height": 1,
@@ -15486,10 +15486,10 @@
                         },
                         {
                           "type": "text",
-                          "id": "A3koFe",
+                          "id": "S8m0Cb",
                           "name": "Code",
                           "fill": "$warn",
-                          "content": "422 · precondition",
+                          "content": "422 · identity_mismatch",
                           "fontFamily": "$font-mono",
                           "fontSize": 11,
                           "fontWeight": "normal"
@@ -15498,12 +15498,12 @@
                     },
                     {
                       "type": "text",
-                      "id": "l0vHL",
+                      "id": "jUiz8",
                       "name": "D",
                       "fill": "$text-secondary",
                       "textGrowth": "fixed-width",
                       "width": "fill_container",
-                      "content": "服务端开着自动追新（sync_live = true），与手动增量更新互斥。要手动更新得先在服务端关掉它；这里不该摆一个按下去必然失败的按钮。",
+                      "content": "请求的 project / MDB / namespace 与模型服务的固定范围不一致。本地闸门 can_mutate 拦下时同码合成、请求根本不发；服务端 ServiceIdentity::validate 拒绝时 message 点名是哪一项错开，这行直接摆给人看。",
                       "lineHeight": 1.5,
                       "fontFamily": "$font-ui",
                       "fontSize": 11,
@@ -15511,12 +15511,12 @@
                     },
                     {
                       "type": "text",
-                      "id": "viywA",
+                      "id": "hSX6p",
                       "name": "Raw",
                       "fill": "$text-muted",
                       "textGrowth": "fixed-width",
                       "width": "fill_container",
-                      "content": "message: \"sync_live=true 时不允许手动更新（自动更新模式独占）\"",
+                      "content": "message: \"请求的 mdb=/SAMPLE 与模型服务 mdb=/ALL 不一致\"",
                       "fontFamily": "$font-mono",
                       "fontSize": 10,
                       "fontWeight": "normal"
@@ -15524,148 +15524,17 @@
                   ]
                 },
                 {
-                  "id": "sq1VY",
+                  "id": "LdP4f",
                   "type": "ref",
                   "ref": "UxOiN",
-                  "name": "Btn-查看服务端状态",
+                  "name": "Btn-打开数据源设置",
                   "height": 28,
                   "descendants": {
                     "DdqNP": {
                       "enabled": false
                     },
                     "uiBZg": {
-                      "content": "查看服务端状态",
-                      "fill": "$text-secondary"
-                    }
-                  }
-                }
-              ]
-            },
-            {
-              "type": "frame",
-              "id": "T0kIVt",
-              "name": "态-本项目已有一个更新在跑",
-              "width": "fill_container",
-              "fill": "$bg-header",
-              "cornerRadius": "$r-md",
-              "stroke": "$border",
-              "strokeWidth": 1,
-              "strokeAlignment": "inner",
-              "gap": 12,
-              "padding": [
-                14,
-                16
-              ],
-              "alignItems": "center",
-              "children": [
-                {
-                  "type": "frame",
-                  "id": "mLXAZ",
-                  "name": "Icon",
-                  "width": 28,
-                  "height": 28,
-                  "fill": "$accent-bg",
-                  "cornerRadius": "$r-md",
-                  "justifyContent": "center",
-                  "alignItems": "center",
-                  "children": [
-                    {
-                      "type": "icon",
-                      "id": "HFpuL",
-                      "name": "I",
-                      "width": 15,
-                      "height": 15,
-                      "icon": "loader-circle",
-                      "library": "lucide",
-                      "fill": "$accent"
-                    }
-                  ]
-                },
-                {
-                  "type": "frame",
-                  "id": "U3efIr",
-                  "name": "V",
-                  "width": "fill_container",
-                  "layout": "vertical",
-                  "gap": 4,
-                  "children": [
-                    {
-                      "type": "frame",
-                      "id": "t7IskU",
-                      "name": "标题行",
-                      "width": "fill_container",
-                      "gap": 8,
-                      "alignItems": "center",
-                      "children": [
-                        {
-                          "type": "text",
-                          "id": "ILm86",
-                          "name": "T",
-                          "fill": "$text-primary",
-                          "content": "本项目已有一个更新在跑",
-                          "fontFamily": "$font-ui",
-                          "fontSize": 13,
-                          "fontWeight": "600"
-                        },
-                        {
-                          "type": "frame",
-                          "id": "OhMLU",
-                          "name": "S",
-                          "width": "fill_container",
-                          "height": 1,
-                          "fill": "#00000000"
-                        },
-                        {
-                          "type": "text",
-                          "id": "B0RCD2",
-                          "name": "Code",
-                          "fill": "$accent",
-                          "content": "409 · conflict",
-                          "fontFamily": "$font-mono",
-                          "fontSize": 11,
-                          "fontWeight": "normal"
-                        }
-                      ]
-                    },
-                    {
-                      "type": "text",
-                      "id": "wgg0J",
-                      "name": "D",
-                      "fill": "$text-secondary",
-                      "textGrowth": "fixed-width",
-                      "width": "fill_container",
-                      "content": "同一项目同时只允许一个手动增量更新。响应的 message 里带着那个任务的 task_id，所以能直接切过去看进度，而不是让人干等。",
-                      "lineHeight": 1.5,
-                      "fontFamily": "$font-ui",
-                      "fontSize": 11,
-                      "fontWeight": "normal"
-                    },
-                    {
-                      "type": "text",
-                      "id": "t7CmP",
-                      "name": "Raw",
-                      "fill": "$text-muted",
-                      "textGrowth": "fixed-width",
-                      "width": "fill_container",
-                      "content": "message: \"项目 AMS-8009 已有手动更新任务正在执行: mu-3c81\"",
-                      "fontFamily": "$font-mono",
-                      "fontSize": 10,
-                      "fontWeight": "normal"
-                    }
-                  ]
-                },
-                {
-                  "id": "S7lM5",
-                  "type": "ref",
-                  "ref": "UxOiN",
-                  "name": "Btn-切到进行中的任务",
-                  "height": 28,
-                  "descendants": {
-                    "DdqNP": {
-                      "enabled": false
-                    },
-                    "uiBZg": {
-                      "content": "切到进行中的任务",
+                      "content": "打开数据源设置",
                       "fill": "$text-secondary"
                     }
                   }
@@ -15966,7 +15835,7 @@
                   "id": "LyW7q",
                   "name": "T",
                   "fill": "$text-muted",
-                  "content": "其余错误统一落到 500 · internal —— 只有这一类才需要把原始 message 摊出来，收进「详情」默认折起",
+                  "content": "其余错误统一落到 500 · internal——只有这一类才把原始 message 摆进「详情」默认折起；意外的 422 / 409 也归这里（互斥与冲突两形态随合流退役，gen-model ADR-011 §12）",
                   "fontFamily": "$font-ui",
                   "fontSize": 11,
                   "fontWeight": "normal"
@@ -20833,6 +20702,1622 @@
       "width": 320,
       "height": 0,
       "content": "S1 命令栏的「生成模型」按钮：代码侧已摘（2026-07-27 拷问定案第 4 条）——它不发任何 Cmd，按不动就是假状态。ADR-0009 显示补齐链路的客户端侧落地时，按本处形态重新接入口。"
+    },
+    {
+      "type": "frame",
+      "id": "vbS1D",
+      "x": 0,
+      "y": 3460,
+      "name": "S1-B 视口显示优化 · 深色",
+      "theme": {
+        "mode": "dark"
+      },
+      "clip": true,
+      "width": 980,
+      "height": 644,
+      "fill": {
+        "type": "gradient",
+        "gradientType": "linear",
+        "enabled": true,
+        "rotation": 180,
+        "size": {
+          "height": 1
+        },
+        "colors": [
+          {
+            "color": "$viewport-top",
+            "position": 0
+          },
+          {
+            "color": "$viewport-bottom",
+            "position": 1
+          }
+        ]
+      },
+      "layout": "none",
+      "children": [
+        {
+          "type": "path",
+          "id": "vbD01",
+          "x": 0,
+          "y": 0,
+          "name": "网格-X向次线",
+          "opacity": 0.38,
+          "geometry": "M451.5 127.2l0.5-1.1 475 211.5-0.5 1.1z m-73.1 32.5l0.5-1.1 475 211.5-0.5 1.1z m-36.5 16.3l0.5-1.1 475 211.5-0.5 1.1z m-36.6 16.3l0.5-1.1 475 211.5-0.5 1.1z m-36.5 16.2l0.5-1.1 475 211.5-0.5 1.1z m-73.1 32.6l0.5-1.1 475 211.5-0.5 1.1z m-36.5 16.2l0.5-1.1 475 211.5-0.5 1.1z m-36.6 16.3l0.5-1.1 475 211.5-0.5 1.1z m-36.5 16.3l0.5-1.1 475 211.5-0.5 1.1z m-73.1 32.5l0.5-1.1 475 211.5-0.5 1.1z m219.2-97.6l0.5-1.1 237.5 105.8-0.4 1z",
+          "fill": "$viewport-grid",
+          "width": 980,
+          "height": 644
+        },
+        {
+          "type": "path",
+          "id": "vbD02",
+          "x": 0,
+          "y": 0,
+          "name": "网格-X向主线",
+          "opacity": 0.62,
+          "geometry": "M414.9 143.5l0.5-1.1 475.1 211.5-0.5 1.1z m-365.4 162.6l0.5-1.1 475.1 211.5-0.5 1.1z",
+          "fill": "$viewport-grid",
+          "width": 980,
+          "height": 644
+        },
+        {
+          "type": "path",
+          "id": "vbD03",
+          "x": 0,
+          "y": 0,
+          "name": "网格-Y向次线",
+          "opacity": 0.38,
+          "geometry": "M488.5 127.2l-0.5-1.1-475 211.5 0.5 1.1z m73.1 32.5l-0.5-1.1-475 211.5 0.5 1.1z m36.5 16.3l-0.5-1.1-475 211.5 0.5 1.1z m36.6 16.3l-0.5-1.1-475 211.5 0.5 1.1z m36.5 16.2l-0.5-1.1-475 211.5 0.5 1.1z m73.1 32.6l-0.5-1.1-475 211.5 0.5 1.1z m36.5 16.2l-0.5-1.1-475 211.5 0.5 1.1z m36.6 16.3l-0.5-1.1-475 211.5 0.5 1.1z m36.5 16.3l-0.5-1.1-475 211.5 0.5 1.1z m73.1 32.5l-0.5-1.1-475 211.5 0.5 1.1z m-219.2-97.6l-0.5-1.1-237.5 105.8 0.4 1z",
+          "fill": "$viewport-grid",
+          "width": 980,
+          "height": 644
+        },
+        {
+          "type": "path",
+          "id": "vbD04",
+          "x": 0,
+          "y": 0,
+          "name": "网格-Y向主线",
+          "opacity": 0.62,
+          "geometry": "M525.1 143.5l-0.5-1.1-475.1 211.5 0.5 1.1z m365.4 162.6l-0.5-1.1-475.1 211.5 0.5 1.1z",
+          "fill": "$viewport-grid",
+          "width": 980,
+          "height": 644
+        },
+        {
+          "type": "path",
+          "id": "vbD05",
+          "x": 0,
+          "y": 0,
+          "name": "轴-X红",
+          "geometry": "M469.5 331.1l1-2.2 173.6 77.3-1 2.2z m186.9 81.9l-14.5-1.9 3.4-7.7z",
+          "fill": "#D9544D",
+          "width": 980,
+          "height": 644
+        },
+        {
+          "type": "path",
+          "id": "vbD06",
+          "x": 0,
+          "y": 0,
+          "name": "轴-Y绿",
+          "geometry": "M470.5 331.1l-1-2.2-173.6 77.3 1 2.2z m-186.9 81.9l14.5-1.9-3.4-7.7z",
+          "fill": "#4CAF6E",
+          "width": 980,
+          "height": 644
+        },
+        {
+          "type": "path",
+          "id": "vbD07",
+          "x": 0,
+          "y": 0,
+          "name": "轴-Z蓝",
+          "geometry": "M471.2 330l-2.4 0 0-144 2.4 0z m-1.2-158l4.2 14-8.4 0z",
+          "fill": "#4B7BE5",
+          "width": 980,
+          "height": 644
+        },
+        {
+          "type": "text",
+          "id": "vbD08",
+          "x": 652,
+          "y": 406,
+          "name": "轴标-X",
+          "fill": "#D9544D",
+          "content": "X",
+          "fontFamily": "$font-mono",
+          "fontSize": 11,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "vbD09",
+          "x": 274,
+          "y": 406,
+          "name": "轴标-Y",
+          "fill": "#4CAF6E",
+          "content": "Y",
+          "fontFamily": "$font-mono",
+          "fontSize": 11,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "vbD10",
+          "x": 464,
+          "y": 148,
+          "name": "轴标-Z",
+          "fill": "#4B7BE5",
+          "content": "Z",
+          "fontFamily": "$font-mono",
+          "fontSize": 11,
+          "fontWeight": "500"
+        },
+        {
+          "type": "ellipse",
+          "id": "vbD11",
+          "x": 570,
+          "y": 424,
+          "name": "投影1",
+          "opacity": 0.16,
+          "fill": "#000000",
+          "width": 40,
+          "height": 11
+        },
+        {
+          "type": "ellipse",
+          "id": "vbD12",
+          "x": 632,
+          "y": 449,
+          "name": "投影2",
+          "opacity": 0.14,
+          "fill": "#000000",
+          "width": 38,
+          "height": 10
+        },
+        {
+          "type": "rectangle",
+          "id": "vbD13",
+          "x": 460,
+          "y": 356,
+          "name": "管线-横",
+          "fill": "#8AADC7",
+          "width": 118,
+          "height": 5
+        },
+        {
+          "type": "rectangle",
+          "id": "vbD14",
+          "x": 460,
+          "y": 356,
+          "name": "管线-立",
+          "fill": "#7FA3BE",
+          "width": 5,
+          "height": 42
+        },
+        {
+          "type": "ellipse",
+          "id": "vbD15",
+          "x": 455,
+          "y": 352,
+          "name": "法兰",
+          "fill": "#A7C4D9",
+          "width": 9,
+          "height": 12
+        },
+        {
+          "type": "rectangle",
+          "id": "vbD16",
+          "x": 576,
+          "y": 340,
+          "name": "容器1-体",
+          "fill": "#8AADC7",
+          "width": 28,
+          "height": 88
+        },
+        {
+          "type": "ellipse",
+          "id": "vbD17",
+          "x": 576,
+          "y": 333,
+          "name": "容器1-顶",
+          "fill": "#A7C4D9",
+          "width": 28,
+          "height": 13
+        },
+        {
+          "type": "ellipse",
+          "id": "vbD18",
+          "x": 576,
+          "y": 421,
+          "name": "容器1-底",
+          "fill": "#6E93AE",
+          "width": 28,
+          "height": 13
+        },
+        {
+          "type": "rectangle",
+          "id": "vbD19",
+          "x": 636,
+          "y": 372,
+          "name": "容器2-体",
+          "fill": "#8AADC7",
+          "width": 26,
+          "height": 82
+        },
+        {
+          "type": "ellipse",
+          "id": "vbD1A",
+          "x": 636,
+          "y": 366,
+          "name": "容器2-顶",
+          "fill": "#A7C4D9",
+          "width": 26,
+          "height": 12
+        },
+        {
+          "type": "ellipse",
+          "id": "vbD1B",
+          "x": 636,
+          "y": 447,
+          "name": "容器2-底",
+          "fill": "#6E93AE",
+          "width": 26,
+          "height": 12
+        },
+        {
+          "type": "frame",
+          "id": "vbD20",
+          "x": 14,
+          "y": 14,
+          "name": "HUD状态",
+          "height": 26,
+          "fill": "$bg-elevated",
+          "cornerRadius": "$r-md",
+          "stroke": "$border",
+          "strokeWidth": 1,
+          "strokeAlignment": "inner",
+          "gap": 10,
+          "padding": [
+            0,
+            10
+          ],
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "ellipse",
+              "id": "vbD21",
+              "name": "LiveDot",
+              "fill": "$success",
+              "width": 6,
+              "height": 6
+            },
+            {
+              "type": "text",
+              "id": "vbD22",
+              "name": "Live",
+              "fill": "$text-secondary",
+              "content": "实时模型 · Bevy",
+              "fontFamily": "$font-mono",
+              "fontSize": 11,
+              "fontWeight": "normal"
+            },
+            {
+              "type": "frame",
+              "id": "vbD23",
+              "name": "HudDiv",
+              "width": 1,
+              "height": 12,
+              "fill": "$border"
+            },
+            {
+              "type": "text",
+              "id": "vbD24",
+              "name": "Target",
+              "fill": "$text-muted",
+              "content": "相机渲染目标",
+              "fontFamily": "$font-mono",
+              "fontSize": 11,
+              "fontWeight": "normal"
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "vbD30",
+          "x": 12,
+          "y": 239,
+          "name": "视口工具栏",
+          "fill": "$bg-elevated",
+          "cornerRadius": "$r-lg",
+          "stroke": "$border",
+          "strokeWidth": 1,
+          "strokeAlignment": "inner",
+          "layout": "vertical",
+          "gap": 4,
+          "padding": 4,
+          "alignItems": "center",
+          "children": [
+            {
+              "id": "vbD31",
+              "type": "ref",
+              "ref": "hB4FY",
+              "name": "Rail-eye",
+              "fill": "#00000000",
+              "descendants": {
+                "X4AxVR": {
+                  "icon": "eye",
+                  "fill": "$text-secondary"
+                }
+              }
+            },
+            {
+              "id": "vbD32",
+              "type": "ref",
+              "ref": "hB4FY",
+              "name": "Rail-eye-off",
+              "fill": "#00000000",
+              "descendants": {
+                "X4AxVR": {
+                  "icon": "eye-off",
+                  "fill": "$text-secondary"
+                }
+              }
+            },
+            {
+              "id": "vbD33",
+              "type": "ref",
+              "ref": "hB4FY",
+              "name": "Rail-ban",
+              "fill": "#00000000",
+              "descendants": {
+                "X4AxVR": {
+                  "icon": "ban",
+                  "fill": "$text-secondary"
+                }
+              }
+            },
+            {
+              "id": "vbD34",
+              "type": "ref",
+              "ref": "hB4FY",
+              "name": "Rail-crosshair",
+              "fill": "#00000000",
+              "descendants": {
+                "X4AxVR": {
+                  "icon": "crosshair",
+                  "fill": "$text-secondary"
+                }
+              }
+            },
+            {
+              "id": "vbD35",
+              "type": "ref",
+              "ref": "hB4FY",
+              "name": "Rail-maximize-2",
+              "fill": "#00000000",
+              "descendants": {
+                "X4AxVR": {
+                  "icon": "maximize-2",
+                  "fill": "$text-secondary"
+                }
+              }
+            },
+            {
+              "id": "vbD36",
+              "type": "ref",
+              "ref": "hB4FY",
+              "name": "Rail-ruler",
+              "fill": "#00000000",
+              "descendants": {
+                "X4AxVR": {
+                  "icon": "ruler",
+                  "fill": "$text-secondary"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "vbD40",
+          "x": 878,
+          "y": 14,
+          "name": "ViewCube",
+          "opacity": 0.85,
+          "width": 88,
+          "height": 88,
+          "fill": "#00000000",
+          "layout": "none",
+          "children": [
+            {
+              "type": "path",
+              "id": "vbD41",
+              "x": 14,
+              "y": 10,
+              "name": "Cube-顶面",
+              "geometry": "M30 0l30 15-30 15-30-15z",
+              "fill": "#3D4A57",
+              "width": 60,
+              "height": 30
+            },
+            {
+              "type": "path",
+              "id": "vbD42",
+              "x": 14,
+              "y": 25,
+              "name": "Cube-前面",
+              "geometry": "M0 0l30 15 0 38-30-15z",
+              "fill": "#333F4B",
+              "width": 30,
+              "height": 53
+            },
+            {
+              "type": "path",
+              "id": "vbD43",
+              "x": 44,
+              "y": 25,
+              "name": "Cube-右面",
+              "geometry": "M0 15l30-15 0 38-30 15z",
+              "fill": "#2A3540",
+              "width": 30,
+              "height": 53
+            },
+            {
+              "type": "text",
+              "id": "vbD44",
+              "x": 38,
+              "y": 18,
+              "name": "标-顶",
+              "fill": "#D5DEE7",
+              "content": "顶",
+              "fontFamily": "$font-ui",
+              "fontSize": 11,
+              "fontWeight": "500"
+            },
+            {
+              "type": "text",
+              "id": "vbD45",
+              "x": 23,
+              "y": 45,
+              "name": "标-前",
+              "fill": "#D5DEE7",
+              "content": "前",
+              "fontFamily": "$font-ui",
+              "fontSize": 11,
+              "fontWeight": "500"
+            },
+            {
+              "type": "text",
+              "id": "vbD46",
+              "x": 53,
+              "y": 45,
+              "name": "标-右",
+              "fill": "#D5DEE7",
+              "content": "右",
+              "fontFamily": "$font-ui",
+              "fontSize": 11,
+              "fontWeight": "500"
+            },
+            {
+              "type": "path",
+              "id": "vbD47",
+              "x": 2,
+              "y": 2,
+              "name": "Home键",
+              "geometry": "M7 1.2l5.8 5-1.4 0 0 6.3-3.1 0 0-3.5-2.6 0 0 3.5-3.1 0 0-6.3-1.4 0z",
+              "fill": "$text-secondary",
+              "width": 14,
+              "height": 14
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "vbS1L",
+      "x": 1060,
+      "y": 3460,
+      "name": "S1-B 视口显示优化 · 浅色",
+      "theme": {
+        "mode": "light"
+      },
+      "clip": true,
+      "width": 980,
+      "height": 644,
+      "fill": {
+        "type": "gradient",
+        "gradientType": "linear",
+        "enabled": true,
+        "rotation": 180,
+        "size": {
+          "height": 1
+        },
+        "colors": [
+          {
+            "color": "$viewport-top",
+            "position": 0
+          },
+          {
+            "color": "$viewport-bottom",
+            "position": 1
+          }
+        ]
+      },
+      "layout": "none",
+      "children": [
+        {
+          "type": "path",
+          "id": "vbL01",
+          "x": 0,
+          "y": 0,
+          "name": "网格-X向次线",
+          "opacity": 0.4,
+          "geometry": "M451.5 127.2l0.5-1.1 475 211.5-0.5 1.1z m-73.1 32.5l0.5-1.1 475 211.5-0.5 1.1z m-36.5 16.3l0.5-1.1 475 211.5-0.5 1.1z m-36.6 16.3l0.5-1.1 475 211.5-0.5 1.1z m-36.5 16.2l0.5-1.1 475 211.5-0.5 1.1z m-73.1 32.6l0.5-1.1 475 211.5-0.5 1.1z m-36.5 16.2l0.5-1.1 475 211.5-0.5 1.1z m-36.6 16.3l0.5-1.1 475 211.5-0.5 1.1z m-36.5 16.3l0.5-1.1 475 211.5-0.5 1.1z m-73.1 32.5l0.5-1.1 475 211.5-0.5 1.1z m219.2-97.6l0.5-1.1 237.5 105.8-0.4 1z",
+          "fill": "$viewport-grid",
+          "width": 980,
+          "height": 644
+        },
+        {
+          "type": "path",
+          "id": "vbL02",
+          "x": 0,
+          "y": 0,
+          "name": "网格-X向主线",
+          "opacity": 0.68,
+          "geometry": "M414.9 143.5l0.5-1.1 475.1 211.5-0.5 1.1z m-365.4 162.6l0.5-1.1 475.1 211.5-0.5 1.1z",
+          "fill": "$viewport-grid",
+          "width": 980,
+          "height": 644
+        },
+        {
+          "type": "path",
+          "id": "vbL03",
+          "x": 0,
+          "y": 0,
+          "name": "网格-Y向次线",
+          "opacity": 0.4,
+          "geometry": "M488.5 127.2l-0.5-1.1-475 211.5 0.5 1.1z m73.1 32.5l-0.5-1.1-475 211.5 0.5 1.1z m36.5 16.3l-0.5-1.1-475 211.5 0.5 1.1z m36.6 16.3l-0.5-1.1-475 211.5 0.5 1.1z m36.5 16.2l-0.5-1.1-475 211.5 0.5 1.1z m73.1 32.6l-0.5-1.1-475 211.5 0.5 1.1z m36.5 16.2l-0.5-1.1-475 211.5 0.5 1.1z m36.6 16.3l-0.5-1.1-475 211.5 0.5 1.1z m36.5 16.3l-0.5-1.1-475 211.5 0.5 1.1z m73.1 32.5l-0.5-1.1-475 211.5 0.5 1.1z m-219.2-97.6l-0.5-1.1-237.5 105.8 0.4 1z",
+          "fill": "$viewport-grid",
+          "width": 980,
+          "height": 644
+        },
+        {
+          "type": "path",
+          "id": "vbL04",
+          "x": 0,
+          "y": 0,
+          "name": "网格-Y向主线",
+          "opacity": 0.68,
+          "geometry": "M525.1 143.5l-0.5-1.1-475.1 211.5 0.5 1.1z m365.4 162.6l-0.5-1.1-475.1 211.5 0.5 1.1z",
+          "fill": "$viewport-grid",
+          "width": 980,
+          "height": 644
+        },
+        {
+          "type": "path",
+          "id": "vbL05",
+          "x": 0,
+          "y": 0,
+          "name": "轴-X红",
+          "geometry": "M469.5 331.1l1-2.2 173.6 77.3-1 2.2z m186.9 81.9l-14.5-1.9 3.4-7.7z",
+          "fill": "#C6403A",
+          "width": 980,
+          "height": 644
+        },
+        {
+          "type": "path",
+          "id": "vbL06",
+          "x": 0,
+          "y": 0,
+          "name": "轴-Y绿",
+          "geometry": "M470.5 331.1l-1-2.2-173.6 77.3 1 2.2z m-186.9 81.9l14.5-1.9-3.4-7.7z",
+          "fill": "#2F8F55",
+          "width": 980,
+          "height": 644
+        },
+        {
+          "type": "path",
+          "id": "vbL07",
+          "x": 0,
+          "y": 0,
+          "name": "轴-Z蓝",
+          "geometry": "M471.2 330l-2.4 0 0-144 2.4 0z m-1.2-158l4.2 14-8.4 0z",
+          "fill": "#3763C8",
+          "width": 980,
+          "height": 644
+        },
+        {
+          "type": "text",
+          "id": "vbL08",
+          "x": 652,
+          "y": 406,
+          "name": "轴标-X",
+          "fill": "#C6403A",
+          "content": "X",
+          "fontFamily": "$font-mono",
+          "fontSize": 11,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "vbL09",
+          "x": 274,
+          "y": 406,
+          "name": "轴标-Y",
+          "fill": "#2F8F55",
+          "content": "Y",
+          "fontFamily": "$font-mono",
+          "fontSize": 11,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "vbL10",
+          "x": 464,
+          "y": 148,
+          "name": "轴标-Z",
+          "fill": "#3763C8",
+          "content": "Z",
+          "fontFamily": "$font-mono",
+          "fontSize": 11,
+          "fontWeight": "500"
+        },
+        {
+          "type": "ellipse",
+          "id": "vbL11",
+          "x": 570,
+          "y": 424,
+          "name": "投影1",
+          "opacity": 0.15,
+          "fill": "#31404E",
+          "width": 40,
+          "height": 11
+        },
+        {
+          "type": "ellipse",
+          "id": "vbL12",
+          "x": 632,
+          "y": 449,
+          "name": "投影2",
+          "opacity": 0.13,
+          "fill": "#31404E",
+          "width": 38,
+          "height": 10
+        },
+        {
+          "type": "rectangle",
+          "id": "vbL13",
+          "x": 460,
+          "y": 356,
+          "name": "管线-横",
+          "fill": "#7FA3BE",
+          "width": 118,
+          "height": 5
+        },
+        {
+          "type": "rectangle",
+          "id": "vbL14",
+          "x": 460,
+          "y": 356,
+          "name": "管线-立",
+          "fill": "#7398B4",
+          "width": 5,
+          "height": 42
+        },
+        {
+          "type": "ellipse",
+          "id": "vbL15",
+          "x": 455,
+          "y": 352,
+          "name": "法兰",
+          "fill": "#93B5CC",
+          "width": 9,
+          "height": 12
+        },
+        {
+          "type": "rectangle",
+          "id": "vbL16",
+          "x": 576,
+          "y": 340,
+          "name": "容器1-体",
+          "fill": "#7FA3BE",
+          "width": 28,
+          "height": 88
+        },
+        {
+          "type": "ellipse",
+          "id": "vbL17",
+          "x": 576,
+          "y": 333,
+          "name": "容器1-顶",
+          "fill": "#93B5CC",
+          "width": 28,
+          "height": 13
+        },
+        {
+          "type": "ellipse",
+          "id": "vbL18",
+          "x": 576,
+          "y": 421,
+          "name": "容器1-底",
+          "fill": "#628BA8",
+          "width": 28,
+          "height": 13
+        },
+        {
+          "type": "rectangle",
+          "id": "vbL19",
+          "x": 636,
+          "y": 372,
+          "name": "容器2-体",
+          "fill": "#7FA3BE",
+          "width": 26,
+          "height": 82
+        },
+        {
+          "type": "ellipse",
+          "id": "vbL1A",
+          "x": 636,
+          "y": 366,
+          "name": "容器2-顶",
+          "fill": "#93B5CC",
+          "width": 26,
+          "height": 12
+        },
+        {
+          "type": "ellipse",
+          "id": "vbL1B",
+          "x": 636,
+          "y": 447,
+          "name": "容器2-底",
+          "fill": "#628BA8",
+          "width": 26,
+          "height": 12
+        },
+        {
+          "type": "frame",
+          "id": "vbL20",
+          "x": 14,
+          "y": 14,
+          "name": "HUD状态",
+          "height": 26,
+          "fill": "$bg-elevated",
+          "cornerRadius": "$r-md",
+          "stroke": "$border",
+          "strokeWidth": 1,
+          "strokeAlignment": "inner",
+          "gap": 10,
+          "padding": [
+            0,
+            10
+          ],
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "ellipse",
+              "id": "vbL21",
+              "name": "LiveDot",
+              "fill": "$success",
+              "width": 6,
+              "height": 6
+            },
+            {
+              "type": "text",
+              "id": "vbL22",
+              "name": "Live",
+              "fill": "$text-secondary",
+              "content": "实时模型 · Bevy",
+              "fontFamily": "$font-mono",
+              "fontSize": 11,
+              "fontWeight": "normal"
+            },
+            {
+              "type": "frame",
+              "id": "vbL23",
+              "name": "HudDiv",
+              "width": 1,
+              "height": 12,
+              "fill": "$border"
+            },
+            {
+              "type": "text",
+              "id": "vbL24",
+              "name": "Target",
+              "fill": "$text-muted",
+              "content": "相机渲染目标",
+              "fontFamily": "$font-mono",
+              "fontSize": 11,
+              "fontWeight": "normal"
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "vbL30",
+          "x": 12,
+          "y": 239,
+          "name": "视口工具栏",
+          "fill": "$bg-elevated",
+          "cornerRadius": "$r-lg",
+          "stroke": "$border",
+          "strokeWidth": 1,
+          "strokeAlignment": "inner",
+          "layout": "vertical",
+          "gap": 4,
+          "padding": 4,
+          "alignItems": "center",
+          "children": [
+            {
+              "id": "vbL31",
+              "type": "ref",
+              "ref": "hB4FY",
+              "name": "Rail-eye",
+              "fill": "#00000000",
+              "descendants": {
+                "X4AxVR": {
+                  "icon": "eye",
+                  "fill": "$text-secondary"
+                }
+              }
+            },
+            {
+              "id": "vbL32",
+              "type": "ref",
+              "ref": "hB4FY",
+              "name": "Rail-eye-off",
+              "fill": "#00000000",
+              "descendants": {
+                "X4AxVR": {
+                  "icon": "eye-off",
+                  "fill": "$text-secondary"
+                }
+              }
+            },
+            {
+              "id": "vbL33",
+              "type": "ref",
+              "ref": "hB4FY",
+              "name": "Rail-ban",
+              "fill": "#00000000",
+              "descendants": {
+                "X4AxVR": {
+                  "icon": "ban",
+                  "fill": "$text-secondary"
+                }
+              }
+            },
+            {
+              "id": "vbL34",
+              "type": "ref",
+              "ref": "hB4FY",
+              "name": "Rail-crosshair",
+              "fill": "#00000000",
+              "descendants": {
+                "X4AxVR": {
+                  "icon": "crosshair",
+                  "fill": "$text-secondary"
+                }
+              }
+            },
+            {
+              "id": "vbL35",
+              "type": "ref",
+              "ref": "hB4FY",
+              "name": "Rail-maximize-2",
+              "fill": "#00000000",
+              "descendants": {
+                "X4AxVR": {
+                  "icon": "maximize-2",
+                  "fill": "$text-secondary"
+                }
+              }
+            },
+            {
+              "id": "vbL36",
+              "type": "ref",
+              "ref": "hB4FY",
+              "name": "Rail-ruler",
+              "fill": "#00000000",
+              "descendants": {
+                "X4AxVR": {
+                  "icon": "ruler",
+                  "fill": "$text-secondary"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "vbL40",
+          "x": 878,
+          "y": 14,
+          "name": "ViewCube",
+          "opacity": 0.85,
+          "width": 88,
+          "height": 88,
+          "fill": "#00000000",
+          "layout": "none",
+          "children": [
+            {
+              "type": "path",
+              "id": "vbL41",
+              "x": 14,
+              "y": 10,
+              "name": "Cube-顶面",
+              "geometry": "M30 0l30 15-30 15-30-15z",
+              "fill": "#E9EFF6",
+              "width": 60,
+              "height": 30
+            },
+            {
+              "type": "path",
+              "id": "vbL42",
+              "x": 14,
+              "y": 25,
+              "name": "Cube-前面",
+              "geometry": "M0 0l30 15 0 38-30-15z",
+              "fill": "#D8E2EC",
+              "width": 30,
+              "height": 53
+            },
+            {
+              "type": "path",
+              "id": "vbL43",
+              "x": 44,
+              "y": 25,
+              "name": "Cube-右面",
+              "geometry": "M0 15l30-15 0 38-30 15z",
+              "fill": "#C7D5E2",
+              "width": 30,
+              "height": 53
+            },
+            {
+              "type": "text",
+              "id": "vbL44",
+              "x": 38,
+              "y": 18,
+              "name": "标-顶",
+              "fill": "#3C4C5C",
+              "content": "顶",
+              "fontFamily": "$font-ui",
+              "fontSize": 11,
+              "fontWeight": "500"
+            },
+            {
+              "type": "text",
+              "id": "vbL45",
+              "x": 23,
+              "y": 45,
+              "name": "标-前",
+              "fill": "#3C4C5C",
+              "content": "前",
+              "fontFamily": "$font-ui",
+              "fontSize": 11,
+              "fontWeight": "500"
+            },
+            {
+              "type": "text",
+              "id": "vbL46",
+              "x": 53,
+              "y": 45,
+              "name": "标-右",
+              "fill": "#3C4C5C",
+              "content": "右",
+              "fontFamily": "$font-ui",
+              "fontSize": 11,
+              "fontWeight": "500"
+            },
+            {
+              "type": "path",
+              "id": "vbL47",
+              "x": 2,
+              "y": 2,
+              "name": "Home键",
+              "geometry": "M7 1.2l5.8 5-1.4 0 0 6.3-3.1 0 0-3.5-2.6 0 0 3.5-3.1 0 0-6.3-1.4 0z",
+              "fill": "$text-secondary",
+              "width": 14,
+              "height": 14
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "vbSC0",
+      "x": 2120,
+      "y": 3460,
+      "name": "S1-C ViewCube 交互细节",
+      "theme": {
+        "mode": "dark"
+      },
+      "clip": true,
+      "width": 1040,
+      "height": 720,
+      "fill": "$bg-panel",
+      "layout": "none",
+      "children": [
+        {
+          "type": "text",
+          "id": "vbC01",
+          "x": 24,
+          "y": 20,
+          "name": "标题",
+          "fill": "$text-primary",
+          "content": "ViewCube 交互细节",
+          "fontFamily": "$font-ui",
+          "fontSize": 16,
+          "fontWeight": "600"
+        },
+        {
+          "type": "text",
+          "id": "vbC02",
+          "x": 24,
+          "y": 46,
+          "name": "副题",
+          "fill": "$text-muted",
+          "content": "26 命中区 · 悬停高亮 · Home · 0.3s 动画 —— 依据 Autodesk ViewCube 规范（26 区 = 6 面 + 12 棱 + 8 角）",
+          "fontFamily": "$font-mono",
+          "fontSize": 11,
+          "fontWeight": "normal"
+        },
+        {
+          "type": "path",
+          "id": "vbC10",
+          "x": 100,
+          "y": 170,
+          "name": "大立方-顶面",
+          "geometry": "M110 0l110 60-110 60-110-60z",
+          "fill": "#3D4A57",
+          "width": 220,
+          "height": 120
+        },
+        {
+          "type": "path",
+          "id": "vbC11",
+          "x": 100,
+          "y": 230,
+          "name": "大立方-前面",
+          "geometry": "M0 0l110 60 0 120-110-60z",
+          "fill": "#333F4B",
+          "width": 110,
+          "height": 180
+        },
+        {
+          "type": "path",
+          "id": "vbC12",
+          "x": 210,
+          "y": 230,
+          "name": "大立方-右面",
+          "geometry": "M0 60l110-60 0 120-110 60z",
+          "fill": "#2A3540",
+          "width": 110,
+          "height": 180
+        },
+        {
+          "type": "path",
+          "id": "vbC13",
+          "x": 0,
+          "y": 0,
+          "name": "大立方-棱区",
+          "opacity": 0.5,
+          "geometry": "M234.2 183.2l61.6 33.6-24 3.7-44.4-24.2z m61.6 60l-61.6 33.6-6.8-13.1 44.4-24.2z m-110 33.6l-61.6-33.6 24-3.7 44.4 24.2z m-61.6-60l61.6-33.6 6.8 13.1-44.4 24.2z",
+          "fill": "$accent",
+          "width": 1040,
+          "height": 720
+        },
+        {
+          "type": "path",
+          "id": "vbC14",
+          "x": 0,
+          "y": 0,
+          "name": "大立方-角区",
+          "opacity": 0.62,
+          "geometry": "M210 170l17.6 9.6-17.6 6-17.6-6z m110 60l-17.6 9.6-11-9.6 11-9.6z m-110 60l-17.6-9.6 17.6-6 17.6 6z m-110-60l17.6-9.6 11 9.6-11 9.6z",
+          "fill": "$warn",
+          "width": 1040,
+          "height": 720
+        },
+        {
+          "type": "text",
+          "id": "vbC15",
+          "x": 202,
+          "y": 222,
+          "name": "大标-顶",
+          "fill": "#D5DEE7",
+          "content": "顶",
+          "fontFamily": "$font-ui",
+          "fontSize": 14,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "vbC16",
+          "x": 147,
+          "y": 306,
+          "name": "大标-前",
+          "fill": "#D5DEE7",
+          "content": "前",
+          "fontFamily": "$font-ui",
+          "fontSize": 14,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "vbC17",
+          "x": 258,
+          "y": 306,
+          "name": "大标-右",
+          "fill": "#D5DEE7",
+          "content": "右",
+          "fontFamily": "$font-ui",
+          "fontSize": 14,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "vbC18",
+          "x": 60,
+          "y": 442,
+          "name": "大图注",
+          "fill": "$text-muted",
+          "content": "示意：面 / 棱 / 角三类命中区（顶面标出，六面同构，共 6+12+8 = 26 区）",
+          "fontFamily": "$font-mono",
+          "fontSize": 11,
+          "fontWeight": "normal"
+        },
+        {
+          "type": "frame",
+          "id": "vbC20",
+          "x": 386,
+          "y": 200,
+          "name": "图例",
+          "layout": "vertical",
+          "gap": 10,
+          "children": [
+            {
+              "type": "frame",
+              "id": "vbC21",
+              "name": "图例-面",
+              "gap": 8,
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "rectangle",
+                  "id": "vbC22",
+                  "name": "样-面",
+                  "fill": "#3D4A57",
+                  "width": 12,
+                  "height": 12
+                },
+                {
+                  "type": "text",
+                  "id": "vbC23",
+                  "name": "文-面",
+                  "fill": "$text-secondary",
+                  "content": "面 ×6 —— 对应正视图（前/后/左/右/顶/底）",
+                  "fontFamily": "$font-ui",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "vbC24",
+              "name": "图例-棱",
+              "gap": 8,
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "rectangle",
+                  "id": "vbC25",
+                  "name": "样-棱",
+                  "fill": "$accent",
+                  "width": 12,
+                  "height": 12
+                },
+                {
+                  "type": "text",
+                  "id": "vbC26",
+                  "name": "文-棱",
+                  "fill": "$text-secondary",
+                  "content": "棱 ×12 —— 两面之间的 45° 半视图",
+                  "fontFamily": "$font-ui",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "vbC27",
+              "name": "图例-角",
+              "gap": 8,
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "rectangle",
+                  "id": "vbC28",
+                  "name": "样-角",
+                  "fill": "$warn",
+                  "width": 12,
+                  "height": 12
+                },
+                {
+                  "type": "text",
+                  "id": "vbC29",
+                  "name": "文-角",
+                  "fill": "$text-secondary",
+                  "content": "角 ×8 —— 三面等角视图（ISO）",
+                  "fontFamily": "$font-ui",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "vbC30",
+          "x": 556,
+          "y": 120,
+          "name": "态1-非激活",
+          "opacity": 0.6,
+          "width": 88,
+          "height": 88,
+          "fill": "#00000000",
+          "layout": "none",
+          "children": [
+            {
+              "type": "path",
+              "id": "vbC31",
+              "x": 14,
+              "y": 10,
+              "name": "顶面",
+              "geometry": "M30 0l30 15-30 15-30-15z",
+              "fill": "#3D4A57",
+              "width": 60,
+              "height": 30
+            },
+            {
+              "type": "path",
+              "id": "vbC32",
+              "x": 14,
+              "y": 25,
+              "name": "前面",
+              "geometry": "M0 0l30 15 0 38-30-15z",
+              "fill": "#333F4B",
+              "width": 30,
+              "height": 53
+            },
+            {
+              "type": "path",
+              "id": "vbC33",
+              "x": 44,
+              "y": 25,
+              "name": "右面",
+              "geometry": "M0 15l30-15 0 38-30 15z",
+              "fill": "#2A3540",
+              "width": 30,
+              "height": 53
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "vbC34",
+          "x": 716,
+          "y": 120,
+          "name": "态2-悬停",
+          "width": 88,
+          "height": 88,
+          "fill": "#00000000",
+          "layout": "none",
+          "children": [
+            {
+              "type": "path",
+              "id": "vbC35",
+              "x": 14,
+              "y": 10,
+              "name": "顶面",
+              "geometry": "M30 0l30 15-30 15-30-15z",
+              "fill": "#3D4A57",
+              "width": 60,
+              "height": 30
+            },
+            {
+              "type": "path",
+              "id": "vbC36",
+              "x": 14,
+              "y": 25,
+              "name": "前面",
+              "geometry": "M0 0l30 15 0 38-30-15z",
+              "fill": "#333F4B",
+              "width": 30,
+              "height": 53
+            },
+            {
+              "type": "path",
+              "id": "vbC37",
+              "x": 44,
+              "y": 25,
+              "name": "右面-高亮",
+              "geometry": "M0 15l30-15 0 38-30 15z",
+              "fill": "$accent",
+              "width": 30,
+              "height": 53
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "vbC38",
+          "x": 876,
+          "y": 120,
+          "name": "态3-点击",
+          "width": 88,
+          "height": 88,
+          "fill": "#00000000",
+          "layout": "none",
+          "children": [
+            {
+              "type": "path",
+              "id": "vbC39",
+              "x": 14,
+              "y": 10,
+              "name": "顶面",
+              "geometry": "M30 0l30 15-30 15-30-15z",
+              "fill": "#3D4A57",
+              "width": 60,
+              "height": 30
+            },
+            {
+              "type": "path",
+              "id": "vbC3A",
+              "x": 14,
+              "y": 25,
+              "name": "前面",
+              "geometry": "M0 0l30 15 0 38-30-15z",
+              "fill": "#333F4B",
+              "width": 30,
+              "height": 53
+            },
+            {
+              "type": "path",
+              "id": "vbC3B",
+              "x": 44,
+              "y": 25,
+              "name": "右面-选中",
+              "geometry": "M0 15l30-15 0 38-30 15z",
+              "fill": "$accent-strong",
+              "width": 30,
+              "height": 53
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "id": "vbC3C",
+          "x": 556,
+          "y": 216,
+          "name": "态1注",
+          "fill": "$text-muted",
+          "content": "非激活 · 60% 不透明",
+          "fontFamily": "$font-mono",
+          "fontSize": 10,
+          "fontWeight": "normal"
+        },
+        {
+          "type": "text",
+          "id": "vbC3D",
+          "x": 716,
+          "y": 216,
+          "name": "态2注",
+          "fill": "$text-muted",
+          "content": "悬停 · 命中区高亮",
+          "fontFamily": "$font-mono",
+          "fontSize": 10,
+          "fontWeight": "normal"
+        },
+        {
+          "type": "text",
+          "id": "vbC3E",
+          "x": 876,
+          "y": 216,
+          "name": "态3注",
+          "fill": "$text-muted",
+          "content": "点击 · 0.3s 到目标视角",
+          "fontFamily": "$font-mono",
+          "fontSize": 10,
+          "fontWeight": "normal"
+        },
+        {
+          "type": "frame",
+          "id": "vbC40",
+          "x": 556,
+          "y": 300,
+          "name": "行为规格",
+          "layout": "vertical",
+          "gap": 8,
+          "children": [
+            {
+              "type": "frame",
+              "id": "vbC41",
+              "name": "Home行",
+              "gap": 8,
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "path",
+                  "id": "vbC42",
+                  "name": "Home图",
+                  "geometry": "M7 1.2l5.8 5-1.4 0 0 6.3-3.1 0 0-3.5-2.6 0 0 3.5-3.1 0 0-6.3-1.4 0z",
+                  "fill": "$text-secondary",
+                  "width": 14,
+                  "height": 14
+                },
+                {
+                  "type": "text",
+                  "id": "vbC43",
+                  "name": "Home文",
+                  "fill": "$text-secondary",
+                  "content": "Home 键 · 回到等距初始视角（FitAll + ISO），常驻立方体左上",
+                  "fontFamily": "$font-ui",
+                  "fontSize": 12,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "text",
+              "id": "vbC44",
+              "name": "规1",
+              "fill": "$text-secondary",
+              "content": "尺寸 88×88 @1x · 悬浮右上，inset 14，无容器底",
+              "fontFamily": "$font-mono",
+              "fontSize": 11,
+              "fontWeight": "normal"
+            },
+            {
+              "type": "text",
+              "id": "vbC45",
+              "name": "规2",
+              "fill": "$text-secondary",
+              "content": "非激活 60% → 悬停 100%（0.15s 过渡）",
+              "fontFamily": "$font-mono",
+              "fontSize": 11,
+              "fontWeight": "normal"
+            },
+            {
+              "type": "text",
+              "id": "vbC46",
+              "name": "规3",
+              "fill": "$text-secondary",
+              "content": "命中判定：26 区投影四边形包含测试（egui 侧，正交投影）",
+              "fontFamily": "$font-mono",
+              "fontSize": 11,
+              "fontWeight": "normal"
+            },
+            {
+              "type": "text",
+              "id": "vbC47",
+              "name": "规4",
+              "fill": "$text-secondary",
+              "content": "视角切换：0.3s ease 插值，orbit 焦点保持不变",
+              "fontFamily": "$font-mono",
+              "fontSize": 11,
+              "fontWeight": "normal"
+            },
+            {
+              "type": "text",
+              "id": "vbC48",
+              "name": "规5",
+              "fill": "$text-secondary",
+              "content": "实现：egui 侧投影绘制，宿主逐帧发布相机姿态（camera_rot）",
+              "fontFamily": "$font-mono",
+              "fontSize": 11,
+              "fontWeight": "normal"
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "vbC50",
+          "x": 60,
+          "y": 500,
+          "name": "面标映射",
+          "layout": "vertical",
+          "gap": 6,
+          "children": [
+            {
+              "type": "text",
+              "id": "vbC51",
+              "name": "映射题",
+              "fill": "$text-primary",
+              "content": "面标映射（X/Y/Z 体系 · Z 上）",
+              "fontFamily": "$font-ui",
+              "fontSize": 13,
+              "fontWeight": "600"
+            },
+            {
+              "type": "text",
+              "id": "vbC52",
+              "name": "映射行",
+              "fill": "$text-secondary",
+              "content": "前 −Y · 后 +Y · 左 −X · 右 +X · 顶 +Z · 底 −Z",
+              "fontFamily": "$font-mono",
+              "fontSize": 11,
+              "fontWeight": "normal"
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "vbC60",
+          "x": 60,
+          "y": 576,
+          "name": "背景与坐标系规格",
+          "layout": "vertical",
+          "gap": 6,
+          "children": [
+            {
+              "type": "text",
+              "id": "vbC61",
+              "name": "规格题",
+              "fill": "$text-primary",
+              "content": "背景与坐标系",
+              "fontFamily": "$font-ui",
+              "fontSize": 13,
+              "fontWeight": "600"
+            },
+            {
+              "type": "text",
+              "id": "vbC62",
+              "name": "规格1",
+              "fill": "$text-secondary",
+              "content": "背景：$viewport-top → $viewport-bottom 竖直渐变，Bevy 全屏背景面片，主题色经 SetBackground 命令下发",
+              "fontFamily": "$font-mono",
+              "fontSize": 11,
+              "fontWeight": "normal"
+            },
+            {
+              "type": "text",
+              "id": "vbC63",
+              "name": "规格2",
+              "fill": "$text-secondary",
+              "content": "网格：Z=0 地平面，间距自适应 10ⁿ，每 5 条一根主线，随距离淡出",
+              "fontFamily": "$font-mono",
+              "fontSize": 11,
+              "fontWeight": "normal"
+            },
+            {
+              "type": "text",
+              "id": "vbC64",
+              "name": "规格3",
+              "fill": "$text-secondary",
+              "content": "轴：X 红 · Y 绿 · Z 蓝，原点三轴带箭头与标签；坐标读数/比例尺另轮迭代",
+              "fontFamily": "$font-mono",
+              "fontSize": 11,
+              "fontWeight": "normal"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "note",
+      "id": "vbNT0",
+      "x": -360,
+      "y": 3460,
+      "name": "注-视口显示优化定案",
+      "width": 320,
+      "height": 0,
+      "content": "S1-B/S1-C 视口显示优化（2026-07-28 grill 定案）：① 范围只做背景色/坐标系/ViewCube，坐标读数与比例尺另轮；② 背景 = Bevy 内全屏面片画 $viewport-top→bottom 渐变（用户点名，主题色经 SetBackground 下发）；③ 坐标系 = 地面网格 + 原点三色轴，X/Y/Z 体系 Z 上；④ ViewCube = 26 区点击 + 悬停高亮 + Home + 0.3s 动画，中文单字面标，无容器悬浮非激活 60%，egui 侧投影绘制（宿主逐帧发布相机姿态）；⑤ 原型先行，验收后落码。依据：Autodesk ViewCube 规范（26 区/Home/动画）；网格与三轴为宿主侧线网格 + 顶点色淡出。"
     }
   ],
   "themes": {
@@ -21244,6 +22729,23 @@
         },
         {
           "value": "#F4F7FA",
+          "theme": {
+            "mode": "light"
+          }
+        }
+      ]
+    },
+    "viewport-grid": {
+      "type": "color",
+      "value": [
+        {
+          "value": "#46586A",
+          "theme": {
+            "mode": "dark"
+          }
+        },
+        {
+          "value": "#7E93A6",
           "theme": {
             "mode": "light"
           }

@@ -277,8 +277,8 @@ impl PlantMesh {
     ///压缩bytes
     #[inline]
     pub fn into_compress_bytes(&self) -> Vec<u8> {
-        use flate2::write::DeflateEncoder;
         use flate2::Compression;
+        use flate2::write::DeflateEncoder;
         let mut e = DeflateEncoder::new(Vec::new(), Compression::default());
         e.write_all(&bincode::serialize(&self).unwrap());
         e.finish().unwrap_or_default()
@@ -433,9 +433,7 @@ pub trait BrepShapeTrait: Downcast + VerifiedShape + Debug + Send + Sync + DynCl
                 })
                 .unwrap_or(vec![Vec3::ZERO.into()]);
         }
-        {
-            Default::default()
-        }
+        { Default::default() }
     }
 
     ///限制参数大小，主要是对负实体的不合理进行限制

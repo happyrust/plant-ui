@@ -1,21 +1,21 @@
 use crate::parsed_data::{CateProfileParam, SProfileData, SannData};
 use crate::prim_geo::spine::*;
 use crate::prim_geo::wire;
+use crate::shape::pdms_shape::{ANGLE_RAD_F64_TOL, BrepShapeTrait, VerifiedShape};
 #[cfg(feature = "truck")]
-use crate::shape::pdms_shape::{convert_to_cg_matrix4, BrepMathTrait};
-use crate::shape::pdms_shape::{BrepShapeTrait, VerifiedShape, ANGLE_RAD_F64_TOL};
+use crate::shape::pdms_shape::{BrepMathTrait, convert_to_cg_matrix4};
 use crate::tool::math_tool::{quat_to_pdms_ori_str, to_pdms_ori_str};
 use anyhow::anyhow;
 use approx::{abs_diff_eq, abs_diff_ne};
 use bevy_ecs::prelude::*;
 use cavalier_contours::core::math::bulge_from_angle;
-use cavalier_contours::polyline::{seg_midpoint, PlineSource, PlineSourceMut, Polyline};
+use cavalier_contours::polyline::{PlineSource, PlineSourceMut, Polyline, seg_midpoint};
+use glam::*;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use glam::*;
 
 use crate::parsed_data::geo_params_data::PdmsGeoParam;
 #[cfg(feature = "occ")]
@@ -232,7 +232,7 @@ impl SweepSolid {
         r2: f32,
     ) -> Option<truck_modeling::Wire> {
         #[cfg(feature = "truck")]
-        use truck_modeling::{builder, Surface, Wire};
+        use truck_modeling::{Surface, Wire, builder};
 
         let (r1, r2) = if is_btm {
             (r1, r2)
@@ -401,7 +401,7 @@ impl SweepSolid {
         #[cfg(feature = "truck")]
         use truck_meshalgo::prelude::*;
         #[cfg(feature = "truck")]
-        use truck_modeling::{builder, Surface};
+        use truck_modeling::{Surface, builder};
 
         let verts = &profile.verts;
         let len = verts.len();

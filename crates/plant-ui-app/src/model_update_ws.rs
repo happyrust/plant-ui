@@ -1,4 +1,9 @@
-//! 手动更新执行进度的跨平台 WebSocket。
+//! 任务队列明细的跨平台 WebSocket：订阅全部任务的 `task_progress`，逐条带
+//! task_id 交给队列视图分桶；起讫信封（`task_started` / `task_finished`）只当
+//! 醒钟用，叫轮询早一拍去取快照。
+//!
+//! 它曾经还有一种「跟单次运行」的订阅形态（`Scope::Run`），随向导第三步一起
+//! 退役（ADR-0011）：执行进度只在队列视图，一条连接订全部。
 
 use std::sync::mpsc::Sender;
 #[cfg(not(target_arch = "wasm32"))]
@@ -6,6 +11,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(not(target_arch = "wasm32"))]
 use ewebsock::{Options, WsEvent, WsMessage, WsReceiver, WsSender};
+#[cfg(not(target_arch = "wasm32"))]
 use plant_ui::model_update::ProgressEvent;
 
 use crate::data::Evt;
@@ -15,46 +21,9 @@ const PING_EVERY: Duration = Duration::from_secs(30);
 #[cfg(not(target_arch = "wasm32"))]
 const RECONNECT_DELAY: Duration = Duration::from_secs(3);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Scope {
-    Run(String),
-    Queue,
-}
-
-impl Scope {
-    fn wants(&self, task_id: &str) -> bool {
-        match self {
-            Self::Run(mine) => mine == task_id,
-            Self::Queue => true,
-        }
-    }
-
-    fn progress(&self, task_id: String, event: ProgressEvent) -> Evt {
-        match self {
-            Self::Run(_) => Evt::ModelUpdateProgress(event),
-            Self::Queue => Evt::QueueProgress(task_id, event),
-        }
-    }
-
-    fn live(&self) -> Evt {
-        match self {
-            Self::Run(_) => Evt::ModelUpdateFeedLive,
-            Self::Queue => Evt::QueueFeedLive,
-        }
-    }
-
-    fn down(&self, reason: String) -> Evt {
-        match self {
-            Self::Run(_) => Evt::ModelUpdateFeedDown(reason),
-            Self::Queue => Evt::QueueFeedDown(reason),
-        }
-    }
-}
-
 #[cfg(not(target_arch = "wasm32"))]
 pub struct Feed {
     url: String,
-    scope: Scope,
     tx: Sender<Evt>,
     ctx: egui::Context,
     socket: Option<(WsSender, WsReceiver)>,
@@ -64,10 +33,9 @@ pub struct Feed {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl Feed {
-    pub fn open(base: &str, scope: Scope, tx: Sender<Evt>, ctx: egui::Context) -> Self {
+    pub fn open(base: &str, tx: Sender<Evt>, ctx: egui::Context) -> Self {
         let mut feed = Self {
             url: ws_url(base),
-            scope,
             tx,
             ctx,
             socket: None,
@@ -91,13 +59,13 @@ impl Feed {
                         sender.send(WsMessage::Text(
                             r#"{"type":"subscribe","topics":["tasks"]}"#.into(),
                         ));
-                        let _ = self.tx.send(self.scope.live());
+                        let _ = self.tx.send(Evt::QueueFeedLive);
                     }
                     WsEvent::Message(WsMessage::Text(text)) => {
-                        if let Some((task_id, event)) = decode(&text, &self.scope) {
-                            let _ = self.tx.send(self.scope.progress(task_id, event));
+                        if let Some((task_id, event)) = decode(&text) {
+                            let _ = self.tx.send(Evt::QueueProgress(task_id, event));
                         }
-                        if self.scope == Scope::Queue && starts_or_finishes(&text) {
+                        if starts_or_finishes(&text) {
                             let _ = self.tx.send(Evt::QueueTaskChanged);
                         }
                     }
@@ -115,7 +83,7 @@ impl Feed {
         if let Some(reason) = disconnected {
             self.socket = None;
             self.reconnect_at = Instant::now() + RECONNECT_DELAY;
-            let _ = self.tx.send(self.scope.down(reason));
+            let _ = self.tx.send(Evt::QueueFeedDown(reason));
         }
         self.ctx.request_repaint_after(Duration::from_secs(1));
     }
@@ -127,7 +95,7 @@ impl Feed {
         }) {
             Ok(socket) => self.socket = Some(socket),
             Err(error) => {
-                let _ = self.tx.send(self.scope.down(error));
+                let _ = self.tx.send(Evt::QueueFeedDown(error));
                 self.reconnect_at = Instant::now() + RECONNECT_DELAY;
             }
         }
@@ -148,9 +116,9 @@ pub struct Feed;
 
 #[cfg(target_arch = "wasm32")]
 impl Feed {
-    pub fn open(_base: &str, scope: Scope, tx: Sender<Evt>, ctx: egui::Context) -> Self {
+    pub fn open(_base: &str, tx: Sender<Evt>, ctx: egui::Context) -> Self {
         // ponytail: 浏览器端先用已有轮询收口；需要逐单元实时明细时再保留 wasm socket。
-        let _ = tx.send(scope.down("浏览器端使用轮询获取任务进度".into()));
+        let _ = tx.send(Evt::QueueFeedDown("浏览器端使用轮询获取任务进度".into()));
         ctx.request_repaint();
         Self
     }
@@ -158,6 +126,7 @@ impl Feed {
     pub fn poll(&mut self) {}
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn ws_url(base: &str) -> String {
     let base = base.trim_end_matches('/');
     let swapped = match base.split_once("://") {
@@ -168,19 +137,18 @@ fn ws_url(base: &str) -> String {
     format!("{swapped}/api/v1/ws")
 }
 
-fn decode(text: &str, scope: &Scope) -> Option<(String, ProgressEvent)> {
+#[cfg(not(target_arch = "wasm32"))]
+fn decode(text: &str) -> Option<(String, ProgressEvent)> {
     let envelope: serde_json::Value = serde_json::from_str(text).ok()?;
     if envelope.get("type")?.as_str()? != "task_progress" {
         return None;
     }
     let task_id = envelope.get("task_id")?.as_str()?;
-    if !scope.wants(task_id) {
-        return None;
-    }
     let event = serde_json::from_value(envelope.get("payload")?.clone()).ok()?;
     Some((task_id.to_owned(), event))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn starts_or_finishes(text: &str) -> bool {
     let Ok(envelope) = serde_json::from_str::<serde_json::Value>(text) else {
         return false;
@@ -200,8 +168,9 @@ mod tests {
         assert_eq!(ws_url("https://host/"), "wss://host/api/v1/ws");
         let unit = r#"{"type":"task_progress","task_id":"db-1","payload":
             {"kind":"model_unit_started","dbnum":1,"root_refno":"1/2","noun":"BRAN"}}"#;
-        assert!(decode(unit, &Scope::Run("db-1".into())).is_some());
-        assert!(decode(unit, &Scope::Run("db-2".into())).is_none());
+        let (task_id, _) = decode(unit).expect("契约 payload 应当能解出来");
+        assert_eq!(task_id, "db-1");
+        assert!(decode(r#"{"type":"task_started","task_id":"db-1"}"#).is_none());
         assert!(starts_or_finishes(r#"{"type":"task_finished"}"#));
     }
 }

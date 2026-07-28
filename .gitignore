@@ -6,3 +6,15 @@
 /web/config.json
 /web/pkg
 
+# Local build artifacts and AI tooling state; never publish these.
+/.code-review-graph/
+/.codegraph/
+/.context/
+/.cursor/
+/.kiro/
+/.review/
+/.sigmap-cache.json
+/.teach/
+/.github/copilot-instructions.md
+/pe_owner
+

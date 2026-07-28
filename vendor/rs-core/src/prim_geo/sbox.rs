@@ -1,19 +1,28 @@
+use crate::NamedAttrMap;
+use crate::parsed_data::geo_params_data::PdmsGeoParam;
+use crate::prim_geo::basic::*;
+use crate::shape::pdms_shape::*;
+use crate::types::attmap::AttrMap;
+use bevy_ecs::prelude::*;
 use glam::Vec3;
+#[cfg(feature = "occ")]
+use opencascade::primitives::*;
+use serde::{Deserialize, Serialize};
 #[cfg(feature = "truck")]
 use truck_base::cgmath64::Vector3;
 #[cfg(feature = "truck")]
-use truck_modeling::{builder, Shell};
-use serde::{Serialize, Deserialize};
-use crate::parsed_data::geo_params_data::PdmsGeoParam;
-use crate::types::attmap::AttrMap;
-use crate::prim_geo::basic::*;
-#[cfg(feature = "occ")]
-use opencascade::primitives::*;
-use crate::shape::pdms_shape::*;
-use bevy_ecs::prelude::*;
-use crate::NamedAttrMap;
+use truck_modeling::{Shell, builder};
 
-#[derive(Component, Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Deserialize, rkyv::Serialize, )]
+#[derive(
+    Component,
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Deserialize,
+    rkyv::Serialize,
+)]
 pub struct SBox {
     pub center: Vec3,
     pub size: Vec3,
@@ -43,7 +52,9 @@ impl BrepShapeTrait for SBox {
 
     #[cfg(feature = "truck")]
     fn gen_brep_shell(&self) -> Option<Shell> {
-        if !self.check_valid() { return None; }
+        if !self.check_valid() {
+            return None;
+        }
         let v = builder::vertex((self.center - self.size / 2.0).point3());
         let e = builder::tsweep(&v, Vector3::unit_x() * self.size.x as f64);
         let f = builder::tsweep(&e, Vector3::unit_y() * self.size.y as f64);
@@ -70,7 +81,6 @@ impl BrepShapeTrait for SBox {
         Box::new(Self::default())
     }
 
-
     #[inline]
     fn get_scaled_vec3(&self) -> Vec3 {
         self.size
@@ -81,14 +91,15 @@ impl BrepShapeTrait for SBox {
     }
 }
 
-
 impl From<&AttrMap> for SBox {
     fn from(m: &AttrMap) -> Self {
         SBox {
             center: Default::default(),
-            size: Vec3::new(m.get_f32("XLEN").unwrap_or_default(),
-                            m.get_f32("YLEN").unwrap_or_default(),
-                            m.get_f32("ZLEN").unwrap_or_default(), ),
+            size: Vec3::new(
+                m.get_f32("XLEN").unwrap_or_default(),
+                m.get_f32("YLEN").unwrap_or_default(),
+                m.get_f32("ZLEN").unwrap_or_default(),
+            ),
         }
     }
 }
@@ -103,9 +114,11 @@ impl From<&NamedAttrMap> for SBox {
     fn from(m: &NamedAttrMap) -> Self {
         SBox {
             center: Default::default(),
-            size: Vec3::new(m.get_f32("XLEN").unwrap_or_default(),
-                            m.get_f32("YLEN").unwrap_or_default(),
-                            m.get_f32("ZLEN").unwrap_or_default(), ),
+            size: Vec3::new(
+                m.get_f32("XLEN").unwrap_or_default(),
+                m.get_f32("YLEN").unwrap_or_default(),
+                m.get_f32("ZLEN").unwrap_or_default(),
+            ),
         }
     }
 }
@@ -115,6 +128,3 @@ impl From<NamedAttrMap> for SBox {
         (&m).into()
     }
 }
-
-
-

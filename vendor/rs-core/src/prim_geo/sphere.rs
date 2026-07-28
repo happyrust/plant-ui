@@ -3,11 +3,11 @@ use hexasphere::shapes::IcoSphere;
 use std::f64::consts::PI;
 use std::sync::Arc;
 #[cfg(feature = "truck")]
+use truck_base::cgmath64::{Point3, Rad, Vector3};
+#[cfg(feature = "truck")]
 use truck_modeling::Shell;
 #[cfg(feature = "truck")]
 use truck_modeling::*;
-#[cfg(feature = "truck")]
-use truck_base::cgmath64::{Point3, Rad, Vector3};
 
 use crate::parsed_data::geo_params_data::PdmsGeoParam;
 use crate::prim_geo::basic::*;
@@ -16,8 +16,8 @@ use crate::shape::pdms_shape::{BrepShapeTrait, PlantMesh, RsVec3, VerifiedShape}
 use opencascade::primitives::*;
 use serde::{Deserialize, Serialize};
 
-use crate::types::attmap::AttrMap;
 use crate::NamedAttrMap;
+use crate::types::attmap::AttrMap;
 use bevy_ecs::prelude::*;
 
 #[derive(
@@ -74,7 +74,9 @@ impl BrepShapeTrait for Sphere {
     //OCC 的生成
     #[cfg(feature = "occ")]
     fn gen_occ_shape(&self) -> anyhow::Result<OccSharedShape> {
-        Ok(OccSharedShape::new(Shape::sphere(self.radius as f64).build()))
+        Ok(OccSharedShape::new(
+            Shape::sphere(self.radius as f64).build(),
+        ))
     }
 
     fn hash_unit_mesh_params(&self) -> u64 {

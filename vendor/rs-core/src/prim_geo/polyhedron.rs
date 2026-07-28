@@ -1,4 +1,6 @@
 use crate::parsed_data::geo_params_data::PdmsGeoParam;
+#[cfg(feature = "occ")]
+use crate::prim_geo::basic::OccSharedShape;
 #[cfg(feature = "truck")]
 use crate::shape::pdms_shape::BrepMathTrait;
 use crate::shape::pdms_shape::{BrepShapeTrait, PlantMesh, RsVec3, TRI_TOL, VerifiedShape};
@@ -7,21 +9,19 @@ use bevy_ecs::prelude::*;
 use glam::Vec3;
 use itertools::Itertools;
 use nalgebra::Point;
+#[cfg(feature = "occ")]
+use opencascade::primitives::{Face, Shell, Wire};
 #[cfg(feature = "opencascade")]
 use opencascade::{Axis, Edge, OCCShape, Vertex, Wire};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-#[cfg(feature = "occ")]
-use opencascade::primitives::{Face, Shell, Wire};
 #[cfg(feature = "truck")]
 use truck_meshalgo::prelude::*;
 #[cfg(feature = "truck")]
-use truck_modeling::builder::*;
-#[cfg(feature = "truck")]
 use truck_modeling::Face;
-#[cfg(feature = "occ")]
-use crate::prim_geo::basic::OccSharedShape;
+#[cfg(feature = "truck")]
+use truck_modeling::builder::*;
 
 #[derive(
     Component,
@@ -59,7 +59,7 @@ impl Polygon {
         #[cfg(feature = "truck")]
         use truck_meshalgo::prelude::*;
         #[cfg(feature = "truck")]
-        use truck_modeling::{builder, Wire};
+        use truck_modeling::{Wire, builder};
         if self.verts.len() < 3 {
             return Err(anyhow!("Polygon must have at least 3 vertices"));
         }

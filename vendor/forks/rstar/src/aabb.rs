@@ -24,9 +24,9 @@ pub struct AABB<P>
 where
     P: Point,
 {
-    #[serde(alias="mins")]
+    #[serde(alias = "mins")]
     lower: P,
-    #[serde(alias="maxs")]
+    #[serde(alias = "maxs")]
     upper: P,
 }
 

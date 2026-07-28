@@ -2,10 +2,10 @@ use crate::accel_tree::acceleration_tree::RStarBoundingBox;
 use crate::room::data::RoomElement;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::room::room::{
-    load_aabb_tree, load_room_aabb_tree, GLOBAL_AABB_TREE, GLOBAL_ROOM_AABB_TREE,
+    GLOBAL_AABB_TREE, GLOBAL_ROOM_AABB_TREE, load_aabb_tree, load_room_aabb_tree,
 };
 use crate::shape::pdms_shape::PlantMesh;
-use crate::{query_insts, RefU64, RefnoEnum, SUL_DB};
+use crate::{RefU64, RefnoEnum, SUL_DB, query_insts};
 use glam::Vec3;
 use nalgebra::Point3;
 use parry3d::bounding_volume::Aabb;

@@ -5,7 +5,7 @@ use crate::tool::float_tool::*;
 use crate::tool::float_tool::{cal_vec2_hash_string, cal_xy_hash_string, vec3_round_2};
 use anyhow::anyhow;
 use approx::abs_diff_eq;
-use cavalier_contours::core::math::{angle, bulge_from_angle, Vector2};
+use cavalier_contours::core::math::{Vector2, angle, bulge_from_angle};
 use cavalier_contours::core::traits::Real;
 use cavalier_contours::pline_closed;
 use cavalier_contours::polyline::internal::pline_boolean::polyline_boolean;
@@ -20,8 +20,8 @@ use clap::builder::TypedValueParser;
 use glam::{DVec2, DVec3, Quat, Vec3};
 use nalgebra::{ComplexField, DimAdd};
 use num_traits::signum;
+use rust_ploop_processor::{PLoop, PLoopProcessor, Vertex as PLoopVertex};
 use serde_derive::{Deserialize, Serialize};
-use rust_ploop_processor::{PLoopProcessor, PLoop, Vertex as PLoopVertex};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::f32::consts::PI;
 use std::panic::AssertUnwindSafe;
@@ -122,7 +122,7 @@ pub fn gen_spline_wire(
     thick: f32,
 ) -> anyhow::Result<truck_modeling::Wire> {
     #[cfg(feature = "truck")]
-    use truck_modeling::{builder, Wire};
+    use truck_modeling::{Wire, builder};
     if input_verts.len() != 3 {
         return Err(anyhow!("SPINE number is not 3".to_string())); //先假定必须有三个
     }
@@ -475,7 +475,7 @@ pub fn resolve_overlap_intersection(
 }
 
 /// 处理基本相交情况
-/// 
+///
 /// 该函数用于处理多段线(polyline)的基本相交情况。基本相交是指两个线段相交于一个点。
 ///
 /// # 参数
@@ -485,7 +485,7 @@ pub fn resolve_overlap_intersection(
 ///
 /// # 返回值
 /// * `Result<Polyline>` - 处理后的新多段线
-/// 
+///
 /// # 处理逻辑
 /// 1. 根据相交点将相交的线段分割成两部分
 /// 2. 根据线段类型(直线或圆弧)采用不同的处理策略
@@ -498,29 +498,29 @@ pub fn resolve_basic_intersection(
 ) -> anyhow::Result<Polyline> {
     let mut new_polyline = polyline.clone();
     let verts_len = polyline.vertex_data.len();
-    
+
     // 检查多段线是否有足够的顶点
     if verts_len < 3 {
         return Err(anyhow!("Polyline has too few vertices."));
     }
-    
+
     // 获取相交线段的起始索引
     let si_0 = intersect.start_index1;
     let mut next_si_0 = (si_0 + 1) % verts_len;
     let mut si_1 = intersect.start_index2;
     let next_si_1 = (si_1 + 1) % verts_len;
-    
+
     // 验证索引的有效性
     if si_0 >= verts_len || si_1 >= verts_len || next_si_0 >= verts_len || next_si_1 >= verts_len {
         return Err(anyhow!("Invalid intersection indices for polyline."));
     }
-    
+
     let point = intersect.point;
 
     // 处理两条直线相交的情况
     if polyline[si_0].bulge == 0.0 && polyline[si_1].bulge == 0.0 {
         new_polyline[si_1] = PlineVertex::new(point.x, point.y, 0.0);
-    } 
+    }
     // 处理直线和圆弧相交的情况(第一条是直线,第二条是圆弧)
     else if polyline[si_0].bulge == 0.0 && polyline[si_1].bulge != 0.0 {
         // 如果点和端点重合，直接砍掉
@@ -547,13 +547,24 @@ pub fn resolve_basic_intersection(
             );
             // 确保范围有效：next_si_1 <= next_si_0
             if next_si_0 < next_si_1 {
-                return Err(anyhow!("Invalid drain range: next_si_0({}) < next_si_1({})", next_si_0, next_si_1));
+                return Err(anyhow!(
+                    "Invalid drain range: next_si_0({}) < next_si_1({})",
+                    next_si_0,
+                    next_si_1
+                ));
             }
             // 安全地移除范围内的顶点
-            if next_si_1 < new_polyline.vertex_data.len() && next_si_0 <= new_polyline.vertex_data.len() {
+            if next_si_1 < new_polyline.vertex_data.len()
+                && next_si_0 <= new_polyline.vertex_data.len()
+            {
                 new_polyline.vertex_data.drain(next_si_1..next_si_0);
             } else {
-                return Err(anyhow!("Invalid drain range for polyline: next_si_1={}, next_si_0={}, len={}", next_si_1, next_si_0, new_polyline.vertex_data.len()));
+                return Err(anyhow!(
+                    "Invalid drain range for polyline: next_si_1={}, next_si_0={}, len={}",
+                    next_si_1,
+                    next_si_0,
+                    new_polyline.vertex_data.len()
+                ));
             }
         } else if use_start {
             new_polyline[si_1] = r.updated_start;
@@ -565,10 +576,11 @@ pub fn resolve_basic_intersection(
             );
         } else {
             // 检查索引的有效性
-            if next_si_0 >= new_polyline.vertex_data.len() || si_1 >= new_polyline.vertex_data.len() {
+            if next_si_0 >= new_polyline.vertex_data.len() || si_1 >= new_polyline.vertex_data.len()
+            {
                 return Err(anyhow!("Invalid vertex indices for polyline."));
             }
-            
+
             new_polyline[next_si_0] = r.split_vertex;
             new_polyline[si_1] = r.split_vertex;
             #[cfg(feature = "debug_wire")]
@@ -578,16 +590,26 @@ pub fn resolve_basic_intersection(
             );
             // 确保范围有效：next_si_0 <= si_1
             if si_1 < next_si_0 {
-                return Err(anyhow!("Invalid drain range: si_1({}) < next_si_0({})", si_1, next_si_0));
+                return Err(anyhow!(
+                    "Invalid drain range: si_1({}) < next_si_0({})",
+                    si_1,
+                    next_si_0
+                ));
             }
             // 安全地移除范围内的顶点
-            if next_si_0 < new_polyline.vertex_data.len() && si_1 <= new_polyline.vertex_data.len() {
+            if next_si_0 < new_polyline.vertex_data.len() && si_1 <= new_polyline.vertex_data.len()
+            {
                 new_polyline.vertex_data.drain(next_si_0..si_1);
             } else {
-                return Err(anyhow!("Invalid drain range for polyline: next_si_0={}, si_1={}, len={}", next_si_0, si_1, new_polyline.vertex_data.len()));
+                return Err(anyhow!(
+                    "Invalid drain range for polyline: next_si_0={}, si_1={}, len={}",
+                    next_si_0,
+                    si_1,
+                    new_polyline.vertex_data.len()
+                ));
             }
         }
-    } 
+    }
     // 处理圆弧和直线相交的情况(第一条是圆弧,第二条是直线)
     else if polyline[si_0].bulge != 0.0 && polyline[si_1].bulge == 0.0 {
         let mut tmp_polyline = Polyline::new_closed();
@@ -610,13 +632,23 @@ pub fn resolve_basic_intersection(
             );
             // 确保范围有效：next_si_0 <= si_1
             if si_1 < next_si_0 {
-                return Err(anyhow!("Invalid drain range: si_1({}) < next_si_0({})", si_1, next_si_0));
+                return Err(anyhow!(
+                    "Invalid drain range: si_1({}) < next_si_0({})",
+                    si_1,
+                    next_si_0
+                ));
             }
             // 安全地移除范围内的顶点
-            if next_si_0 < new_polyline.vertex_data.len() && si_1 <= new_polyline.vertex_data.len() {
+            if next_si_0 < new_polyline.vertex_data.len() && si_1 <= new_polyline.vertex_data.len()
+            {
                 new_polyline.vertex_data.drain(next_si_0..si_1);
             } else {
-                return Err(anyhow!("Invalid drain range for polyline: next_si_0={}, si_1={}, len={}", next_si_0, si_1, new_polyline.vertex_data.len()));
+                return Err(anyhow!(
+                    "Invalid drain range for polyline: next_si_0={}, si_1={}, len={}",
+                    next_si_0,
+                    si_1,
+                    new_polyline.vertex_data.len()
+                ));
             }
         } else {
             if use_start {
@@ -629,20 +661,33 @@ pub fn resolve_basic_intersection(
                 );
                 // 确保范围有效：next_si_0 <= si_1
                 if si_1 < next_si_0 {
-                    return Err(anyhow!("Invalid drain range: si_1({}) < next_si_0({})", si_1, next_si_0));
+                    return Err(anyhow!(
+                        "Invalid drain range: si_1({}) < next_si_0({})",
+                        si_1,
+                        next_si_0
+                    ));
                 }
                 // 安全地移除范围内的顶点
-                if next_si_0 < new_polyline.vertex_data.len() && si_1 <= new_polyline.vertex_data.len() {
+                if next_si_0 < new_polyline.vertex_data.len()
+                    && si_1 <= new_polyline.vertex_data.len()
+                {
                     new_polyline.vertex_data.drain(next_si_0..si_1);
                 } else {
-                    return Err(anyhow!("Invalid drain range for polyline: next_si_0={}, si_1={}, len={}", next_si_0, si_1, new_polyline.vertex_data.len()));
+                    return Err(anyhow!(
+                        "Invalid drain range for polyline: next_si_0={}, si_1={}, len={}",
+                        next_si_0,
+                        si_1,
+                        new_polyline.vertex_data.len()
+                    ));
                 }
             } else {
                 // 检查索引的有效性
-                if si_0 >= new_polyline.vertex_data.len() || next_si_1 >= new_polyline.vertex_data.len() {
+                if si_0 >= new_polyline.vertex_data.len()
+                    || next_si_1 >= new_polyline.vertex_data.len()
+                {
                     return Err(anyhow!("Invalid vertex indices for polyline."));
                 }
-                
+
                 new_polyline[si_0] = r.split_vertex;
                 new_polyline[next_si_1] = r.split_vertex;
                 #[cfg(feature = "debug_wire")]
@@ -652,14 +697,14 @@ pub fn resolve_basic_intersection(
                 );
             }
         }
-    } 
+    }
     // 处理两条圆弧相交的情况
     else if polyline[si_0].bulge != 0.0 && polyline[si_1].bulge != 0.0 {
         // 验证索引的有效性
         if si_0 >= verts_len || (si_0 + 1) >= verts_len {
             return Err(anyhow!("Invalid index for polyline."));
         }
-        
+
         let sr = seg_split(
             polyline[si_0],
             polyline[(si_0 + 1) % verts_len],
@@ -668,12 +713,12 @@ pub fn resolve_basic_intersection(
         );
         // 更新第一条圆弧的起点
         new_polyline[si_0] = sr.updated_start;
-        
+
         // 验证索引的有效性
         if si_1 >= verts_len || (si_1 + 1) >= verts_len {
             return Err(anyhow!("Invalid index for polyline."));
         }
-        
+
         // 更新第二条圆弧的起点
         let er = seg_split(
             polyline[si_1],
@@ -688,13 +733,23 @@ pub fn resolve_basic_intersection(
             println!("both arc, remove between {} .. {}", next_si_0, si_1);
             // 确保范围有效：next_si_0 <= si_1
             if si_1 < next_si_0 {
-                return Err(anyhow!("Invalid drain range: si_1({}) < next_si_0({})", si_1, next_si_0));
+                return Err(anyhow!(
+                    "Invalid drain range: si_1({}) < next_si_0({})",
+                    si_1,
+                    next_si_0
+                ));
             }
             // 安全地移除范围内的顶点
-            if next_si_0 < new_polyline.vertex_data.len() && si_1 <= new_polyline.vertex_data.len() {
+            if next_si_0 < new_polyline.vertex_data.len() && si_1 <= new_polyline.vertex_data.len()
+            {
                 new_polyline.vertex_data.drain(next_si_0..si_1);
             } else {
-                return Err(anyhow!("Invalid drain range for polyline: next_si_0={}, si_1={}, len={}", next_si_0, si_1, new_polyline.vertex_data.len()));
+                return Err(anyhow!(
+                    "Invalid drain range for polyline: next_si_0={}, si_1={}, len={}",
+                    next_si_0,
+                    si_1,
+                    new_polyline.vertex_data.len()
+                ));
             }
         }
     }
@@ -742,7 +797,10 @@ pub fn gen_polyline(pts: &Vec<Vec3>) -> anyhow::Result<Polyline> {
     // 统一使用 rust-ploop-processor 处理所有顶点
     let processed_vertices = process_ploop_vertices(pts, "POLYLINE_GENERATION")?;
 
-    println!("   rust-ploop-processor 处理完成，得到 {} 个顶点", processed_vertices.len());
+    println!(
+        "   rust-ploop-processor 处理完成，得到 {} 个顶点",
+        processed_vertices.len()
+    );
 
     // 将处理后的顶点转换为 Polyline
     convert_vertices_to_polyline(&processed_vertices)
@@ -843,7 +901,10 @@ fn convert_vertices_to_polyline(vertices: &[Vec3]) -> anyhow::Result<Polyline> {
         }
     }
 
-    println!("✅ Polyline 转换完成，包含 {} 个顶点", polyline.vertex_data.len());
+    println!(
+        "✅ Polyline 转换完成，包含 {} 个顶点",
+        polyline.vertex_data.len()
+    );
 
     Ok(polyline)
 }
@@ -1208,7 +1269,7 @@ pub fn gen_wire(
     input_fradius_vec: &Vec<f32>,
 ) -> anyhow::Result<truck_modeling::Wire> {
     #[cfg(feature = "truck")]
-    use truck_modeling::{builder, Vertex, Wire};
+    use truck_modeling::{Vertex, Wire, builder};
     if input_pts.len() < 3 || input_fradius_vec.len() != input_pts.len() {
         return Err(anyhow!("wire 顶点数量不够，小于3。"));
     }
@@ -1554,10 +1615,7 @@ pub fn test_gen_polyline_complex_shape() {
 /// ];
 /// let processed = process_ploop_vertices(&vertices, "TEST_PLOOP")?;
 /// ```
-pub fn process_ploop_vertices(
-    vertices: &[Vec3],
-    ploop_name: &str
-) -> anyhow::Result<Vec<Vec3>> {
+pub fn process_ploop_vertices(vertices: &[Vec3], ploop_name: &str) -> anyhow::Result<Vec<Vec3>> {
     if vertices.len() < 3 {
         return Err(anyhow::anyhow!("顶点数量不足，至少需要3个顶点"));
     }
@@ -1569,7 +1627,8 @@ pub fn process_ploop_vertices(
     let processor = PLoopProcessor::new();
 
     // 将 Vec3 转换为 PLoopVertex
-    let ploop_vertices: Vec<PLoopVertex> = vertices.iter()
+    let ploop_vertices: Vec<PLoopVertex> = vertices
+        .iter()
         .map(|v| {
             if v.z > 0.0 {
                 // 有 fradius 的顶点
@@ -1588,18 +1647,22 @@ pub fn process_ploop_vertices(
     }
 
     // 使用 rust-ploop-processor 处理 PLOOP
-    let processed_vertices = processor.process_ploop(&ploop)
+    let processed_vertices = processor
+        .process_ploop(&ploop)
         .map_err(|e| anyhow::anyhow!("处理PLOOP失败: {}", e))?;
 
     println!("   处理后顶点数: {}", processed_vertices.len());
 
     // 转换回 Vec3 格式（x,y 为坐标，z 为 fradius）
-    let result: Vec<Vec3> = processed_vertices.iter()
-        .map(|vertex| Vec3::new(
-            vertex.x() as f32,
-            vertex.y() as f32,
-            vertex.get_fradius() as f32  // z 存储 fradius 值
-        ))
+    let result: Vec<Vec3> = processed_vertices
+        .iter()
+        .map(|vertex| {
+            Vec3::new(
+                vertex.x() as f32,
+                vertex.y() as f32,
+                vertex.get_fradius() as f32, // z 存储 fradius 值
+            )
+        })
         .collect();
 
     let fradius_count = result.iter().filter(|v| v.z > 0.0).count();
@@ -1630,13 +1693,14 @@ pub fn process_ploop_vertices(
 /// ```
 pub fn process_ploop_from_content(
     ploop_content: &str,
-    ploop_name: Option<&str>
+    ploop_name: Option<&str>,
 ) -> anyhow::Result<Vec<Vec3>> {
     // 创建 PLOOP 处理器
     let processor = PLoopProcessor::new();
 
     // 解析 PLOOP 文件
-    let ploops = processor.parse_file(ploop_content)
+    let ploops = processor
+        .parse_file(ploop_content)
         .map_err(|e| anyhow::anyhow!("解析PLOOP文件失败: {}", e))?;
 
     if ploops.is_empty() {
@@ -1645,7 +1709,8 @@ pub fn process_ploop_from_content(
 
     // 查找指定的 PLOOP 或使用第一个
     let target_ploop = if let Some(name) = ploop_name {
-        ploops.iter()
+        ploops
+            .iter()
             .find(|ploop| ploop.name.contains(name))
             .ok_or_else(|| anyhow::anyhow!("没有找到名为 '{}' 的PLOOP", name))?
     } else {
@@ -1656,18 +1721,22 @@ pub fn process_ploop_from_content(
     println!("   原始顶点数: {}", target_ploop.vertices.len());
 
     // 使用 rust-ploop-processor 处理 PLOOP
-    let processed_vertices = processor.process_ploop(target_ploop)
+    let processed_vertices = processor
+        .process_ploop(target_ploop)
         .map_err(|e| anyhow::anyhow!("处理PLOOP失败: {}", e))?;
 
     println!("   处理后顶点数: {}", processed_vertices.len());
 
     // 转换为 Vec3 格式（x,y 为坐标，z 为 fradius）
-    let result: Vec<Vec3> = processed_vertices.iter()
-        .map(|vertex| Vec3::new(
-            vertex.x() as f32,
-            vertex.y() as f32,
-            vertex.get_fradius() as f32  // z 存储 fradius 值
-        ))
+    let result: Vec<Vec3> = processed_vertices
+        .iter()
+        .map(|vertex| {
+            Vec3::new(
+                vertex.x() as f32,
+                vertex.y() as f32,
+                vertex.get_fradius() as f32, // z 存储 fradius 值
+            )
+        })
         .collect();
 
     let fradius_count = result.iter().filter(|v| v.z > 0.0).count();
@@ -1690,13 +1759,19 @@ fn test_process_ploop_vertices() {
     // 测试 process_ploop_vertices 方法
     match process_ploop_vertices(&test_vertices, "TEST_FRAME") {
         Ok(processed_vertices) => {
-            println!("✅ 顶点处理测试成功: 处理得到 {} 个顶点", processed_vertices.len());
+            println!(
+                "✅ 顶点处理测试成功: 处理得到 {} 个顶点",
+                processed_vertices.len()
+            );
             assert!(processed_vertices.len() > 0, "应该至少有一个顶点");
 
             // 打印顶点信息
             for (i, vertex) in processed_vertices.iter().enumerate() {
                 if vertex.z > 0.0 {
-                    println!("  顶点[{}]: ({:.2}, {:.2}) FRADIUS: {:.1}", i, vertex.x, vertex.y, vertex.z);
+                    println!(
+                        "  顶点[{}]: ({:.2}, {:.2}) FRADIUS: {:.1}",
+                        i, vertex.x, vertex.y, vertex.z
+                    );
                 } else {
                     println!("  顶点[{}]: ({:.2}, {:.2})", i, vertex.x, vertex.y);
                 }
@@ -1733,11 +1808,12 @@ END FRMWORK
             // 打印顶点信息
             for (i, vertex) in vertices.iter().enumerate() {
                 if vertex.z > 0.0 {
-                    println!("  顶点[{}]: ({:.2}, {:.2}) FRADIUS: {:.1}",
-                        i, vertex.x, vertex.y, vertex.z);
+                    println!(
+                        "  顶点[{}]: ({:.2}, {:.2}) FRADIUS: {:.1}",
+                        i, vertex.x, vertex.y, vertex.z
+                    );
                 } else {
-                    println!("  顶点[{}]: ({:.2}, {:.2})",
-                        i, vertex.x, vertex.y);
+                    println!("  顶点[{}]: ({:.2}, {:.2})", i, vertex.x, vertex.y);
                 }
             }
 
@@ -1769,11 +1845,18 @@ fn test_gen_polyline_with_ploop_processor() {
     match gen_polyline(&vertices_with_fradius) {
         Ok(polyline) => {
             println!("✅ 带 FRADIUS 测试成功！");
-            println!("   生成的 Polyline 有 {} 个顶点", polyline.vertex_data.len());
+            println!(
+                "   生成的 Polyline 有 {} 个顶点",
+                polyline.vertex_data.len()
+            );
             println!("   Polyline 是否闭合: {}", polyline.is_closed());
 
             // 检查是否有圆弧段（bulge != 0）
-            let arc_count = polyline.vertex_data.iter().filter(|v| v.bulge.abs() > 0.001).count();
+            let arc_count = polyline
+                .vertex_data
+                .iter()
+                .filter(|v| v.bulge.abs() > 0.001)
+                .count();
             println!("   包含 {} 个圆弧段", arc_count);
         }
         Err(e) => {
@@ -1794,7 +1877,10 @@ fn test_gen_polyline_with_ploop_processor() {
     match gen_polyline(&vertices_no_fradius) {
         Ok(polyline) => {
             println!("✅ 无 FRADIUS 测试成功！");
-            println!("   生成的 Polyline 有 {} 个顶点", polyline.vertex_data.len());
+            println!(
+                "   生成的 Polyline 有 {} 个顶点",
+                polyline.vertex_data.len()
+            );
             println!("   Polyline 是否闭合: {}", polyline.is_closed());
         }
         Err(e) => {
@@ -1819,8 +1905,6 @@ fn gen_polyline_handles_fillet_radius_equal_to_edge_length() {
         polyline
             .vertex_data
             .iter()
-            .all(|vertex| vertex.x.is_finite()
-                && vertex.y.is_finite()
-                && vertex.bulge.is_finite())
+            .all(|vertex| vertex.x.is_finite() && vertex.y.is_finite() && vertex.bulge.is_finite())
     );
 }

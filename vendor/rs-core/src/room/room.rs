@@ -1,10 +1,10 @@
-use std::io::{Read, Write};
 use once_cell::sync::Lazy;
+use std::io::{Read, Write};
 use tokio::sync::RwLock;
 
 use crate::{
+    RefU64, SUL_DB,
     accel_tree::acceleration_tree::{AccelerationTree, RStarBoundingBox},
-    SUL_DB, RefU64,
 };
 
 //或者改成第一次，需要去加载，后续就不用了
@@ -26,7 +26,8 @@ pub async fn load_aabb_tree() -> anyhow::Result<bool> {
     }
     #[cfg(not(feature = "web"))]
     {
-        *GLOBAL_AABB_TREE.write().await = AccelerationTree::deserialize_from_bin_file().unwrap_or_default();
+        *GLOBAL_AABB_TREE.write().await =
+            AccelerationTree::deserialize_from_bin_file().unwrap_or_default();
     }
     // {
     //     if !GLOBAL_AABB_TREE.read().await.is_empty() {
@@ -95,7 +96,9 @@ pub async fn load_room_aabb_tree() -> anyhow::Result<bool> {
         }
         for r in refno_aabbs {
             if let Some(r) = r {
-                if r.aabb.extents().magnitude().is_infinite() || r.aabb.extents().magnitude().is_nan() {
+                if r.aabb.extents().magnitude().is_infinite()
+                    || r.aabb.extents().magnitude().is_nan()
+                {
                     continue;
                 }
                 rstar_objs.push(r);
@@ -113,6 +116,3 @@ pub async fn load_room_aabb_tree() -> anyhow::Result<bool> {
 
     Ok(true)
 }
-
-
-
