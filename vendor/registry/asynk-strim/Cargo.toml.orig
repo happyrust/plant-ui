@@ -1,0 +1,38 @@
+[package]
+name = "asynk-strim"
+version = "0.1.5"
+edition = "2021"
+
+# crates.io metadata
+rust-version = "1.89"
+description = "Lightweight stream generator library"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/aumetra/asynk-strim.git"
+categories = ["asynchronous", "no-std", "no-std::no-alloc"]
+keywords = ["async", "no_std", "stream"]
+
+# Make crate as small as possible
+include = [
+  "src/**/*.rs",
+  "Cargo.toml",
+  "README.md",
+  "LICENSE-APACHE",
+  "LICENSE-MIT",
+]
+
+[[bench]]
+name = "bench"
+harness = false
+
+[dependencies]
+futures-core = { version = "0.3.31", default-features = false }
+pin-project-lite = "0.2.14"
+
+[dev-dependencies]
+async-fn-stream = "0.3.2"
+async-stream = "0.3.6"
+criterion = { version = "0.7.0", default-features = false, features = ["cargo_bench_support", "plotters"] }
+futures-lite = { version = "2.3.0", default-features = false, features = [
+  "std",
+] }
+trybuild = "1.0.99"

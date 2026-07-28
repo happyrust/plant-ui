@@ -1,0 +1,26 @@
+[package]
+name = "static_assertions_next"
+version = "1.1.2"
+authors = ["Nikolai Vazquez"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+homepage = "https://github.com/scuffletv/static-assertions"
+repository = "https://github.com/scuffletv/static-assertions"
+documentation = "https://docs.rs/static_assertions_next/"
+categories = ["no-std", "rust-patterns", "development-tools::testing"]
+keywords = ["assert", "static", "testing"]
+description = "Compile-time assertions to ensure that invariants are met."
+include = ["Cargo.toml", "src/**/*.rs", "README.md", "CHANGELOG.md", "LICENSE*"]
+edition = "2021"
+
+[dependencies.proc_static_assertions_next]
+version = "0.0.1"
+path = "proc"
+optional = true
+
+[workspace]
+members = ["proc"]
+
+[features]
+nightly = []
+proc = ["proc_static_assertions_next"]

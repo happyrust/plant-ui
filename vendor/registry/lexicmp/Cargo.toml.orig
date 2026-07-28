@@ -1,0 +1,16 @@
+[package]
+name = "lexicmp"
+publish = true
+edition = "2021"
+version = "0.1.0"
+readme = "README.md"
+authors = ["Tobie Morgan Hitchcock <tobie@surrealdb.com>"]
+description = "Library for comparing and sorting strings lexicographically and naturally"
+repository = "https://github.com/surrealdb/lexicmp"
+homepage = "https://github.com/surrealdb/lexicmp"
+keywords = ["unicode", "transliteration", "lexicographical", "sort", "emoji"]
+categories = ["algorithms", "text-processing", "internationalization"]
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+any_ascii = "0.3.2"

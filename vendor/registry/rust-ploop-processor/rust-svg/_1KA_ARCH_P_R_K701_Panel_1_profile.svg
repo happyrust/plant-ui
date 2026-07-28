@@ -1,0 +1,100 @@
+<svg width="1000" height="800" viewBox="0 0 1000 800" xmlns="http://www.w3.org/2000/svg">
+<rect x="0" y="0" width="1000" height="800" fill="white" stroke="none"/>
+<text x="500" y="25" text-anchor="middle" font-family="Arial" font-size="16" fill="black">PLOOP Profile: /1KA-ARCH-P-R-K701_Panel_1 (高度: 5700.0mm)</text>
+<path d="M 384.02 713.75 A 1123.52 1123.52 0 0 1 374.24 681.30 L 374.24 97.29 L 384.02 64.84 L 379.02 60.00 L 94.54 354.03 L 125.19 383.69 L 60.00 451.07 L 358.62 740.00 L 384.02 713.75 Z" fill="none" stroke="blue" stroke-width="2"/>
+<circle cx="384" cy="714" r="3" fill="red" stroke="white" stroke-width="1"/>
+<text x="392" y="706" font-family="Arial" font-size="10" font-weight="bold" fill="black">0</text>
+<circle cx="374" cy="681" r="3" fill="red" stroke="white" stroke-width="1"/>
+<text x="382" y="673" font-family="Arial" font-size="10" font-weight="bold" fill="black">1</text>
+<circle cx="374" cy="97" r="3" fill="red" stroke="white" stroke-width="1"/>
+<text x="382" y="89" font-family="Arial" font-size="10" font-weight="bold" fill="black">2</text>
+<circle cx="384" cy="65" r="3" fill="red" stroke="white" stroke-width="1"/>
+<text x="392" y="57" font-family="Arial" font-size="10" font-weight="bold" fill="black">3</text>
+<circle cx="379" cy="60" r="3" fill="red" stroke="white" stroke-width="1"/>
+<text x="387" y="52" font-family="Arial" font-size="10" font-weight="bold" fill="black">4</text>
+<circle cx="95" cy="354" r="3" fill="red" stroke="white" stroke-width="1"/>
+<text x="103" y="346" font-family="Arial" font-size="10" font-weight="bold" fill="black">5</text>
+<circle cx="125" cy="384" r="3" fill="red" stroke="white" stroke-width="1"/>
+<text x="133" y="376" font-family="Arial" font-size="10" font-weight="bold" fill="black">6</text>
+<circle cx="60" cy="451" r="3" fill="red" stroke="white" stroke-width="1"/>
+<text x="68" y="443" font-family="Arial" font-size="10" font-weight="bold" fill="black">7</text>
+<circle cx="359" cy="740" r="3" fill="red" stroke="white" stroke-width="1"/>
+<text x="367" y="732" font-family="Arial" font-size="10" font-weight="bold" fill="black">8</text>
+<circle cx="286" cy="389" r="4" fill="none" stroke="orange" stroke-width="2"/>
+<text x="296" y="379" font-family="Arial" font-size="8" fill="orange">R26363</text>
+<line x1="60" y1="740" x2="60" y2="60" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="110" y1="740" x2="110" y2="60" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="160" y1="740" x2="160" y2="60" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="210" y1="740" x2="210" y2="60" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="260" y1="740" x2="260" y2="60" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="310" y1="740" x2="310" y2="60" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="360" y1="740" x2="360" y2="60" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="410" y1="740" x2="410" y2="60" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="460" y1="740" x2="460" y2="60" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="510" y1="740" x2="510" y2="60" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="560" y1="740" x2="560" y2="60" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="610" y1="740" x2="610" y2="60" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="660" y1="740" x2="660" y2="60" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="710" y1="740" x2="710" y2="60" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="760" y1="740" x2="760" y2="60" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="810" y1="740" x2="810" y2="60" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="860" y1="740" x2="860" y2="60" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="910" y1="740" x2="910" y2="60" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="60" y1="60" x2="940" y2="60" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="60" y1="110" x2="940" y2="110" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="60" y1="160" x2="940" y2="160" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="60" y1="210" x2="940" y2="210" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="60" y1="260" x2="940" y2="260" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="60" y1="310" x2="940" y2="310" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="60" y1="360" x2="940" y2="360" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="60" y1="410" x2="940" y2="410" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="60" y1="460" x2="940" y2="460" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="60" y1="510" x2="940" y2="510" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="60" y1="560" x2="940" y2="560" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="60" y1="610" x2="940" y2="610" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="60" y1="660" x2="940" y2="660" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<line x1="60" y1="710" x2="940" y2="710" stroke="lightgray" stroke-width="1" opacity="0.3"/>
+<rect x="630" y="642" width="360" height="148" fill="white" stroke="gray" stroke-width="1" opacity="0.95" rx="5"/>
+<text x="810" y="657" text-anchor="middle" font-family="Arial" font-size="12" font-weight="bold" fill="black">顶点坐标表</text>
+<text x="640" y="672" font-family="Arial" font-size="10" font-weight="bold" fill="gray">序号</text>
+<text x="680" y="672" font-family="Arial" font-size="10" font-weight="bold" fill="gray">X (mm)</text>
+<text x="760" y="672" font-family="Arial" font-size="10" font-weight="bold" fill="gray">Y (mm)</text>
+<text x="840" y="672" font-family="Arial" font-size="10" font-weight="bold" fill="orange">FRADIUS</text>
+<line x1="635" y1="675" x2="985" y2="675" stroke="lightgray" stroke-width="1"/>
+<text x="645" y="687" text-anchor="middle" font-family="Arial" font-size="9" fill="black">0</text>
+<text x="685" y="687" font-family="Arial" font-size="9" fill="black">0.00</text>
+<text x="765" y="687" font-family="Arial" font-size="9" fill="black">0.00</text>
+<text x="845" y="687" font-family="Arial" font-size="9" fill="gray">-</text>
+<text x="645" y="699" text-anchor="middle" font-family="Arial" font-size="9" fill="black">1</text>
+<text x="685" y="699" font-family="Arial" font-size="9" fill="black">-229.64</text>
+<text x="765" y="699" font-family="Arial" font-size="9" fill="black">761.32</text>
+<text x="845" y="699" font-family="Arial" font-size="9" font-weight="bold" fill="orange">26363.2</text>
+<text x="645" y="711" text-anchor="middle" font-family="Arial" font-size="9" fill="black">2</text>
+<text x="685" y="711" font-family="Arial" font-size="9" fill="black">-229.65</text>
+<text x="765" y="711" font-family="Arial" font-size="9" fill="black">14464.99</text>
+<text x="845" y="711" font-family="Arial" font-size="9" fill="gray">-</text>
+<text x="645" y="723" text-anchor="middle" font-family="Arial" font-size="9" fill="black">3</text>
+<text x="685" y="723" font-family="Arial" font-size="9" fill="black">0.00</text>
+<text x="765" y="723" font-family="Arial" font-size="9" fill="black">15226.34</text>
+<text x="845" y="723" font-family="Arial" font-size="9" fill="gray">-</text>
+<text x="645" y="735" text-anchor="middle" font-family="Arial" font-size="9" fill="black">4</text>
+<text x="685" y="735" font-family="Arial" font-size="9" fill="black">-117.45</text>
+<text x="765" y="735" font-family="Arial" font-size="9" fill="black">15339.98</text>
+<text x="845" y="735" font-family="Arial" font-size="9" fill="gray">-</text>
+<text x="645" y="747" text-anchor="middle" font-family="Arial" font-size="9" fill="black">5</text>
+<text x="685" y="747" font-family="Arial" font-size="9" fill="black">-6792.77</text>
+<text x="765" y="747" font-family="Arial" font-size="9" fill="black">8440.70</text>
+<text x="845" y="747" font-family="Arial" font-size="9" fill="gray">-</text>
+<text x="645" y="759" text-anchor="middle" font-family="Arial" font-size="9" fill="black">6</text>
+<text x="685" y="759" font-family="Arial" font-size="9" fill="black">-6073.38</text>
+<text x="765" y="759" font-family="Arial" font-size="9" fill="black">7744.65</text>
+<text x="845" y="759" font-family="Arial" font-size="9" fill="gray">-</text>
+<text x="645" y="771" text-anchor="middle" font-family="Arial" font-size="9" fill="black">7</text>
+<text x="685" y="771" font-family="Arial" font-size="9" fill="black">-7603.14</text>
+<text x="765" y="771" font-family="Arial" font-size="9" fill="black">6163.57</text>
+<text x="845" y="771" font-family="Arial" font-size="9" fill="gray">-</text>
+<text x="645" y="783" text-anchor="middle" font-family="Arial" font-size="9" fill="black">8</text>
+<text x="685" y="783" font-family="Arial" font-size="9" fill="black">-596.06</text>
+<text x="765" y="783" font-family="Arial" font-size="9" fill="black">-616.06</text>
+<text x="845" y="783" font-family="Arial" font-size="9" fill="gray">-</text>
+</svg>

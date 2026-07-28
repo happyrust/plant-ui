@@ -1,0 +1,40 @@
+sudo: false
+language: rust
+cache: cargo
+
+addons:
+  apt:
+    packages:
+      - libcurl4-openssl-dev
+      - libelf-dev
+      - libdw-dev
+      - binutils-dev
+      - cmake
+    sources:
+      - kalakris-cmake
+
+rust:
+  - stable
+  - beta
+  - nightly
+matrix:
+  allow_failures:
+    - rust: beta
+    - rust: nightly
+
+before_script:
+  - export PATH=$HOME/.cargo/bin:$PATH
+  - which cargo-coverage && which cargo-coveralls || cargo install cargo-travis
+  - rustup component add rustfmt
+
+script:
+  - |
+      cargo fmt --verbose -- --check &&
+      cargo build &&
+      cargo test &&
+      cargo bench &&
+      cargo doc
+
+after_success:
+  # measure code coverage and upload to coveralls.io
+  - cargo coveralls

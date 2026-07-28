@@ -1,0 +1,21 @@
+[package]
+name = "async-graphql-value"
+version = "7.2.1"
+authors = ["sunli <scott_s829@163.com>", "Koxiaet"]
+edition = "2024"
+description = "GraphQL value for async-graphql"
+license = "MIT OR Apache-2.0"
+documentation = "https://docs.rs/async-graphql/"
+homepage = "https://github.com/async-graphql/async-graphql"
+repository = "https://github.com/async-graphql/async-graphql"
+keywords = ["futures", "async", "graphql"]
+categories = ["network-programming", "asynchronous"]
+
+[dependencies]
+serde_json.workspace = true
+serde.workspace = true
+bytes.workspace = true
+indexmap.workspace = true
+
+[features]
+raw_value = ["serde_json/raw_value"]

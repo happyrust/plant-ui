@@ -1,0 +1,35 @@
+[package]
+name = "vart"
+publish = true
+version = "0.8.1"
+edition = "2021"
+license = "Apache-2.0"
+readme = "README.md"
+description = "An immutable versioned adaptive radix trie."
+repository = "https://github.com/surrealdb/vart"
+homepage = "https://github.com/surrealdb/vart"
+documentation = "https://docs.rs/vart/"
+keywords = [
+    "trie",
+    "immutable-trie",
+    "snapshot-isolation",
+    "adaptive-radix-trie",
+    "radix-trie",
+]
+
+[dependencies]
+
+[dev-dependencies]
+rand = "0.8.5"
+criterion = "0.5.1"
+divan = "0.1.14"
+
+[[bench]]
+name = "vart_bench"
+path = "benches/vart_bench.rs"
+harness = false
+
+[[bench]]
+name = "allocs"
+path = "benches/allocs.rs"
+harness = false
