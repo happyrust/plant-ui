@@ -30,16 +30,17 @@ $backendTarget = $backendBuildTarget
 
 if (Test-Path $releaseRoot) { Remove-Item -Recurse -Force $releaseRoot }
 New-Item -ItemType Directory -Force $backendRelease, $pcRelease | Out-Null
+New-Item -ItemType Directory -Force (Join-Path $backendRelease "assets") | Out-Null
 
 Copy-Item (Join-Path $backendTarget "release\aios-database.exe") $backendRelease
 Copy-Item (Join-Path $backendRoot "DbOption.toml") $backendRelease
 Copy-Item (Join-Path $backendRoot "bin") $backendRelease -Recurse
-Copy-Item (Join-Path $backendRoot "assets") $backendRelease -Recurse
 Copy-Item (Join-Path $backendRoot "resource") $backendRelease -Recurse
 Copy-Item (Join-Path $backendRoot "rs_surreal") $backendRelease -Recurse
 Copy-Item (Join-Path $uiRoot "web\public") (Join-Path $backendRelease "web") -Recurse
 Copy-Item (Join-Path $uiTarget "release\plant-ui-app.exe") $pcRelease
 Copy-Item (Join-Path $uiRoot "DbOption.toml") $pcRelease
+Copy-Item (Join-Path $uiRoot "resource") $pcRelease -Recurse
 
 @'
 param(
@@ -51,9 +52,11 @@ $root = $PSScriptRoot
 $backend = Join-Path $root "backend"
 $pc = Join-Path $root "pc"
 
-if ([string]::IsNullOrWhiteSpace($AssetRoot)) {
-  $AssetRoot = Join-Path $backend "assets"
-} else {
+$usingLegacyAssets = -not [string]::IsNullOrWhiteSpace($AssetRoot)
+if ($usingLegacyAssets) {
+  if (-not (Test-Path -LiteralPath $AssetRoot -PathType Container)) {
+    throw "资产根目录不存在: $AssetRoot"
+  }
   $legacyConfig = Join-Path $AssetRoot "config\e3d.project.ron"
   $legacyMeshes = Join-Path $AssetRoot "meshes"
   if (-not (Test-Path -LiteralPath $legacyConfig -PathType Leaf)) {
@@ -62,10 +65,15 @@ if ([string]::IsNullOrWhiteSpace($AssetRoot)) {
   if (-not (Test-Path -LiteralPath $legacyMeshes -PathType Container)) {
     throw "旧版 mesh 目录不存在: $legacyMeshes"
   }
+  $AssetRoot = (Resolve-Path -LiteralPath $AssetRoot).Path
+  $env:PLANT_ASSET_ROOT = $AssetRoot
+} else {
+  Remove-Item Env:PLANT_ASSET_ROOT -ErrorAction SilentlyContinue
 }
-$AssetRoot = (Resolve-Path -LiteralPath $AssetRoot).Path
-$env:PLANT_ASSET_ROOT = $AssetRoot
 
+if ([string]::IsNullOrWhiteSpace($env:SURREAL_ROCKSDB_BLOCK_CACHE_SIZE)) {
+  $env:SURREAL_ROCKSDB_BLOCK_CACHE_SIZE = "536870912"
+}
 Start-Process -FilePath (Join-Path $backend "bin\surreal.exe") -WorkingDirectory $backend -ArgumentList @("start", "--bind", "127.0.0.1:8009", "--user", "root", "--pass", "root", "rocksdb:./data/surreal")
 for ($i = 0; $i -lt 30; $i++) {
   if (Test-NetConnection 127.0.0.1 -Port 8009 -InformationLevel Quiet) { break }
@@ -91,6 +99,7 @@ Write-Host "已启动：Web http://127.0.0.1:8022，PC 客户端与本地数据�
 
 运行 `powershell -ExecutionPolicy Bypass -File .\Start-Plant.ps1`。
 Web 端在 `http://127.0.0.1:8022`，PC 客户端会同时启动。
+不传 `-AssetRoot` 时继续使用 `DbOption.toml` 与 Web `config.json`。
 
 复用旧版 `rs-plant3-d` 数据时，不复制 mesh，直接挂载旧 `assets` 目录：
 
