@@ -11,6 +11,7 @@
 /.context/
 /.cursor/
 /.kiro/
+vendor/*
 /.review/
 /.sigmap-cache.json
 /.teach/

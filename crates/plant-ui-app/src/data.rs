@@ -100,7 +100,10 @@ pub enum Evt {
     QueuePoll(anyhow::Result<QueuePoll>),
     /// 暂停 / 恢复的回执。真值仍以下一次轮询的快照为准，这里只负责把失败说出来。
     QueueSetPaused(bool, anyhow::Result<()>),
-    DataPublish(PublishRequest, anyhow::Result<String>),
+    DataPublish(
+        PublishRequest,
+        anyhow::Result<crate::data_publish_api::SubmitResult>,
+    ),
     /// 队列视图的逐单元明细，带发生在哪个任务上。
     ///
     /// 这三个只有原生端的 WebSocket 构造（`model_update_ws`）；wasm 的 Feed 是

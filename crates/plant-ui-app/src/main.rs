@@ -627,7 +627,7 @@ impl App {
         app
     }
 
-    fn pump_events(&mut self) {
+    fn pump_events(&mut self, ctx: &egui::Context) {
         if let Some(feed) = &mut self.queue_feed {
             feed.poll();
         }
@@ -995,15 +995,20 @@ impl App {
                     }
                 },
                 data::Evt::DataPublish(request, result) => match result {
-                    Ok(response) => self.logs.info(
-                        &mut self.vm.logs,
-                        format!(
-                            "{} 已提交（{}）：{}",
-                            request.category.label(),
-                            request.category.endpoint(),
-                            response
-                        ),
-                    ),
+                    Ok(response) => {
+                        if let Some(login_url) = response.login_url {
+                            ctx.open_url(egui::OpenUrl::new_tab(login_url));
+                        }
+                        self.logs.info(
+                            &mut self.vm.logs,
+                            format!(
+                                "{} 已提交（{}）：{}",
+                                request.category.label(),
+                                request.category.endpoint(),
+                                response.message
+                            ),
+                        );
+                    }
                     Err(error) => self.logs.error(
                         &mut self.vm.logs,
                         format!("{}提交失败", request.category.label()),
@@ -1937,7 +1942,7 @@ fn db_label(ns: &str, db_nums: &[u32]) -> String {
 
 impl App {
     fn ui(&mut self, ui: &mut egui::Ui) {
-        self.pump_events();
+        self.pump_events(ui.ctx());
         let t = theme_tokens::current();
         let d = self.settings_state.saved.density;
         // 首帧与每次换主题，把视口配色送给三维侧。对着当前生效令牌比对而不是

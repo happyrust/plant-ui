@@ -82,7 +82,7 @@ batch_insert_sql_cnt = 100 #mysql 批量插入的数量
 # 起法与单个 dbnum 的解析流程见 gen-model/docs/runbook-local-stack-and-dbnum-parse.md。
 # 8022 是 ams7997 的专用落盘实例，ns 与库名跟 8009 完全同名，指错了看不出来。
 v_ip = "localhost"
-v_port = 8009
+v_port = 1516
 v_user = "root"
 v_password = "root"
 pe_chunk = 300
