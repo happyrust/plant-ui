@@ -37,12 +37,9 @@ pub struct SubmitResult {
 /// `ThreeDDatacenterResponse` 判断业务成功，而不只依赖 HTTP 状态。
 pub async fn submit(base: &str, request: &PublishRequest) -> anyhow::Result<SubmitResult> {
     let body = request_body(request)?.to_string();
-    let mut req = ehttp::Request::post(
-        format!("{base}{}", request.category.endpoint()),
-        body.into_bytes(),
-    );
-    req.headers
-        .insert("content-type", "application/json; charset=utf-8");
+    let url = format!("{base}{}", request.category.endpoint());
+    eprintln!("[data_publish] POST {url}\n[data_publish] request: {body}");
+    let mut req = http_request(url, body);
     req.timeout = Some(Duration::from_secs(60));
     let response = ehttp::fetch_async(req)
         .await
@@ -55,6 +52,15 @@ pub async fn submit(base: &str, request: &PublishRequest) -> anyhow::Result<Subm
     }
 
     response_body(request.category, body)
+}
+
+fn http_request(url: String, body: String) -> ehttp::Request {
+    ehttp::Request::new(
+        ehttp::Method::POST,
+        url,
+        ehttp::Headers::new(&[("content-type", "application/json; charset=utf-8")]),
+    )
+    .with_body(body.into_bytes())
 }
 
 fn request_body(request: &PublishRequest) -> anyhow::Result<serde_json::Value> {
@@ -152,6 +158,18 @@ mod tests {
         let mut request = request(PublishCategory::Process);
         request.elements.clear();
         assert!(request_body(&request).is_err());
+    }
+
+    #[test]
+    fn publish_http_request_has_one_json_content_type() {
+        let request = http_request("http://127.0.0.1:9099/get_gy_bran_data".into(), "{}".into());
+
+        assert_eq!(request.method, ehttp::Method::POST);
+        assert_eq!(
+            request.headers.get_all("content-type").collect::<Vec<_>>(),
+            vec!["application/json; charset=utf-8"]
+        );
+        assert_eq!(request.body, b"{}");
     }
 
     #[test]
