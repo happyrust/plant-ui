@@ -6,13 +6,15 @@ $backendRoot = Join-Path (Split-Path $uiRoot -Parent) "gen-model"
 $releaseRoot = Join-Path $uiRoot "release\plant-suite-$version"
 $backendRelease = Join-Path $releaseRoot "backend"
 $pcRelease = Join-Path $releaseRoot "pc"
+$backendBuildTarget = Join-Path $uiRoot "target-release-backend"
 $env:CARGO_BUILD_JOBS = "1"
+$env:CARGO_PROFILE_RELEASE_OPT_LEVEL = "0"
 
 if (-not (Test-Path $backendRoot)) { throw "未找到后端工程: $backendRoot" }
 
 Push-Location $uiRoot
 try {
-  cargo build -j 1 -p plant-ui-app --release
+  cargo --config 'build.jobs=1' --config 'profile.release.opt-level=0' build -p plant-ui-app --release
   if ($LASTEXITCODE) { exit $LASTEXITCODE }
   & (Join-Path $PSScriptRoot "build-wasm.ps1")
   if ($LASTEXITCODE) { exit $LASTEXITCODE }
@@ -20,21 +22,24 @@ try {
 
 Push-Location $backendRoot
 try {
-  cargo build -j 1 --release --features http_api
+  cargo --config 'build.jobs=1' --config 'profile.release.opt-level=0' build --target-dir $backendBuildTarget --release --features http_api
   if ($LASTEXITCODE) { exit $LASTEXITCODE }
 } finally { Pop-Location }
+
+$uiTarget = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).target_directory
+$backendTarget = $backendBuildTarget
 
 if (Test-Path $releaseRoot) { Remove-Item -Recurse -Force $releaseRoot }
 New-Item -ItemType Directory -Force $backendRelease, $pcRelease | Out-Null
 
-Copy-Item (Join-Path $backendRoot "target\release\aios-database.exe") $backendRelease
+Copy-Item (Join-Path $backendTarget "release\aios-database.exe") $backendRelease
 Copy-Item (Join-Path $backendRoot "DbOption.toml") $backendRelease
 Copy-Item (Join-Path $backendRoot "bin") $backendRelease -Recurse
 Copy-Item (Join-Path $backendRoot "assets") $backendRelease -Recurse
 Copy-Item (Join-Path $backendRoot "resource") $backendRelease -Recurse
 Copy-Item (Join-Path $backendRoot "rs_surreal") $backendRelease -Recurse
 Copy-Item (Join-Path $uiRoot "web\public") (Join-Path $backendRelease "web") -Recurse
-Copy-Item (Join-Path $uiRoot "target\release\plant-ui-app.exe") $pcRelease
+Copy-Item (Join-Path $uiTarget "release\plant-ui-app.exe") $pcRelease
 Copy-Item (Join-Path $uiRoot "DbOption.toml") $pcRelease
 
 @'
