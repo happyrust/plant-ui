@@ -123,6 +123,10 @@ pub struct Bridge {
     pub evt_tx: mpsc::Sender<Evt>,
 }
 
+fn is_model_load(req: &Req) -> bool {
+    matches!(req, Req::Models(..))
+}
+
 /// 取回工作：先丢本进程的查询缓存，再把根层与这些分支重查一遍。
 ///
 /// 缓存必须先丢。重查 SITE 根层走的是带 memoize 的那条查询，缓存还在的话它会
@@ -167,12 +171,31 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
     let (req_tx, req_rx) = mpsc::channel();
     let (evt_tx, evt_rx) = mpsc::channel();
     let evt_tx_out = evt_tx.clone();
+    #[cfg(not(target_arch = "wasm32"))]
+    let runtime = tasks.runtime().runtime_arc();
     let worker = move |mut task_ctx: bevy_wasm_tasks::TaskContext| async move {
         let _ = evt_tx.send(Evt::Ready(ready().await));
         ctx.request_repaint();
 
         loop {
             while let Ok(req) = req_rx.try_recv() {
+                // 模型实例冷加载在大库上可达 88 秒。它若占住这个串行桥，树展开和
+                // 属性查询都会排在它后面，界面看上去像节点打不开。模型结果本来就是
+                // 独立事件，原生端直接交给同一个 Tokio runtime 的另一任务即可。
+                #[cfg(not(target_arch = "wasm32"))]
+                if is_model_load(&req) {
+                    let Req::Models(roots, debt_reload) = req else {
+                        unreachable!();
+                    };
+                    let evt_tx = evt_tx.clone();
+                    let ctx = ctx.clone();
+                    runtime.spawn(async move {
+                        let result = plant_ui_data::model_instances(&roots).await;
+                        let _ = evt_tx.send(Evt::Models(debt_reload, result));
+                        ctx.request_repaint();
+                    });
+                    continue;
+                }
                 match req {
                     Req::Reconnect => {
                         let _ = evt_tx.send(Evt::Ready(ready().await));
@@ -189,6 +212,8 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
                         ctx.request_repaint();
                     }
                     Req::Models(roots, debt_reload) => {
+                        // wasm 是单线程运行时；这里保留原有 await，避免为了这一条
+                        // 原生端卡顿引入另一套浏览器调度机制。
                         let result = plant_ui_data::model_instances(&roots).await;
                         let _ = evt_tx.send(Evt::Models(debt_reload, result));
                         ctx.request_repaint();
@@ -268,5 +293,18 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
         req: req_tx,
         evt: evt_rx,
         evt_tx: evt_tx_out,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Req, is_model_load};
+    use plant_ui::RefU64;
+
+    #[test]
+    fn only_the_expensive_model_load_leaves_the_interactive_queue() {
+        assert!(is_model_load(&Req::Models(vec![RefU64::default()], false)));
+        assert!(!is_model_load(&Req::Children(RefU64::default())));
+        assert!(!is_model_load(&Req::Props(RefU64::default())));
     }
 }
