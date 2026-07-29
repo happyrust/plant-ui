@@ -284,6 +284,8 @@ pub async fn init_surreal_with(db_option: &DbOption) -> anyhow::Result<()> {
         .map_err(|e| HandleError::SurrealError {
             msg: format!("Failed to define common functions: {}", e),
         })?;
+    define_owner_index().await?;
+    define_pe_index().await?;
     Ok(())
 }
 

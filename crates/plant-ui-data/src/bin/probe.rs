@@ -2,6 +2,7 @@
 //! M1-3 元素属性。运行：cargo run -p plant-ui-data --bin probe（工作目录需有 DbOption.toml）
 
 use plant_ui_data::AttrKind;
+use std::time::{Duration, Instant};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -16,8 +17,19 @@ async fn main() -> anyhow::Result<()> {
         println!("  {refno:<16} {noun:<6} {name}");
     }
 
-    let sites = plant_ui_data::site_nodes().await?;
-    println!("site_nodes -> {} rows", sites.len());
+    let started = Instant::now();
+    let sites = match std::env::var("MBD_PROBE_MDB") {
+        Ok(mdb) => aios_core::get_mdb_world_site_ele_nodes(mdb, aios_core::DBType::DESI).await?,
+        Err(_) => plant_ui_data::site_nodes().await?,
+    };
+    let elapsed = started.elapsed();
+    println!("site_nodes -> {} rows ({elapsed:?})", sites.len());
+    if elapsed > Duration::from_secs(2) {
+        anyhow::bail!("site_nodes exceeded 2s performance budget: {elapsed:?}");
+    }
+    if std::env::var_os("MBD_PROBE_SITE_ONLY").is_some() {
+        return Ok(());
+    }
     for s in &sites {
         println!(
             "  {:<12} {:<6} {:<20} children={}",
