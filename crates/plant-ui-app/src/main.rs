@@ -1282,7 +1282,7 @@ impl App {
     fn query_attr(&self, attr: &str) -> Result<String, String> {
         let data = match &self.vm.props {
             PropsVm::Uninit => return Err("当前未选中元素".into()),
-            PropsVm::Loading => return Err("当前元素属性仍在加载".into()),
+            PropsVm::Loading(_) => return Err("当前元素属性仍在加载".into()),
             PropsVm::Failed(error) => return Err(format!("当前元素属性不可用：{error}")),
             PropsVm::Ready(data) => data,
         };
@@ -1530,7 +1530,7 @@ impl App {
     }
 
     fn refetch_props(&mut self, refno: RefU64) {
-        self.vm.props = PropsVm::Loading;
+        self.vm.props.begin_query();
         let _ = self.bridge.req.send(data::Req::Props(refno));
     }
 
