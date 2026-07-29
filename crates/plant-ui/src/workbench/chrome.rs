@@ -66,66 +66,108 @@ pub fn command_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: 
             ui.set_width(ui.available_width());
             ui.set_height(d.command_bar_h());
             ui.horizontal_centered(|ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                for (i, name) in ["项目", "创建", "元件库", "插件", "设置", "帮助"]
-                    .into_iter()
-                    .enumerate()
-                {
-                    let response = ui.add(widgets::chip(t, d, name, i == 0));
-                    if name == "项目" {
-                        egui::Popup::menu(&response).show(|ui| {
-                            if ui.button("打开项目…").clicked() {
-                                cmds.push(Cmd::OpenProjectPicker);
-                                ui.close();
-                            }
-                            ui.separator();
-                            // 没连上库时取回工作无从谈起：没有树可重查，也没有
-                            // 模型可重载。禁用而不是隐藏——菜单项换位置比灰着更难找。
-                            let busy = vm.get_work_busy;
-                            let label = if busy {
-                                "正在取回工作…"
-                            } else {
-                                "取回工作 GET WORK"
-                            };
-                            if ui
-                                .add_enabled(vm.data_source_ok && !busy, egui::Button::new(label))
-                                .clicked()
-                            {
-                                cmds.push(Cmd::GetWork);
-                                ui.close();
-                            }
-                            // 取回工作只取界面。设计库里还躺着没应用的会话时，
-                            // 这一行是唯一告诉人「该去的是另一个入口」的地方。
-                            if let Some(pending) = vm.pending_sessions.filter(|n| *n > 0) {
-                                ui.label(
-                                    RichText::new(format!(
-                                        "设计库还有 {pending} 个会话未应用 · 去「模型更新」"
-                                    ))
-                                    .font(Font::micro(d))
-                                    .color(t.text_muted),
-                                );
-                            }
-                        });
-                    } else if name == "创建" {
-                        egui::Popup::menu(&response).show(|ui| {
-                            if ui.button("三维数据接口").clicked() {
-                                cmds.push(Cmd::OpenDataPublish);
-                                ui.close();
-                            }
-                        });
-                    } else if response.clicked() && name == "设置" {
-                        cmds.push(Cmd::OpenSettings);
+                ui.spacing_mut().item_spacing.x = space::S1;
+
+                let project = ui.add(command_menu_button(d, "项目", true));
+                let project_popup = egui::Popup::menu(&project);
+                open_menu_marker(ui, t, d, &project, project_popup.is_open());
+                project_popup.show(|ui| {
+                    ui.set_min_width(d.px(236.0));
+                    if ui
+                        .add(command_menu_action(
+                            d,
+                            ph::FOLDER_OPEN,
+                            "打开项目…",
+                            "选择配置",
+                        ))
+                        .clicked()
+                    {
+                        cmds.push(Cmd::OpenProjectPicker);
+                        ui.close();
                     }
+                    ui.separator();
+                    // 没连上库时取回工作无从谈起：没有树可重查，也没有
+                    // 模型可重载。禁用而不是隐藏——菜单项换位置比灰着更难找。
+                    let busy = vm.get_work_busy;
+                    let label = if busy {
+                        "正在取回工作…"
+                    } else {
+                        "取回工作"
+                    };
+                    let get_work = ui
+                        .add_enabled(
+                            vm.data_source_ok && !busy,
+                            command_menu_action(
+                                d,
+                                ph::ARROW_CLOCKWISE,
+                                label,
+                                if busy { "请稍候" } else { "GET WORK" },
+                            ),
+                        )
+                        .on_disabled_hover_text(if busy {
+                            "取回工作正在进行"
+                        } else {
+                            "连接数据源后可用"
+                        });
+                    if get_work.clicked() {
+                        cmds.push(Cmd::GetWork);
+                        ui.close();
+                    }
+                    // 取回工作只取界面。设计库里还躺着没应用的会话时，
+                    // 这一行是唯一告诉人「该去的是另一个入口」的地方。
+                    if let Some(pending) = vm.pending_sessions.filter(|n| *n > 0) {
+                        ui.label(
+                            RichText::new(format!(
+                                "设计库还有 {pending} 个会话未应用 · 去「模型更新」"
+                            ))
+                            .font(Font::micro(d))
+                            .color(t.text_muted),
+                        );
+                    }
+                });
+
+                let create = ui.add(command_menu_button(d, "创建", true));
+                let create_popup = egui::Popup::menu(&create);
+                open_menu_marker(ui, t, d, &create, create_popup.is_open());
+                create_popup.show(|ui| {
+                    ui.set_min_width(d.px(236.0));
+                    if ui
+                        .add(command_menu_action(
+                            d,
+                            ph::SHARE_NETWORK,
+                            "三维数据接口",
+                            "创建提资任务",
+                        ))
+                        .clicked()
+                    {
+                        cmds.push(Cmd::OpenDataPublish);
+                        ui.close();
+                    }
+                });
+
+                for (name, hint) in [
+                    ("元件库", "元件库尚未接入当前工作台"),
+                    ("插件", "插件管理尚未接入当前工作台"),
+                ] {
+                    ui.add_enabled(false, command_menu_button(d, name, false))
+                        .on_disabled_hover_text(hint);
                 }
+                if ui.add(command_menu_button(d, "设置", false)).clicked() {
+                    cmds.push(Cmd::OpenSettings);
+                }
+                ui.add_enabled(false, command_menu_button(d, "帮助", false))
+                    .on_disabled_hover_text("帮助中心尚未接入当前工作台");
+
                 ui.add_space(space::S2);
                 divider(ui, t, d);
                 ui.add_space(space::S2);
-                for icon in [
-                    ph::ARROW_COUNTER_CLOCKWISE,
-                    ph::ARROW_CLOCKWISE,
-                    ph::FLOPPY_DISK,
+                for (icon, hint) in [
+                    (ph::ARROW_COUNTER_CLOCKWISE, "撤销"),
+                    (ph::ARROW_CLOCKWISE, "重做"),
+                    (ph::FLOPPY_DISK, "保存"),
                 ] {
-                    let _ = ui.add(widgets::tool_btn(t, d, icon, false));
+                    ui.add_enabled(false, widgets::tool_btn(t, d, icon, false))
+                        .on_disabled_hover_text(format!("{hint}功能尚未接入"));
                 }
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -321,6 +363,37 @@ fn meta_icon(ui: &mut Ui, d: Density, icon: &str, color: Color32) {
             ))
             .color(color),
     );
+}
+
+fn command_menu_button(d: Density, label: &str, has_popup: bool) -> egui::Button<'static> {
+    let label = if has_popup {
+        format!("{label}  {}", ph::CARET_DOWN)
+    } else {
+        label.to_owned()
+    };
+    egui::Button::new(RichText::new(label).font(Font::label(d)))
+        .frame(true)
+        .frame_when_inactive(false)
+        .stroke(Stroke::NONE)
+        .corner_radius(CornerRadius::same(radius::MD))
+        .min_size(vec2(0.0, d.px(26.0)))
+}
+
+fn command_menu_action(d: Density, icon: &str, label: &str, detail: &str) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(format!("{icon}  {label}")).font(Font::label(d)))
+        .shortcut_text(RichText::new(detail).font(Font::micro(d)))
+        .min_size(vec2(d.px(224.0), d.px(28.0)))
+}
+
+fn open_menu_marker(ui: &mut Ui, t: &Tokens, d: Density, response: &egui::Response, open: bool) {
+    if open {
+        let marker = egui::Rect::from_min_size(
+            pos2(response.rect.left(), response.rect.bottom() - d.px(2.0)),
+            vec2(response.rect.width(), d.px(2.0)),
+        );
+        ui.painter()
+            .rect_filled(marker, CornerRadius::ZERO, t.accent);
+    }
 }
 
 /// 纯视觉搜索框（M1-1）；真实的命令面板 / 搜索交互不在本里程碑。
