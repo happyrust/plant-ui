@@ -6,7 +6,7 @@ $backendRoot = Join-Path (Split-Path $uiRoot -Parent) "gen-model"
 $releaseRoot = Join-Path $uiRoot "release\plant-suite-$version"
 $backendRelease = Join-Path $releaseRoot "backend"
 $pcRelease = Join-Path $releaseRoot "pc"
-$backendBuildTarget = Join-Path $uiRoot "target-release-backend"
+$backendBuildTarget = Join-Path $uiRoot "target"
 $env:CARGO_BUILD_JOBS = "1"
 
 if (-not (Test-Path $backendRoot)) { throw "未找到后端工程: $backendRoot" }

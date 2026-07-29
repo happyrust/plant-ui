@@ -123,8 +123,16 @@ pub struct Bridge {
     pub evt_tx: mpsc::Sender<Evt>,
 }
 
-fn is_model_load(req: &Req) -> bool {
-    matches!(req, Req::Models(..))
+type ModelLoad = (Vec<RefU64>, bool);
+
+fn route_model_load(req: Req, tx: &mpsc::Sender<ModelLoad>) -> Option<Req> {
+    match req {
+        Req::Models(roots, debt_reload) => {
+            let _ = tx.send((roots, debt_reload));
+            None
+        }
+        req => Some(req),
+    }
 }
 
 /// 取回工作：先丢本进程的查询缓存，再把根层与这些分支重查一遍。
@@ -169,10 +177,21 @@ async fn ready() -> anyhow::Result<ReadyInfo> {
 /// 起数据线程：连库、抓工程标识与 SITE 根层，然后循环处理懒加载请求。
 pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
     let (req_tx, req_rx) = mpsc::channel();
+    let (model_tx, model_rx) = mpsc::channel::<ModelLoad>();
     let (evt_tx, evt_rx) = mpsc::channel();
     let evt_tx_out = evt_tx.clone();
-    #[cfg(not(target_arch = "wasm32"))]
-    let runtime = tasks.runtime().runtime_arc();
+    let model_evt_tx = evt_tx.clone();
+    let model_ctx = ctx.clone();
+    let model_worker = move |mut task_ctx: bevy_wasm_tasks::TaskContext| async move {
+        loop {
+            while let Ok((roots, debt_reload)) = model_rx.try_recv() {
+                let result = plant_ui_data::model_instances(&roots).await;
+                let _ = model_evt_tx.send(Evt::Models(debt_reload, result));
+                model_ctx.request_repaint();
+            }
+            task_ctx.sleep_updates(1).await;
+        }
+    };
     let worker = move |mut task_ctx: bevy_wasm_tasks::TaskContext| async move {
         let _ = evt_tx.send(Evt::Ready(ready().await));
         ctx.request_repaint();
@@ -180,22 +199,11 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
         loop {
             while let Ok(req) = req_rx.try_recv() {
                 // 模型实例冷加载在大库上可达 88 秒。它若占住这个串行桥，树展开和
-                // 属性查询都会排在它后面，界面看上去像节点打不开。模型结果本来就是
-                // 独立事件，原生端直接交给同一个 Tokio runtime 的另一任务即可。
-                #[cfg(not(target_arch = "wasm32"))]
-                if is_model_load(&req) {
-                    let Req::Models(roots, debt_reload) = req else {
-                        unreachable!();
-                    };
-                    let evt_tx = evt_tx.clone();
-                    let ctx = ctx.clone();
-                    runtime.spawn(async move {
-                        let result = plant_ui_data::model_instances(&roots).await;
-                        let _ = evt_tx.send(Evt::Models(debt_reload, result));
-                        ctx.request_repaint();
-                    });
+                // 属性查询都会排在它后面，界面看上去像节点打不开。PC 与 Web 都把
+                // 它送到专用串行任务，交互查询留在这里立即处理。
+                let Some(req) = route_model_load(req, &model_tx) else {
                     continue;
-                }
+                };
                 match req {
                     Req::Reconnect => {
                         let _ = evt_tx.send(Evt::Ready(ready().await));
@@ -211,13 +219,7 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
                         let _ = evt_tx.send(Evt::Props(refno, r));
                         ctx.request_repaint();
                     }
-                    Req::Models(roots, debt_reload) => {
-                        // wasm 是单线程运行时；这里保留原有 await，避免为了这一条
-                        // 原生端卡顿引入另一套浏览器调度机制。
-                        let result = plant_ui_data::model_instances(&roots).await;
-                        let _ = evt_tx.send(Evt::Models(debt_reload, result));
-                        ctx.request_repaint();
-                    }
+                    Req::Models(..) => unreachable!("模型请求已路由到专用任务"),
                     Req::ResolveName(name) => {
                         let result = plant_ui_data::resolve_name(&name).await;
                         let _ = evt_tx.send(Evt::ResolvedName(name, result));
@@ -286,9 +288,15 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
         }
     };
     #[cfg(target_arch = "wasm32")]
-    tasks.spawn_wasm(worker);
+    {
+        tasks.spawn_wasm(model_worker);
+        tasks.spawn_wasm(worker);
+    }
     #[cfg(not(target_arch = "wasm32"))]
-    tasks.spawn_tokio(worker);
+    {
+        tasks.spawn_tokio(model_worker);
+        tasks.spawn_tokio(worker);
+    }
     Bridge {
         req: req_tx,
         evt: evt_rx,
@@ -298,13 +306,25 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
 
 #[cfg(test)]
 mod tests {
-    use super::{Req, is_model_load};
+    use super::{Req, route_model_load};
     use plant_ui::RefU64;
+    use std::sync::mpsc;
 
     #[test]
-    fn only_the_expensive_model_load_leaves_the_interactive_queue() {
-        assert!(is_model_load(&Req::Models(vec![RefU64::default()], false)));
-        assert!(!is_model_load(&Req::Children(RefU64::default())));
-        assert!(!is_model_load(&Req::Props(RefU64::default())));
+    fn model_load_uses_dedicated_lane() {
+        let (model_tx, model_rx) = mpsc::channel();
+        assert!(route_model_load(Req::Models(vec![RefU64::default()], false), &model_tx).is_none());
+        assert!(matches!(
+            model_rx.try_recv(),
+            Ok((roots, false)) if roots == vec![RefU64::default()]
+        ));
+        assert!(matches!(
+            route_model_load(Req::Props(RefU64::default()), &model_tx),
+            Some(Req::Props(_))
+        ));
+        assert!(matches!(
+            route_model_load(Req::Children(RefU64::default()), &model_tx),
+            Some(Req::Children(_))
+        ));
     }
 }
