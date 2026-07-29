@@ -86,6 +86,8 @@ pub struct PublishRequest {
 pub struct State {
     pub open: bool,
     pub preview_open: bool,
+    /// 从首次点击提交起，到宿主收到接口回执为止。
+    pub submitting: bool,
     pub request: PublishRequest,
     pub selected_refno: Option<RefU64>,
 }
@@ -261,13 +263,22 @@ pub fn show(
             });
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let submit = ui
-                    .add_enabled(
-                        !state.request.elements.is_empty(),
-                        widgets::button(tokens, density, "提交").primary(),
-                    )
-                    .on_disabled_hover_text("请至少添加一个元素");
+                let can_submit = !state.submitting && !state.request.elements.is_empty();
+                let submit = ui.add_enabled(
+                    can_submit,
+                    widgets::button(tokens, density, "提交")
+                        .primary()
+                        .loading(state.submitting),
+                );
+                if !can_submit {
+                    submit.clone().on_disabled_hover_text(if state.submitting {
+                        "正在提交，请稍候"
+                    } else {
+                        "请至少添加一个元素"
+                    });
+                }
                 if submit.clicked() {
+                    state.submitting = true;
                     commands.push(Cmd::SubmitDataPublish(state.request.clone()));
                 }
                 if ui.add(widgets::button(tokens, density, "预览")).clicked() {

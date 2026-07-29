@@ -45,6 +45,7 @@ pub struct Btn<'a> {
     label: &'a str,
     icon: Option<&'a str>,
     primary: bool,
+    loading: bool,
     width: Option<f32>,
 }
 
@@ -56,6 +57,12 @@ impl<'a> Btn<'a> {
 
     pub fn primary(mut self) -> Self {
         self.primary = true;
+        self
+    }
+
+    /// 保持按钮尺寸不变，并用旋转加载动画替换文字。
+    pub fn loading(mut self, loading: bool) -> Self {
+        self.loading = loading;
         self
     }
 
@@ -72,6 +79,7 @@ pub fn button<'a>(t: &'a Tokens, d: Density, label: &'a str) -> Btn<'a> {
         label,
         icon: None,
         primary: false,
+        loading: false,
         width: None,
     }
 }
@@ -115,6 +123,18 @@ impl Widget for Btn<'_> {
         };
 
         fill_rect(ui, rect, radius::MD, bg, border);
+
+        if self.loading {
+            let spinner_size = d.px(16.0);
+            let spinner_rect =
+                Rect::from_center_size(rect.center(), vec2(spinner_size, spinner_size));
+            ui.put(
+                spinner_rect,
+                egui::Spinner::new().size(spinner_size).color(fg),
+            );
+            ui.ctx().request_repaint();
+            return resp;
+        }
 
         let content_w = label.size().x + icon.as_ref().map_or(0.0, |g| g.size().x + gap);
         let mut x = rect.center().x - content_w / 2.0;

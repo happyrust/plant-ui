@@ -994,28 +994,31 @@ impl App {
                         self.logs.error(&mut self.vm.logs, what, &error, None);
                     }
                 },
-                data::Evt::DataPublish(request, result) => match result {
-                    Ok(response) => {
-                        if let Some(login_url) = response.login_url {
-                            ctx.open_url(egui::OpenUrl::new_tab(login_url));
+                data::Evt::DataPublish(request, result) => {
+                    self.data_publish_state.submitting = false;
+                    match result {
+                        Ok(response) => {
+                            if let Some(login_url) = response.login_url {
+                                ctx.open_url(egui::OpenUrl::new_tab(login_url));
+                            }
+                            self.logs.info(
+                                &mut self.vm.logs,
+                                format!(
+                                    "{} 已提交（{}）：{}",
+                                    request.category.label(),
+                                    request.category.endpoint(),
+                                    response.message
+                                ),
+                            );
                         }
-                        self.logs.info(
+                        Err(error) => self.logs.error(
                             &mut self.vm.logs,
-                            format!(
-                                "{} 已提交（{}）：{}",
-                                request.category.label(),
-                                request.category.endpoint(),
-                                response.message
-                            ),
-                        );
+                            format!("{}提交失败", request.category.label()),
+                            &error,
+                            None,
+                        ),
                     }
-                    Err(error) => self.logs.error(
-                        &mut self.vm.logs,
-                        format!("{}提交失败", request.category.label()),
-                        &error,
-                        None,
-                    ),
-                },
+                }
                 data::Evt::QueueProgress(task_id, event) => self.queue.apply(&task_id, event),
                 data::Evt::QueueTaskChanged => {
                     self.model_reload_ready = false;
@@ -1096,10 +1099,23 @@ impl App {
                 Cmd::OpenSettings => self.settings_state.open(),
                 Cmd::OpenDataPublish => self.data_publish_state.open = true,
                 Cmd::SubmitDataPublish(request) => {
-                    let _ = self.bridge.req.send(data::Req::DataPublish {
-                        base: self.data_api_url.clone(),
-                        request,
-                    });
+                    if self
+                        .bridge
+                        .req
+                        .send(data::Req::DataPublish {
+                            base: self.data_api_url.clone(),
+                            request,
+                        })
+                        .is_err()
+                    {
+                        self.data_publish_state.submitting = false;
+                        self.logs.error(
+                            &mut self.vm.logs,
+                            "提交数据发布请求失败",
+                            &anyhow::anyhow!("数据请求线程不可用"),
+                            None,
+                        );
+                    }
                 }
                 Cmd::OpenModelUpdate => {
                     self.model_update_state.open = true;
