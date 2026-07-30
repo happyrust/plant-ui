@@ -57,7 +57,7 @@ pub async fn get_mdb_world_site_ele_nodes(
     let sql = format!(
         r#"
         let $dbnos = {MDB_DESI_DBNOS};
-        let $site_refnos = select value refno from pe where noun='SITE' and dbnum in $dbnos;
+        let $site_refnos = select value REFNO from SITE where REFNO.dbnum in $dbnos;
         let $worlds = select value id from (
             select REFNO.id as id, array::find_index($dbnos, REFNO.dbnum) as o
             from WORL where REFNO.dbnum in $dbnos order by o
@@ -84,8 +84,8 @@ pub async fn get_mdb_world_site_ele_nodes(
             r#"
             let $dbnos = {MDB_DESI_DBNOS};
             select refno, noun, name, owner, array::len(select value in from <-pe_owner) as children_count
-            from (select id, array::find_index($dbnos, dbnum) as o
-                  from pe where noun='SITE' and dbnum in $dbnos order by o).id;
+            from (select REFNO as id, array::find_index($dbnos, REFNO.dbnum) as o
+                  from SITE where REFNO.dbnum in $dbnos order by o).id;
             "#
         );
         let mut response = SUL_DB
@@ -239,8 +239,8 @@ pub async fn query_mdb_db_nums(module: DBType) -> anyhow::Result<Vec<u32>> {
     let mut response = SUL_DB
         .query(format!(r#"
             let $dbnos = {MDB_DESI_DBNOS};
-            array::distinct(select value dbnum from (select dbnum, array::find_index($dbnos, dbnum) as o
-                from pe where noun='SITE' and dbnum in $dbnos order by o));
+            array::distinct(select value REFNO.dbnum from (select REFNO, array::find_index($dbnos, REFNO.dbnum) as o
+                from SITE where REFNO.dbnum in $dbnos order by o));
         "#))
         .bind(("mdb", mdb))
         .bind(("db_type", db_type))

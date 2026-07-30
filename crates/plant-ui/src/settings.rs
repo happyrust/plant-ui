@@ -97,6 +97,22 @@ pub fn show(ctx: &egui::Context, t: &Tokens, d: Density, state: &mut State) -> O
         .default_size([880.0, 640.0])
         .min_size([620.0, 480.0])
         .show(ctx, |ui| {
+            egui::Panel::bottom("plant-settings-footer")
+                .show_separator_line(false)
+                .show(ui, |ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.add(widgets::button(t, d, "保存").primary()).clicked() {
+                            save = true;
+                        }
+                        if ui.add(widgets::button(t, d, "取消")).clicked() {
+                            cancel = true;
+                        }
+                        if ui.add(widgets::button(t, d, "恢复默认值")).clicked() {
+                            state.draft = Settings::default();
+                        }
+                    });
+                });
+
             ui.label(RichText::new("外观").strong().color(t.text_secondary));
             setting_row(ui, t, "主题", "亮色为默认主题", |ui| {
                 widgets::segmented(
@@ -157,20 +173,6 @@ pub fn show(ctx: &egui::Context, t: &Tokens, d: Density, state: &mut State) -> O
                     );
                 },
             );
-
-            ui.with_layout(Layout::bottom_up(Align::RIGHT), |ui| {
-                ui.horizontal(|ui| {
-                    if ui.add(widgets::button(t, d, "保存").primary()).clicked() {
-                        save = true;
-                    }
-                    if ui.add(widgets::button(t, d, "取消")).clicked() {
-                        cancel = true;
-                    }
-                    if ui.add(widgets::button(t, d, "恢复默认值")).clicked() {
-                        state.draft = Settings::default();
-                    }
-                });
-            });
         });
 
     if cancel || !open {
@@ -265,5 +267,34 @@ mod tests {
         state.open();
         assert_eq!(state.saved.model_api_url, "http://10.0.0.9:8021");
         assert_eq!(state.saved.data_api_url, "http://10.0.0.9:9099");
+    }
+
+    #[test]
+    fn settings_window_height_stays_stable_after_opening() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0));
+        let window_id = egui::Id::new("plant-settings-window");
+        let mut state = State::default();
+        state.open();
+
+        let heights = (0..8)
+            .map(|_| {
+                let input = egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                };
+                ctx.begin_pass(input);
+                show(&ctx, &Tokens::light(), Density::Standard, &mut state);
+                let _ = ctx.end_pass();
+                ctx.memory(|memory| memory.area_rect(window_id).unwrap().height())
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            heights[2..]
+                .windows(2)
+                .all(|pair| (pair[1] - pair[0]).abs() < f32::EPSILON),
+            "设置窗口高度逐帧增长：{heights:?}"
+        );
     }
 }
