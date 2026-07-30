@@ -26,10 +26,10 @@ if (-not $clang) {
   $env:AR_wasm32_unknown_unknown = Join-Path (Split-Path $clang) "llvm-ar.exe"
 }
 
-cargo build -p plant-ui-app --target wasm32-unknown-unknown --release
+cargo build -p rs-plant --target wasm32-unknown-unknown --release
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $targetDir = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).target_directory
-$wasm = Join-Path $targetDir "wasm32-unknown-unknown/release/plant-ui-app.wasm"
+$wasm = Join-Path $targetDir "wasm32-unknown-unknown/release/rs-plant.wasm"
 
 if (-not (Get-Command wasm-bindgen -ErrorAction SilentlyContinue)) {
   cargo install wasm-bindgen-cli --version 0.2.126 --locked
@@ -38,6 +38,6 @@ if (-not (Get-Command wasm-bindgen -ErrorAction SilentlyContinue)) {
 wasm-bindgen `
   --target web `
   --out-dir web/public/pkg `
-  --out-name plant_ui_app `
+  --out-name rs-plant `
   $wasm
 exit $LASTEXITCODE

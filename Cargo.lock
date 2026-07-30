@@ -6754,33 +6754,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "plant-ui-app"
-version = "0.1.4"
-dependencies = [
- "aios_core",
- "anyhow",
- "bevy",
- "bevy-wasm-tasks",
- "bevy_egui35",
- "chrono",
- "eframe",
- "egui",
- "egui-phosphor",
- "egui_inspection",
- "ehttp",
- "ewebsock",
- "getrandom 0.3.4",
- "plant-ui",
- "plant-ui-data",
- "plant-ui-view3d",
- "ring",
- "serde",
- "serde_json",
- "wasm-bindgen",
- "web-time",
-]
-
-[[package]]
 name = "plant-ui-data"
 version = "0.1.4"
 dependencies = [
@@ -7456,6 +7429,33 @@ dependencies = [
  "bitflags 2.13.1",
  "serde",
  "serde_derive",
+]
+
+[[package]]
+name = "rs-plant"
+version = "0.1.4"
+dependencies = [
+ "aios_core",
+ "anyhow",
+ "bevy",
+ "bevy-wasm-tasks",
+ "bevy_egui35",
+ "chrono",
+ "eframe",
+ "egui",
+ "egui-phosphor",
+ "egui_inspection",
+ "ehttp",
+ "ewebsock",
+ "getrandom 0.3.4",
+ "plant-ui",
+ "plant-ui-data",
+ "plant-ui-view3d",
+ "ring",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+ "web-time",
 ]
 
 [[package]]

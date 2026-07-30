@@ -1,0 +1,33 @@
+/* tslint:disable */
+/* eslint-disable */
+export const memory: WebAssembly.Memory;
+export const start: (a: number, b: number, c: number, d: number) => [number, number];
+export const main: (a: number, b: number) => number;
+export const ring_core_0_17_14__bn_mul_mont: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+export const wasm_bindgen_5a61dc47ac36b8d3___convert__closures_____invoke___wasm_bindgen_5a61dc47ac36b8d3___JsValue__core_79482a60015d25f0___result__Result_____wasm_bindgen_5a61dc47ac36b8d3___JsError___true_: (a: number, b: number, c: any) => [number, number];
+export const wasm_bindgen_5a61dc47ac36b8d3___convert__closures_____invoke___js_sys_46ce9e9812cf9fbd___Array__web_sys_fe5c6605b2fff1d8___features__gen_ResizeObserver__ResizeObserver______true_: (a: number, b: number, c: any, d: any) => void;
+export const wasm_bindgen_5a61dc47ac36b8d3___convert__closures_____invoke___wasm_bindgen_5a61dc47ac36b8d3___JsValue______true_: (a: number, b: number, c: any) => void;
+export const wasm_bindgen_5a61dc47ac36b8d3___convert__closures_____invoke___wasm_bindgen_5a61dc47ac36b8d3___JsValue______true__3: (a: number, b: number, c: any) => void;
+export const wasm_bindgen_5a61dc47ac36b8d3___convert__closures_____invoke___web_sys_fe5c6605b2fff1d8___features__gen_InputEvent__InputEvent______true_: (a: number, b: number, c: any) => void;
+export const wasm_bindgen_5a61dc47ac36b8d3___convert__closures_____invoke___web_sys_fe5c6605b2fff1d8___features__gen_CloseEvent__CloseEvent______true_: (a: number, b: number, c: any) => void;
+export const wasm_bindgen_5a61dc47ac36b8d3___convert__closures_____invoke___wasm_bindgen_5a61dc47ac36b8d3___JsValue______true__6: (a: number, b: number, c: any) => void;
+export const wasm_bindgen_5a61dc47ac36b8d3___convert__closures_____invoke___wasm_bindgen_5a61dc47ac36b8d3___JsValue______true__7: (a: number, b: number, c: any) => void;
+export const wasm_bindgen_5a61dc47ac36b8d3___convert__closures_____invoke___wasm_bindgen_5a61dc47ac36b8d3___JsValue______true__8: (a: number, b: number, c: any) => void;
+export const wasm_bindgen_5a61dc47ac36b8d3___convert__closures_____invoke___web_sys_fe5c6605b2fff1d8___features__gen_InputEvent__InputEvent______true__9: (a: number, b: number, c: any) => void;
+export const wasm_bindgen_5a61dc47ac36b8d3___convert__closures_____invoke___wasm_bindgen_5a61dc47ac36b8d3___JsValue______true__10: (a: number, b: number, c: any) => void;
+export const wasm_bindgen_5a61dc47ac36b8d3___convert__closures_____invoke___web_sys_fe5c6605b2fff1d8___features__gen_MessageEvent__MessageEvent______true_: (a: number, b: number, c: any) => void;
+export const wasm_bindgen_5a61dc47ac36b8d3___convert__closures_____invoke___wasm_bindgen_5a61dc47ac36b8d3___JsValue______true__12: (a: number, b: number, c: any) => void;
+export const wasm_bindgen_5a61dc47ac36b8d3___convert__closures_____invoke___wasm_bindgen_5a61dc47ac36b8d3___JsValue______true__13: (a: number, b: number, c: any) => void;
+export const wasm_bindgen_5a61dc47ac36b8d3___convert__closures_____invoke___web_sys_fe5c6605b2fff1d8___features__gen_InputEvent__InputEvent______true__14: (a: number, b: number, c: any) => void;
+export const wasm_bindgen_5a61dc47ac36b8d3___convert__closures_____invoke___wasm_bindgen_5a61dc47ac36b8d3___JsValue______true__15: (a: number, b: number, c: any) => void;
+export const wasm_bindgen_5a61dc47ac36b8d3___convert__closures_____invoke_______true_: (a: number, b: number) => void;
+export const wasm_bindgen_5a61dc47ac36b8d3___convert__closures_____invoke_______true__1_: (a: number, b: number) => void;
+export const __wbindgen_malloc: (a: number, b: number) => number;
+export const __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
+export const __externref_table_alloc: () => number;
+export const __wbindgen_externrefs: WebAssembly.Table;
+export const __wbindgen_exn_store: (a: number) => void;
+export const __wbindgen_free: (a: number, b: number, c: number) => void;
+export const __wbindgen_destroy_closure: (a: number, b: number) => void;
+export const __externref_table_dealloc: (a: number) => void;
+export const __wbindgen_start: () => void;

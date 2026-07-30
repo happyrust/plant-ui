@@ -5,6 +5,8 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 static BASE_URL: OnceLock<String> = OnceLock::new();
+/// 测试期间统一跳转至此数据中心登录页，不使用服务端返回的 LoginUrl。
+const TEST_LOGIN_URL: &str = "http://pms.powerpms.net:1801/sysin.html";
 
 pub fn base_url() -> String {
     BASE_URL
@@ -92,7 +94,7 @@ fn response_body(category: PublishCategory, body: &str) -> anyhow::Result<Submit
     if category == PublishCategory::Room {
         return Ok(SubmitResult {
             message: body.to_owned(),
-            login_url: None,
+            login_url: Some(TEST_LOGIN_URL.to_owned()),
         });
     }
 
@@ -111,7 +113,7 @@ fn response_body(category: PublishCategory, body: &str) -> anyhow::Result<Submit
 
     Ok(SubmitResult {
         message: response.result,
-        login_url: (!response.login_url.trim().is_empty()).then_some(response.login_url),
+        login_url: Some(TEST_LOGIN_URL.to_owned()),
     })
 }
 
@@ -173,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn professional_response_uses_success_result_and_login_url() {
+    fn successful_responses_always_use_the_test_login_url() {
         let result = response_body(
             PublishCategory::Process,
             r#"{"Success":true,"Result":"已提交","KeyValue":"","LoginUrl":"https://example.test/login"}"#,
@@ -183,8 +185,15 @@ mod tests {
         assert_eq!(result.message, "已提交");
         assert_eq!(
             result.login_url.as_deref(),
-            Some("https://example.test/login")
+            Some(TEST_LOGIN_URL)
         );
+    }
+
+    #[test]
+    fn room_responses_also_use_the_test_login_url() {
+        let result = response_body(PublishCategory::Room, "room response").unwrap();
+
+        assert_eq!(result.login_url.as_deref(), Some(TEST_LOGIN_URL));
     }
 
     #[test]

@@ -48,7 +48,7 @@ fn main() {
     if gallery {
         run_gallery().expect("组件画廊启动失败");
     } else {
-        run("#plant-ui");
+        run("#rs-plant");
     }
 }
 
@@ -82,7 +82,7 @@ struct BrowserDb {
 pub fn start(canvas: String, config_json: String) -> Result<(), wasm_bindgen::JsValue> {
     if !canvas.starts_with('#') || canvas.len() < 2 {
         return Err(wasm_bindgen::JsValue::from_str(
-            "canvas 必须是形如 #plant-ui 的 CSS id 选择器",
+            "canvas 必须是形如 #rs-plant 的 CSS id 选择器",
         ));
     }
     let config: BrowserConfig = serde_json::from_str(&config_json)
@@ -127,11 +127,11 @@ fn run_gallery() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1600.0, 1000.0])
-            .with_title("plant-ui"),
+            .with_title("rs-plant"),
         ..Default::default()
     };
     eframe::run_native(
-        "plant-ui",
+        "rs-plant",
         options,
         Box::new(move |cc| {
             let (defs, _warnings) = fonts::definitions();
@@ -146,7 +146,7 @@ fn run_gallery() -> eframe::Result {
 
 fn run(canvas: &str) {
     let window = Window {
-        title: "plant-ui".into(),
+        title: "rs-plant".into(),
         resolution: (1600.0_f32, 1000.0_f32).into(),
         ..Default::default()
     };
@@ -207,7 +207,7 @@ fn setup_ui_camera(mut commands: Commands, mut egui: ResMut<EguiGlobalSettings>)
 /// wasm32-unknown-unknown` 直接 E0425。
 #[cfg(not(target_arch = "wasm32"))]
 fn attach_inspection(ctx: &egui::Context) {
-    if let Err(error) = egui_inspection::attach_from_env(ctx, Some("plant-ui".into())) {
+    if let Err(error) = egui_inspection::attach_from_env(ctx, Some("rs-plant".into())) {
         eprintln!("egui inspection unavailable: {error}");
     }
 }
