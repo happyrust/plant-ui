@@ -9,6 +9,7 @@ mod gallery;
 mod logs;
 mod model_update_api;
 mod model_update_ws;
+mod startup;
 
 use std::collections::{HashMap, HashSet};
 use web_time::{Duration, Instant};
@@ -47,35 +48,14 @@ fn main() {
     let gallery = std::env::args().any(|a| a == "--gallery");
     if gallery {
         run_gallery().expect("组件画廊启动失败");
-    } else {
-        run("#rs-plant");
+    } else if let Err(error) = run_native() {
+        eprintln!("plant-ui 启动失败：{error:#}");
+        std::process::exit(1);
     }
 }
 
 #[cfg(target_arch = "wasm32")]
 fn main() {}
-
-#[cfg(target_arch = "wasm32")]
-#[derive(serde::Deserialize)]
-struct BrowserConfig {
-    db: BrowserDb,
-    model_api_url: String,
-    data_api_url: String,
-}
-
-#[cfg(target_arch = "wasm32")]
-#[derive(serde::Deserialize)]
-struct BrowserDb {
-    host: String,
-    port: u16,
-    #[serde(default)]
-    secure: bool,
-    namespace: String,
-    database: String,
-    mdb: String,
-    username: String,
-    password: String,
-}
 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen::prelude::wasm_bindgen]
@@ -85,40 +65,107 @@ pub fn start(canvas: String, config_json: String) -> Result<(), wasm_bindgen::Js
             "canvas 必须是形如 #rs-plant 的 CSS id 选择器",
         ));
     }
-    let config: BrowserConfig = serde_json::from_str(&config_json)
-        .map_err(|error| wasm_bindgen::JsValue::from_str(&format!("浏览器配置无效：{error}")))?;
-    if config.model_api_url.trim().is_empty() {
-        return Err(wasm_bindgen::JsValue::from_str("model_api_url 不能为空"));
-    }
-    if config.data_api_url.trim().is_empty() {
-        return Err(wasm_bindgen::JsValue::from_str("data_api_url 不能为空"));
-    }
-    if config.db.mdb.trim().is_empty() {
-        return Err(wasm_bindgen::JsValue::from_str("db.mdb 不能为空"));
-    }
-    let db_host = config.db.host.trim_end_matches('/');
-    let db = aios_core::options::DbOption {
-        v_ip: if config.db.secure && !db_host.starts_with("ws://") && !db_host.starts_with("wss://")
-        {
-            format!("wss://{db_host}")
-        } else {
-            db_host.to_owned()
-        },
-        v_port: config.db.port,
-        surreal_ns: config.db.namespace,
-        project_name: config.db.database,
-        mdb_name: config.db.mdb,
-        v_user: config.db.username,
-        v_password: config.db.password,
-        ..Default::default()
-    };
-    aios_core::set_db_option(db)
+    let config = startup::browser_runtime_config(&config_json)
+        .map_err(|error| wasm_bindgen::JsValue::from_str(&format!("浏览器配置无效：{error:#}")))?;
+    aios_core::set_db_option(config.db)
         .map_err(|error| wasm_bindgen::JsValue::from_str(&error.to_string()))?;
-    model_update_api::set_base_url(config.model_api_url)
-        .map_err(|error| wasm_bindgen::JsValue::from_str(&error.to_string()))?;
+    if let Some(model_api_url) = config.model_api_url {
+        model_update_api::set_base_url(model_api_url)
+            .map_err(|error| wasm_bindgen::JsValue::from_str(&error.to_string()))?;
+    }
     data_publish_api::set_base_url(config.data_api_url)
         .map_err(|error| wasm_bindgen::JsValue::from_str(&error.to_string()))?;
-    run(&canvas);
+    if config.auto_gen_mesh {
+        console_warn("旧配置的 auto_gen_mesh 由模型服务负责，客户端不会在本地生成 mesh");
+    }
+    run(&canvas, "assets".into());
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(js_namespace = console, js_name = warn)]
+    fn console_warn(message: &str);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn run_native() -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let development_root =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web/public/assets");
+    let executable = std::env::current_exe().context("读取可执行文件路径失败")?;
+    let asset_root = startup::resolve_asset_root(
+        std::env::var_os("PLANT_ASSET_ROOT"),
+        executable.parent(),
+        &development_root,
+    );
+    if !asset_root.is_dir() {
+        anyhow::bail!("资产根不存在或不是目录：{}", asset_root.display());
+    }
+
+    let legacy_path = asset_root.join(startup::LEGACY_PROJECT_CONFIG);
+    if legacy_path.exists() {
+        #[derive(serde::Deserialize)]
+        struct ReleaseDbCredentials {
+            v_user: Option<String>,
+            v_password: Option<String>,
+        }
+
+        let release_db_path = executable
+            .parent()
+            .map(|dir| dir.join("DbOption.toml"))
+            .filter(|path| path.is_file())
+            .unwrap_or_else(|| "DbOption.toml".into());
+        let release_db = if release_db_path.is_file() {
+            Some(
+                config::Config::builder()
+                    .add_source(config::File::from(release_db_path))
+                    .build()
+                    .context("读取 DbOption.toml 失败")?
+                    .try_deserialize::<ReleaseDbCredentials>()
+                    .context("读取 DbOption.toml 数据库账号失败")?,
+            )
+        } else {
+            None
+        };
+        let release_user = release_db
+            .as_ref()
+            .and_then(|db| db.v_user.as_deref())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("root");
+        let release_password = release_db
+            .as_ref()
+            .and_then(|db| db.v_password.as_deref())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("root");
+        let username = std::env::var("PLANT_DB_USER")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| release_user.to_owned());
+        let password = std::env::var("PLANT_DB_PASSWORD")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| release_password.to_owned());
+        let text = std::fs::read_to_string(&legacy_path)
+            .with_context(|| format!("读取旧版项目配置失败：{}", legacy_path.display()))?;
+        let config = startup::legacy_runtime_config(
+            &text,
+            &username,
+            &password,
+            None,
+            std::env::var("PLANT_DATA_API_URL").ok(),
+        )
+        .with_context(|| format!("旧版项目配置无效：{}", legacy_path.display()))?;
+        aios_core::set_db_option(config.db)?;
+        data_publish_api::set_base_url(config.data_api_url)?;
+        if config.auto_gen_mesh {
+            eprintln!("旧配置的 auto_gen_mesh 由模型服务负责，客户端不会在本地生成 mesh");
+        }
+    }
+
+    run("#plant-ui", asset_root.to_string_lossy().into_owned());
     Ok(())
 }
 
@@ -144,7 +191,7 @@ fn run_gallery() -> eframe::Result {
     )
 }
 
-fn run(canvas: &str) {
+fn run(canvas: &str, asset_root: String) {
     let window = Window {
         title: "rs-plant".into(),
         resolution: (1600.0_f32, 1000.0_f32).into(),
@@ -168,7 +215,7 @@ fn run(canvas: &str) {
                     ..Default::default()
                 })
                 .set(bevy::asset::AssetPlugin {
-                    file_path: asset_root(),
+                    file_path: asset_root,
                     meta_check: AssetMetaCheck::Never,
                     ..Default::default()
                 }),
@@ -179,17 +226,6 @@ fn run(canvas: &str) {
         .add_systems(bevy::prelude::Startup, setup_ui_camera)
         .add_systems(EguiPrimaryContextPass, show_app)
         .run();
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn asset_root() -> String {
-    std::env::var("PLANT_ASSET_ROOT")
-        .unwrap_or_else(|_| format!("{}/../../web/public/assets", env!("CARGO_MANIFEST_DIR")))
-}
-
-#[cfg(target_arch = "wasm32")]
-fn asset_root() -> String {
-    "assets".into()
 }
 
 fn setup_ui_camera(mut commands: Commands, mut egui: ResMut<EguiGlobalSettings>) {
@@ -1267,7 +1303,7 @@ impl App {
     fn query_attr(&self, attr: &str) -> Result<String, String> {
         let data = match &self.vm.props {
             PropsVm::Uninit => return Err("当前未选中元素".into()),
-            PropsVm::Loading => return Err("当前元素属性仍在加载".into()),
+            PropsVm::Loading(_) => return Err("当前元素属性仍在加载".into()),
             PropsVm::Failed(error) => return Err(format!("当前元素属性不可用：{error}")),
             PropsVm::Ready(data) => data,
         };
@@ -1515,7 +1551,7 @@ impl App {
     }
 
     fn refetch_props(&mut self, refno: RefU64) {
-        self.vm.props = PropsVm::Loading;
+        self.vm.props.begin_query();
         let _ = self.bridge.req.send(data::Req::Props(refno));
     }
 

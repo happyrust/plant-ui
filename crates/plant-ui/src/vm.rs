@@ -373,8 +373,8 @@ pub enum PropsVm {
     /// 尚未选中任何元素——是「还没轮到它」而不是「查完了没有」。
     #[default]
     Uninit,
-    /// 选中元素的属性查询在途。
-    Loading,
+    /// 选中元素的属性查询在途。切换元素时保留上一份完整属性数据供绘制，首次查询为 None。
+    Loading(Option<PropsDataVm>),
     /// 属性到位，按设计稿分组展示。
     Ready(PropsDataVm),
     /// 查询失败，附原因。
@@ -382,6 +382,16 @@ pub enum PropsVm {
 }
 
 impl PropsVm {
+    /// 开始查询下一份属性。已有数据继续显示到新结果完整到位，避免切换元素时
+    /// 先把整张属性表换成加载提示、下一帧又换回来造成闪烁。
+    pub fn begin_query(&mut self) {
+        let previous = match std::mem::take(self) {
+            Self::Ready(data) | Self::Loading(Some(data)) => Some(data),
+            _ => None,
+        };
+        *self = Self::Loading(previous);
+    }
+
     /// Apply an accepted scalar edit to the displayed snapshot.
     pub fn edit(&mut self, refno: RefU64, attr: &str, value: String) {
         let Self::Ready(data) = self else {
@@ -509,6 +519,32 @@ mod tests {
         s.range(&order, r(5));
         assert_eq!(s.to_vec(), vec![r(4), r(5)]);
         assert_eq!(s.primary(), Some(r(5)));
+    }
+
+    #[test]
+    fn props_query_keeps_the_previous_data_until_replacement_arrives() {
+        let mut props = PropsVm::Ready(PropsDataVm {
+            refno: r(1),
+            name: "previous".into(),
+            ..Default::default()
+        });
+
+        props.begin_query();
+
+        assert!(matches!(
+            props,
+            PropsVm::Loading(Some(PropsDataVm { ref name, .. })) if name == "previous"
+        ));
+
+        props.begin_query();
+        assert!(matches!(
+            props,
+            PropsVm::Loading(Some(PropsDataVm { ref name, .. })) if name == "previous"
+        ));
+
+        let mut first_query = PropsVm::Uninit;
+        first_query.begin_query();
+        assert!(matches!(first_query, PropsVm::Loading(None)));
     }
 
     /// 未加载与已隐藏都是「让它出来」。把这两档合并成 `!visible` 是最容易写错的

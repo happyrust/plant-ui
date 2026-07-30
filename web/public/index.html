@@ -15,11 +15,39 @@
     <script type="module">
       import init, { start } from "./pkg/rs-plant.js";
 
+      async function loadConfig() {
+        const [legacyResponse, currentResponse] = await Promise.all([
+          fetch("/assets/config/e3d.project.ron", { cache: "no-store" }),
+          fetch("./config.json", { cache: "no-store" }),
+        ]);
+        if (legacyResponse.ok) {
+          if (!currentResponse.ok && currentResponse.status !== 404) {
+            throw new Error(`config.json: HTTP ${currentResponse.status}`);
+          }
+          const current = currentResponse.ok ? await currentResponse.json() : {};
+          const configuredModelUrl = current.model_api_url?.trim();
+          return {
+            legacy_project_ron: await legacyResponse.text(),
+            model_api_url:
+              configuredModelUrl && configuredModelUrl !== "http://127.0.0.1:8022"
+                ? configuredModelUrl
+                : window.location.origin,
+            data_api_url: current.data_api_url || "",
+            username: current.db?.username || "",
+            password: current.db?.password || "",
+          };
+        }
+        if (legacyResponse.status !== 404) {
+          throw new Error(`e3d.project.ron: HTTP ${legacyResponse.status}`);
+        }
+        if (!currentResponse.ok) {
+          throw new Error(`config.json: HTTP ${currentResponse.status}`);
+        }
+        return currentResponse.json();
+      }
+
       const [config] = await Promise.all([
-        fetch("./config.json", { cache: "no-store" }).then(response => {
-          if (!response.ok) throw new Error(`config.json: HTTP ${response.status}`);
-          return response.json();
-        }),
+        loadConfig(),
         init(),
       ]);
       start("#rs-plant", JSON.stringify(config));

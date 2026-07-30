@@ -54,22 +54,47 @@ pub async fn get_mdb_world_site_ele_nodes(
     module: DBType,
 ) -> anyhow::Result<Vec<EleTreeNode>> {
     let db_type: u8 = module.into();
-    // 根层按 dbnum 直取 SITE，不经过 WORL。世界元素经常没被同步写进来——
-    // ams7997 那个库一条 WORL 都没有，8000 的真实世界 pe:16192_0 也缺，而
-    // 指向它们的 pe_owner 边一条不少。绕道 WORL 的话，缺一个节点整棵树就是空的。
     let sql = format!(
         r#"
         let $dbnos = {MDB_DESI_DBNOS};
+        let $site_refnos = select value refno from pe where noun='SITE' and dbnum in $dbnos;
+        let $worlds = select value id from (
+            select REFNO.id as id, array::find_index($dbnos, REFNO.dbnum) as o
+            from WORL where REFNO.dbnum in $dbnos order by o
+        );
+        return $site_refnos;
         select refno, noun, name, owner, array::len(select value in from <-pe_owner) as children_count
-        from (select id, array::find_index($dbnos, dbnum) as o from pe where noun='SITE' and dbnum in $dbnos order by o).id;
+        from array::flatten(select value in from $worlds<-pe_owner);
         "#
     );
     let mut response = SUL_DB
         .query(&sql)
-        .bind(("mdb", mdb))
+        .bind(("mdb", mdb.clone()))
         .bind(("db_type", db_type))
         .await?;
-    let mut nodes: Vec<EleTreeNode> = response.take(1)?;
+    let site_refnos: Vec<RefnoEnum> = response.take(3)?;
+    let mut nodes: Vec<EleTreeNode> = response.take(4)?;
+    nodes.retain(|node| node.noun == "SITE");
+    if site_refnos.len() != nodes.len()
+        || site_refnos
+            .iter()
+            .any(|refno| !nodes.iter().any(|node| node.refno == *refno))
+    {
+        let sql = format!(
+            r#"
+            let $dbnos = {MDB_DESI_DBNOS};
+            select refno, noun, name, owner, array::len(select value in from <-pe_owner) as children_count
+            from (select id, array::find_index($dbnos, dbnum) as o
+                  from pe where noun='SITE' and dbnum in $dbnos order by o).id;
+            "#
+        );
+        let mut response = SUL_DB
+            .query(&sql)
+            .bind(("mdb", mdb))
+            .bind(("db_type", db_type))
+            .await?;
+        nodes = response.take(1)?;
+    }
     for (i, node) in nodes.iter_mut().enumerate() {
         node.order = i as _;
         if node.name.is_empty() {

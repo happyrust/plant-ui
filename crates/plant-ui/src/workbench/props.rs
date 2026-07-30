@@ -40,8 +40,13 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                 "在模型树中选中元素查看属性",
             );
         }
-        PropsVm::Loading => {
+        PropsVm::Loading(None) => {
             note(ui, t, d, PaneState::Loading, ph::SPINNER, "属性加载中…");
+        }
+        PropsVm::Loading(Some(data)) => {
+            // 上一份属性数据只负责撑住布局；查询未完成前产生的编辑命令不能落到旧元素。
+            let mut ignored = Vec::new();
+            ready(ui, t, d, data, &mut ignored);
         }
         // 重查的是当前选中元素；选中已经挪走的话 App 侧会把这条丢掉。
         PropsVm::Failed(reason) => {
@@ -51,25 +56,27 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                 cmds.push(Cmd::RetryProps(refno));
             }
         }
-        PropsVm::Ready(data) => {
-            egui::Frame::new().fill(t.bg_panel).show(ui, |ui| {
-                ui.set_min_size(ui.available_size());
-                // 头部、下边框、分组行之间不能有间距，否则边框会被推离头部。
-                ui.spacing_mut().item_spacing.y = 0.0;
-                current_element(ui, t, d, data);
-                ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        section(ui, t, d, data, "通用属性", &data.common, false, cmds);
-                        section(ui, t, d, data, "元件属性", &data.attrs, false, cmds);
-                        if !data.udas.is_empty() {
-                            section(ui, t, d, data, "UDA 属性", &data.udas, true, cmds);
-                        }
-                    });
-            });
-        }
+        PropsVm::Ready(data) => ready(ui, t, d, data, cmds),
     }
+}
+
+fn ready(ui: &mut Ui, t: &Tokens, d: Density, data: &PropsDataVm, cmds: &mut Vec<Cmd>) {
+    egui::Frame::new().fill(t.bg_panel).show(ui, |ui| {
+        ui.set_min_size(ui.available_size());
+        // 头部、下边框、分组行之间不能有间距，否则边框会被推离头部。
+        ui.spacing_mut().item_spacing.y = 0.0;
+        current_element(ui, t, d, data);
+        ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                section(ui, t, d, data, "通用属性", &data.common, false, cmds);
+                section(ui, t, d, data, "元件属性", &data.attrs, false, cmds);
+                if !data.udas.is_empty() {
+                    section(ui, t, d, data, "UDA 属性", &data.udas, true, cmds);
+                }
+            });
+    });
 }
 
 /// 「当前元素」头：类型图标 + 「NOUN 名称」+ refno 芯片。

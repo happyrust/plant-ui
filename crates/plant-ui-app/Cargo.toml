@@ -17,6 +17,8 @@ egui_inspection.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+ron.workspace = true
+url.workspace = true
 chrono.workspace = true
 bevy.workspace = true
 bevy_egui35.workspace = true
@@ -26,6 +28,7 @@ web-time.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 bevy-wasm-tasks = { workspace = true, features = ["tokio"] }
+config.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 bevy-wasm-tasks = { workspace = true, features = ["wasm"] }
