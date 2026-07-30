@@ -267,48 +267,41 @@ pub fn status_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
                             .font(Font::micro(d))
                             .color(t.text_muted),
                     );
+                    if vm.model_load.is_some() {
+                        ui.add_space(space::S3);
+                        model_load_progress(ui, t, d, vm);
+                    }
                 });
             });
         });
 }
 
-pub fn model_load_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
+fn model_load_progress(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
     let Some(state) = &vm.model_load else {
         return;
     };
-    ui.spacing_mut().item_spacing.y = 0.0;
-    hairline(ui, t);
-    egui::Frame::new()
-        .fill(t.bg_chrome)
-        .inner_margin(Margin::symmetric(space::S3 as i8, 0))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.set_height(d.px(24.0));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let fraction = state.fraction();
-                let text = match state {
-                    ModelLoadVm::Loading {
-                        label, done, total, ..
-                    } if *total > 0 => {
-                        format!("{label}  {done}/{total}  {:.0}%", fraction.unwrap() * 100.0)
-                    }
-                    _ => state.label().to_owned(),
-                };
-                let fill = match state {
-                    ModelLoadVm::Success(_) => t.success,
-                    ModelLoadVm::Failed(_) => t.danger,
-                    _ => t.accent,
-                };
-                ui.add(
-                    egui::ProgressBar::new(fraction.unwrap_or(0.0))
-                        .desired_width(d.px(320.0))
-                        .desired_height(d.px(14.0))
-                        .fill(fill)
-                        .animate(fraction.is_none())
-                        .text(RichText::new(text).font(Font::micro(d))),
-                );
-            });
-        });
+    let fraction = state.fraction();
+    let text = match state {
+        ModelLoadVm::Loading {
+            label, done, total, ..
+        } if *total > 0 => {
+            format!("{label}  {done}/{total}  {:.0}%", fraction.unwrap() * 100.0)
+        }
+        _ => state.label().to_owned(),
+    };
+    let fill = match state {
+        ModelLoadVm::Success(_) => t.success,
+        ModelLoadVm::Failed(_) => t.danger,
+        _ => t.accent,
+    };
+    ui.add(
+        egui::ProgressBar::new(fraction.unwrap_or(0.0))
+            .desired_width(d.px(320.0))
+            .desired_height(d.px(14.0))
+            .fill(fill)
+            .animate(fraction.is_none())
+            .text(RichText::new(text).font(Font::micro(d))),
+    );
 }
 
 /// 队列计数。队列视图被折起时由它叫住人，**不重复面板上的明细**——同一组数字
