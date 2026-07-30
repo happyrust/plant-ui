@@ -104,6 +104,13 @@ pub fn show(
         .frame(egui::Frame::NONE)
         .show_separator_line(false)
         .show(ui, |ui| chrome::command_bar(ui, t, d, vm, &mut cmds));
+    if vm.model_load.is_some() {
+        egui::Panel::bottom("wb-model-load")
+            .exact_size(d.px(24.0) + 1.0)
+            .frame(egui::Frame::NONE)
+            .show_separator_line(false)
+            .show(ui, |ui| chrome::model_load_bar(ui, t, d, vm));
+    }
     egui::Panel::bottom("wb-status")
         .exact_size(d.status_bar_h() + 1.0)
         .frame(egui::Frame::NONE)

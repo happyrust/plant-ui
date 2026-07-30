@@ -17,7 +17,7 @@ use aios_core::pdms_types::PdmsGenericType;
 use aios_core::shape::pdms_shape::PlantMesh;
 use aios_core::{GeomInstQuery, RefU64};
 use bevy::asset::io::Reader;
-use bevy::asset::{AssetLoader, AssetServer, Assets, LoadContext};
+use bevy::asset::{AssetLoader, AssetServer, Assets, LoadContext, LoadState};
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::prelude::*;
 use bevy::render::camera::{ClearColorConfig, RenderTarget, ScalingMode};
@@ -83,6 +83,7 @@ impl Plugin for View3dPlugin {
                 Update,
                 (
                     load_models,
+                    update_mesh_progress,
                     apply_resize,
                     apply_commands,
                     apply_selection,
@@ -112,7 +113,10 @@ pub struct View3d {
     pub axis_labels: [Option<[f32; 2]>; 3],
     image: Handle<Image>,
     commands: VecDeque<ViewCommand>,
-    pending_models: Option<Vec<GeomInstQuery>>,
+    pending_models: VecDeque<ModelBatch>,
+    loading_meshes: Vec<LoadingMesh>,
+    mesh_progress: Option<MeshLoadProgress>,
+    desired_visibility: HashMap<RefU64, bool>,
     pending_resize: Option<(UVec2, Instant)>,
     picked: Option<RefU64>,
     selected: HashSet<RefU64>,
@@ -122,7 +126,21 @@ pub struct View3d {
 
 impl View3d {
     pub fn load(&mut self, models: Vec<GeomInstQuery>) {
-        self.pending_models = Some(models);
+        self.pending_models.clear();
+        self.desired_visibility.clear();
+        self.pending_models.push_back(ModelBatch::Replace(models));
+    }
+
+    /// 在当前场景上只追加新模型；调用方负责按 refno 去重。
+    pub fn append(&mut self, models: Vec<GeomInstQuery>) {
+        if models.is_empty() {
+            return;
+        }
+        if let Some(ModelBatch::Append(pending)) = self.pending_models.back_mut() {
+            pending.extend(models);
+        } else {
+            self.pending_models.push_back(ModelBatch::Append(models));
+        }
     }
 
     pub fn resize(&mut self, size: [u32; 2]) {
@@ -139,6 +157,7 @@ impl View3d {
     }
 
     pub fn model(&mut self, action: ModelAction) {
+        record_model_visibility(&action, &mut self.desired_visibility);
         self.commands.push_back(ViewCommand::Model(action));
     }
 
@@ -183,6 +202,61 @@ impl View3d {
 
     pub fn take_picked(&mut self) -> Option<RefU64> {
         self.picked.take()
+    }
+
+    /// 取一拍 mesh 文件加载进度；终态只交付一次。
+    pub fn take_mesh_progress(&mut self) -> Option<MeshLoadProgress> {
+        let progress = self.mesh_progress.clone();
+        if progress.as_ref().is_some_and(MeshLoadProgress::finished) {
+            self.mesh_progress = None;
+        }
+        progress
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshLoadProgress {
+    pub done: usize,
+    pub total: usize,
+    pub errors: Vec<String>,
+}
+
+impl MeshLoadProgress {
+    pub fn finished(&self) -> bool {
+        self.done == self.total
+    }
+}
+
+struct LoadingMesh {
+    path: String,
+    handle: Handle<Mesh>,
+}
+
+enum ModelBatch {
+    Replace(Vec<GeomInstQuery>),
+    Append(Vec<GeomInstQuery>),
+}
+
+impl ModelBatch {
+    fn clears_scene(&self) -> bool {
+        matches!(self, Self::Replace(_))
+    }
+
+    fn into_models(self) -> Vec<GeomInstQuery> {
+        match self {
+            Self::Replace(models) | Self::Append(models) => models,
+        }
+    }
+}
+
+fn record_model_visibility(action: &ModelAction, desired: &mut HashMap<RefU64, bool>) {
+    match action {
+        ModelAction::SetVisible { refnos, visible } => {
+            desired.extend(refnos.iter().copied().map(|refno| (refno, *visible)));
+        }
+        ModelAction::HideAll => desired.values_mut().for_each(|visible| *visible = false),
+        ModelAction::ShowAll => desired.values_mut().for_each(|visible| *visible = true),
+        _ => {}
     }
 }
 
@@ -343,7 +417,10 @@ fn setup(
         axis_labels: [None; 3],
         image: image.clone(),
         commands: VecDeque::new(),
-        pending_models: None,
+        pending_models: VecDeque::new(),
+        loading_meshes: Vec::new(),
+        mesh_progress: None,
+        desired_visibility: HashMap::new(),
         pending_resize: None,
         picked: None,
         selected: HashSet::new(),
@@ -649,10 +726,16 @@ fn load_models(
     mut materials: ResMut<Assets<StandardMaterial>>,
     highlight: Res<HighlightMaterial>,
 ) {
-    let Some(models) = view.pending_models.take() else {
+    let Some(batch) = view.pending_models.pop_front() else {
         return;
     };
-    view.bounds.clear();
+    let replace = batch.clears_scene();
+    let models = batch.into_models();
+    if replace {
+        view.bounds.clear();
+        view.loading_meshes.clear();
+        view.mesh_progress = None;
+    }
     let scene_transform = Transform::from_scale(Vec3::splat(MODEL_SCALE))
         * Transform::from_rotation(Quat::from_rotation_x(-FRAC_PI_2));
     let scene_matrix = scene_transform.compute_matrix();
@@ -675,64 +758,127 @@ fn load_models(
         extend_bounds(&mut view.bounds, model.refno.refno(), min, max);
         extend_bounds(&mut view.bounds, model.owner.refno(), min, max);
     }
-    let mut all_min = Vec3::splat(f32::INFINITY);
-    let mut all_max = Vec3::splat(f32::NEG_INFINITY);
-    for &(min, max) in view.bounds.values() {
-        all_min = all_min.min(min);
-        all_max = all_max.max(max);
+    if replace {
+        let mut all_min = Vec3::splat(f32::INFINITY);
+        let mut all_max = Vec3::splat(f32::NEG_INFINITY);
+        for &(min, max) in view.bounds.values() {
+            all_min = all_min.min(min);
+            all_max = all_max.max(max);
+        }
+        if all_min.is_finite()
+            && all_max.is_finite()
+            && let Ok((mut camera, mut projection)) = camera.single_mut()
+        {
+            frame_bounds(all_min, all_max, &mut orbit, &mut camera, &mut projection);
+        }
+        for entity in &roots {
+            commands.entity(entity).despawn();
+        }
     }
-    if all_min.is_finite()
-        && all_max.is_finite()
-        && let Ok((mut camera, mut projection)) = camera.single_mut()
-    {
-        frame_bounds(all_min, all_max, &mut orbit, &mut camera, &mut projection);
-    }
-    for entity in &roots {
-        commands.entity(entity).despawn();
-    }
+    let scene = if replace {
+        commands
+            .spawn((scene_transform, Visibility::Visible, SceneRoot))
+            .id()
+    } else {
+        roots.iter().next().unwrap_or_else(|| {
+            commands
+                .spawn((scene_transform, Visibility::Visible, SceneRoot))
+                .id()
+        })
+    };
     // 一类一枚材质：同类构件成千上万，逐网格建材质既费显存也断批。按基色缓存，
     // 同色（含 UNKOWN 兜底）只落一枚。
     let mut material_cache: HashMap<[u8; 4], Handle<StandardMaterial>> = HashMap::new();
-    commands
-        .spawn((scene_transform, Visibility::Visible, SceneRoot))
-        .with_children(|scene| {
-            for model in models {
-                let refno = model.refno.refno();
-                let owner = model.owner.refno();
-                let color = type_color(&model.generic);
-                let key = color.to_srgba().to_u8_array();
-                let material = material_cache
-                    .entry(key)
-                    .or_insert_with(|| materials.add(model_material(color)))
-                    .clone();
-                let shown_material =
-                    if view.selected.contains(&refno) || view.selected.contains(&owner) {
-                        highlight.0.clone()
-                    } else {
-                        material.clone()
-                    };
-                scene
-                    .spawn((
-                        model.world_trans,
-                        Visibility::Visible,
-                        ModelRoot { refno, owner },
-                    ))
-                    .with_children(|element| {
-                        for inst in model.insts {
-                            element.spawn((
-                                Mesh3d(assets.load(format!("meshes/{}.mesh", inst.geo_hash))),
-                                MeshMaterial3d(shown_material.clone()),
-                                inst.transform,
-                                ModelMesh {
-                                    refno,
-                                    owner,
-                                    base: material.clone(),
-                                },
-                            ));
-                        }
-                    });
-            }
+    let selected = view.selected.clone();
+    let desired_visibility = view.desired_visibility.clone();
+    let mut loading_meshes = Vec::new();
+    commands.entity(scene).with_children(|scene| {
+        for model in models {
+            let refno = model.refno.refno();
+            let owner = model.owner.refno();
+            let color = type_color(&model.generic);
+            let key = color.to_srgba().to_u8_array();
+            let material = material_cache
+                .entry(key)
+                .or_insert_with(|| materials.add(model_material(color)))
+                .clone();
+            let shown_material = if selected.contains(&refno) || selected.contains(&owner) {
+                highlight.0.clone()
+            } else {
+                material.clone()
+            };
+            let visibility = if desired_visibility
+                .get(&refno)
+                .or_else(|| desired_visibility.get(&owner))
+                .copied()
+                .unwrap_or(true)
+            {
+                Visibility::Visible
+            } else {
+                Visibility::Hidden
+            };
+            scene
+                .spawn((model.world_trans, visibility, ModelRoot { refno, owner }))
+                .with_children(|element| {
+                    for inst in model.insts {
+                        let path = format!("meshes/{}.mesh", inst.geo_hash);
+                        let handle = assets.load(path.clone());
+                        loading_meshes.push(LoadingMesh {
+                            path,
+                            handle: handle.clone(),
+                        });
+                        element.spawn((
+                            Mesh3d(handle),
+                            MeshMaterial3d(shown_material.clone()),
+                            inst.transform,
+                            ModelMesh {
+                                refno,
+                                owner,
+                                base: material.clone(),
+                            },
+                        ));
+                    }
+                });
+        }
+    });
+    view.loading_meshes.extend(loading_meshes);
+    if !view.loading_meshes.is_empty() {
+        view.mesh_progress = Some(MeshLoadProgress {
+            done: 0,
+            total: view.loading_meshes.len(),
+            errors: Vec::new(),
         });
+    }
+}
+
+fn update_mesh_progress(mut view: ResMut<View3d>, assets: Res<AssetServer>) {
+    if view.loading_meshes.is_empty() {
+        return;
+    }
+    let mut done = 0;
+    let mut errors = Vec::new();
+    let mut failed_paths = HashSet::new();
+    for mesh in &view.loading_meshes {
+        match assets.get_load_state(&mesh.handle) {
+            Some(LoadState::Loaded) => done += 1,
+            Some(LoadState::Failed(error)) => {
+                done += 1;
+                if failed_paths.insert(&mesh.path) {
+                    errors.push(format!("{}: {error}", mesh.path));
+                }
+            }
+            _ => {}
+        }
+    }
+    let total = view.loading_meshes.len();
+    view.mesh_progress = Some(MeshLoadProgress {
+        done,
+        total,
+        errors,
+    });
+    if done == total {
+        view.loading_meshes.clear();
+    }
 }
 
 fn apply_resize(mut view: ResMut<View3d>, mut images: ResMut<Assets<Image>>) {
@@ -1086,7 +1232,28 @@ fn surface_hit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::asset::AssetPlugin;
     use bevy::render::mesh::VertexAttributeValues;
+
+    fn test_view() -> View3d {
+        View3d {
+            texture: egui::TextureId::Managed(0),
+            size: UVec2::new(16, 16),
+            camera_rot: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            axis_labels: [None; 3],
+            image: Handle::default(),
+            commands: VecDeque::new(),
+            pending_models: VecDeque::new(),
+            loading_meshes: Vec::new(),
+            mesh_progress: None,
+            desired_visibility: HashMap::new(),
+            pending_resize: None,
+            picked: None,
+            selected: HashSet::new(),
+            selection_dirty: false,
+            bounds: HashMap::new(),
+        }
+    }
 
     #[test]
     fn framing_centers_and_keeps_the_camera_outside_the_model() {
@@ -1138,21 +1305,116 @@ mod tests {
     }
 
     #[test]
+    fn incremental_batches_keep_the_existing_scene_and_last_visibility_wins() {
+        assert!(ModelBatch::Replace(Vec::new()).clears_scene());
+        assert!(!ModelBatch::Append(Vec::new()).clears_scene());
+
+        let target = RefU64::from(42);
+        let mut desired = HashMap::new();
+        record_model_visibility(
+            &ModelAction::SetVisible {
+                refnos: vec![target],
+                visible: true,
+            },
+            &mut desired,
+        );
+        record_model_visibility(
+            &ModelAction::SetVisible {
+                refnos: vec![target],
+                visible: false,
+            },
+            &mut desired,
+        );
+        assert_eq!(desired.get(&target), Some(&false));
+    }
+
+    #[test]
+    fn incremental_load_system_keeps_the_existing_scene_root() {
+        let mut view = test_view();
+        view.pending_models
+            .push_back(ModelBatch::Append(Vec::new()));
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .insert_resource(view)
+            .insert_resource(OrbitCamera::default())
+            .insert_resource(HighlightMaterial(Handle::default()))
+            .insert_resource(Assets::<StandardMaterial>::default())
+            .add_systems(Update, load_models);
+        app.world_mut().spawn((
+            Transform::default(),
+            Projection::Perspective(PerspectiveProjection::default()),
+            ViewCamera,
+        ));
+        let existing = app
+            .world_mut()
+            .spawn((Transform::default(), Visibility::Visible, SceneRoot))
+            .id();
+
+        app.update();
+
+        assert!(app.world().entity(existing).contains::<SceneRoot>());
+    }
+
+    #[test]
+    fn terminal_mesh_progress_is_delivered_once() {
+        let mut view = test_view();
+        view.mesh_progress = Some(MeshLoadProgress {
+            done: 2,
+            total: 2,
+            errors: vec!["meshes/missing.mesh: not found".into()],
+        });
+
+        assert_eq!(view.take_mesh_progress().unwrap().errors.len(), 1);
+        assert!(view.take_mesh_progress().is_none());
+    }
+
+    #[test]
+    fn missing_mesh_file_finishes_with_a_visible_error() {
+        let path = "meshes/__plant_ui_missing_test__.mesh";
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_asset::<Mesh>()
+            .init_asset_loader::<MeshLoader>()
+            .insert_resource(test_view())
+            .add_systems(Update, update_mesh_progress);
+        let handle = app.world().resource::<AssetServer>().load(path);
+        app.world_mut()
+            .resource_mut::<View3d>()
+            .loading_meshes
+            .push(LoadingMesh {
+                path: path.into(),
+                handle,
+            });
+
+        for _ in 0..100 {
+            app.update();
+            if app
+                .world()
+                .resource::<View3d>()
+                .mesh_progress
+                .as_ref()
+                .is_some_and(MeshLoadProgress::finished)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let progress = app
+            .world()
+            .resource::<View3d>()
+            .mesh_progress
+            .as_ref()
+            .unwrap();
+        assert_eq!((progress.done, progress.total), (1, 1));
+        assert_eq!(progress.errors.len(), 1);
+        assert!(progress.errors[0].contains(path));
+    }
+
+    #[test]
     fn repeated_resize_request_keeps_the_original_debounce_deadline() {
-        let mut view = View3d {
-            texture: egui::TextureId::Managed(0),
-            size: UVec2::new(1200, 700),
-            camera_rot: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-            axis_labels: [None; 3],
-            image: Handle::default(),
-            commands: VecDeque::new(),
-            pending_models: None,
-            pending_resize: None,
-            picked: None,
-            selected: HashSet::new(),
-            selection_dirty: false,
-            bounds: HashMap::new(),
-        };
+        let mut view = test_view();
+        view.size = UVec2::new(1200, 700);
         let first_asked_at = Instant::now() - Duration::from_secs(1);
         view.pending_resize = Some((UVec2::new(1000, 600), first_asked_at));
 
@@ -1174,22 +1436,12 @@ mod tests {
         let highlight = materials.add(model_material(SELECT_COLOR));
         assert_eq!(type_color("CE").to_srgba().to_u8_array()[3], 200);
         let mut app = App::new();
+        let mut view = test_view();
+        view.selected.insert(owner);
+        view.selection_dirty = true;
         app.add_plugins(MinimalPlugins)
             .insert_resource(HighlightMaterial(highlight.clone()))
-            .insert_resource(View3d {
-                texture: egui::TextureId::Managed(0),
-                size: UVec2::new(16, 16),
-                camera_rot: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-                axis_labels: [None; 3],
-                image: Handle::default(),
-                commands: VecDeque::new(),
-                pending_models: None,
-                pending_resize: None,
-                picked: None,
-                selected: HashSet::from([owner]),
-                selection_dirty: true,
-                bounds: HashMap::new(),
-            })
+            .insert_resource(view)
             .add_systems(Update, apply_selection);
         let entity = app
             .world_mut()

@@ -37,8 +37,8 @@ use plant_ui::style::theme_tokens::{self, set_weight_families_ready};
 use plant_ui::style::tokens::{Density, Tokens};
 use plant_ui::task_queue;
 use plant_ui::vm::{
-    CommandLineKind, CommandLineVm, LogElement, PropKind, PropRowVm, PropsDataVm, PropsVm,
-    RowVisibility, Selection, TreeRowVm, TreeVm, View3dVm, WorkbenchVm,
+    CommandLineKind, CommandLineVm, LogElement, ModelLoadVm, PropKind, PropRowVm, PropsDataVm,
+    PropsVm, RowVisibility, Selection, TreeRowVm, TreeVm, View3dVm, WorkbenchVm,
 };
 use plant_ui::workbench::{self, Pane, WorkbenchState};
 use plant_ui_data::{EleTreeNode, RefU64};
@@ -283,6 +283,9 @@ fn show_app(
     if let Some(refno) = view3d.take_picked() {
         app.handle_cmds(ctx, vec![Cmd::LocateElement(refno)]);
     }
+    if let Some(progress) = view3d.take_mesh_progress() {
+        app.sync_mesh_progress(progress);
+    }
     app.vm.view3d = Some(View3dVm {
         texture: view3d.texture,
         size: egui::vec2(view3d.size.x as f32, view3d.size.y as f32),
@@ -303,6 +306,9 @@ fn show_app(
     view3d.set_selection(app.vm.selection.to_vec());
     if let Some(models) = app.pending_models.take() {
         view3d.load(models);
+    }
+    for models in app.pending_incremental_models.drain(..) {
+        view3d.append(models);
     }
     for command in app.view3d_commands.drain(..) {
         match command {
@@ -514,6 +520,16 @@ struct App {
     pending_locate: Option<PendingLocate>,
     logs: logs::LogBuffer,
     pending_models: Option<Vec<aios_core::GeomInstQuery>>,
+    pending_incremental_models: Vec<Vec<aios_core::GeomInstQuery>>,
+    /// tree/container refno -> 实际可见 ModelRoot refno。
+    model_scopes: HashMap<RefU64, Vec<RefU64>>,
+    model_scope_pending: HashSet<RefU64>,
+    model_scope_epoch: u64,
+    loaded_models: HashSet<RefU64>,
+    model_show_waiting: HashSet<RefU64>,
+    latest_mesh_progress: Option<plant_ui_view3d::MeshLoadProgress>,
+    model_scope_failures: usize,
+    model_progress_until: Option<Instant>,
     view3d_commands: Vec<Cmd>,
     font_weights_pending: bool,
     /// 上一次发给三维视口的主题配色。视口的渐变背景画在宿主侧（拷问定案第 2 题），
@@ -572,6 +588,50 @@ fn model_reload_due(owed: &mut bool, refresh_observed: bool, models_settled: boo
 
 fn restore_model_reload(owed: &mut bool, failed_debt_reload: bool) {
     *owed |= failed_debt_reload;
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ModelVisibilityPlan {
+    resolved: Vec<RefU64>,
+    query: Vec<RefU64>,
+}
+
+fn model_visibility_plan(
+    targets: &[RefU64],
+    scopes: &HashMap<RefU64, Vec<RefU64>>,
+    pending: &HashSet<RefU64>,
+) -> ModelVisibilityPlan {
+    let mut plan = ModelVisibilityPlan::default();
+    let mut seen = HashSet::new();
+    for target in targets {
+        if let Some(models) = scopes.get(target) {
+            plan.resolved
+                .extend(models.iter().copied().filter(|refno| seen.insert(*refno)));
+        } else if !pending.contains(target) {
+            plan.query.push(*target);
+        }
+    }
+    plan
+}
+
+fn cache_model_scope(scopes: &mut HashMap<RefU64, Vec<RefU64>>, target: RefU64, model: RefU64) {
+    let models = scopes.entry(target).or_default();
+    if !models.contains(&model) {
+        models.push(model);
+    }
+}
+
+fn mark_model_scope_unavailable(
+    visibility: &mut HashMap<RefU64, bool>,
+    failures: &mut usize,
+    target: RefU64,
+) {
+    visibility.remove(&target);
+    *failures += 1;
+}
+
+fn model_progress_terminal(pending_meshes: usize, failures: usize) -> Option<bool> {
+    (pending_meshes == 0).then_some(failures == 0)
 }
 
 fn settled_pending_roots(
@@ -649,6 +709,15 @@ impl App {
             pending_locate: None,
             logs: logs::LogBuffer::default(),
             pending_models: None,
+            pending_incremental_models: Vec::new(),
+            model_scopes: HashMap::new(),
+            model_scope_pending: HashSet::new(),
+            model_scope_epoch: 0,
+            loaded_models: HashSet::new(),
+            model_show_waiting: HashSet::new(),
+            latest_mesh_progress: None,
+            model_scope_failures: 0,
+            model_progress_until: None,
             view3d_commands: Vec::new(),
             font_weights_pending,
             sent_viewport_bg: None,
@@ -772,6 +841,17 @@ impl App {
                             self.run_deferred_get_work();
                             let mesh_count =
                                 models.iter().map(|model| model.insts.len()).sum::<usize>();
+                            self.pending_incremental_models.clear();
+                            self.model_show_waiting.clear();
+                            self.latest_mesh_progress = None;
+                            self.model_scope_failures = 0;
+                            self.model_scopes.clear();
+                            self.loaded_models.clear();
+                            for model in &models {
+                                let refno = model.refno.refno();
+                                self.loaded_models.insert(refno);
+                                cache_model_scope(&mut self.model_scopes, refno, refno);
+                            }
                             self.tree.visibility.clear();
                             self.tree
                                 .visibility
@@ -796,6 +876,161 @@ impl App {
                         }
                     }
                 }
+                data::Evt::ModelScopeProgress {
+                    epoch,
+                    target,
+                    done,
+                    total,
+                } if epoch == self.model_scope_epoch => {
+                    if self.model_scope_pending.contains(&target) {
+                        self.model_progress_until = None;
+                        self.vm.model_load = Some(if total == 0 {
+                            ModelLoadVm::Resolving("解析模型范围…".into())
+                        } else {
+                            ModelLoadVm::Loading {
+                                label: "查询已有模型".into(),
+                                done,
+                                total,
+                            }
+                        });
+                    }
+                }
+                data::Evt::ModelScope(epoch, target, result) if epoch == self.model_scope_epoch => {
+                    self.model_scope_pending.remove(&target);
+                    match result {
+                        Ok(models) if models.is_empty() => {
+                            mark_model_scope_unavailable(
+                                &mut self.tree.visibility,
+                                &mut self.model_scope_failures,
+                                target,
+                            );
+                            let element = self.tree.element(target);
+                            self.logs
+                                .warn_of(&mut self.vm.logs, element, "未找到已生成模型");
+                            self.finish_model_progress("模型加载完成");
+                            dirty = true;
+                        }
+                        Ok(models) => {
+                            let mesh_count =
+                                models.iter().map(|model| model.insts.len()).sum::<usize>();
+                            let mut refs = Vec::new();
+                            let mut seen = HashSet::new();
+                            for model in &models {
+                                let refno = model.refno.refno();
+                                if seen.insert(refno) {
+                                    refs.push(refno);
+                                }
+                                cache_model_scope(&mut self.model_scopes, refno, refno);
+                            }
+                            self.model_scopes.insert(target, refs.clone());
+                            let element = self.tree.element(target);
+                            self.logs.info_of(
+                                &mut self.vm.logs,
+                                element,
+                                format!("查询到 {} 个元素、{} 个网格实例", refs.len(), mesh_count),
+                            );
+
+                            let visible =
+                                self.tree.visibility.get(&target).copied().unwrap_or(false);
+                            let mut new_models = Vec::new();
+                            let mut new_meshes = 0;
+                            for model in models {
+                                let refno = model.refno.refno();
+                                if self.loaded_models.insert(refno) {
+                                    new_meshes += model.insts.len();
+                                    new_models.push(model);
+                                }
+                            }
+                            if !new_models.is_empty() {
+                                self.pending_incremental_models.push(new_models);
+                                if new_meshes > 0 {
+                                    self.model_show_waiting.insert(target);
+                                    self.model_progress_until = None;
+                                    self.vm.model_load = Some(ModelLoadVm::Loading {
+                                        label: "加载模型网格".into(),
+                                        done: 0,
+                                        total: new_meshes,
+                                    });
+                                } else {
+                                    self.logs.info_of(
+                                        &mut self.vm.logs,
+                                        self.tree.element(target),
+                                        if visible {
+                                            "显示完成"
+                                        } else {
+                                            "隐藏完成"
+                                        },
+                                    );
+                                    self.finish_model_progress(if visible {
+                                        "模型显示完成"
+                                    } else {
+                                        "模型隐藏完成"
+                                    });
+                                }
+                            } else {
+                                if visible
+                                    && (self.pending_models.is_some()
+                                        || !self.pending_incremental_models.is_empty()
+                                        || self.latest_mesh_progress.is_some())
+                                {
+                                    let (done, total) = self
+                                        .latest_mesh_progress
+                                        .as_ref()
+                                        .map_or((0, mesh_count), |progress| {
+                                            (progress.done, progress.total)
+                                        });
+                                    self.model_show_waiting.insert(target);
+                                    self.model_progress_until = None;
+                                    self.vm.model_load = Some(ModelLoadVm::Loading {
+                                        label: "加载模型网格".into(),
+                                        done,
+                                        total,
+                                    });
+                                } else {
+                                    self.logs.info_of(
+                                        &mut self.vm.logs,
+                                        self.tree.element(target),
+                                        if visible {
+                                            "显示完成"
+                                        } else {
+                                            "隐藏完成"
+                                        },
+                                    );
+                                    self.finish_model_progress(if visible {
+                                        "模型显示完成"
+                                    } else {
+                                        "模型隐藏完成"
+                                    });
+                                }
+                            }
+                            self.view3d_commands.push(Cmd::Model(
+                                plant_ui::ModelAction::SetVisible {
+                                    refnos: refs,
+                                    visible,
+                                },
+                            ));
+                            dirty = true;
+                        }
+                        Err(error) => {
+                            mark_model_scope_unavailable(
+                                &mut self.tree.visibility,
+                                &mut self.model_scope_failures,
+                                target,
+                            );
+                            let element = self.tree.element(target);
+                            self.logs.error_of(
+                                &mut self.vm.logs,
+                                element,
+                                "已有模型查询失败",
+                                &error,
+                                None,
+                            );
+                            self.finish_model_progress("模型加载完成");
+                            dirty = true;
+                        }
+                    }
+                }
+                data::Evt::ModelScopeProgress { .. } | data::Evt::ModelScope(..) => {}
                 data::Evt::ResolvedName(name, result) => match result {
                     // `/名称` 与 `=参考号` 之后走的是同一条定位路径，只有回执文案不同。
                     Ok(Some(refno)) => {
@@ -1065,6 +1300,91 @@ impl App {
         }
     }
 
+    fn succeed_model_progress(&mut self, label: impl Into<String>) {
+        self.vm.model_load = Some(ModelLoadVm::Success(label.into()));
+        self.model_progress_until = Some(Instant::now() + Duration::from_millis(1_500));
+    }
+
+    fn fail_model_progress(&mut self, label: impl Into<String>) {
+        self.vm.model_load = Some(ModelLoadVm::Failed(label.into()));
+        self.model_progress_until = Some(Instant::now() + Duration::from_secs(4));
+    }
+
+    fn finish_model_progress(&mut self, success: impl Into<String>) {
+        if !self.model_scope_pending.is_empty() {
+            self.model_progress_until = None;
+            self.vm.model_load = Some(ModelLoadVm::Resolving("解析模型范围…".into()));
+            return;
+        }
+        let Some(succeeded) =
+            model_progress_terminal(self.model_show_waiting.len(), self.model_scope_failures)
+        else {
+            return;
+        };
+        let failures = std::mem::take(&mut self.model_scope_failures);
+        if succeeded {
+            self.succeed_model_progress(success);
+        } else {
+            self.fail_model_progress(format!("模型加载失败（{failures} 项）"));
+        }
+    }
+
+    fn tick_model_progress(&mut self) {
+        if self
+            .model_progress_until
+            .is_some_and(|until| Instant::now() >= until)
+        {
+            self.model_progress_until = None;
+            self.vm.model_load = None;
+        }
+    }
+
+    fn sync_mesh_progress(&mut self, progress: plant_ui_view3d::MeshLoadProgress) {
+        self.latest_mesh_progress = (!progress.finished()).then(|| progress.clone());
+        if self.model_show_waiting.is_empty() {
+            return;
+        }
+        self.model_progress_until = None;
+        self.vm.model_load = Some(ModelLoadVm::Loading {
+            label: "加载模型网格".into(),
+            done: progress.done,
+            total: progress.total,
+        });
+        if !progress.finished() {
+            return;
+        }
+
+        let targets = self.model_show_waiting.iter().copied().collect::<Vec<_>>();
+        self.model_show_waiting.clear();
+        if progress.errors.is_empty() {
+            let shown = targets
+                .iter()
+                .filter(|target| self.tree.visibility.get(target).copied().unwrap_or(false))
+                .count();
+            let hidden = targets.len() - shown;
+            let (message, label) = match (shown, hidden) {
+                (shown, 0) => (format!("模型显示完成：{shown} 个目标"), "模型显示完成"),
+                (0, hidden) => (format!("模型隐藏完成：{hidden} 个目标"), "模型隐藏完成"),
+                (shown, hidden) => (
+                    format!("模型加载完成：显示 {shown} 个、隐藏 {hidden} 个目标"),
+                    "模型加载完成",
+                ),
+            };
+            self.logs.info(&mut self.vm.logs, message);
+            self.finish_model_progress(label);
+        } else {
+            let error = anyhow::anyhow!(progress.errors.join("\n"));
+            self.logs.error(
+                &mut self.vm.logs,
+                format!("mesh 文件加载失败：{} 个", progress.errors.len()),
+                &error,
+                None,
+            );
+            self.model_scope_failures += progress.errors.len();
+            self.finish_model_progress("模型加载完成");
+        }
+    }
+
     fn handle_cmds(&mut self, ctx: &egui::Context, cmds: Vec<Cmd>) {
         let mut dirty = false;
         for cmd in cmds {
@@ -1188,11 +1508,90 @@ impl App {
                 }
                 Cmd::ReconnectQueueFeed => self.reopen_queue_feed(ctx),
                 Cmd::Model(action) => {
-                    match &action {
+                    match action {
                         plant_ui::ModelAction::SetVisible { refnos, visible } => {
-                            for refno in refnos {
-                                if let Some(current) = self.tree.visibility.get_mut(refno) {
-                                    *current = *visible;
+                            for refno in &refnos {
+                                self.tree.visibility.insert(*refno, visible);
+                            }
+                            let plan = model_visibility_plan(
+                                &refnos,
+                                &self.model_scopes,
+                                &self.model_scope_pending,
+                            );
+                            if !plan.resolved.is_empty() {
+                                self.view3d_commands.push(Cmd::Model(
+                                    plant_ui::ModelAction::SetVisible {
+                                        refnos: plan.resolved,
+                                        visible,
+                                    },
+                                ));
+                                if visible
+                                    && (self.pending_models.is_some()
+                                        || !self.pending_incremental_models.is_empty()
+                                        || self.latest_mesh_progress.is_some())
+                                {
+                                    let (done, total) = self
+                                        .latest_mesh_progress
+                                        .as_ref()
+                                        .map_or((0, 0), |progress| (progress.done, progress.total));
+                                    self.model_show_waiting.extend(refnos.iter().copied());
+                                    self.model_progress_until = None;
+                                    self.vm.model_load = Some(ModelLoadVm::Loading {
+                                        label: "加载模型网格".into(),
+                                        done,
+                                        total,
+                                    });
+                                }
+                                let still_loading = refnos
+                                    .iter()
+                                    .any(|refno| self.model_show_waiting.contains(refno));
+                                if !still_loading {
+                                    let verb = if visible { "显示" } else { "隐藏" };
+                                    self.logs.info(
+                                        &mut self.vm.logs,
+                                        format!("模型{verb}完成：{} 个目标", refnos.len()),
+                                    );
+                                    self.finish_model_progress(format!("模型{verb}完成"));
+                                }
+                            }
+                            if !plan.query.is_empty() {
+                                if self.model_scope_pending.is_empty()
+                                    && self.model_show_waiting.is_empty()
+                                {
+                                    self.model_scope_failures = 0;
+                                }
+                                self.model_scope_pending.extend(plan.query.iter().copied());
+                                let verb = if visible { "显示" } else { "隐藏" };
+                                self.logs.info(
+                                    &mut self.vm.logs,
+                                    format!("开始查询并{verb}模型：{} 个目标", plan.query.len()),
+                                );
+                                self.model_progress_until = None;
+                                self.vm.model_load =
+                                    Some(ModelLoadVm::Resolving("解析模型范围…".into()));
+                                let targets = plan.query;
+                                if self
+                                    .bridge
+                                    .req
+                                    .send(data::Req::ModelScopes {
+                                        epoch: self.model_scope_epoch,
+                                        targets: targets.clone(),
+                                    })
+                                    .is_err()
+                                {
+                                    for target in targets {
+                                        self.model_scope_pending.remove(&target);
+                                        self.tree.visibility.remove(&target);
+                                    }
+                                    self.model_scope_failures += 1;
+                                    let error = anyhow::anyhow!("数据查询线程已停止");
+                                    self.logs.error(
+                                        &mut self.vm.logs,
+                                        "已有模型查询失败",
+                                        &error,
+                                        None,
+                                    );
+                                    self.finish_model_progress("模型加载完成");
                                 }
                             }
                         }
@@ -1201,17 +1600,20 @@ impl App {
                                 .visibility
                                 .values_mut()
                                 .for_each(|visible| *visible = false);
+                            self.view3d_commands
+                                .push(Cmd::Model(plant_ui::ModelAction::HideAll));
                         }
                         plant_ui::ModelAction::ShowAll => {
                             self.tree
                                 .visibility
                                 .values_mut()
                                 .for_each(|visible| *visible = true);
+                            self.view3d_commands
+                                .push(Cmd::Model(plant_ui::ModelAction::ShowAll));
                         }
-                        _ => {}
+                        action => self.view3d_commands.push(Cmd::Model(action)),
                     }
                     dirty = true;
-                    self.view3d_commands.push(Cmd::Model(action));
                 }
                 command @ (Cmd::PickViewport(_)
                 | Cmd::Camera(_)
@@ -1668,6 +2070,16 @@ impl App {
 
     fn reconnect(&mut self) {
         // 新连接必须从空缓存开始：否则失败时状态栏和属性仍在说旧模型已经就绪。
+        self.model_scope_epoch = self.model_scope_epoch.wrapping_add(1);
+        self.model_scopes.clear();
+        self.model_scope_pending.clear();
+        self.loaded_models.clear();
+        self.model_show_waiting.clear();
+        self.pending_incremental_models.clear();
+        self.latest_mesh_progress = None;
+        self.model_scope_failures = 0;
+        self.model_progress_until = None;
+        self.vm.model_load = None;
         self.tree = TreeModel::default();
         self.vm.data_source_ok = false;
         self.vm.project.clear();
@@ -1833,10 +2245,12 @@ impl App {
 mod tests {
     use super::{
         RefU64, background_models_settled, begin_get_work, finished_after, in_mdb_path,
-        model_reload_due, restore_model_reload, settled_pending_roots, task_matches_project,
+        mark_model_scope_unavailable, model_progress_terminal, model_reload_due,
+        model_visibility_plan, restore_model_reload, settled_pending_roots, task_matches_project,
     };
     use chrono::{TimeZone, Utc};
     use plant_ui::model_update::PendingModelUnit;
+    use std::collections::{HashMap, HashSet};
 
     fn refs(raw: &[&str]) -> Vec<RefU64> {
         raw.iter().map(|s| s.parse().unwrap()).collect()
@@ -1942,6 +2356,68 @@ mod tests {
         restore_model_reload(&mut owed, true);
         assert!(model_reload_due(&mut owed, false, true));
     }
+
+    #[test]
+    fn unloaded_eye_queries_existing_models_before_changing_view3d_visibility() {
+        let target = "24381/1".parse::<RefU64>().unwrap();
+        let scopes = HashMap::new();
+        let pending = HashSet::new();
+
+        let plan = model_visibility_plan(&[target], &scopes, &pending);
+
+        assert_eq!(plan.query, vec![target]);
+        assert!(plan.resolved.is_empty());
+    }
+
+    #[test]
+    fn cached_container_scope_reuses_actual_models_and_pending_clicks_are_deduplicated() {
+        let [container, first, second, pending_target] =
+            refs(&["24381/1", "24381/11", "24381/12", "24381/2"])
+                .try_into()
+                .unwrap();
+        let scopes = HashMap::from([(container, vec![first, second])]);
+        let pending = HashSet::from([pending_target]);
+
+        let plan = model_visibility_plan(&[container, pending_target], &scopes, &pending);
+
+        assert_eq!(plan.resolved, vec![first, second]);
+        assert!(plan.query.is_empty());
+    }
+
+    #[test]
+    fn eye_dispatch_does_not_call_the_model_generation_api() {
+        let source = include_str!("main.rs");
+        let handler = source
+            .split("fn handle_cmds")
+            .nth(1)
+            .unwrap()
+            .split("fn submit_command")
+            .next()
+            .unwrap();
+        assert!(!handler.contains("ensure_model"));
+        assert!(!handler.contains("/api/v1/model/ensure"));
+    }
+
+    #[test]
+    fn batch_failure_becomes_terminal_only_after_queries_and_meshes_finish() {
+        assert_eq!(model_progress_terminal(1, 1), None);
+        assert_eq!(model_progress_terminal(0, 1), Some(false));
+        assert_eq!(model_progress_terminal(0, 0), Some(true));
+    }
+
+    #[test]
+    fn empty_and_failed_scope_queries_restore_unloaded_state() {
+        let [empty, failed] = refs(&["24381/1", "24381/2"]).try_into().unwrap();
+        let mut visibility = HashMap::from([(empty, true), (failed, true)]);
+        let mut failures = 0;
+
+        mark_model_scope_unavailable(&mut visibility, &mut failures, empty);
+        mark_model_scope_unavailable(&mut visibility, &mut failures, failed);
+
+        assert!(!visibility.contains_key(&empty));
+        assert!(!visibility.contains_key(&failed));
+        assert_eq!(failures, 2);
+    }
 }
 
 /// 数据层的属性形态 -> 绘制层的控件选择。数据层的 `Unset` / `Opaque` 在 UI 侧
@@ -1974,6 +2450,10 @@ fn db_label(ns: &str, db_nums: &[u32]) -> String {
 impl App {
     fn ui(&mut self, ui: &mut egui::Ui) {
         self.pump_events();
+        self.tick_model_progress();
+        if self.model_progress_until.is_some() {
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
+        }
         let t = theme_tokens::current();
         let d = self.settings_state.saved.density;
         // 首帧与每次换主题，把视口配色送给三维侧。对着当前生效令牌比对而不是

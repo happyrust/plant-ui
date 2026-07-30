@@ -47,8 +47,45 @@ pub struct WorkbenchVm {
     /// 三维视口的画面（M1-5 是占位纹理，M3 换成 Bevy 的渲染目标）。
     /// `None` = 还没有可画的东西。
     pub view3d: Option<View3dVm>,
+    /// eye 查询和增量 mesh 装载的短状态；完成/失败由宿主延时清除。
+    pub model_load: Option<ModelLoadVm>,
     /// 任务队列在状态栏上的那一格。
     pub queue: QueueStatusVm,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelLoadVm {
+    Resolving(String),
+    Loading {
+        label: String,
+        done: usize,
+        total: usize,
+    },
+    Success(String),
+    Failed(String),
+}
+
+impl ModelLoadVm {
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Resolving(label)
+            | Self::Loading { label, .. }
+            | Self::Success(label)
+            | Self::Failed(label) => label,
+        }
+    }
+
+    pub fn fraction(&self) -> Option<f32> {
+        match self {
+            Self::Resolving(_) => None,
+            Self::Loading { done, total, .. } if *total > 0 => {
+                Some((*done as f32 / *total as f32).clamp(0.0, 1.0))
+            }
+            Self::Loading { .. } => None,
+            Self::Success(_) => Some(1.0),
+            Self::Failed(_) => Some(1.0),
+        }
+    }
 }
 
 /// 状态栏上的队列计数。队列视图被折起时由它叫住人，**不重复面板上的明细**
@@ -554,6 +591,20 @@ mod tests {
         assert!(RowVisibility::Unloaded.on_click());
         assert!(RowVisibility::Hidden.on_click());
         assert!(!RowVisibility::Shown.on_click());
+    }
+
+    #[test]
+    fn model_load_progress_uses_real_completed_counts() {
+        let progress = ModelLoadVm::Loading {
+            label: "加载模型网格".into(),
+            done: 3,
+            total: 4,
+        };
+        assert_eq!(progress.fraction(), Some(0.75));
+        assert_eq!(
+            ModelLoadVm::Resolving("解析模型范围".into()).fraction(),
+            None
+        );
     }
 
     #[test]

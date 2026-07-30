@@ -11,7 +11,7 @@ use crate::Cmd;
 use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Status, Tokens, radius, space};
 use crate::style::widgets;
-use crate::vm::WorkbenchVm;
+use crate::vm::{ModelLoadVm, WorkbenchVm};
 
 pub fn title_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
     // 栏体(Frame)与 hairline 必须严丝合缝：全局 item_spacing.y=6 会把
@@ -268,6 +268,45 @@ pub fn status_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
                             .color(t.text_muted),
                     );
                 });
+            });
+        });
+}
+
+pub fn model_load_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
+    let Some(state) = &vm.model_load else {
+        return;
+    };
+    ui.spacing_mut().item_spacing.y = 0.0;
+    hairline(ui, t);
+    egui::Frame::new()
+        .fill(t.bg_chrome)
+        .inner_margin(Margin::symmetric(space::S3 as i8, 0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.set_height(d.px(24.0));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let fraction = state.fraction();
+                let text = match state {
+                    ModelLoadVm::Loading {
+                        label, done, total, ..
+                    } if *total > 0 => {
+                        format!("{label}  {done}/{total}  {:.0}%", fraction.unwrap() * 100.0)
+                    }
+                    _ => state.label().to_owned(),
+                };
+                let fill = match state {
+                    ModelLoadVm::Success(_) => t.success,
+                    ModelLoadVm::Failed(_) => t.danger,
+                    _ => t.accent,
+                };
+                ui.add(
+                    egui::ProgressBar::new(fraction.unwrap_or(0.0))
+                        .desired_width(d.px(320.0))
+                        .desired_height(d.px(14.0))
+                        .fill(fill)
+                        .animate(fraction.is_none())
+                        .text(RichText::new(text).font(Font::micro(d))),
+                );
             });
         });
 }
