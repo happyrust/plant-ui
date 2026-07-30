@@ -260,6 +260,10 @@ fn record_model_visibility(action: &ModelAction, desired: &mut HashMap<RefU64, b
     }
 }
 
+fn should_frame_batch(replace: bool, scene_empty: bool) -> bool {
+    replace || scene_empty
+}
+
 fn srgb(c: egui::Color32) -> Color {
     Color::srgba_u8(c.r(), c.g(), c.b(), c.a())
 }
@@ -730,6 +734,7 @@ fn load_models(
         return;
     };
     let replace = batch.clears_scene();
+    let frame = should_frame_batch(replace, roots.is_empty());
     let models = batch.into_models();
     if replace {
         view.bounds.clear();
@@ -758,7 +763,7 @@ fn load_models(
         extend_bounds(&mut view.bounds, model.refno.refno(), min, max);
         extend_bounds(&mut view.bounds, model.owner.refno(), min, max);
     }
-    if replace {
+    if frame {
         let mut all_min = Vec3::splat(f32::INFINITY);
         let mut all_max = Vec3::splat(f32::NEG_INFINITY);
         for &(min, max) in view.bounds.values() {
@@ -771,6 +776,8 @@ fn load_models(
         {
             frame_bounds(all_min, all_max, &mut orbit, &mut camera, &mut projection);
         }
+    }
+    if replace {
         for entity in &roots {
             commands.entity(entity).despawn();
         }
@@ -1326,6 +1333,12 @@ mod tests {
             &mut desired,
         );
         assert_eq!(desired.get(&target), Some(&false));
+    }
+
+    #[test]
+    fn first_incremental_batch_frames_an_empty_scene() {
+        assert!(should_frame_batch(false, true));
+        assert!(!should_frame_batch(false, false));
     }
 
     #[test]
