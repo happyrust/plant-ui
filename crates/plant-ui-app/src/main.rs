@@ -688,7 +688,7 @@ impl App {
                     self.queue.project = self.vm.project.clone();
                     self.queue.mdb = self.mdb.clone();
                     self.queue.namespace = self.namespace.clone();
-                    self.vm.db = db_label(&info.ns, &info.db_nums);
+                    self.vm.project_code = info.ns;
                     let roots = info.sites.iter().map(|site| site.refno.refno()).collect();
                     self.tree.roots = info.sites;
                     let _ = self.bridge.req.send(data::Req::Models(roots, false));
@@ -1684,7 +1684,7 @@ impl App {
         self.model_reload_ready = false;
         self.model_reload_owed = false;
         self.model_reload_in_flight = false;
-        self.vm.db.clear();
+        self.vm.project_code.clear();
         self.vm.element_count = 0;
         self.vm.selection.clear();
         self.vm.tree_reveal = None;

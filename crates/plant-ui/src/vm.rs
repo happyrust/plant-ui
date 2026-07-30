@@ -11,8 +11,8 @@ use crate::style::tokens::Status;
 pub struct WorkbenchVm {
     /// 项目名（标题栏芯片 + 状态栏）。
     pub project: String,
-    /// 库标识（如 "ns 1516 / db 7997"），等宽渲染。
-    pub db: String,
+    /// 项目代号（标题栏 + 状态栏），等宽渲染。
+    pub project_code: String,
     /// 当前用户（标题栏右侧）。
     pub user: String,
     /// 数据源是否就绪（状态栏指示点）。

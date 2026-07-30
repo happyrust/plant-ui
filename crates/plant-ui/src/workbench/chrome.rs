@@ -34,9 +34,14 @@ pub fn title_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
                 // 连接成功前没有工程标识，这一段整体不画（不摆空芯片）。
                 if !vm.project.is_empty() {
                     divider(ui, t, d);
-                    ui.add(widgets::status_tag(t, d, &vm.project, Status::Info));
+                    ui.add(widgets::status_tag(
+                        t,
+                        d,
+                        &format!("项目名 {}", vm.project),
+                        Status::Info,
+                    ));
                     ui.label(
-                        RichText::new(&vm.db)
+                        RichText::new(format!("项目代号 {}", vm.project_code))
                             .font(Font::mono_meta(d))
                             .color(t.text_muted),
                     );
@@ -214,12 +219,12 @@ pub fn status_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
                     divider(ui, t, d);
                     meta_icon(ui, d, ph::DATABASE, t.accent);
                     ui.label(
-                        RichText::new(&vm.project)
+                        RichText::new(format!("项目名 {}", vm.project))
                             .font(Font::micro(d))
                             .color(t.text_secondary),
                     );
                     ui.label(
-                        RichText::new(&vm.db)
+                        RichText::new(format!("项目代号 {}", vm.project_code))
                             .font(Font::mono_micro(d))
                             .color(t.text_muted),
                     );
