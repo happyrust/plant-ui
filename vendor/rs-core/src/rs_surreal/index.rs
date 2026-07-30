@@ -67,6 +67,7 @@ pub async fn define_pe_index() -> anyhow::Result<()> {
         -- pe.owner 字段的索引，与 define_owner_index 建的 pe_owner 边表索引是两回事。
         -- 缺它时按 owner 过滤是全表扫：200,873 行上 count 一个 50 行的结果要 1.25s。
         DEFINE INDEX IF NOT EXISTS pe_owner_index ON TABLE pe COLUMNS owner;
+        DEFINE INDEX IF NOT EXISTS inst_relate_zone_refno_index ON TABLE inst_relate COLUMNS zone_refno;
                 "#,
         )
         .await?;

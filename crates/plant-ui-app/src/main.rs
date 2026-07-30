@@ -758,9 +758,7 @@ impl App {
                     self.queue.mdb = self.mdb.clone();
                     self.queue.namespace = self.namespace.clone();
                     self.vm.project_code = info.ns;
-                    let roots = info.sites.iter().map(|site| site.refno.refno()).collect();
                     self.tree.roots = info.sites;
-                    let _ = self.bridge.req.send(data::Req::Models(roots, false));
                     let _ = self.bridge.req.send(data::Req::PendingSessions);
                     dirty = true;
                 }

@@ -265,7 +265,7 @@ pub async fn query_insts_by_zone(
 ) -> anyhow::Result<Vec<GeomInstQuery>> {
     let zone_refnos = refnos
         .into_iter()
-        .map(|x| format!("ZONE:{}", x))
+        .map(RefnoEnum::to_pe_key)
         .collect::<Vec<_>>()
         .join(",");
 
@@ -305,6 +305,22 @@ pub async fn query_insts_by_zone(
     let geom_insts: Vec<GeomInstQuery> = response.take(0)?;
 
     Ok(geom_insts)
+}
+
+pub async fn query_inst_refnos_by_zone(
+    refnos: impl IntoIterator<Item = &RefnoEnum>,
+) -> anyhow::Result<Vec<RefnoEnum>> {
+    let zone_refnos = refnos
+        .into_iter()
+        .map(RefnoEnum::to_pe_key)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut response = SUL_DB
+        .query(format!(
+            "select value in.id from inst_relate where zone_refno in [{zone_refnos}] and aabb.d != none"
+        ))
+        .await?;
+    Ok(response.take(0)?)
 }
 
 #[cfg(test)]

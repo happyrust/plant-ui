@@ -79,19 +79,35 @@ pub async fn model_instances_with_progress(
 ) -> Result<Vec<aios_core::GeomInstQuery>> {
     let mut refnos = Vec::new();
     let mut branch_refnos = Vec::new();
-    for root in roots {
-        let root = (*root).into();
+    let mut zone_refnos = Vec::new();
+    let roots = roots
+        .iter()
+        .copied()
+        .map(Into::into)
+        .collect::<Vec<aios_core::RefnoEnum>>();
+    let nouns = aios_core::get_type_names(roots.iter()).await?;
+    for (root, noun) in roots.into_iter().zip(nouns) {
+        match noun.as_str() {
+            "ZONE" => {
+                zone_refnos.push(root);
+                continue;
+            }
+            "SITE" => {
+                zone_refnos.extend(aios_core::query_filter_deep_children(root, &["ZONE"]).await?);
+                continue;
+            }
+            _ => {}
+        }
         refnos.extend(aios_core::query_deep_visible_inst_refnos(root).await?);
-        let types = aios_core::get_self_and_owner_type_name(root).await?;
-        if types
-            .first()
-            .is_some_and(|noun| noun == "BRAN" || noun == "HANG")
-        {
+        if noun == "BRAN" || noun == "HANG" {
             branch_refnos.push(root);
         } else {
             branch_refnos
                 .extend(aios_core::query_filter_deep_children(root, &["BRAN", "HANG"]).await?);
         }
+    }
+    for chunk in zone_refnos.chunks(500) {
+        refnos.extend(aios_core::query_inst_refnos_by_zone(chunk.iter()).await?);
     }
     let mut models = Vec::new();
     let total = refnos.len().div_ceil(500) + branch_refnos.len().div_ceil(500);
