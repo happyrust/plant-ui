@@ -110,9 +110,11 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                                 // （连点两下就是切两次，开关本来就该这样）。
                                 // 只作用于这一行——整批走右键菜单与视口的 S / H。
                                 if out.response.clicked() {
+                                    // 方向由宿主算好挂在行上：图标跟的是实际渲染
+                                    // 结果，指令还在路上时它不动，这里不能拿它反推。
                                     cmds.push(Cmd::Model(ModelAction::SetVisible {
                                         refnos: vec![row.refno],
-                                        visible: row.visibility.on_click(),
+                                        visible: row.next_visible,
                                     }));
                                 }
                             } else if out.response.double_clicked()
@@ -149,13 +151,14 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
     }
 }
 
-/// Vm 的三态可见性翻成组件层的画法。两个枚举是同一件事在两层的说法——
+/// Vm 的四态可见性翻成组件层的画法。两个枚举是同一件事在两层的说法——
 /// 组件层不认识 `vm`，见 `widgets::Eye`。
 fn eye_of(vis: RowVisibility) -> Eye {
     match vis {
         RowVisibility::Unloaded => Eye::Unloaded,
         RowVisibility::Shown => Eye::Shown,
         RowVisibility::Hidden => Eye::Hidden,
+        RowVisibility::Partial => Eye::Partial,
     }
 }
 

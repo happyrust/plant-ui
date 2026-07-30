@@ -85,11 +85,11 @@ impl eframe::App for GalleryApp {
             // 后两行都在选择集里，只有末行是主选中：多选下的主 / 从两种描边
             // 就是靠这两行并排看出来的。
             //
-            // 四行的眼睛各占一档：首行是「未选中 + 已隐藏」，验整行弱化；末行是
+            // 五行的眼睛各占一档：首行是「未选中 + 已隐藏」，验整行弱化；末行是
             // 「选中 + 已隐藏」，验选中优先于弱化；第三行未加载，要把鼠标移上去
             // 才画得出来——但那一格的宽度**任何时候都占着**，`24381/100060` 的
-            // 位置不该随悬停移动。
-            let rows: [(usize, &str, Option<bool>, bool, bool, Eye); 4] = [
+            // 位置不该随悬停移动。第四行是半可见，半闭的眼要与斜杠眼分得开。
+            let rows: [(usize, &str, Option<bool>, bool, bool, Eye); 5] = [
                 (
                     0,
                     "SITE /-RX-CSV-OLD",
@@ -106,6 +106,14 @@ impl eframe::App for GalleryApp {
                     true,
                     false,
                     Eye::Unloaded,
+                ),
+                (
+                    1,
+                    "ZONE /-RX-CSV-S4010",
+                    Some(false),
+                    false,
+                    false,
+                    Eye::Partial,
                 ),
                 (
                     2,

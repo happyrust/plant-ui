@@ -286,6 +286,10 @@ fn show_app(
     if let Some(progress) = view3d.take_mesh_progress() {
         app.sync_mesh_progress(progress);
     }
+    let render_states = view3d.take_render_states();
+    if !render_states.is_empty() {
+        app.sync_render_states(render_states);
+    }
     app.vm.view3d = Some(View3dVm {
         texture: view3d.texture,
         size: egui::vec2(view3d.size.x as f32, view3d.size.y as f32),
@@ -363,16 +367,136 @@ struct TreeModel {
     expanded: HashSet<RefU64>,
     /// 子层查询在途的节点。
     loading: HashSet<RefU64>,
-    visibility: HashMap<RefU64, bool>,
+    /// 三维回执上来的**实际渲染结果**，按模型参考号记（ADR-0016）。
+    /// 树上任何一行的 eye 都由它聚合出来，容器行也不例外。
+    visibility: HashMap<RefU64, ModelVisibility>,
+    /// **待执行方向**：点过眼睛、指令还没落到画面上的那些目标（可以是容器行）。
+    /// 它只决定「下一次点击往哪边翻」和「查询回来之后照哪个方向操作模型」，
+    /// 不参与画 eye——画 eye 的是 `visibility`。
+    pending_direction: HashMap<RefU64, bool>,
+    /// 一次操作开始前的 eye。多模型范围分批回执时先保持这个状态，整组落地后再切换。
+    pending_visibility: HashMap<RefU64, RowVisibility>,
+}
+
+/// 一个模型的实际渲染结果，来自 View3d 的回执。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModelVisibility {
+    visible: bool,
+    mesh_loaded: usize,
+    mesh_failed: usize,
+}
+
+impl ModelVisibility {
+    /// 一个网格都没画出来——三维里等于没有它，eye 该退回「未加载」。
+    fn nothing_rendered(self) -> bool {
+        self.mesh_loaded == 0
+    }
+
+    /// 画出来了，但有网格没成：看到的只是这个模型的一部分。
+    fn partly_rendered(self) -> bool {
+        self.mesh_loaded > 0 && self.mesh_failed > 0
+    }
+}
+
+/// 一行的 eye：把它那次显示解析出来的模型的实际状态聚合起来。
+///
+/// 几何行的范围就是它自己（`cache_model_scope` 给每个模型都记了一条自指），
+/// 所以容器行与几何行走同一段代码，不用分两套。
+fn row_visibility(
+    models: Option<&Vec<RefU64>>,
+    actual: &HashMap<RefU64, ModelVisibility>,
+) -> RowVisibility {
+    let Some(models) = models else {
+        return RowVisibility::Unloaded;
+    };
+    let mut shown = 0usize;
+    let mut hidden = 0usize;
+    let mut unavailable = 0usize;
+    let mut partial = false;
+    for refno in models {
+        match actual.get(refno) {
+            Some(state) if !state.nothing_rendered() => {
+                if state.visible {
+                    shown += 1;
+                    partial |= state.partly_rendered();
+                } else {
+                    hidden += 1;
+                }
+            }
+            _ => unavailable += 1,
+        }
+    }
+    if shown + hidden == 0 {
+        RowVisibility::Unloaded
+    } else if partial || unavailable > 0 || (shown > 0 && hidden > 0) {
+        RowVisibility::Partial
+    } else if shown > 0 {
+        RowVisibility::Shown
+    } else {
+        RowVisibility::Hidden
+    }
+}
+
+/// 点这一行眼睛该下什么方向。
+///
+/// 有待执行方向就反转**上一次指令**：图标这时候还停在旧样子，拿它反推会把
+/// 「显示到一半再点一下」变成又一次显示。没有在途指令时才照实际状态推。
+fn next_click_visible(pending: Option<bool>, visibility: RowVisibility) -> bool {
+    match pending {
+        Some(direction) => !direction,
+        None => visibility.on_click(),
+    }
+}
+
+/// 待执行方向什么时候算落地：范围里每个模型的实际状态都到齐，且方向对上了。
+///
+/// 「一个网格都没画出来」也算到齐——那种模型永远对不上方向，再等就是死等。
+fn direction_settled(
+    models: &[RefU64],
+    want: bool,
+    actual: &HashMap<RefU64, ModelVisibility>,
+) -> bool {
+    !models.is_empty()
+        && models.iter().all(|refno| {
+            actual
+                .get(refno)
+                .is_some_and(|state| state.visible == want || state.nothing_rendered())
+        })
+}
+
+fn settle_pending_directions(
+    pending: &mut HashMap<RefU64, bool>,
+    previous: &mut HashMap<RefU64, RowVisibility>,
+    scopes: &HashMap<RefU64, Vec<RefU64>>,
+    actual: &HashMap<RefU64, ModelVisibility>,
+) {
+    pending.retain(|target, want| {
+        // 范围还没查回来的继续挂着：这一次点击连往哪些模型下手都还不知道。
+        scopes
+            .get(target)
+            .is_none_or(|models| !direction_settled(models, *want, actual))
+    });
+    previous.retain(|target, _| pending.contains_key(target));
 }
 
 impl TreeModel {
     /// 按展开状态 DFS 展平可见行。只在结构变化时调用，绘制层逐帧只读。
-    fn flatten(&self) -> Vec<TreeRowVm> {
-        fn walk(model: &TreeModel, nodes: &[EleTreeNode], depth: u16, rows: &mut Vec<TreeRowVm>) {
+    fn flatten(&self, scopes: &HashMap<RefU64, Vec<RefU64>>) -> Vec<TreeRowVm> {
+        fn walk(
+            model: &TreeModel,
+            scopes: &HashMap<RefU64, Vec<RefU64>>,
+            nodes: &[EleTreeNode],
+            depth: u16,
+            rows: &mut Vec<TreeRowVm>,
+        ) {
             for n in nodes {
                 let refno = n.refno.refno();
                 let expandable = (n.children_count > 0).then(|| model.expanded.contains(&refno));
+                let visibility = model
+                    .pending_visibility
+                    .get(&refno)
+                    .copied()
+                    .unwrap_or_else(|| row_visibility(scopes.get(&refno), &model.visibility));
                 rows.push(TreeRowVm {
                     refno,
                     depth,
@@ -380,21 +504,21 @@ impl TreeModel {
                     noun: n.noun.clone(),
                     expandable,
                     loading: model.loading.contains(&refno),
-                    visibility: match model.visibility.get(&refno) {
-                        Some(true) => RowVisibility::Shown,
-                        Some(false) => RowVisibility::Hidden,
-                        None => RowVisibility::Unloaded,
-                    },
+                    visibility,
+                    next_visible: next_click_visible(
+                        model.pending_direction.get(&refno).copied(),
+                        visibility,
+                    ),
                 });
                 if expandable == Some(true)
                     && let Some(kids) = model.children.get(&refno)
                 {
-                    walk(model, kids, depth + 1, rows);
+                    walk(model, scopes, kids, depth + 1, rows);
                 }
             }
         }
         let mut rows = Vec::new();
-        walk(self, &self.roots, 0, &mut rows);
+        walk(self, scopes, &self.roots, 0, &mut rows);
         rows
     }
 
@@ -621,12 +745,13 @@ fn cache_model_scope(scopes: &mut HashMap<RefU64, Vec<RefU64>>, target: RefU64, 
     }
 }
 
+/// 查空、查失败：这次点击什么都没落到三维上，待执行方向撤掉，eye 留在未加载。
 fn mark_model_scope_unavailable(
-    visibility: &mut HashMap<RefU64, bool>,
+    pending_direction: &mut HashMap<RefU64, bool>,
     failures: &mut usize,
     target: RefU64,
 ) {
-    visibility.remove(&target);
+    pending_direction.remove(&target);
     *failures += 1;
 }
 
@@ -850,10 +975,11 @@ impl App {
                                 self.loaded_models.insert(refno);
                                 cache_model_scope(&mut self.model_scopes, refno, refno);
                             }
+                            // 整场重载：旧的实际状态全作废，新的等 View3d 装完
+                            // 网格再回执上来。这中间 eye 停在未加载而不是抢先
+                            // 说「已显示」。
                             self.tree.visibility.clear();
-                            self.tree
-                                .visibility
-                                .extend(models.iter().map(|model| (model.refno.refno(), true)));
+                            self.tree.pending_direction.clear();
                             self.logs.info(
                                 &mut self.vm.logs,
                                 format!(
@@ -898,7 +1024,7 @@ impl App {
                     match result {
                         Ok(models) if models.is_empty() => {
                             mark_model_scope_unavailable(
-                                &mut self.tree.visibility,
+                                &mut self.tree.pending_direction,
                                 &mut self.model_scope_failures,
                                 target,
                             );
@@ -928,8 +1054,14 @@ impl App {
                                 format!("查询到 {} 个元素、{} 个网格实例", refs.len(), mesh_count),
                             );
 
-                            let visible =
-                                self.tree.visibility.get(&target).copied().unwrap_or(false);
+                            // 用**最新**的方向操作模型：查询期间用户可能已经反向
+                            // 点过好几下，或者中途来过一次 HideAll。
+                            let visible = self
+                                .tree
+                                .pending_direction
+                                .get(&target)
+                                .copied()
+                                .unwrap_or(true);
                             let mut new_models = Vec::new();
                             let mut new_meshes = 0;
                             for model in models {
@@ -1011,7 +1143,7 @@ impl App {
                         }
                         Err(error) => {
                             mark_model_scope_unavailable(
-                                &mut self.tree.visibility,
+                                &mut self.tree.pending_direction,
                                 &mut self.model_scope_failures,
                                 target,
                             );
@@ -1357,7 +1489,13 @@ impl App {
         if progress.errors.is_empty() {
             let shown = targets
                 .iter()
-                .filter(|target| self.tree.visibility.get(target).copied().unwrap_or(false))
+                .filter(|target| {
+                    self.tree
+                        .pending_direction
+                        .get(target)
+                        .copied()
+                        .unwrap_or(true)
+                })
                 .count();
             let hidden = targets.len() - shown;
             let (message, label) = match (shown, hidden) {
@@ -1381,6 +1519,24 @@ impl App {
             self.model_scope_failures += progress.errors.len();
             self.finish_model_progress("模型加载完成");
         }
+    }
+
+    /// 收下 View3d 的实际渲染回执，整批更新 eye。
+    ///
+    /// 回执按模型参考号来，几何行与容器行都从这一份聚合（`row_visibility`），
+    /// 所以这里只管把状态记下、再让落地的待执行方向退场。
+    fn sync_render_states(&mut self, states: Vec<plant_ui_view3d::ModelRenderState>) {
+        for state in states {
+            self.tree.visibility.insert(
+                state.refno,
+                ModelVisibility {
+                    visible: state.visible,
+                    mesh_loaded: state.mesh_loaded,
+                    mesh_failed: state.mesh_failed,
+                },
+            );
+        }
+        self.rebuild_tree();
     }
 
     fn handle_cmds(&mut self, ctx: &egui::Context, cmds: Vec<Cmd>) {
@@ -1508,8 +1664,17 @@ impl App {
                 Cmd::Model(action) => {
                     match action {
                         plant_ui::ModelAction::SetVisible { refnos, visible } => {
+                            // 只记方向，不动 eye：图标要等三维真的画成这样再变。
                             for refno in &refnos {
-                                self.tree.visibility.insert(*refno, visible);
+                                let previous = row_visibility(
+                                    self.model_scopes.get(refno),
+                                    &self.tree.visibility,
+                                );
+                                self.tree
+                                    .pending_visibility
+                                    .entry(*refno)
+                                    .or_insert(previous);
+                                self.tree.pending_direction.insert(*refno, visible);
                             }
                             let plan = model_visibility_plan(
                                 &refnos,
@@ -1579,7 +1744,7 @@ impl App {
                                 {
                                     for target in targets {
                                         self.model_scope_pending.remove(&target);
-                                        self.tree.visibility.remove(&target);
+                                        self.tree.pending_direction.remove(&target);
                                     }
                                     self.model_scope_failures += 1;
                                     let error = anyhow::anyhow!("数据查询线程已停止");
@@ -1593,9 +1758,13 @@ impl App {
                                 }
                             }
                         }
+                        // 全局的两条只作用于**已加载**的模型：eye 照样等 View3d
+                        // 回执。在途的那些点击把方向改成全局这一次的——它就是
+                        // 最后一次指令，查询回来时得照它走，不然那几个目标会在
+                        // 一片全隐藏里独自冒出来。
                         plant_ui::ModelAction::HideAll => {
                             self.tree
-                                .visibility
+                                .pending_direction
                                 .values_mut()
                                 .for_each(|visible| *visible = false);
                             self.view3d_commands
@@ -1603,7 +1772,7 @@ impl App {
                         }
                         plant_ui::ModelAction::ShowAll => {
                             self.tree
-                                .visibility
+                                .pending_direction
                                 .values_mut()
                                 .for_each(|visible| *visible = true);
                             self.view3d_commands
@@ -2175,7 +2344,15 @@ impl App {
     }
 
     fn rebuild_tree(&mut self) {
-        self.vm.tree = TreeVm::Ready(self.tree.flatten());
+        // 方向落地与展平放在一处：eye 与「下一次点击往哪边翻」是同一份数据算出来的
+        // 两个字段，分开更新迟早会出现图标已经变了、方向还停在上一次的那一帧。
+        settle_pending_directions(
+            &mut self.tree.pending_direction,
+            &mut self.tree.pending_visibility,
+            &self.model_scopes,
+            &self.tree.visibility,
+        );
+        self.vm.tree = TreeVm::Ready(self.tree.flatten(&self.model_scopes));
         self.vm.element_count = self.tree.element_count();
     }
 
@@ -2242,9 +2419,11 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{
-        RefU64, background_models_settled, begin_get_work, finished_after, in_mdb_path,
-        mark_model_scope_unavailable, model_progress_terminal, model_reload_due,
-        model_visibility_plan, restore_model_reload, settled_pending_roots, task_matches_project,
+        EleTreeNode, ModelVisibility, ModelVisibilityPlan, RefU64, RowVisibility, TreeModel,
+        TreeRowVm, background_models_settled, begin_get_work, cache_model_scope, finished_after,
+        in_mdb_path, mark_model_scope_unavailable, model_progress_terminal, model_reload_due,
+        model_visibility_plan, restore_model_reload, row_visibility, settle_pending_directions,
+        settled_pending_roots, task_matches_project,
     };
     use chrono::{TimeZone, Utc};
     use plant_ui::model_update::PendingModelUnit;
@@ -2252,6 +2431,364 @@ mod tests {
 
     fn refs(raw: &[&str]) -> Vec<RefU64> {
         raw.iter().map(|s| s.parse().unwrap()).collect()
+    }
+
+    fn node(refno: RefU64, noun: &str, children: u16) -> EleTreeNode {
+        EleTreeNode {
+            refno: refno.into(),
+            noun: noun.to_owned(),
+            name: format!("/{refno}"),
+            children_count: children,
+            ..Default::default()
+        }
+    }
+
+    /// eye 那条链路的最小复现：点击 -> 查询 -> View3d 回执。
+    ///
+    /// 中间那几步用的就是 `handle_cmds` / `Evt::ModelScope` / `sync_render_states`
+    /// 里的同一批函数，这里只把它们按真实顺序串起来，再补上三维那一侧的回执。
+    struct Eyes {
+        tree: TreeModel,
+        scopes: HashMap<RefU64, Vec<RefU64>>,
+        querying: HashSet<RefU64>,
+        failures: usize,
+    }
+
+    /// SITE > ZONE > 两个几何行，整棵都展开。
+    const SITE: RefU64 = RefU64(1);
+    const ZONE: RefU64 = RefU64(2);
+    const PANE_A: RefU64 = RefU64(11);
+    const PANE_B: RefU64 = RefU64(12);
+
+    impl Eyes {
+        fn new() -> Self {
+            let mut tree = TreeModel {
+                roots: vec![node(SITE, "SITE", 1)],
+                ..Default::default()
+            };
+            tree.children.insert(SITE, vec![node(ZONE, "ZONE", 2)]);
+            tree.children
+                .insert(ZONE, vec![node(PANE_A, "PANE", 0), node(PANE_B, "PANE", 0)]);
+            tree.expanded.extend([SITE, ZONE]);
+            Self {
+                tree,
+                scopes: HashMap::new(),
+                querying: HashSet::new(),
+                failures: 0,
+            }
+        }
+
+        /// 同 `rebuild_tree`：先让落地的方向退场，再展平。
+        fn row(&mut self, refno: RefU64) -> TreeRowVm {
+            settle_pending_directions(
+                &mut self.tree.pending_direction,
+                &mut self.tree.pending_visibility,
+                &self.scopes,
+                &self.tree.visibility,
+            );
+            self.tree
+                .flatten(&self.scopes)
+                .into_iter()
+                .find(|row| row.refno == refno)
+                .expect("行不在展平结果里")
+        }
+
+        fn eye(&mut self, refno: RefU64) -> RowVisibility {
+            self.row(refno).visibility
+        }
+
+        /// 点一行的眼睛，方向取行上算好的那个。
+        fn click(&mut self, target: RefU64) -> ModelVisibilityPlan {
+            let visible = self.row(target).next_visible;
+            self.dispatch(target, visible)
+        }
+
+        fn dispatch(&mut self, target: RefU64, visible: bool) -> ModelVisibilityPlan {
+            let previous = row_visibility(self.scopes.get(&target), &self.tree.visibility);
+            self.tree
+                .pending_visibility
+                .entry(target)
+                .or_insert(previous);
+            self.tree.pending_direction.insert(target, visible);
+            let plan = model_visibility_plan(&[target], &self.scopes, &self.querying);
+            self.querying.extend(plan.query.iter().copied());
+            plan
+        }
+
+        /// 范围查询回来。返回这一刻该拿去操作模型的方向。
+        fn resolve(&mut self, target: RefU64, models: &[RefU64]) -> Option<bool> {
+            self.querying.remove(&target);
+            if models.is_empty() {
+                mark_model_scope_unavailable(
+                    &mut self.tree.pending_direction,
+                    &mut self.failures,
+                    target,
+                );
+                return None;
+            }
+            for model in models {
+                cache_model_scope(&mut self.scopes, *model, *model);
+            }
+            self.scopes.insert(target, models.to_vec());
+            Some(
+                self.tree
+                    .pending_direction
+                    .get(&target)
+                    .copied()
+                    .unwrap_or(true),
+            )
+        }
+
+        fn fail_query(&mut self, target: RefU64) {
+            self.querying.remove(&target);
+            mark_model_scope_unavailable(
+                &mut self.tree.pending_direction,
+                &mut self.failures,
+                target,
+            );
+        }
+
+        /// View3d 的一条回执。
+        fn report(&mut self, refno: RefU64, visible: bool, loaded: usize, failed: usize) {
+            self.tree.visibility.insert(
+                refno,
+                ModelVisibility {
+                    visible,
+                    mesh_loaded: loaded,
+                    mesh_failed: failed,
+                },
+            );
+        }
+
+        fn hide_all(&mut self) {
+            self.tree
+                .pending_direction
+                .values_mut()
+                .for_each(|visible| *visible = false);
+        }
+
+        fn show_all(&mut self) {
+            self.tree
+                .pending_direction
+                .values_mut()
+                .for_each(|visible| *visible = true);
+        }
+    }
+
+    /// eye 跟的是画面不是指令：点完到三维真的画出来之间，图标一动不动。
+    #[test]
+    fn the_eye_waits_for_the_render_receipt_instead_of_the_click() {
+        let mut eyes = Eyes::new();
+
+        let plan = eyes.click(PANE_A);
+        assert_eq!(plan.query, vec![PANE_A]);
+        assert_eq!(eyes.eye(PANE_A), RowVisibility::Unloaded);
+
+        assert_eq!(eyes.resolve(PANE_A, &[PANE_A]), Some(true));
+        // 模型已经在装网格了，画面上还什么都没有——这一刻仍然不许变。
+        assert_eq!(eyes.eye(PANE_A), RowVisibility::Unloaded);
+
+        eyes.report(PANE_A, true, 3, 0);
+        assert_eq!(eyes.eye(PANE_A), RowVisibility::Shown);
+    }
+
+    /// 几何行显示、隐藏，以及缓存之后再切换：第二次起不该再查一遍库。
+    #[test]
+    fn a_cached_geometry_row_toggles_without_querying_again() {
+        let mut eyes = Eyes::new();
+        eyes.click(PANE_A);
+        eyes.resolve(PANE_A, &[PANE_A]);
+        eyes.report(PANE_A, true, 2, 0);
+
+        let plan = eyes.click(PANE_A);
+        assert!(plan.query.is_empty(), "已缓存的范围不该再查一次");
+        assert_eq!(plan.resolved, vec![PANE_A]);
+        assert_eq!(
+            eyes.eye(PANE_A),
+            RowVisibility::Shown,
+            "回执之前图标停在原样"
+        );
+        eyes.report(PANE_A, false, 2, 0);
+        assert_eq!(eyes.eye(PANE_A), RowVisibility::Hidden);
+
+        let plan = eyes.click(PANE_A);
+        assert!(plan.query.is_empty());
+        eyes.report(PANE_A, true, 2, 0);
+        assert_eq!(eyes.eye(PANE_A), RowVisibility::Shown);
+    }
+
+    /// 容器行的 eye 由它那次显示解析出来的模型聚合而成。
+    #[test]
+    fn a_container_row_aggregates_the_models_it_resolved_to() {
+        let mut eyes = Eyes::new();
+        eyes.click(ZONE);
+        eyes.resolve(ZONE, &[PANE_A, PANE_B]);
+        assert_eq!(eyes.eye(ZONE), RowVisibility::Unloaded);
+
+        eyes.report(PANE_A, true, 1, 0);
+        assert_eq!(
+            eyes.eye(ZONE),
+            RowVisibility::Unloaded,
+            "同一范围未全部回执前保持旧 eye"
+        );
+        eyes.report(PANE_B, true, 1, 0);
+        assert_eq!(eyes.eye(ZONE), RowVisibility::Shown);
+
+        // 只隐藏其中一个几何行：容器变半可见，SITE 那一层没解析过范围，仍是未加载。
+        eyes.click(PANE_A);
+        eyes.report(PANE_A, false, 1, 0);
+        assert_eq!(eyes.eye(PANE_A), RowVisibility::Hidden);
+        assert_eq!(eyes.eye(ZONE), RowVisibility::Partial);
+        assert_eq!(eyes.eye(SITE), RowVisibility::Unloaded);
+
+        eyes.report(PANE_B, false, 1, 0);
+        assert_eq!(eyes.eye(ZONE), RowVisibility::Hidden);
+    }
+
+    /// 半可见的容器点一下是「显示全部」，不是把剩下那半也藏起来。
+    #[test]
+    fn clicking_a_half_visible_container_shows_everything() {
+        let mut eyes = Eyes::new();
+        eyes.click(ZONE);
+        eyes.resolve(ZONE, &[PANE_A, PANE_B]);
+        eyes.report(PANE_A, true, 1, 0);
+        eyes.report(PANE_B, true, 1, 0);
+        assert_eq!(eyes.eye(ZONE), RowVisibility::Shown);
+
+        // 容器上一轮显示已经落地，再单独隐藏一个后代，才形成真实的半可见。
+        eyes.click(PANE_B);
+        eyes.report(PANE_B, false, 1, 0);
+        assert_eq!(eyes.eye(ZONE), RowVisibility::Partial);
+        assert!(eyes.row(ZONE).next_visible);
+
+        eyes.click(ZONE);
+        eyes.report(PANE_A, true, 1, 0);
+        eyes.report(PANE_B, true, 1, 0);
+        assert_eq!(eyes.eye(ZONE), RowVisibility::Shown);
+    }
+
+    /// 查询期间连着反向点：图标全程不动，最终以最后一次指令为准。
+    #[test]
+    fn reversing_clicks_while_the_query_is_in_flight_obeys_the_last_one() {
+        let mut eyes = Eyes::new();
+        eyes.click(ZONE);
+        for expected in [false, true, false] {
+            let plan = eyes.click(ZONE);
+            assert!(plan.query.is_empty(), "查询在途时不该再发一次");
+            assert_eq!(eyes.tree.pending_direction[&ZONE], expected);
+            assert_eq!(eyes.eye(ZONE), RowVisibility::Unloaded);
+        }
+        assert_eq!(eyes.resolve(ZONE, &[PANE_A]), Some(false));
+        eyes.report(PANE_A, false, 1, 0);
+        assert_eq!(eyes.eye(ZONE), RowVisibility::Hidden);
+    }
+
+    /// 回执还没到就再点一下：方向翻回去，最终状态是最后一次点击那个。
+    #[test]
+    fn clicking_again_before_the_receipt_arrives_ends_on_the_last_direction() {
+        let mut eyes = Eyes::new();
+        eyes.click(PANE_A);
+        eyes.resolve(PANE_A, &[PANE_A]);
+        eyes.report(PANE_A, true, 1, 0);
+
+        eyes.click(PANE_A);
+        assert!(!eyes.tree.pending_direction[&PANE_A]);
+        let plan = eyes.click(PANE_A);
+        assert!(eyes.tree.pending_direction[&PANE_A]);
+        assert_eq!(plan.resolved, vec![PANE_A]);
+        eyes.report(PANE_A, true, 1, 0);
+        assert_eq!(eyes.eye(PANE_A), RowVisibility::Shown);
+    }
+
+    /// 部分 mesh 失败 = 半可见；全部失败 = 三维里什么都没有，退回未加载。
+    #[test]
+    fn mesh_failures_show_up_as_half_visible_or_unloaded() {
+        let mut eyes = Eyes::new();
+        eyes.click(PANE_A);
+        eyes.resolve(PANE_A, &[PANE_A]);
+
+        eyes.report(PANE_A, true, 2, 1);
+        assert_eq!(eyes.eye(PANE_A), RowVisibility::Partial);
+
+        eyes.report(PANE_A, true, 0, 3);
+        assert_eq!(eyes.eye(PANE_A), RowVisibility::Unloaded);
+        // 死等一个永远对不上的方向没有意义：这次点击到此为止。
+        assert!(!eyes.tree.pending_direction.contains_key(&PANE_A));
+    }
+
+    #[test]
+    fn a_container_with_one_rendered_and_one_failed_model_is_partial() {
+        let mut eyes = Eyes::new();
+        eyes.click(ZONE);
+        eyes.resolve(ZONE, &[PANE_A, PANE_B]);
+        eyes.report(PANE_A, true, 2, 0);
+        eyes.report(PANE_B, true, 0, 2);
+
+        assert_eq!(eyes.eye(ZONE), RowVisibility::Partial);
+
+        eyes.click(PANE_A);
+        eyes.report(PANE_A, false, 2, 0);
+        assert_eq!(eyes.eye(ZONE), RowVisibility::Partial);
+    }
+
+    /// 一个 mesh 都没有的模型：查得到、画不出，eye 停在未加载。
+    #[test]
+    fn a_model_without_any_mesh_stays_unloaded() {
+        let mut eyes = Eyes::new();
+        eyes.click(PANE_A);
+        eyes.resolve(PANE_A, &[PANE_A]);
+        eyes.report(PANE_A, true, 0, 0);
+
+        assert_eq!(eyes.eye(PANE_A), RowVisibility::Unloaded);
+        assert!(eyes.row(PANE_A).next_visible, "还是「让它出来」那一档");
+    }
+
+    /// 查空与查失败都不该在图标上留下痕迹。
+    #[test]
+    fn an_empty_or_failed_scope_query_restores_the_unloaded_eye() {
+        let mut eyes = Eyes::new();
+        eyes.click(PANE_A);
+        assert_eq!(eyes.resolve(PANE_A, &[]), None);
+        assert_eq!(eyes.eye(PANE_A), RowVisibility::Unloaded);
+        assert!(!eyes.tree.pending_direction.contains_key(&PANE_A));
+
+        eyes.click(PANE_B);
+        eyes.fail_query(PANE_B);
+        assert_eq!(eyes.eye(PANE_B), RowVisibility::Unloaded);
+        assert!(!eyes.tree.pending_direction.contains_key(&PANE_B));
+        assert_eq!(eyes.failures, 2);
+    }
+
+    /// `HideAll` / `ShowAll` 只动实际已加载的模型；在途的那次点击跟着改方向，
+    /// 免得它查回来之后在一片全隐藏里独自冒出来。
+    #[test]
+    fn hide_all_and_show_all_only_move_models_that_are_really_loaded() {
+        let mut eyes = Eyes::new();
+        eyes.click(PANE_A);
+        eyes.resolve(PANE_A, &[PANE_A]);
+        eyes.report(PANE_A, true, 1, 0);
+        // PANE_B 的范围还在查。
+        eyes.click(PANE_B);
+
+        eyes.hide_all();
+        assert_eq!(
+            eyes.eye(PANE_A),
+            RowVisibility::Shown,
+            "回执没来之前图标不动"
+        );
+        eyes.report(PANE_A, false, 1, 0);
+        assert_eq!(eyes.eye(PANE_A), RowVisibility::Hidden);
+        assert_eq!(eyes.resolve(PANE_B, &[PANE_B]), Some(false));
+        eyes.report(PANE_B, false, 1, 0);
+        assert_eq!(eyes.eye(PANE_B), RowVisibility::Hidden);
+
+        eyes.show_all();
+        eyes.report(PANE_A, true, 1, 0);
+        eyes.report(PANE_B, true, 1, 0);
+        assert_eq!(eyes.eye(PANE_A), RowVisibility::Shown);
+        assert_eq!(eyes.eye(PANE_B), RowVisibility::Shown);
+        // 从没显示过的容器不在「全部」里：三维里压根没有它的实体。
+        assert_eq!(eyes.eye(SITE), RowVisibility::Unloaded);
     }
 
     #[test]
@@ -2401,20 +2938,6 @@ mod tests {
         assert_eq!(model_progress_terminal(1, 1), None);
         assert_eq!(model_progress_terminal(0, 1), Some(false));
         assert_eq!(model_progress_terminal(0, 0), Some(true));
-    }
-
-    #[test]
-    fn empty_and_failed_scope_queries_restore_unloaded_state() {
-        let [empty, failed] = refs(&["24381/1", "24381/2"]).try_into().unwrap();
-        let mut visibility = HashMap::from([(empty, true), (failed, true)]);
-        let mut failures = 0;
-
-        mark_model_scope_unavailable(&mut visibility, &mut failures, empty);
-        mark_model_scope_unavailable(&mut visibility, &mut failures, failed);
-
-        assert!(!visibility.contains_key(&empty));
-        assert!(!visibility.contains_key(&failed));
-        assert_eq!(failures, 2);
     }
 }
 

@@ -357,22 +357,25 @@ pub enum TreeVm {
     Failed(String),
 }
 
-/// 一行在三维里的可见性。
+/// 一行在三维里的可见性。说的是**三维此刻真的画成什么样**，不是下过什么指令
+/// （ADR-0016）。
 ///
-/// 三态而不是 `bool`：宿主开机时可见性台账是空的，每一行都既不是显示也不是隐藏，
-/// 而是从没被显示指令提到过。二态在这里必然说谎，理由与台账本身见 ADR-0010。
+/// 四态而不是 `bool`：三维里没有它的实体、全显示、全隐藏、以及只显示出一部分，
+/// 是四件不同的事。二态在这里必然说谎，理由见 ADR-0010 与 ADR-0016。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RowVisibility {
-    /// 从没被显示指令提到过——三维里压根没有它的实体。
+    /// 三维里压根没有它的实体：没显示过，或者显示了但一个网格都没画出来。
     #[default]
     Unloaded,
     Shown,
     Hidden,
+    /// 半可见：后代有的显示有的隐藏，或者可见的模型只画出了一部分网格。
+    Partial,
 }
 
 impl RowVisibility {
     /// 点这一行的眼睛之后，`SetVisible` 该带什么方向。
-    /// 未加载与已隐藏都是「让它出来」，只有显示中才是「藏起来」。
+    /// 未加载、已隐藏与半可见都是「让它出来」，只有全显示才是「藏起来」。
     pub fn on_click(self) -> bool {
         self != Self::Shown
     }
@@ -395,11 +398,17 @@ pub struct TreeRowVm {
     pub expandable: Option<bool>,
     /// 子层查询在途（行尾以「加载中…」提示）。
     pub loading: bool,
-    /// 这一行在三维里的可见性。真值在宿主的可见性台账上，绘制层只读。
+    /// 这一行在三维里的可见性。真值是三维回执上来的实际渲染结果，绘制层只读。
     ///
-    /// 容器行（SITE / ZONE / PIPE）自己没有 mesh 实体，它这一格说的是
-    /// **对这一行下过的指令**，不是子树此刻的实际状态。
+    /// 容器行（SITE / ZONE / PIPE）自己没有 mesh 实体，它这一格是把它那次显示
+    /// 解析出来的那些模型聚合出来的：有显示有隐藏就是半可见。
     pub visibility: RowVisibility,
+    /// 点这一行眼睛时 `SetVisible` 该带的方向。
+    ///
+    /// 不能由 `visibility` 现推：eye 现在跟的是实际渲染结果，而指令下出去到
+    /// 画面变过来之间隔着查询与网格装载。那段时间里图标停在原样，再点一下要的是
+    /// **反转上一次指令**，不是反转图标。
+    pub next_visible: bool,
 }
 
 /// 属性视图数据状态（跟随 `WorkbenchVm::selected`）。
@@ -586,10 +595,12 @@ mod tests {
 
     /// 未加载与已隐藏都是「让它出来」。把这两档合并成 `!visible` 是最容易写错的
     /// 一处：开机时整棵树都是未加载，那一版点下去会把元素**隐藏**掉。
+    /// 半可见也归「让它出来」——点一个显示了一半的 ZONE，要的是显示全部。
     #[test]
     fn clicking_the_eye_shows_everything_that_is_not_already_shown() {
         assert!(RowVisibility::Unloaded.on_click());
         assert!(RowVisibility::Hidden.on_click());
+        assert!(RowVisibility::Partial.on_click());
         assert!(!RowVisibility::Shown.on_click());
     }
 
