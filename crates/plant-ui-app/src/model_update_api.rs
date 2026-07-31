@@ -45,6 +45,9 @@ pub fn base_url() -> String {
 
 static BASE_URL: OnceLock<String> = OnceLock::new();
 
+/// 只有 wasm 的 `start()` 会调它——地址由宿主页面注入，钉死一次不再变。原生端
+/// 不设这一格，让 [`base_url`] 保持「设置项 > 环境变量 > 出厂默认」那条优先级。
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub fn set_base_url(base: String) -> anyhow::Result<()> {
     BASE_URL
         .set(base.trim_end_matches('/').to_owned())

@@ -1,3 +1,9 @@
+# 并行编译上限。默认取满逻辑核（本机 32），而 bevy / parry / wgpu 这一档单个 rustc
+# 峰值就能吃到数 GB，满并发会把物理内存耗尽。它的现象不是编译报错，是 rustc 以
+# STATUS_STACK_BUFFER_OVERRUN 退出并在仓库根目录吐 rustc-ice-*.txt，容易被当成代码问题。
+[build]
+jobs = 8
+
 # 源替换：全部依赖改读 vendor/registry（cargo vendor 产物，只读、带校验和）。
 # 可编辑源码树（vendor/rs-core、vendor/bevy_egui35、vendor/forks/*）走 path 依赖，不受此替换影响。
 # 片段由 `cargo vendor vendor/registry` 生成；重跑 vendor 前先移开本文件。

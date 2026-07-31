@@ -21,11 +21,18 @@ pub struct LegacyProjectConfig {
 #[derive(Debug)]
 pub struct RuntimeConfig {
     pub db: aios_core::options::DbOption,
+    /// 只有 wasm 的 `start()` 会读它去钉死模型服务地址；原生端不经过这里，
+    /// 让 `model_update_api::base_url()` 自己走设置项 / 环境变量的优先级。
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     pub model_api_url: Option<String>,
     pub data_api_url: String,
     pub auto_gen_mesh: bool,
 }
 
+/// 这一组连同 [`browser_runtime_config`] 只有 wasm 的 `start()` 入口用得到——配置由
+/// 宿主页面以 JSON 注入；原生端从命令行与 `e3d.project.ron` 直接走
+/// [`legacy_runtime_config`]，所以在原生目标上它们没有构造点。
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum BrowserStartupConfig {
@@ -33,6 +40,7 @@ enum BrowserStartupConfig {
     Legacy(LegacyBrowserConfig),
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Debug, Deserialize)]
 struct BrowserConfig {
     db: BrowserDb,
@@ -40,6 +48,7 @@ struct BrowserConfig {
     data_api_url: String,
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Debug, Deserialize)]
 struct BrowserDb {
     host: String,
@@ -53,6 +62,7 @@ struct BrowserDb {
     password: String,
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Debug, Deserialize)]
 struct LegacyBrowserConfig {
     legacy_project_ron: String,
@@ -65,6 +75,7 @@ struct LegacyBrowserConfig {
     password: String,
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub fn browser_runtime_config(json: &str) -> Result<RuntimeConfig> {
     let config: BrowserStartupConfig =
         serde_json::from_str(json).context("解析浏览器启动配置失败")?;

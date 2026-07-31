@@ -1,6 +1,8 @@
 use aios_core::shape::pdms_shape::PlantMesh;
 
+/// 前置条件：`PLANT_TEST_MESH_DIR` 指向 gen-model 产出的 meshes 目录。
 #[test]
+#[ignore = "需要 PLANT_TEST_MESH_DIR，用 --ignored 显式跑"]
 fn meshes_from_configured_directory_load() {
     let dir = std::env::var_os("PLANT_TEST_MESH_DIR").expect("PLANT_TEST_MESH_DIR 未设置");
     let mut count = 0;
@@ -42,7 +44,10 @@ fn meshes_from_configured_directory_load() {
     eprintln!("已验证 {count} 个 mesh");
 }
 
+/// 前置条件：本机 SurrealDB 在跑，且 `PLANT_TEST_MESH_DIR`、`PLANT_TEST_DB_PORT`、
+/// `PLANT_TEST_SITE_NAME` 三个环境变量都已设好。
 #[tokio::test]
+#[ignore = "需要本机 SurrealDB 与 PLANT_TEST_* 环境变量，用 --ignored 显式跑"]
 async fn configured_site_models_have_meshes() {
     std::env::set_current_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
         .expect("无法切换到工作区目录");
