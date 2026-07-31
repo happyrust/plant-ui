@@ -376,6 +376,8 @@ struct TreeModel {
     pending_direction: HashMap<RefU64, bool>,
     /// 一次操作开始前的 eye。多模型范围分批回执时先保持这个状态，整组落地后再切换。
     pending_visibility: HashMap<RefU64, RowVisibility>,
+    /// 该行已经明确查空或查询失败，不能再从已显示的祖先继承 eye。
+    visibility_unavailable: HashSet<RefU64>,
 }
 
 /// 一个模型的实际渲染结果，来自 View3d 的回执。
@@ -480,6 +482,32 @@ fn settle_pending_directions(
 }
 
 impl TreeModel {
+    /// 当前行的 eye。没有独立模型范围的树行继承最近祖先的实际状态；
+    /// 一旦自己查过范围（含明确查空 / 失败），就以自己的结果为准。
+    fn visibility_for(
+        &self,
+        refno: RefU64,
+        scopes: &HashMap<RefU64, Vec<RefU64>>,
+    ) -> RowVisibility {
+        let mut current = Some(refno);
+        for _ in 0..=self.parent.len() {
+            let Some(row) = current else {
+                break;
+            };
+            if let Some(visibility) = self.pending_visibility.get(&row) {
+                return *visibility;
+            }
+            if self.visibility_unavailable.contains(&row) {
+                return RowVisibility::Unloaded;
+            }
+            if let Some(models) = scopes.get(&row) {
+                return row_visibility(Some(models), &self.visibility);
+            }
+            current = self.parent.get(&row).copied();
+        }
+        RowVisibility::Unloaded
+    }
+
     /// 按展开状态 DFS 展平可见行。只在结构变化时调用，绘制层逐帧只读。
     fn flatten(&self, scopes: &HashMap<RefU64, Vec<RefU64>>) -> Vec<TreeRowVm> {
         fn walk(
@@ -492,11 +520,7 @@ impl TreeModel {
             for n in nodes {
                 let refno = n.refno.refno();
                 let expandable = (n.children_count > 0).then(|| model.expanded.contains(&refno));
-                let visibility = model
-                    .pending_visibility
-                    .get(&refno)
-                    .copied()
-                    .unwrap_or_else(|| row_visibility(scopes.get(&refno), &model.visibility));
+                let visibility = model.visibility_for(refno, scopes);
                 rows.push(TreeRowVm {
                     refno,
                     depth,
@@ -571,6 +595,8 @@ impl TreeModel {
         self.parent.retain(|refno, _| alive.contains(refno));
         self.expanded.retain(|refno| alive.contains(refno));
         self.loading.retain(|refno| alive.contains(refno));
+        self.visibility_unavailable
+            .retain(|refno| alive.contains(refno));
     }
 
     /// 从最近的父到 SITE 根的祖先链；不在已加载的树里就是 None。
@@ -748,10 +774,12 @@ fn cache_model_scope(scopes: &mut HashMap<RefU64, Vec<RefU64>>, target: RefU64, 
 /// 查空、查失败：这次点击什么都没落到三维上，待执行方向撤掉，eye 留在未加载。
 fn mark_model_scope_unavailable(
     pending_direction: &mut HashMap<RefU64, bool>,
+    visibility_unavailable: &mut HashSet<RefU64>,
     failures: &mut usize,
     target: RefU64,
 ) {
     pending_direction.remove(&target);
+    visibility_unavailable.insert(target);
     *failures += 1;
 }
 
@@ -969,6 +997,7 @@ impl App {
                             self.latest_mesh_progress = None;
                             self.model_scope_failures = 0;
                             self.model_scopes.clear();
+                            self.tree.visibility_unavailable.clear();
                             self.loaded_models.clear();
                             for model in &models {
                                 let refno = model.refno.refno();
@@ -1025,6 +1054,7 @@ impl App {
                         Ok(models) if models.is_empty() => {
                             mark_model_scope_unavailable(
                                 &mut self.tree.pending_direction,
+                                &mut self.tree.visibility_unavailable,
                                 &mut self.model_scope_failures,
                                 target,
                             );
@@ -1035,6 +1065,7 @@ impl App {
                             dirty = true;
                         }
                         Ok(models) => {
+                            self.tree.visibility_unavailable.remove(&target);
                             let mesh_count =
                                 models.iter().map(|model| model.insts.len()).sum::<usize>();
                             let mut refs = Vec::new();
@@ -1144,6 +1175,7 @@ impl App {
                         Err(error) => {
                             mark_model_scope_unavailable(
                                 &mut self.tree.pending_direction,
+                                &mut self.tree.visibility_unavailable,
                                 &mut self.model_scope_failures,
                                 target,
                             );
@@ -1666,14 +1698,12 @@ impl App {
                         plant_ui::ModelAction::SetVisible { refnos, visible } => {
                             // 只记方向，不动 eye：图标要等三维真的画成这样再变。
                             for refno in &refnos {
-                                let previous = row_visibility(
-                                    self.model_scopes.get(refno),
-                                    &self.tree.visibility,
-                                );
+                                let previous = self.tree.visibility_for(*refno, &self.model_scopes);
                                 self.tree
                                     .pending_visibility
                                     .entry(*refno)
                                     .or_insert(previous);
+                                self.tree.visibility_unavailable.remove(refno);
                                 self.tree.pending_direction.insert(*refno, visible);
                             }
                             let plan = model_visibility_plan(
@@ -1745,6 +1775,7 @@ impl App {
                                     for target in targets {
                                         self.model_scope_pending.remove(&target);
                                         self.tree.pending_direction.remove(&target);
+                                        self.tree.visibility_unavailable.insert(target);
                                     }
                                     self.model_scope_failures += 1;
                                     let error = anyhow::anyhow!("数据查询线程已停止");
@@ -2239,6 +2270,7 @@ impl App {
         // 新连接必须从空缓存开始：否则失败时状态栏和属性仍在说旧模型已经就绪。
         self.model_scope_epoch = self.model_scope_epoch.wrapping_add(1);
         self.model_scopes.clear();
+        self.tree.visibility_unavailable.clear();
         self.model_scope_pending.clear();
         self.loaded_models.clear();
         self.model_show_waiting.clear();
@@ -2422,7 +2454,7 @@ mod tests {
         EleTreeNode, ModelVisibility, ModelVisibilityPlan, RefU64, RowVisibility, TreeModel,
         TreeRowVm, background_models_settled, begin_get_work, cache_model_scope, finished_after,
         in_mdb_path, mark_model_scope_unavailable, model_progress_terminal, model_reload_due,
-        model_visibility_plan, restore_model_reload, row_visibility, settle_pending_directions,
+        model_visibility_plan, restore_model_reload, settle_pending_directions,
         settled_pending_roots, task_matches_project,
     };
     use chrono::{TimeZone, Utc};
@@ -2457,6 +2489,7 @@ mod tests {
     /// SITE > ZONE > 两个几何行，整棵都展开。
     const SITE: RefU64 = RefU64(1);
     const ZONE: RefU64 = RefU64(2);
+    const STRU: RefU64 = RefU64(3);
     const PANE_A: RefU64 = RefU64(11);
     const PANE_B: RefU64 = RefU64(12);
 
@@ -2469,6 +2502,9 @@ mod tests {
             tree.children.insert(SITE, vec![node(ZONE, "ZONE", 2)]);
             tree.children
                 .insert(ZONE, vec![node(PANE_A, "PANE", 0), node(PANE_B, "PANE", 0)]);
+            tree.parent.insert(ZONE, SITE);
+            tree.parent.insert(PANE_A, ZONE);
+            tree.parent.insert(PANE_B, ZONE);
             tree.expanded.extend([SITE, ZONE]);
             Self {
                 tree,
@@ -2504,11 +2540,12 @@ mod tests {
         }
 
         fn dispatch(&mut self, target: RefU64, visible: bool) -> ModelVisibilityPlan {
-            let previous = row_visibility(self.scopes.get(&target), &self.tree.visibility);
+            let previous = self.tree.visibility_for(target, &self.scopes);
             self.tree
                 .pending_visibility
                 .entry(target)
                 .or_insert(previous);
+            self.tree.visibility_unavailable.remove(&target);
             self.tree.pending_direction.insert(target, visible);
             let plan = model_visibility_plan(&[target], &self.scopes, &self.querying);
             self.querying.extend(plan.query.iter().copied());
@@ -2521,11 +2558,13 @@ mod tests {
             if models.is_empty() {
                 mark_model_scope_unavailable(
                     &mut self.tree.pending_direction,
+                    &mut self.tree.visibility_unavailable,
                     &mut self.failures,
                     target,
                 );
                 return None;
             }
+            self.tree.visibility_unavailable.remove(&target);
             for model in models {
                 cache_model_scope(&mut self.scopes, *model, *model);
             }
@@ -2543,6 +2582,7 @@ mod tests {
             self.querying.remove(&target);
             mark_model_scope_unavailable(
                 &mut self.tree.pending_direction,
+                &mut self.tree.visibility_unavailable,
                 &mut self.failures,
                 target,
             );
@@ -2643,6 +2683,53 @@ mod tests {
 
         eyes.report(PANE_B, false, 1, 0);
         assert_eq!(eyes.eye(ZONE), RowVisibility::Hidden);
+    }
+
+    /// 父范围已经把后代模型显示出来时，中间容器不该因为没单独查过 scope 而装成未加载。
+    #[test]
+    fn a_child_container_inherits_the_rendered_scope_of_its_parent() {
+        let mut eyes = Eyes::new();
+        eyes.tree.children.insert(ZONE, vec![node(STRU, "STRU", 1)]);
+        eyes.tree
+            .children
+            .insert(STRU, vec![node(PANE_A, "PANE", 0)]);
+        eyes.tree.parent.insert(STRU, ZONE);
+        eyes.tree.parent.insert(PANE_A, STRU);
+        eyes.tree.expanded.insert(STRU);
+
+        eyes.click(ZONE);
+        eyes.resolve(ZONE, &[PANE_A]);
+        eyes.report(PANE_A, true, 1, 0);
+
+        assert_eq!(eyes.eye(STRU), RowVisibility::Shown);
+
+        eyes.click(ZONE);
+        eyes.report(PANE_A, false, 1, 0);
+        assert_eq!(eyes.eye(STRU), RowVisibility::Hidden);
+    }
+
+    #[test]
+    fn an_explicit_empty_child_scope_overrides_inherited_visibility() {
+        let mut eyes = Eyes::new();
+        eyes.tree.children.insert(ZONE, vec![node(STRU, "STRU", 1)]);
+        eyes.tree
+            .children
+            .insert(STRU, vec![node(PANE_A, "PANE", 0)]);
+        eyes.tree.parent.insert(STRU, ZONE);
+        eyes.tree.parent.insert(PANE_A, STRU);
+        eyes.tree.expanded.insert(STRU);
+        eyes.click(ZONE);
+        eyes.resolve(ZONE, &[PANE_A]);
+        eyes.report(PANE_A, true, 1, 0);
+
+        eyes.click(STRU);
+        assert_eq!(
+            eyes.eye(STRU),
+            RowVisibility::Shown,
+            "子范围查询期间保持继承来的旧 eye"
+        );
+        eyes.resolve(STRU, &[]);
+        assert_eq!(eyes.eye(STRU), RowVisibility::Unloaded);
     }
 
     /// 半可见的容器点一下是「显示全部」，不是把剩下那半也藏起来。
