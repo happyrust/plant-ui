@@ -1466,6 +1466,29 @@ impl App {
         }
     }
 
+    fn handle_publish_result(
+        &mut self,
+        ctx: &egui::Context,
+        label: &str,
+        endpoint: &str,
+        result: anyhow::Result<data_publish_api::SubmitResult>,
+    ) {
+        match result {
+            Ok(response) => {
+                let mut message = format!("{label} 已提交（{endpoint}）：{}", response.message);
+                if let Some(login_url) = response.login_url.filter(|url| !url.trim().is_empty()) {
+                    message.push_str(&format!("；登录地址：{login_url}"));
+                }
+                self.logs.info(&mut self.vm.logs, message);
+            }
+            Err(error) => {
+                self.logs
+                    .error(&mut self.vm.logs, format!("{label}提交失败"), &error, None)
+            }
+        }
+        ctx.request_repaint();
+    }
+
     fn succeed_model_progress(&mut self, label: impl Into<String>) {
         self.vm.model_load = Some(ModelLoadVm::Success(label.into()));
         self.model_progress_until = Some(Instant::now() + Duration::from_millis(1_500));
@@ -3094,7 +3117,7 @@ fn db_label(ns: &str, db_nums: &[u32]) -> String {
 
 impl App {
     fn ui(&mut self, ui: &mut egui::Ui) {
-        self.pump_events();
+        self.pump_events(ui.ctx());
         self.tick_model_progress();
         if self.model_progress_until.is_some() {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
