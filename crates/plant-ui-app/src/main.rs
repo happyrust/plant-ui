@@ -27,6 +27,7 @@ use eframe::egui;
 use logs::Retry;
 use plant_ui::Cmd;
 use plant_ui::data_publish::{self, State as DataPublishState};
+use plant_ui::manual_data_publish::{self, State as ManualDataPublishState};
 use plant_ui::fonts;
 use plant_ui::model_update::{
     self, Feed as ModelUpdateFeed, State as ModelUpdateState, Vm as ModelUpdateVm,
@@ -475,6 +476,7 @@ struct App {
     model_update: ModelUpdateVm,
     model_update_state: ModelUpdateState,
     data_publish_state: DataPublishState,
+    manual_data_publish_state: ManualDataPublishState,
     project_picker_state: ProjectPickerState,
     settings_state: SettingsState,
     model_api_url: String,
@@ -623,6 +625,7 @@ impl App {
             model_update: ModelUpdateVm::default(),
             model_update_state: ModelUpdateState::default(),
             data_publish_state: DataPublishState::default(),
+            manual_data_publish_state: ManualDataPublishState::default(),
             project_picker_state: ProjectPickerState::new(Vec::new(), false),
             settings_state,
             model_api_url,
@@ -1134,6 +1137,7 @@ impl App {
                 Cmd::LoadProject(_) => self.project_picker_state.open = false,
                 Cmd::OpenSettings => self.settings_state.open(),
                 Cmd::OpenDataPublish => self.data_publish_state.open = true,
+                Cmd::OpenManualDataPublish => self.manual_data_publish_state.open = true,
                 Cmd::SubmitDataPublish(request) => {
                     if self
                         .bridge
@@ -2016,6 +2020,7 @@ impl App {
             &self.vm,
             &mut self.data_publish_state,
         ));
+        manual_data_publish::show(ui.ctx(), &t, d, &mut self.manual_data_publish_state);
         cmds.extend(model_update::show(
             ui.ctx(),
             &t,

@@ -143,6 +143,18 @@ pub fn command_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: 
                         cmds.push(Cmd::OpenDataPublish);
                         ui.close();
                     }
+                    if ui
+                        .add(command_menu_action(
+                            d,
+                            ph::HAND_POINTING,
+                            "手动提资接口",
+                            "手动创建提资任务",
+                        ))
+                        .clicked()
+                    {
+                        cmds.push(Cmd::OpenManualDataPublish);
+                        ui.close();
+                    }
                 });
 
                 for (name, hint) in [

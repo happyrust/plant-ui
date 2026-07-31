@@ -2,6 +2,7 @@
 //! 不认识数据库、不认识 Bevy：输入 &Vm，输出 Vec<Cmd>。
 
 pub mod data_publish;
+pub mod manual_data_publish;
 pub mod fonts;
 pub mod model_update;
 pub mod project_picker;
@@ -131,6 +132,7 @@ pub enum Cmd {
     OpenSettings,
     /// 打开三维数据发布任务窗。
     OpenDataPublish,
+    OpenManualDataPublish,
     /// 提交三维数据发布请求；实际发送由宿主负责。
     SubmitDataPublish(data_publish::PublishRequest),
     /// 打开并刷新模型增量更新预览。

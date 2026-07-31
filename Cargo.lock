@@ -7441,6 +7441,7 @@ dependencies = [
  "bevy-wasm-tasks",
  "bevy_egui35",
  "chrono",
+ "config",
  "eframe",
  "egui",
  "egui-phosphor",
@@ -7452,8 +7453,10 @@ dependencies = [
  "plant-ui-data",
  "plant-ui-view3d",
  "ring",
+ "ron",
  "serde",
  "serde_json",
+ "url",
  "wasm-bindgen",
  "web-time",
 ]
