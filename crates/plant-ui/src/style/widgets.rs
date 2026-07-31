@@ -435,13 +435,15 @@ pub struct RowTag<'a> {
 /// 行内可见性眼睛的画法。
 ///
 /// 组件层不认识 `vm::RowVisibility`（这里只依赖 egui 与令牌），所以另立一个说法，
-/// 由调用点映射。三档而不是开关的理由在 ADR-0010。
+/// 由调用点映射。四档而不是开关的理由在 ADR-0010 与 ADR-0016。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Eye {
-    /// 从没显示过。槽位照占，但只有整行悬停时才浮出来。
+    /// 三维里没有它的实体。槽位照占，但只有整行悬停时才浮出来。
     Unloaded,
     Shown,
     Hidden,
+    /// 只显示出来一部分：后代有显示有隐藏，或者可见的模型只画出了一部分网格。
+    Partial,
 }
 
 pub struct TreeRow<'a> {
@@ -571,13 +573,15 @@ pub fn tree_row_ui(ui: &mut Ui, t: &Tokens, d: Density, row: TreeRow<'_>) -> Tre
             // 开机时整棵树都是未加载。这一档常驻画出来，满屏都是「默认就是这样」的图标。
             Eye::Unloaded if !resp.hovered() => None,
             Eye::Unloaded => Some(t.text_muted),
-            Eye::Shown | Eye::Hidden => Some(t.text_secondary),
+            Eye::Shown | Eye::Hidden | Eye::Partial => Some(t.text_secondary),
         };
         if let Some(tint) = tint {
-            let glyph = if eye == Eye::Hidden {
-                egui_phosphor::regular::EYE_SLASH
-            } else {
-                egui_phosphor::regular::EYE
+            // 半可见用半闭的眼：它与斜杠眼要一眼分得开——一个是「我全藏了」，
+            // 一个是「有一部分没出来」，后者往往还得再点一下。
+            let glyph = match eye {
+                Eye::Hidden => egui_phosphor::regular::EYE_SLASH,
+                Eye::Partial => egui_phosphor::regular::EYE_CLOSED,
+                Eye::Unloaded | Eye::Shown => egui_phosphor::regular::EYE,
             };
             let g = lay(ui, glyph, FontId::new(sz, FontFamily::Proportional));
             let pos = pos2(

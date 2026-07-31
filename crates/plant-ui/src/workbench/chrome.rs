@@ -11,7 +11,7 @@ use crate::Cmd;
 use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Status, Tokens, radius, space};
 use crate::style::widgets;
-use crate::vm::WorkbenchVm;
+use crate::vm::{ModelLoadVm, WorkbenchVm};
 
 pub fn title_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
     // 栏体(Frame)与 hairline 必须严丝合缝：全局 item_spacing.y=6 会把
@@ -34,9 +34,14 @@ pub fn title_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
                 // 连接成功前没有工程标识，这一段整体不画（不摆空芯片）。
                 if !vm.project.is_empty() {
                     divider(ui, t, d);
-                    ui.add(widgets::status_tag(t, d, &vm.project, Status::Info));
+                    ui.add(widgets::status_tag(
+                        t,
+                        d,
+                        &format!("项目名 {}", vm.project),
+                        Status::Info,
+                    ));
                     ui.label(
-                        RichText::new(&vm.db)
+                        RichText::new(format!("项目代号 {}", vm.project_code))
                             .font(Font::mono_meta(d))
                             .color(t.text_muted),
                     );
@@ -226,12 +231,12 @@ pub fn status_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
                     divider(ui, t, d);
                     meta_icon(ui, d, ph::DATABASE, t.accent);
                     ui.label(
-                        RichText::new(&vm.project)
+                        RichText::new(format!("项目名 {}", vm.project))
                             .font(Font::micro(d))
                             .color(t.text_secondary),
                     );
                     ui.label(
-                        RichText::new(&vm.db)
+                        RichText::new(format!("项目代号 {}", vm.project_code))
                             .font(Font::mono_micro(d))
                             .color(t.text_muted),
                     );
@@ -274,9 +279,41 @@ pub fn status_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
                             .font(Font::micro(d))
                             .color(t.text_muted),
                     );
+                    if vm.model_load.is_some() {
+                        ui.add_space(space::S3);
+                        model_load_progress(ui, t, d, vm);
+                    }
                 });
             });
         });
+}
+
+fn model_load_progress(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
+    let Some(state) = &vm.model_load else {
+        return;
+    };
+    let fraction = state.fraction();
+    let text = match state {
+        ModelLoadVm::Loading {
+            label, done, total, ..
+        } if *total > 0 => {
+            format!("{label}  {done}/{total}  {:.0}%", fraction.unwrap() * 100.0)
+        }
+        _ => state.label().to_owned(),
+    };
+    let fill = match state {
+        ModelLoadVm::Success(_) => t.success,
+        ModelLoadVm::Failed(_) => t.danger,
+        _ => t.accent,
+    };
+    ui.add(
+        egui::ProgressBar::new(fraction.unwrap_or(0.0))
+            .desired_width(d.px(320.0))
+            .desired_height(d.px(14.0))
+            .fill(fill)
+            .animate(fraction.is_none())
+            .text(RichText::new(text).font(Font::micro(d))),
+    );
 }
 
 /// 队列计数。队列视图被折起时由它叫住人，**不重复面板上的明细**——同一组数字

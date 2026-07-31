@@ -67,25 +67,56 @@ pub async fn ancestor_refnos(refno: RefnoEnum) -> Result<Vec<RefU64>> {
 /// 八成时间花在按根逐个解可见实例集上，而那 19 次调用是串行的。真要优化就从
 /// 那一层入手（并发发起，或者由查询侧一次解完多个根），改这里的调用次数没用。
 pub async fn model_instances(roots: &[RefU64]) -> Result<Vec<aios_core::GeomInstQuery>> {
+    model_instances_with_progress(roots, |_, _| {}).await
+}
+
+/// 查询已经生成好的模型，并在范围解析完成后按查询分块报告进度。
+///
+/// 这里仍然只读 SurrealDB；mesh 文件由 View3d 的 AssetLoader 消费，不会触发模型生成。
+pub async fn model_instances_with_progress(
+    roots: &[RefU64],
+    mut progress: impl FnMut(usize, usize),
+) -> Result<Vec<aios_core::GeomInstQuery>> {
     let mut refnos = Vec::new();
     let mut branch_refnos = Vec::new();
-    for root in roots {
-        let root = (*root).into();
+    let mut zone_refnos = Vec::new();
+    let roots = roots
+        .iter()
+        .copied()
+        .map(Into::into)
+        .collect::<Vec<aios_core::RefnoEnum>>();
+    let nouns = aios_core::get_type_names(roots.iter()).await?;
+    for (root, noun) in roots.into_iter().zip(nouns) {
+        match noun.as_str() {
+            "ZONE" => {
+                zone_refnos.push(root);
+                continue;
+            }
+            "SITE" => {
+                zone_refnos.extend(aios_core::query_filter_deep_children(root, &["ZONE"]).await?);
+                continue;
+            }
+            _ => {}
+        }
         refnos.extend(aios_core::query_deep_visible_inst_refnos(root).await?);
-        let types = aios_core::get_self_and_owner_type_name(root).await?;
-        if types
-            .first()
-            .is_some_and(|noun| noun == "BRAN" || noun == "HANG")
-        {
+        if noun == "BRAN" || noun == "HANG" {
             branch_refnos.push(root);
         } else {
             branch_refnos
                 .extend(aios_core::query_filter_deep_children(root, &["BRAN", "HANG"]).await?);
         }
     }
+    for chunk in zone_refnos.chunks(500) {
+        refnos.extend(aios_core::query_inst_refnos_by_zone(chunk.iter()).await?);
+    }
     let mut models = Vec::new();
+    let total = refnos.len().div_ceil(500) + branch_refnos.len().div_ceil(500);
+    let mut done = 0;
+    progress(done, total);
     for chunk in refnos.chunks(500) {
         models.extend(aios_core::query_insts(chunk.iter(), false).await?);
+        done += 1;
+        progress(done, total);
     }
     for chunk in branch_refnos.chunks(500) {
         models.extend(
@@ -112,6 +143,8 @@ pub async fn model_instances(roots: &[RefU64]) -> Result<Vec<aios_core::GeomInst
                     }
                 }),
         );
+        done += 1;
+        progress(done, total);
     }
     Ok(models)
 }

@@ -19,6 +19,8 @@ pub enum Req {
     Props(RefU64),
     /// 加载这些模型树根下已经生成的几何实例。
     Models(Vec<RefU64>, bool),
+    /// eye 显示路径：逐个解析树节点下已经生成的模型，不生成缺失模型。
+    ModelScopes { epoch: u64, targets: Vec<RefU64> },
     /// 命令行按名称定位元素。
     ResolveName(String),
     /// 树定位目标的祖先链。目标不在已加载的树里时才发，见 ADR-0014。
@@ -90,6 +92,13 @@ pub enum Evt {
     Children(RefU64, anyhow::Result<Vec<EleTreeNode>>),
     Props(RefU64, anyhow::Result<Vec<plant_ui_data::Attr>>),
     Models(bool, anyhow::Result<Vec<aios_core::GeomInstQuery>>),
+    ModelScopeProgress {
+        epoch: u64,
+        target: RefU64,
+        done: usize,
+        total: usize,
+    },
+    ModelScope(u64, RefU64, anyhow::Result<Vec<aios_core::GeomInstQuery>>),
     ResolvedName(String, anyhow::Result<Option<RefU64>>),
     /// 目标的祖先链，「自己 -> 上级 -> …」序。带上请求时的那个 refno：
     /// 连续定位只算最后一次，晚到的旧链要认得出来才好丢。
@@ -132,15 +141,22 @@ pub struct Bridge {
     pub evt_tx: mpsc::Sender<Evt>,
 }
 
-type ModelLoad = (Vec<RefU64>, bool);
+enum ModelLoad {
+    Replace(Vec<RefU64>, bool),
+    Scopes(u64, Vec<RefU64>),
+}
 
-fn route_model_load(req: Req, tx: &mpsc::Sender<ModelLoad>) -> Option<Req> {
+fn route_model_load(req: Req, tx: &mpsc::Sender<ModelLoad>) -> Result<Option<Req>, ModelLoad> {
     match req {
-        Req::Models(roots, debt_reload) => {
-            let _ = tx.send((roots, debt_reload));
-            None
-        }
-        req => Some(req),
+        Req::Models(roots, debt_reload) => tx
+            .send(ModelLoad::Replace(roots, debt_reload))
+            .map(|_| None)
+            .map_err(|error| error.0),
+        Req::ModelScopes { epoch, targets } => tx
+            .send(ModelLoad::Scopes(epoch, targets))
+            .map(|_| None)
+            .map_err(|error| error.0),
+        req => Ok(Some(req)),
     }
 }
 
@@ -193,10 +209,34 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
     let model_ctx = ctx.clone();
     let model_worker = move |mut task_ctx: bevy_wasm_tasks::TaskContext| async move {
         loop {
-            while let Ok((roots, debt_reload)) = model_rx.try_recv() {
-                let result = plant_ui_data::model_instances(&roots).await;
-                let _ = model_evt_tx.send(Evt::Models(debt_reload, result));
-                model_ctx.request_repaint();
+            while let Ok(load) = model_rx.try_recv() {
+                match load {
+                    ModelLoad::Replace(roots, debt_reload) => {
+                        let result = plant_ui_data::model_instances(&roots).await;
+                        let _ = model_evt_tx.send(Evt::Models(debt_reload, result));
+                        model_ctx.request_repaint();
+                    }
+                    ModelLoad::Scopes(epoch, targets) => {
+                        for target in targets {
+                            let progress_tx = model_evt_tx.clone();
+                            let result = plant_ui_data::model_instances_with_progress(
+                                &[target],
+                                |done, total| {
+                                    let _ = progress_tx.send(Evt::ModelScopeProgress {
+                                        epoch,
+                                        target,
+                                        done,
+                                        total,
+                                    });
+                                    model_ctx.request_repaint();
+                                },
+                            )
+                            .await;
+                            let _ = model_evt_tx.send(Evt::ModelScope(epoch, target, result));
+                            model_ctx.request_repaint();
+                        }
+                    }
+                }
             }
             task_ctx.sleep_updates(1).await;
         }
@@ -210,8 +250,28 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
                 // 模型实例冷加载在大库上可达 88 秒。它若占住这个串行桥，树展开和
                 // 属性查询都会排在它后面，界面看上去像节点打不开。PC 与 Web 都把
                 // 它送到专用串行任务，交互查询留在这里立即处理。
-                let Some(req) = route_model_load(req, &model_tx) else {
-                    continue;
+                let req = match route_model_load(req, &model_tx) {
+                    Ok(Some(req)) => req,
+                    Ok(None) => continue,
+                    Err(ModelLoad::Replace(_, debt_reload)) => {
+                        let _ = evt_tx.send(Evt::Models(
+                            debt_reload,
+                            Err(anyhow::anyhow!("模型查询任务已停止")),
+                        ));
+                        ctx.request_repaint();
+                        continue;
+                    }
+                    Err(ModelLoad::Scopes(epoch, targets)) => {
+                        for target in targets {
+                            let _ = evt_tx.send(Evt::ModelScope(
+                                epoch,
+                                target,
+                                Err(anyhow::anyhow!("模型查询任务已停止")),
+                            ));
+                        }
+                        ctx.request_repaint();
+                        continue;
+                    }
                 };
                 match req {
                     Req::Reconnect => {
@@ -228,7 +288,9 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
                         let _ = evt_tx.send(Evt::Props(refno, r));
                         ctx.request_repaint();
                     }
-                    Req::Models(..) => unreachable!("模型请求已路由到专用任务"),
+                    Req::Models(..) | Req::ModelScopes { .. } => {
+                        unreachable!("模型请求已路由到专用任务")
+                    }
                     Req::ResolveName(name) => {
                         let result = plant_ui_data::resolve_name(&name).await;
                         let _ = evt_tx.send(Evt::ResolvedName(name, result));
@@ -320,25 +382,55 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
 
 #[cfg(test)]
 mod tests {
-    use super::{Req, route_model_load};
+    use super::{ModelLoad, Req, route_model_load};
     use plant_ui::RefU64;
     use std::sync::mpsc;
 
     #[test]
     fn model_load_uses_dedicated_lane() {
         let (model_tx, model_rx) = mpsc::channel();
-        assert!(route_model_load(Req::Models(vec![RefU64::default()], false), &model_tx).is_none());
+        assert!(matches!(
+            route_model_load(Req::Models(vec![RefU64::default()], false), &model_tx),
+            Ok(None)
+        ));
         assert!(matches!(
             model_rx.try_recv(),
-            Ok((roots, false)) if roots == vec![RefU64::default()]
+            Ok(ModelLoad::Replace(roots, false)) if roots == vec![RefU64::default()]
+        ));
+        let target = RefU64::from(42);
+        assert!(matches!(
+            route_model_load(
+                Req::ModelScopes {
+                    epoch: 7,
+                    targets: vec![target],
+                },
+                &model_tx
+            ),
+            Ok(None)
+        ));
+        assert!(matches!(
+            model_rx.try_recv(),
+            Ok(ModelLoad::Scopes(7, targets)) if targets == vec![target]
         ));
         assert!(matches!(
             route_model_load(Req::Props(RefU64::default()), &model_tx),
-            Some(Req::Props(_))
+            Ok(Some(Req::Props(_)))
         ));
         assert!(matches!(
             route_model_load(Req::Children(RefU64::default()), &model_tx),
-            Some(Req::Children(_))
+            Ok(Some(Req::Children(_)))
+        ));
+
+        drop(model_rx);
+        assert!(matches!(
+            route_model_load(
+                Req::ModelScopes {
+                    epoch: 8,
+                    targets: vec![target],
+                },
+                &model_tx
+            ),
+            Err(ModelLoad::Scopes(8, targets)) if targets == vec![target]
         ));
     }
 }
