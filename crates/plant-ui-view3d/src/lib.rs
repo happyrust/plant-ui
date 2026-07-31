@@ -1209,16 +1209,18 @@ fn apply_commands(
                         ) {
                             orbit.focus = point;
                         }
-                        let offset = camera_transform.translation - orbit.focus;
-                        camera_transform.translation =
-                            orbit.focus + offset * (amount * -0.002).exp().clamp(0.2, 5.0);
-                        camera_transform.look_at(orbit.focus, Vec3::Y);
+                        zoom_camera(&mut camera_transform, orbit.focus, amount);
                     }
                     CameraGesture::End => orbit.motion = None,
                 }
             }
         }
     }
+}
+
+fn zoom_camera(camera: &mut Transform, focus: Vec3, amount: f32) {
+    let offset = camera.translation - focus;
+    camera.translation = focus + offset * (amount * -0.002).exp().clamp(0.2, 5.0);
 }
 
 fn orbit_camera(camera: &mut Transform, focus: Vec3, x: f32, y: f32) {
@@ -1817,6 +1819,30 @@ mod tests {
         assert!(
             (moved_anchor_angle - anchor_angle).abs() < 1e-4,
             "旋转起手把指针锚点瞬间拉到了画面中心"
+        );
+    }
+
+    #[test]
+    fn zoom_keeps_an_off_center_anchor_stable() {
+        let focus = Vec3::new(2.0, 0.0, 0.0);
+        let mut camera = Transform::from_xyz(0.0, 0.0, 10.0).looking_at(Vec3::ZERO, Vec3::Y);
+        let anchor_angle = camera
+            .forward()
+            .angle_between((focus - camera.translation).normalize());
+        let distance = camera.translation.distance(focus);
+
+        zoom_camera(&mut camera, focus, 100.0);
+
+        let moved_anchor_angle = camera
+            .forward()
+            .angle_between((focus - camera.translation).normalize());
+        assert!(
+            camera.translation.distance(focus) < distance,
+            "相机没有拉近"
+        );
+        assert!(
+            (moved_anchor_angle - anchor_angle).abs() < 1e-4,
+            "缩放把指针锚点拉到了画面中心"
         );
     }
 
