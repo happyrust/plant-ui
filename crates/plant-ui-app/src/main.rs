@@ -1035,28 +1035,21 @@ impl App {
                 },
                 data::Evt::DataPublish(request, result) => {
                     self.data_publish_state.submitting = false;
-                    match result {
-                        Ok(response) => {
-                            if let Some(login_url) = response.login_url {
-                                ctx.open_url(egui::OpenUrl::new_tab(login_url));
-                            }
-                            self.logs.info(
-                                &mut self.vm.logs,
-                                format!(
-                                    "{} 已提交（{}）：{}",
-                                    request.category.label(),
-                                    request.category.endpoint(),
-                                    response.message
-                                ),
-                            );
-                        }
-                        Err(error) => self.logs.error(
-                            &mut self.vm.logs,
-                            format!("{}提交失败", request.category.label()),
-                            &error,
-                            None,
-                        ),
-                    }
+                    self.handle_publish_result(
+                        ctx,
+                        request.category.label(),
+                        request.category.endpoint(),
+                        result,
+                    );
+                }
+                data::Evt::RoomCodePublish(result) => {
+                    self.manual_data_publish_state.submitting = false;
+                    self.handle_publish_result(
+                        ctx,
+                        "手动提资接口",
+                        "/send_room_code_to_data_center",
+                        result,
+                    );
                 }
                 data::Evt::QueueProgress(task_id, event) => self.queue.apply(&task_id, event),
                 data::Evt::QueueTaskChanged => {
@@ -1073,6 +1066,32 @@ impl App {
         }
         if dirty {
             self.rebuild_tree();
+        }
+    }
+
+    fn handle_publish_result(
+        &mut self,
+        ctx: &egui::Context,
+        label: &str,
+        endpoint: &str,
+        result: anyhow::Result<data_publish_api::SubmitResult>,
+    ) {
+        match result {
+            Ok(response) => {
+                if let Some(login_url) = response.login_url {
+                    ctx.open_url(egui::OpenUrl::new_tab(login_url));
+                }
+                self.logs.info(
+                    &mut self.vm.logs,
+                    format!("{label} 已提交（{endpoint}）：{}", response.message),
+                );
+            }
+            Err(error) => self.logs.error(
+                &mut self.vm.logs,
+                format!("{label}提交失败"),
+                &error,
+                None,
+            ),
         }
     }
 
@@ -1152,6 +1171,25 @@ impl App {
                         self.logs.error(
                             &mut self.vm.logs,
                             "提交数据发布请求失败",
+                            &anyhow::anyhow!("数据请求线程不可用"),
+                            None,
+                        );
+                    }
+                }
+                Cmd::SubmitRoomCodePublish(request) => {
+                    if self
+                        .bridge
+                        .req
+                        .send(data::Req::RoomCodePublish {
+                            base: self.data_api_url.clone(),
+                            request,
+                        })
+                        .is_err()
+                    {
+                        self.manual_data_publish_state.submitting = false;
+                        self.logs.error(
+                            &mut self.vm.logs,
+                            "手动提资请求发送失败",
                             &anyhow::anyhow!("数据请求线程不可用"),
                             None,
                         );
@@ -2020,7 +2058,12 @@ impl App {
             &self.vm,
             &mut self.data_publish_state,
         ));
-        manual_data_publish::show(ui.ctx(), &t, d, &mut self.manual_data_publish_state);
+        cmds.extend(manual_data_publish::show(
+            ui.ctx(),
+            &t,
+            d,
+            &mut self.manual_data_publish_state,
+        ));
         cmds.extend(model_update::show(
             ui.ctx(),
             &t,

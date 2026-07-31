@@ -1,6 +1,7 @@
 use aios_core::data_center::{ThreeDDatacenterRequest, ThreeDDatacenterResponse};
 use anyhow::Context;
 use plant_ui::data_publish::{DesignPhase, PublishCategory, PublishRequest};
+use plant_ui::manual_data_publish::RoomCodePublishRequest;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -56,6 +57,30 @@ pub async fn submit(base: &str, request: &PublishRequest) -> anyhow::Result<Subm
     response_body(request.category, body)
 }
 
+pub async fn submit_room_codes(
+    base: &str,
+    request: &RoomCodePublishRequest,
+) -> anyhow::Result<SubmitResult> {
+    if request.room_codes.is_empty() {
+        anyhow::bail!("请至少填写一条设备名称和房间号");
+    }
+    let body = serde_json::to_string(request)?;
+    let url = format!("{base}/send_room_code_to_data_center");
+    eprintln!("[room_code_publish] POST {url}\n[room_code_publish] request: {body}");
+    let mut req = http_request(url, body);
+    req.timeout = Some(Duration::from_secs(60));
+    let response = ehttp::fetch_async(req)
+        .await
+        .map_err(anyhow::Error::msg)
+        .context("请求数据服务失败")?;
+    let status = response.status;
+    let body = response.text().context("数据服务响应不是 UTF-8")?;
+    if !response.ok {
+        anyhow::bail!("数据服务返回 HTTP {status}: {body}")
+    }
+    three_d_response_body(body)
+}
+
 fn http_request(url: String, body: String) -> ehttp::Request {
     ehttp::Request::new(
         ehttp::Method::POST,
@@ -98,6 +123,10 @@ fn response_body(category: PublishCategory, body: &str) -> anyhow::Result<Submit
         });
     }
 
+    three_d_response_body(body)
+}
+
+fn three_d_response_body(body: &str) -> anyhow::Result<SubmitResult> {
     let response: ThreeDDatacenterResponse =
         serde_json::from_str(body).context("数据服务响应不符合 ThreeDDatacenterResponse 契约")?;
     if !response.success {

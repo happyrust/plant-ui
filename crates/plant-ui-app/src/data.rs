@@ -7,6 +7,7 @@
 use std::sync::mpsc;
 
 use plant_ui::data_publish::PublishRequest;
+use plant_ui::manual_data_publish::RoomCodePublishRequest;
 use plant_ui::model_update::{Enqueued, Preview, ProgressEvent};
 use plant_ui::task_queue::Poll as QueuePoll;
 use plant_ui_data::{EleTreeNode, RefU64};
@@ -54,6 +55,10 @@ pub enum Req {
     DataPublish {
         base: String,
         request: PublishRequest,
+    },
+    RoomCodePublish {
+        base: String,
+        request: RoomCodePublishRequest,
     },
 }
 
@@ -104,6 +109,7 @@ pub enum Evt {
         PublishRequest,
         anyhow::Result<crate::data_publish_api::SubmitResult>,
     ),
+    RoomCodePublish(anyhow::Result<crate::data_publish_api::SubmitResult>),
     /// 队列视图的逐单元明细，带发生在哪个任务上。
     ///
     /// 这三个只有原生端的 WebSocket 构造（`model_update_ws`）；wasm 的 Feed 是
@@ -283,6 +289,11 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
                     Req::DataPublish { base, request } => {
                         let result = crate::data_publish_api::submit(&base, &request).await;
                         let _ = evt_tx.send(Evt::DataPublish(request, result));
+                        ctx.request_repaint();
+                    }
+                    Req::RoomCodePublish { base, request } => {
+                        let result = crate::data_publish_api::submit_room_codes(&base, &request).await;
+                        let _ = evt_tx.send(Evt::RoomCodePublish(result));
                         ctx.request_repaint();
                     }
                 }
