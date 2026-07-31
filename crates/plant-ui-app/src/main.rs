@@ -18,9 +18,15 @@ use bevy::asset::AssetMetaCheck;
 use bevy::prelude::{
     App as BevyApp, Camera2d, Commands, DefaultPlugins, PluginGroup, ResMut, Window, WindowPlugin,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use bevy::prelude::{IntoScheduleConfigs, PostUpdate, Query, With};
+#[cfg(not(target_arch = "wasm32"))]
+use bevy::window::PrimaryWindow;
 use bevy_egui35::{
     EguiContexts, EguiGlobalSettings, EguiPlugin, EguiPrimaryContextPass, PrimaryEguiContext,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use bevy_egui35::{EguiOutput, EguiPostUpdateSet};
 use chrono::{DateTime, Utc};
 use command::ParsedCommand;
 use eframe::egui;
@@ -208,31 +214,56 @@ fn run(canvas: &str, asset_root: String) {
     #[cfg(not(target_arch = "wasm32"))]
     let _ = canvas;
 
-    BevyApp::new()
-        .add_plugins(
-            DefaultPlugins
-                .set(WindowPlugin {
-                    primary_window: Some(window),
-                    ..Default::default()
-                })
-                .set(bevy::asset::AssetPlugin {
-                    file_path: asset_root,
-                    meta_check: AssetMetaCheck::Never,
-                    ..Default::default()
-                }),
-        )
-        .add_plugins(bevy_wasm_tasks::TasksPlugin::default())
-        .add_plugins(EguiPlugin::default())
-        .add_plugins(plant_ui_view3d::View3dPlugin)
-        .add_systems(bevy::prelude::Startup, setup_ui_camera)
-        .add_systems(EguiPrimaryContextPass, show_app)
-        .run();
+    let mut app = BevyApp::new();
+    app.add_plugins(
+        DefaultPlugins
+            .set(WindowPlugin {
+                primary_window: Some(window),
+                ..Default::default()
+            })
+            .set(bevy::asset::AssetPlugin {
+                file_path: asset_root,
+                meta_check: AssetMetaCheck::Never,
+                ..Default::default()
+            }),
+    )
+    .add_plugins(bevy_wasm_tasks::TasksPlugin::default())
+    .add_plugins(EguiPlugin::default())
+    .add_plugins(plant_ui_view3d::View3dPlugin)
+    .add_systems(bevy::prelude::Startup, setup_ui_camera)
+    .add_systems(EguiPrimaryContextPass, show_app);
+    #[cfg(not(target_arch = "wasm32"))]
+    app.add_systems(
+        PostUpdate,
+        sync_desktop_ime.after(EguiPostUpdateSet::ProcessOutput),
+    );
+    app.run();
 }
 
 fn setup_ui_camera(mut commands: Commands, mut egui: ResMut<EguiGlobalSettings>) {
     // 三维插件也会创建摄像机；明确绑定，避免 egui 把主界面画进离屏纹理。
     egui.auto_create_primary_context = false;
     commands.spawn((Camera2d, PrimaryEguiContext));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn sync_desktop_ime(
+    output: Query<&EguiOutput, With<PrimaryEguiContext>>,
+    mut window: Query<&mut Window, With<PrimaryWindow>>,
+) {
+    let (Ok(output), Ok(mut window)) = (output.single(), window.single_mut()) else {
+        return;
+    };
+    sync_ime_window(&mut window, output.platform_output.ime.as_ref());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn sync_ime_window(window: &mut Window, ime: Option<&egui::output::IMEOutput>) {
+    window.ime_enabled = ime.is_some();
+    if let Some(ime) = ime {
+        let position = ime.cursor_rect.left_bottom();
+        window.ime_position = bevy::math::Vec2::new(position.x, position.y);
+    }
 }
 
 /// 挂上验收探针的服务端那一半（`egui_inspection`），由 `EGUI_INSPECTION` 环境变量
@@ -2528,14 +2559,66 @@ impl App {
 mod tests {
     use super::{
         EleTreeNode, ModelVisibility, ModelVisibilityPlan, RefU64, RowVisibility, TreeModel,
-        TreeRowVm, background_models_settled, begin_get_work, cache_model_scope,
+        TreeRowVm, Window, background_models_settled, begin_get_work, cache_model_scope,
         claim_unloaded_model_refnos, finished_after, in_mdb_path, mark_model_scope_unavailable,
         model_progress_terminal, model_reload_due, model_visibility_plan, restore_model_reload,
-        settle_pending_directions, settled_pending_roots, task_matches_project,
+        settle_pending_directions, settled_pending_roots, sync_ime_window, task_matches_project,
     };
     use chrono::{TimeZone, Utc};
     use plant_ui::model_update::PendingModelUnit;
     use std::collections::{HashMap, HashSet};
+
+    fn ime_output(cursor: egui::Rect) -> egui::output::IMEOutput {
+        egui::output::IMEOutput {
+            rect: cursor.expand(8.0),
+            cursor_rect: cursor,
+            should_interrupt_composition: false,
+        }
+    }
+
+    #[test]
+    fn ime_focus_enables_window_and_positions_candidate_box() {
+        let mut window = Window::default();
+        let ime = ime_output(egui::Rect::from_min_max(
+            egui::pos2(120.0, 30.0),
+            egui::pos2(121.0, 48.0),
+        ));
+
+        sync_ime_window(&mut window, Some(&ime));
+
+        assert!(window.ime_enabled);
+        assert_eq!(window.ime_position, bevy::math::Vec2::new(120.0, 48.0));
+    }
+
+    #[test]
+    fn losing_text_focus_disables_window_ime() {
+        let mut window = Window {
+            ime_enabled: true,
+            ..Default::default()
+        };
+
+        sync_ime_window(&mut window, None);
+
+        assert!(!window.ime_enabled);
+    }
+
+    #[test]
+    fn ime_candidate_position_tracks_cursor_changes() {
+        let mut window = Window::default();
+        let first = ime_output(egui::Rect::from_min_max(
+            egui::pos2(10.0, 20.0),
+            egui::pos2(11.0, 40.0),
+        ));
+        let second = ime_output(egui::Rect::from_min_max(
+            egui::pos2(210.0, 220.0),
+            egui::pos2(211.0, 240.0),
+        ));
+
+        sync_ime_window(&mut window, Some(&first));
+        sync_ime_window(&mut window, Some(&second));
+
+        assert_eq!(window.ime_position, bevy::math::Vec2::new(210.0, 240.0));
+    }
 
     fn refs(raw: &[&str]) -> Vec<RefU64> {
         raw.iter().map(|s| s.parse().unwrap()).collect()
