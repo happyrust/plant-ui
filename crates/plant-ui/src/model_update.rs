@@ -2777,7 +2777,10 @@ mod tests {
         state.step = Step::Confirm;
         let (_, hint, tone) = footer_hint(&vm, &state, API);
         assert_eq!(tone, Status::Warn);
-        assert!(hint.contains("不可中途取消"), "确认页丢了不可撤销警告：{hint}");
+        assert!(
+            hint.contains("不可中途取消"),
+            "确认页丢了不可撤销警告：{hint}"
+        );
 
         state.step = Step::Preview;
         let (_, hint, tone) = footer_hint(&vm, &state, API);
@@ -2874,11 +2877,17 @@ mod tests {
         assert!(!state.open_row("db8191", false));
 
         state.toggle_row("db8000");
-        assert!(!state.open_row("db8000", true), "默认展开的行 toggle 一次要收起来");
+        assert!(
+            !state.open_row("db8000", true),
+            "默认展开的行 toggle 一次要收起来"
+        );
         state.toggle_row("db8000");
         assert!(state.open_row("db8000", true), "再 toggle 一次回到默认");
 
         state.toggle_row("db8191");
-        assert!(state.open_row("db8191", false), "默认折叠的行 toggle 一次要展开");
+        assert!(
+            state.open_row("db8191", false),
+            "默认折叠的行 toggle 一次要展开"
+        );
     }
 }
