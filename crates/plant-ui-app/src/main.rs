@@ -771,6 +771,18 @@ fn cache_model_scope(scopes: &mut HashMap<RefU64, Vec<RefU64>>, target: RefU64, 
     }
 }
 
+fn claim_unloaded_model_refnos(
+    loaded: &mut HashSet<RefU64>,
+    incoming: impl IntoIterator<Item = RefU64>,
+) -> HashSet<RefU64> {
+    let claimed = incoming
+        .into_iter()
+        .filter(|refno| !loaded.contains(refno))
+        .collect::<HashSet<_>>();
+    loaded.extend(claimed.iter().copied());
+    claimed
+}
+
 /// 查空、查失败：这次点击什么都没落到三维上，待执行方向撤掉，eye 留在未加载。
 fn mark_model_scope_unavailable(
     pending_direction: &mut HashMap<RefU64, bool>,
@@ -1093,11 +1105,15 @@ impl App {
                                 .get(&target)
                                 .copied()
                                 .unwrap_or(true);
+                            let new_refnos = claim_unloaded_model_refnos(
+                                &mut self.loaded_models,
+                                models.iter().map(|model| model.refno.refno()),
+                            );
                             let mut new_models = Vec::new();
                             let mut new_meshes = 0;
                             for model in models {
                                 let refno = model.refno.refno();
-                                if self.loaded_models.insert(refno) {
+                                if new_refnos.contains(&refno) {
                                     new_meshes += model.insts.len();
                                     new_models.push(model);
                                 }
@@ -2452,10 +2468,10 @@ impl App {
 mod tests {
     use super::{
         EleTreeNode, ModelVisibility, ModelVisibilityPlan, RefU64, RowVisibility, TreeModel,
-        TreeRowVm, background_models_settled, begin_get_work, cache_model_scope, finished_after,
-        in_mdb_path, mark_model_scope_unavailable, model_progress_terminal, model_reload_due,
-        model_visibility_plan, restore_model_reload, settle_pending_directions,
-        settled_pending_roots, task_matches_project,
+        TreeRowVm, background_models_settled, begin_get_work, cache_model_scope,
+        claim_unloaded_model_refnos, finished_after, in_mdb_path, mark_model_scope_unavailable,
+        model_progress_terminal, model_reload_due, model_visibility_plan, restore_model_reload,
+        settle_pending_directions, settled_pending_roots, task_matches_project,
     };
     use chrono::{TimeZone, Utc};
     use plant_ui::model_update::PendingModelUnit;
@@ -2463,6 +2479,23 @@ mod tests {
 
     fn refs(raw: &[&str]) -> Vec<RefU64> {
         raw.iter().map(|s| s.parse().unwrap()).collect()
+    }
+
+    #[test]
+    fn incremental_load_keeps_every_tubi_row_for_a_new_branch() {
+        let branch = RefU64(11);
+        let already_loaded = RefU64(12);
+        let incoming = [branch, branch, branch, already_loaded];
+        let mut loaded = HashSet::from([already_loaded]);
+
+        let claimed = claim_unloaded_model_refnos(&mut loaded, incoming);
+        let kept = incoming
+            .into_iter()
+            .filter(|refno| claimed.contains(refno))
+            .count();
+
+        assert_eq!(kept, 3);
+        assert_eq!(loaded, HashSet::from([branch, already_loaded]));
     }
 
     fn node(refno: RefU64, noun: &str, children: u16) -> EleTreeNode {

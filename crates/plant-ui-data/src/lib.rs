@@ -70,6 +70,19 @@ pub async fn model_instances(roots: &[RefU64]) -> Result<Vec<aios_core::GeomInst
     model_instances_with_progress(roots, |_, _| {}).await
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchQuery {
+    Root,
+    Descendants,
+}
+
+fn branch_query(noun: &str) -> BranchQuery {
+    match noun {
+        "BRAN" | "HANG" => BranchQuery::Root,
+        _ => BranchQuery::Descendants,
+    }
+}
+
 /// 查询已经生成好的模型，并在范围解析完成后按查询分块报告进度。
 ///
 /// 这里仍然只读 SurrealDB；mesh 文件由 View3d 的 AssetLoader 消费，不会触发模型生成。
@@ -88,22 +101,18 @@ pub async fn model_instances_with_progress(
     let nouns = aios_core::get_type_names(roots.iter()).await?;
     for (root, noun) in roots.into_iter().zip(nouns) {
         match noun.as_str() {
-            "ZONE" => {
-                zone_refnos.push(root);
-                continue;
-            }
+            "ZONE" => zone_refnos.push(root),
             "SITE" => {
                 zone_refnos.extend(aios_core::query_filter_deep_children(root, &["ZONE"]).await?);
-                continue;
             }
-            _ => {}
+            _ => refnos.extend(aios_core::query_deep_visible_inst_refnos(root).await?),
         }
-        refnos.extend(aios_core::query_deep_visible_inst_refnos(root).await?);
-        if noun == "BRAN" || noun == "HANG" {
-            branch_refnos.push(root);
-        } else {
-            branch_refnos
-                .extend(aios_core::query_filter_deep_children(root, &["BRAN", "HANG"]).await?);
+        match branch_query(&noun) {
+            BranchQuery::Root => branch_refnos.push(root),
+            BranchQuery::Descendants => {
+                branch_refnos
+                    .extend(aios_core::query_filter_deep_children(root, &["BRAN", "HANG"]).await?);
+            }
         }
     }
     for chunk in zone_refnos.chunks(500) {
@@ -147,6 +156,17 @@ pub async fn model_instances_with_progress(
         progress(done, total);
     }
     Ok(models)
+}
+
+#[cfg(test)]
+mod model_scope_tests {
+    use super::{BranchQuery, branch_query};
+
+    #[test]
+    fn site_and_zone_scopes_include_descendant_straight_tubes() {
+        assert_eq!(branch_query("ZONE"), BranchQuery::Descendants);
+        assert_eq!(branch_query("SITE"), BranchQuery::Descendants);
+    }
 }
 
 /// 设计库里还没被应用到模型的会话数。
