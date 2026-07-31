@@ -1,5 +1,8 @@
-//! 临时诊断：真实 .mesh 资产的三角形绕序 vs bevy_picking 的背面剔除。
-//! 结论拿到后即删。
+//! 真实 .mesh 资产的三角形绕序回归：绕序必须与顶点法线同向，否则 bevy_picking 的
+//! 背面剔除会把正面当背面丢掉，表现为「模型看得见但点不中」。
+//!
+//! 射线命中数（cull / include 两种口径）只作为诊断量打印，不断言——它取决于抽到的
+//! 那 60 个网格，钉死会变成一条一换资产就红的假警报。
 
 use aios_core::shape::pdms_shape::PlantMesh;
 use glam::Vec3;
@@ -48,9 +51,12 @@ fn ray_mesh(origin: Vec3, dir: Vec3, mesh: &PlantMesh, cull: bool) -> Option<f32
     best
 }
 
+/// 前置条件：`PLANT_TEST_MESH_DIR` 指向 gen-model 产出的 meshes 目录。
 #[test]
+#[ignore = "需要 PLANT_TEST_MESH_DIR，用 --ignored 显式跑"]
 fn probe_real_mesh_winding() {
-    let dir = std::path::Path::new(r"D:\work\plant-code\old\gen-model\assets\meshes");
+    let dir = std::env::var_os("PLANT_TEST_MESH_DIR").expect("PLANT_TEST_MESH_DIR 未设置");
+    let dir = std::path::Path::new(&dir);
     let mut checked = 0usize;
     let mut cull_hits = 0usize;
     let mut include_hits = 0usize;
@@ -110,8 +116,12 @@ fn probe_real_mesh_winding() {
         checked += 1;
     }
 
-    panic!(
-        "诊断结果：checked={checked} cull_hits={cull_hits} include_hits={include_hits} \
+    println!(
+        "checked={checked} cull_hits={cull_hits} include_hits={include_hits} \
          绕序vs法线 agree={agree} oppose={oppose} degenerate={degenerate}"
     );
+
+    assert!(checked > 0, "{} 里没有可读的 .mesh", dir.display());
+    assert_eq!(oppose, 0, "有三角形的绕序与顶点法线相反");
+    assert_eq!(degenerate, 0, "有退化三角形或零长顶点法线");
 }

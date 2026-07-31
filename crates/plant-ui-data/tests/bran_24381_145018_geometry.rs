@@ -5,9 +5,15 @@ fn aabb_gap(a_min: Vec3, a_max: Vec3, b_min: Vec3, b_max: Vec3) -> f32 {
     (a_min - b_max).max(b_min - a_max).max(Vec3::ZERO).length()
 }
 
+/// 前置条件：本机 SurrealDB 在跑（连哪台取工作区根的 `DbOption.toml`），且
+/// `PLANT_TEST_MESH_DIR` 指向 gen-model 产出的 meshes 目录。
 #[tokio::test]
+#[ignore = "需要本机 SurrealDB 与 PLANT_TEST_MESH_DIR，用 --ignored 显式跑"]
 async fn generated_branch_is_one_connected_route() {
-    std::env::set_current_dir(r"D:\work\plant-code\old\plant-ui").unwrap();
+    // rs-core 的 `try_get_db_option` 拿 `File::with_name("DbOption")` 按进程 CWD 找配置，
+    // 所以连库前得先站到工作区根上——DbOption.toml 在那里。
+    std::env::set_current_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+        .expect("无法切换到工作区目录");
     plant_ui_data::connect().await.unwrap();
     let root = "24381_145018".parse::<plant_ui_data::RefU64>().unwrap();
     let models = plant_ui_data::model_instances(&[root]).await.unwrap();
@@ -70,7 +76,8 @@ async fn assert_generated_mesh_bounds_match_database_bounds() {
     let models = aios_core::query_insts(refnos.iter(), true).await.unwrap();
     assert!(!models.is_empty(), "BRAN 没有生成任何可显示实例");
 
-    let mesh_dir = std::path::Path::new(r"D:\work\plant-code\old\gen-model\assets\meshes");
+    let mesh_dir = std::env::var_os("PLANT_TEST_MESH_DIR").expect("PLANT_TEST_MESH_DIR 未设置");
+    let mesh_dir = std::path::Path::new(&mesh_dir);
     let mut stored_min = Vec3::splat(f32::INFINITY);
     let mut stored_max = Vec3::splat(f32::NEG_INFINITY);
     let mut actual_min = Vec3::splat(f32::INFINITY);

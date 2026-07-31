@@ -3,9 +3,15 @@
 use aios_core::shape::pdms_shape::PlantMesh;
 use std::collections::BTreeMap;
 
+/// 前置条件：本机 SurrealDB 在跑（连哪台取工作区根的 `DbOption.toml`），且
+/// `PLANT_TEST_MESH_DIR` 指向 gen-model 产出的 meshes 目录。
 #[tokio::test]
+#[ignore = "需要本机 SurrealDB 与 PLANT_TEST_MESH_DIR，用 --ignored 显式跑"]
 async fn report_opposed_triangles() {
-    std::env::set_current_dir(r"D:\work\plant-code\old\plant-ui").unwrap();
+    // rs-core 的 `try_get_db_option` 拿 `File::with_name("DbOption")` 按进程 CWD 找配置，
+    // 所以连库前得先站到工作区根上——DbOption.toml 在那里。
+    std::env::set_current_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+        .expect("无法切换到工作区目录");
     plant_ui_data::connect().await.unwrap();
     let root = "24381_145018".into();
     let refnos = aios_core::query_deep_visible_inst_refnos(root)
@@ -13,7 +19,8 @@ async fn report_opposed_triangles() {
         .unwrap();
     let models = aios_core::query_insts(refnos.iter(), true).await.unwrap();
 
-    let mesh_dir = std::path::Path::new(r"D:\work\plant-code\old\gen-model\assets\meshes");
+    let mesh_dir = std::env::var_os("PLANT_TEST_MESH_DIR").expect("PLANT_TEST_MESH_DIR 未设置");
+    let mesh_dir = std::path::Path::new(&mesh_dir);
     // geo_hash -> (总三角数, 反向数, 反向里 |dot| 相对量的最大值, 所属元素)
     let mut per_geo: BTreeMap<String, (usize, usize, f32, Vec<String>)> = BTreeMap::new();
 
