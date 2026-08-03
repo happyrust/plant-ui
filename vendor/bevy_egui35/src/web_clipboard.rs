@@ -302,6 +302,11 @@ fn setup_clipboard_paste(subscribed_events: &mut SubscribedEvents, tx: Sender<We
         };
         match clipboard_data.get_data("text/plain") {
             Ok(data) => {
+                // The focused web text agent also receives the browser's
+                // default paste, which would emit a second `Event::Text`.
+                // Egui receives this clipboard event below, so consume the
+                // browser action after we have captured its text.
+                event.prevent_default();
                 if tx.send(WebClipboardEvent::Paste(data)).is_err() {
                     log::error!("Failed to send the \"paste\" event: channel is disconnected");
                 }
