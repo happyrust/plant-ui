@@ -171,8 +171,8 @@ use crate::input::*;
 #[cfg(target_arch = "wasm32")]
 use crate::text_agent::{
     install_text_agent_system, is_mobile_safari, process_safari_virtual_keyboard_system,
-    write_text_agent_channel_events_system, SafariVirtualKeyboardTouchState, TextAgentChannel,
-    VirtualTouchInfo,
+    sync_text_agent_system, write_text_agent_channel_events_system, SafariVirtualKeyboardTouchState,
+    TextAgentChannel, VirtualTouchInfo,
 };
 #[cfg(all(
     feature = "manage_clipboard",
@@ -1114,6 +1114,11 @@ impl Plugin for EguiPlugin {
                         }))
                         .in_set(EguiPreUpdateSet::ProcessInput)
                         .in_set(EguiInputSet::ReadBevyEvents),
+                );
+
+                app.add_systems(
+                    PostUpdate,
+                    sync_text_agent_system.in_set(EguiPostUpdateSet::PostProcessOutput),
                 );
 
                 if is_mobile_safari() {
