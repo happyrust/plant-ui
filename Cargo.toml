@@ -31,7 +31,7 @@ bevy = { git = "https://gitee.com/happydpc/bevy", default-features = false, feat
 # + navigator.clipboard，配套的快捷键放行见 vendor 里 web_clipboard.rs 的捕获拦截。
 # 所需依赖（arboard / thread_local / image / crossbeam-channel）全在 lock 与 vendor 里，开关不动 Cargo.lock。
 bevy_egui35 = { path = "vendor/bevy_egui35", default-features = false, features = [
-    "render", "default_fonts", "manage_clipboard",
+    "render", "default_fonts", "manage_clipboard", "open_url",
 ] }
 # 双端 spawn：原生走 tokio、浏览器走 spawn_local（view3d-migration.md 决定 5）
 bevy-wasm-tasks = { git = "https://gitee.com/happydpc/bevy-wasm-tasks", rev = "51aabcb8124ad80be902fa120c84a2e91d28c9ed" }

@@ -6,8 +6,6 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 static BASE_URL: OnceLock<String> = OnceLock::new();
-/// 测试期间统一跳转至此数据中心登录页，不使用服务端返回的 LoginUrl。
-const TEST_LOGIN_URL: &str = "http://pms.powerpms.net:1801/sysin.html";
 
 pub fn base_url() -> String {
     BASE_URL
@@ -28,16 +26,15 @@ pub fn set_base_url(base: String) -> anyhow::Result<()> {
 
 /// 一次成功提交的服务端回执。
 ///
-/// 专业发布会返回数据中心的 `LoginUrl`；房间接口没有该字段时保持为空。
+/// 数据中心成功响应中的 `LoginUrl`；未返回时保持为空。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmitResult {
     pub message: String,
     pub login_url: Option<String>,
 }
 
-/// rs-server 数据中心接口：专业发布复用 `ThreeDDatacenterRequest`；房间查询走服务端
-/// 已有的 `PipeNameRequest[]` 契约。专业发布的响应按
-/// `ThreeDDatacenterResponse` 判断业务成功，而不只依赖 HTTP 状态。
+/// rs-server 数据中心接口：所有发布类别均复用 `ThreeDDatacenterRequest`。
+/// 响应按 `ThreeDDatacenterResponse` 判断业务成功，而不只依赖 HTTP 状态。
 pub async fn submit(base: &str, request: &PublishRequest) -> anyhow::Result<SubmitResult> {
     let body = request_body(request)?.to_string();
     let url = format!("{base}{}", request.category.endpoint());
@@ -94,35 +91,19 @@ fn request_body(request: &PublishRequest) -> anyhow::Result<serde_json::Value> {
     if request.elements.is_empty() {
         anyhow::bail!("请至少添加一个元素");
     }
-    Ok(match request.category {
-        PublishCategory::Room => serde_json::json!(
-            request
-                .elements
-                .iter()
-                .map(|element| serde_json::json!({ "name": element.name, "position": [] }))
-                .collect::<Vec<_>>()
-        ),
-        _ => serde_json::to_value(ThreeDDatacenterRequest {
-            refnos: request
-                .elements
-                .iter()
-                .map(|element| element.refno.to_string())
-                .collect(),
-            title: request.title.clone(),
-            create_rvm_relations: true,
-            b_first_time_design: request.design_phase == DesignPhase::Preliminary,
-        })?,
-    })
+    Ok(serde_json::to_value(ThreeDDatacenterRequest {
+        refnos: request
+            .elements
+            .iter()
+            .map(|element| element.refno.to_string())
+            .collect(),
+        title: request.title.clone(),
+        create_rvm_relations: true,
+        b_first_time_design: false,
+    })?)
 }
 
-fn response_body(category: PublishCategory, body: &str) -> anyhow::Result<SubmitResult> {
-    if category == PublishCategory::Room {
-        return Ok(SubmitResult {
-            message: body.to_owned(),
-            login_url: Some(TEST_LOGIN_URL.to_owned()),
-        });
-    }
-
+fn response_body(_category: PublishCategory, body: &str) -> anyhow::Result<SubmitResult> {
     three_d_response_body(body)
 }
 
@@ -142,7 +123,8 @@ fn three_d_response_body(body: &str) -> anyhow::Result<SubmitResult> {
 
     Ok(SubmitResult {
         message: response.result,
-        login_url: Some(TEST_LOGIN_URL.to_owned()),
+        login_url: (!response.login_url.trim().is_empty()).then_some(response.login_url),
+        //login_url: Some("http://pms.powerpms.net:1801/sysin.html".to_string()),
     })
 }
 
@@ -177,10 +159,15 @@ mod tests {
     }
 
     #[test]
-    fn room_query_uses_the_pipe_room_contract() {
+    fn room_publish_uses_the_datacenter_contract() {
         assert_eq!(
             request_body(&request(PublishCategory::Room)).unwrap(),
-            serde_json::json!([{"name": "/PIPE-100", "position": []}])
+            serde_json::json!({
+                "refnos": ["0_12345"],
+                "title": "发布测试",
+                "create_rvm_relations": true,
+                "b_first_time_design": false,
+            })
         );
     }
 
@@ -204,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_responses_always_use_the_test_login_url() {
+    fn successful_responses_keep_the_server_login_url() {
         let result = response_body(
             PublishCategory::Process,
             r#"{"Success":true,"Result":"已提交","KeyValue":"","LoginUrl":"https://example.test/login"}"#,
@@ -214,15 +201,23 @@ mod tests {
         assert_eq!(result.message, "已提交");
         assert_eq!(
             result.login_url.as_deref(),
-            Some(TEST_LOGIN_URL)
+            Some("https://example.test/login")
         );
     }
 
     #[test]
-    fn room_responses_also_use_the_test_login_url() {
-        let result = response_body(PublishCategory::Room, "room response").unwrap();
+    fn room_responses_use_the_datacenter_contract() {
+        let result = response_body(
+            PublishCategory::Room,
+            r#"{"Success":true,"Result":"已提交","KeyValue":"","LoginUrl":"https://example.test/login"}"#,
+        )
+        .unwrap();
 
-        assert_eq!(result.login_url.as_deref(), Some(TEST_LOGIN_URL));
+        assert_eq!(result.message, "已提交");
+        assert_eq!(
+            result.login_url.as_deref(),
+            Some("https://example.test/login")
+        );
     }
 
     #[test]

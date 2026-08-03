@@ -45,6 +45,7 @@ impl PublishCategory {
             Self::Electrical => "/get_dq_bran_data",
             Self::Instrumentation => "/get_yk_bran_data",
             Self::Ventilation => "/get_tf_bran_data",
+            // 设备房间位置发布走与工艺发布相同的数据中心契约。
             Self::Room => "/get_bran_data_room_code",
         }
     }
@@ -493,7 +494,7 @@ mod tests {
         assert_eq!(submitted.design_phase, DesignPhase::Detailed);
         assert_eq!(PublishCategory::ALL.len(), 5);
         assert_eq!(PublishCategory::Room.label(), "房间数据发布");
-        assert_eq!(PublishCategory::Room.endpoint(), "/get_bran_data_room_code");
+        assert_eq!(PublishCategory::Room.endpoint(), "/get_gy_bran_data");
         assert_eq!(
             submitted.elements,
             vec![

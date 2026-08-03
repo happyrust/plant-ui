@@ -1525,6 +1525,10 @@ impl App {
                 let mut message = format!("{label} 已提交（{endpoint}）：{}", response.message);
                 if let Some(login_url) = response.login_url.filter(|url| !url.trim().is_empty()) {
                     message.push_str(&format!("；登录地址：{login_url}"));
+                    ctx.open_url(egui::OpenUrl {
+                        url: login_url,
+                        new_tab: true,
+                    });
                 }
                 self.logs.info(&mut self.vm.logs, message);
             }
