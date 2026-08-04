@@ -63,6 +63,9 @@ pub struct DbPreview {
     pub units: Vec<UnitPreview>,
     #[serde(default)]
     pub zones: Vec<ZonePreview>,
+    /// 纯位姿变更目标（与 `units` 互斥的另一类工作：变换刷新，不重建网格）。
+    #[serde(default)]
+    pub transform_targets: Vec<TransformTargetPreview>,
     pub no_generation: u32,
     pub blocked: bool,
     pub anomaly: Option<FileAnomaly>,
@@ -138,6 +141,22 @@ pub struct UnitPreview {
 
 fn yes() -> bool {
     true
+}
+
+/// 一个纯位姿（`POS`/`ORI`）变更目标：执行阶段走 `transform` 便宜工作项——
+/// 只刷新世界变换、包围盒、空间树与房间归属，不重建网格、不整单重生成，
+/// 所以它不出现在交付单元列表里。老服务端的 payload 没有这个字段，缺省为空。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TransformTargetPreview {
+    /// PDMS `a/b` 引用串。
+    pub refno: String,
+    #[serde(default)]
+    pub noun: String,
+    #[serde(default)]
+    pub name: String,
+    /// 粗层级容器（WORL/SITE/ZONE）：执行时会刷新其**整棵子树**的模型实例。
+    #[serde(default)]
+    pub container: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -363,6 +382,12 @@ pub struct Totals {
     pub no_generation: u32,
     /// 受影响交付单元：`DeliveryUnitSummary` 已按 refno 去重，直接相加。
     pub units: usize,
+    /// 其中执行阶段真正会重新生成的单元（`will_generate`）。E3D 的 SAVEWORK
+    /// 常会顺带触碰整库元素，产生大量「不生成」单元行——确认页说「将重新生成」
+    /// 时必须用这个数，不能用 `units` 总数。
+    pub generating: usize,
+    /// 纯位姿刷新目标（`transform` 便宜路径，不重建网格）。
+    pub transform_targets: usize,
     /// 会产生数据批次的 dbnum 数。
     pub batches: usize,
     /// 在本期执行范围之内的 DESI 库数（当前 MDB 声明、且当前项目目录里有文件）。
@@ -385,6 +410,8 @@ impl Preview {
             t.model_affecting += db.model_affecting;
             t.no_generation += db.no_generation;
             t.units += db.units.len();
+            t.generating += db.units.iter().filter(|u| u.will_generate).count();
+            t.transform_targets += db.transform_targets.len();
             t.batches += usize::from(db.will_run());
             if !db.is_desi() {
                 t.excluded += 1;
@@ -1550,6 +1577,36 @@ fn db_rows(ui: &mut Ui, t: &Tokens, d: Density, db: &DbPreview, state: &mut Stat
         };
         let _ = row(ui, t, d, urow);
     }
+
+    // 纯位姿目标单独成组：它们是「变换刷新」不是「重新生成」，混进交付单元里
+    // 会让人以为要重建网格。容器目标（ZONE/SITE）额外说明整棵子树都会跟着动。
+    for target in &db.transform_targets {
+        let tlabel = format!("{} {}", target.noun, target.refno);
+        let trow = Row {
+            depth: 1,
+            caret: None,
+            icon: crate::workbench::noun_icon(&target.noun),
+            icon_color: t.accent,
+            label: &tlabel,
+            label_color: t.text_primary,
+            strong: false,
+            tag: target.name.as_str(),
+            tag_color: t.text_muted,
+            meta: if target.container {
+                "整棵子树".to_owned()
+            } else {
+                String::new()
+            },
+            note: if target.container {
+                "位姿刷新 · 子树"
+            } else {
+                "位姿刷新"
+            },
+            note_color: t.accent,
+            fill: Color32::TRANSPARENT,
+        };
+        let _ = row(ui, t, d, trow);
+    }
 }
 
 fn summary_block(ui: &mut Ui, t: &Tokens, d: Density, applying: usize, totals: &Totals) {
@@ -1616,6 +1673,19 @@ fn summary_block(ui: &mut Ui, t: &Tokens, d: Density, applying: usize, totals: &
         &totals.model_affecting.to_string(),
         false,
     );
+    if totals.transform_targets > 0 {
+        ui.add_space(d.px(8.0));
+        stat_row(
+            ui,
+            t,
+            d,
+            ph::ARROWS_CLOCKWISE,
+            t.accent,
+            "位姿刷新目标（不重建网格）",
+            &totals.transform_targets.to_string(),
+            false,
+        );
+    }
     // 预览与数据批次并发（合流后没有单飞预检）：正在被应用的会话也会被算进
     // 「待应用」。数字说不清来路就把来路说出来——为 0 时整条不画，不摆空话。
     if applying > 0 {
@@ -1671,6 +1741,20 @@ fn hints_block(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, totals: &
                 .as_ref()
                 .map(FileAnomaly::to_string)
                 .unwrap_or_default(),
+        );
+        ui.add_space(d.px(10.0));
+    }
+
+    if totals.transform_targets > 0 {
+        any = true;
+        note_card(
+            ui,
+            t,
+            d,
+            Status::Info,
+            ph::ARROWS_CLOCKWISE,
+            &format!("{} 个纯位姿目标走便宜路径刷新", totals.transform_targets),
+            "只更新世界变换、包围盒、空间树与房间归属，不重建网格；ZONE/SITE 容器目标会连带刷新整棵子树的模型实例。",
         );
         ui.add_space(d.px(10.0));
     }
@@ -1772,11 +1856,26 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
                     t,
                     d,
                     Dot::Glyph(ph::STACK, t.accent),
-                    &format!("{} 个最小交付单元将重新生成", totals.units),
+                    &format!("{} 个最小交付单元将重新生成", totals.generating),
                     "",
                     "本期执行范围：当前 MDB 声明的 DESI 库 + sesno",
                     t.text_muted,
                 );
+                if totals.transform_targets > 0 {
+                    line(
+                        ui,
+                        t,
+                        d,
+                        Dot::Glyph(ph::ARROWS_CLOCKWISE, t.accent),
+                        &format!(
+                            "{} 个位姿目标只做变换刷新",
+                            totals.transform_targets
+                        ),
+                        "",
+                        "不重建网格；容器目标连带整棵子树",
+                        t.text_muted,
+                    );
+                }
                 ui.add_space(d.px(6.0));
                 strip(
                     ui,
@@ -2615,6 +2714,8 @@ mod tests {
         pending.model_affecting = 361;
         pending.no_generation = 14;
         pending.units = vec![UnitPreview::default(); 23];
+        pending.units[0].will_generate = true;
+        pending.transform_targets = vec![TransformTargetPreview::default(); 2];
 
         let mut blocked = db(8003, "DESI");
         blocked.blocked = true;
@@ -2635,6 +2736,8 @@ mod tests {
             (128, 342, 17)
         );
         assert_eq!(totals.units, 23);
+        assert_eq!(totals.generating, 1);
+        assert_eq!(totals.transform_targets, 2);
         assert_eq!(totals.model_affecting, 361);
         assert_eq!(totals.no_generation, 14);
         assert_eq!(totals.batches, 1);

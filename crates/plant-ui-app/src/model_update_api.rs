@@ -150,8 +150,13 @@ async fn post<T: DeserializeOwned>(
     timeout: Duration,
 ) -> anyhow::Result<T> {
     let mut req = ehttp::Request::post(format!("{base}{path}"), body.into_bytes());
-    req.headers
-        .insert("content-type", "application/json; charset=utf-8");
+    // ehttp 的 `post()` 默认带 `Content-Type: text/plain`，而 `Headers::insert`
+    // 是**追加**不是替换（同名键允许重复）——insert 会造出两个 Content-Type，
+    // axum 只看第一个，Json 提取器直接 415。整体覆盖 headers 才是替换。
+    req.headers = ehttp::Headers::new(&[
+        ("Accept", "*/*"),
+        ("Content-Type", "application/json; charset=utf-8"),
+    ]);
     req.timeout = Some(timeout);
     let response = ehttp::fetch_async(req)
         .await
