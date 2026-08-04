@@ -804,6 +804,101 @@ pub struct LogRowOut<R> {
     pub trailing: R,
 }
 
+/// 可变高度的日志行。正文占用元信息和处置入口后的剩余空间，并按面板当前宽度折行。
+pub fn log_row_ui<R>(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    row: LogRow<'_>,
+    trailing: impl FnOnce(&mut Ui) -> R,
+) -> LogRowOut<R> {
+    let (fg, bg) = t.status(row.level);
+    let fill = if row.level == Status::Error {
+        bg
+    } else {
+        t.bg_panel
+    };
+    let pad = d.px(14.0) as i8;
+    let gap = d.px(12.0);
+
+    let content = egui::Frame::new()
+        .fill(fill)
+        .inner_margin(egui::Margin::symmetric(pad, d.px(4.0) as i8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                let _time = ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(row.time)
+                            .font(Font::mono_meta(d))
+                            .color(t.text_muted),
+                    )
+                    .selectable(true),
+                );
+
+                let tag = egui::Frame::new()
+                    .fill(bg)
+                    .inner_margin(egui::Margin::symmetric(d.px(4.0) as i8, 0))
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(row.level_text)
+                                    .font(Font::mono_micro(d))
+                                    .color(fg),
+                            )
+                            .selectable(true),
+                        )
+                    })
+                    .inner;
+
+                let element = row.element.map(|name| {
+                    let width = lay(ui, name, Font::mono_meta(d))
+                        .size()
+                        .x
+                        .min(ui.available_width() * 0.4);
+                    ui.add_sized(
+                        vec2(width.max(0.0), d.px(20.0)),
+                        egui::Label::new(
+                            egui::RichText::new(name)
+                                .font(Font::mono_meta(d))
+                                .color(t.accent),
+                        )
+                        .selectable(true)
+                        .truncate(),
+                    )
+                });
+
+                let trailing = trailing(ui);
+
+                let color = if row.level == Status::Info {
+                    t.text_secondary
+                } else {
+                    fg
+                };
+                let message = ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(row.message)
+                            .font(Font::meta(d))
+                            .color(color),
+                    )
+                    .selectable(true)
+                    .wrap(),
+                );
+
+                (tag, element, message, trailing)
+            })
+            .inner
+        });
+
+    LogRowOut {
+        response: content.response,
+        element: content.inner.1,
+        message: content.inner.2,
+        trailing: content.inner.3,
+    }
+}
+
 /// 日志行（C/LogRow：高 24、时间等宽 `text-muted` + 52pt 分级标签 + 正文；
 /// ERROR 行整行 `danger-bg`）。
 ///
@@ -816,7 +911,8 @@ pub struct LogRowOut<R> {
 /// `trailing` 在行尾从右往左画处置入口（重试 / 复制），正文按剩下的宽度截断。
 /// `element` 给出时在分级标签与正文之间插一段 accent 色的元素名，调用点拿
 /// `LogRowOut::element` 的点击回指该元素（M1-6 的命令行定位）。
-pub fn log_row_ui<R>(
+#[allow(dead_code)]
+fn log_row_ui_single_line<R>(
     ui: &mut Ui,
     t: &Tokens,
     d: Density,
@@ -926,6 +1022,7 @@ pub fn log_row_ui<R>(
 
 /// 在指定矩形里左对齐地放一段可选中文本。`truncate` 为真时按矩形宽度截断并加省略号
 /// ——整段被选中时 egui 复制的是未截断原文，所以截断不影响抄走完整内容。
+#[allow(dead_code)]
 fn selectable_at(ui: &mut Ui, rect: Rect, text: egui::RichText, truncate: bool) -> Response {
     ui.scope_builder(
         egui::UiBuilder::new()

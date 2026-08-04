@@ -354,7 +354,8 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
                         ctx.request_repaint();
                     }
                     Req::RoomCodePublish { base, request } => {
-                        let result = crate::data_publish_api::submit_room_codes(&base, &request).await;
+                        let result =
+                            crate::data_publish_api::submit_room_codes(&base, &request).await;
                         let _ = evt_tx.send(Evt::RoomCodePublish(result));
                         ctx.request_repaint();
                     }

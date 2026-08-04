@@ -1532,14 +1532,12 @@ impl App {
                 }
                 self.logs.info(&mut self.vm.logs, message);
             }
-            Err(error) => {
-                self.logs.error(
-                    &mut self.vm.logs,
-                    format!("{label}提交失败：{}", logs::error_chain(&error)),
-                    &error,
-                    None,
-                )
-            }
+            Err(error) => self.logs.error(
+                &mut self.vm.logs,
+                format!("{label}提交失败：{}", logs::error_chain(&error)),
+                &error,
+                None,
+            ),
         }
         ctx.request_repaint();
     }

@@ -129,8 +129,8 @@ fn list(
     ScrollArea::vertical()
         .auto_shrink([false, false])
         .stick_to_bottom(true)
-        .show_rows(ui, d.px(24.0), lines.len(), |ui, range| {
-            for line in &lines[range] {
+        .show(ui, |ui| {
+            for line in lines {
                 row(ui, t, d, line, cmds);
             }
         });
