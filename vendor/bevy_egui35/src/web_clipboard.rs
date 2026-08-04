@@ -1,14 +1,53 @@
 use crate::{
+    EguiClipboard, EguiContext, EguiContextSettings, EventClosure, SubscribedEvents,
     input::{EguiInputEvent, FocusedNonWindowEguiContext},
-    string_from_js_value, EguiClipboard, EguiContext, EguiContextSettings, EventClosure,
-    SubscribedEvents,
+    string_from_js_value,
 };
 use bevy_ecs::prelude::*;
 use bevy_log as log;
 use bevy_platform::collections::HashSet;
 use crossbeam_channel::{Receiver, Sender};
 use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::spawn_local;
+
+// `navigator.clipboard` is only exposed in secure contexts. The web client is
+// commonly served from an intranet HTTP address, so retain the legacy DOM copy
+// path for those deployments. Keeping this in JavaScript also avoids expanding
+// the `web-sys` feature set just for `HtmlTextAreaElement` and `Document::exec_command`.
+#[wasm_bindgen(inline_js = r#"
+export function writeTextToClipboard(text) {
+    const fallbackCopy = () => {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.setAttribute('readonly', '');
+        textarea.style.cssText =
+            'position:fixed;left:-9999px;top:0;opacity:0;pointer-events:none';
+        document.body.appendChild(textarea);
+        textarea.select();
+        textarea.setSelectionRange(0, textarea.value.length);
+
+        try {
+            return document.execCommand('copy');
+        } finally {
+            textarea.remove();
+        }
+    };
+
+    if (window.isSecureContext && navigator.clipboard?.writeText) {
+        navigator.clipboard.writeText(text).catch((error) => {
+            console.warn('Clipboard API write failed; trying the legacy copy path:', error);
+            if (!fallbackCopy()) {
+                console.warn('Legacy clipboard copy failed');
+            }
+        });
+    } else if (!fallbackCopy()) {
+        console.warn('Clipboard is unavailable and the legacy copy path failed');
+    }
+}
+"#)]
+extern "C" {
+    #[wasm_bindgen(js_name = writeTextToClipboard)]
+    fn write_text_to_clipboard(text: &str);
+}
 
 /// Startup system to initialize web clipboard events.
 pub fn startup_setup_web_events_system(
@@ -343,22 +382,7 @@ fn setup_clipboard_paste(subscribed_events: &mut SubscribedEvents, tx: Sender<We
 }
 
 fn set_clipboard_text(contents: String) {
-    spawn_local(async move {
-        let Some(window) = web_sys::window() else {
-            log::warn!("Failed to access the window object");
-            return;
-        };
-
-        let clipboard = window.navigator().clipboard();
-
-        let promise = clipboard.write_text(&contents);
-        if let Err(err) = wasm_bindgen_futures::JsFuture::from(promise).await {
-            log::warn!(
-                "Failed to write to clipboard: {}",
-                string_from_js_value(&err)
-            );
-        }
-    });
+    write_text_to_clipboard(&contents);
 }
 
 fn set_clipboard_image(image: &egui::ColorImage) {
