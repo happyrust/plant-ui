@@ -753,6 +753,17 @@ fn finished_after(finished_at: Option<&str>, observed_at: DateTime<Utc>) -> bool
 ///
 /// `None` = 链里没有落脚点，目标是树外元素。目标自己就是 SITE 根时返回空路径：
 /// 它那一行本来就在，不用展开谁。
+/// 展开定位路径时，这一节要不要（重新）打一次子层查询。
+///
+/// 平时「缓存里有」就够了。但**目标的直接父那一节是个例外**：祖先链是刚从库里
+/// 查回来的，它说的是目标**此刻**挂在谁下面，而那个父的子层缓存可能比目标还老。
+/// 增量更新之后从更新面板或日志跳过去正是这个形状——元素是刚建的，父分支却在
+/// 更新之前就展开过。缓存命中就跳过的话那一行永远出不来，而收尾那句还会把
+/// 「缓存旧了」讲成「它已不在这条路径下」（gen-model issue #9）。
+fn needs_children_query(is_freshly_resolved_parent: bool, cached: bool) -> bool {
+    is_freshly_resolved_parent || !cached
+}
+
 fn in_mdb_path(chain: &[RefU64], is_root: impl Fn(RefU64) -> bool) -> Option<Vec<RefU64>> {
     let anchor = chain.iter().position(|ancestor| is_root(*ancestor))?;
     Some(chain[1..=anchor].to_vec())
@@ -1766,7 +1777,9 @@ impl App {
                     }
                     self.logs.info(
                         &mut self.vm.logs,
-                        format!("已提交复活 db{dbnum} 的 {root_refno}：重试次数清零，等调度器下一轮取它"),
+                        format!(
+                            "已提交复活 db{dbnum} 的 {root_refno}：重试次数清零，等调度器下一轮取它"
+                        ),
                     );
                     let _ = self.bridge.req.send(data::Req::RetryPendingUnit {
                         base: self.model_api_url.clone(),
@@ -1993,7 +2006,9 @@ impl App {
     fn locate(&mut self, refno: RefU64, from_command: bool) -> Locate {
         self.select(refno);
         if let Some(chain) = self.tree.ancestors(refno) {
-            self.expand_path(&chain);
+            // 链来自本端缓存：目标既然在 `tree.parent` 里，它那一行本来就在树上，
+            // 没有「父分支比目标还老」这回事，不必重查。
+            self.expand_path(&chain, false);
             self.pending_locate = Some(PendingLocate {
                 target: refno,
                 path: chain,
@@ -2020,10 +2035,16 @@ impl App {
     ///
     /// 只补直接子层，不预载整棵树：为一次定位把模型树整个拉下来，代价是几万行
     /// 无人看的节点。
-    fn expand_path(&mut self, path: &[RefU64]) {
-        for &ancestor in path {
+    ///
+    /// `from_chain` = 这条路径是刚从库里查回来的祖先链。那时候**直接父那一节
+    /// 即使已有缓存也要重查**，理由见 [`needs_children_query`]。
+    fn expand_path(&mut self, path: &[RefU64], from_chain: bool) {
+        for (i, &ancestor) in path.iter().enumerate() {
             self.tree.expanded.insert(ancestor);
-            if !self.tree.children.contains_key(&ancestor) && self.tree.loading.insert(ancestor) {
+            let cached = self.tree.children.contains_key(&ancestor);
+            if needs_children_query(from_chain && i == 0, cached)
+                && self.tree.loading.insert(ancestor)
+            {
                 let _ = self.bridge.req.send(data::Req::Children(ancestor));
             }
         }
@@ -2055,7 +2076,7 @@ impl App {
         for pair in chain[..=path.len()].windows(2) {
             self.tree.parent.insert(pair[0], pair[1]);
         }
-        self.expand_path(&path);
+        self.expand_path(&path, true);
         if let Some(pending) = &mut self.pending_locate {
             pending.path = path;
         }
@@ -2538,8 +2559,9 @@ mod tests {
         EleTreeNode, ModelVisibility, ModelVisibilityPlan, RefU64, RowVisibility, TreeModel,
         TreeRowVm, Window, background_models_settled, begin_get_work, cache_model_scope,
         claim_unloaded_model_refnos, finished_after, in_mdb_path, mark_model_scope_unavailable,
-        model_progress_terminal, model_reload_due, model_visibility_plan, restore_model_reload,
-        settle_pending_directions, settled_pending_roots, sync_ime_window, task_matches_project,
+        model_progress_terminal, model_reload_due, model_visibility_plan, needs_children_query,
+        restore_model_reload, settle_pending_directions, settled_pending_roots, sync_ime_window,
+        task_matches_project,
     };
     use chrono::{TimeZone, Utc};
     use plant_ui::model_update::PendingModelUnit;
@@ -3029,6 +3051,32 @@ mod tests {
         assert_eq!(eyes.eye(PANE_B), RowVisibility::Shown);
         // 从没显示过的容器不在「全部」里：三维里压根没有它的实体。
         assert_eq!(eyes.eye(SITE), RowVisibility::Unloaded);
+    }
+
+    /// 刚查回来的祖先链上，目标的直接父必须重查子层——哪怕缓存里已经有。
+    ///
+    /// gen-model issue #9：在 E3D 里复制一个 PIPE 粘到另一个 ZONE，增量更新把数据
+    /// 应用了（实测库里 `pe_owner` 边、`owner` 标量都在，树的原始查询也返回得出
+    /// 那一行），但界面上跳过去之后树上没有节点。原因就在这一格：那个 ZONE 在更新
+    /// 之前展开过、子层进了缓存，而祖先链是现查的——缓存命中就跳过重查的话，新元素
+    /// 永远进不了那份列表，收尾还会把「缓存旧了」讲成「它已不在这条路径下」。
+    ///
+    /// 只重查直接父那一节：再往上的祖先结构没变，为一次定位把整条链都重查是白花钱。
+    #[test]
+    fn a_freshly_resolved_parent_is_requeried_even_when_its_children_are_cached() {
+        assert!(
+            needs_children_query(true, true),
+            "祖先链现查回来的直接父，缓存再新也可能比目标还老"
+        );
+        assert!(needs_children_query(true, false));
+        assert!(
+            needs_children_query(false, false),
+            "没缓存的那几节照旧要补查"
+        );
+        assert!(
+            !needs_children_query(false, true),
+            "路径上其余各节有缓存就够，不该为一次定位重查整条链"
+        );
     }
 
     #[test]

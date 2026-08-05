@@ -1957,10 +1957,7 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
                         t,
                         d,
                         Dot::Glyph(ph::ARROWS_CLOCKWISE, t.accent),
-                        &format!(
-                            "{} 个位姿目标只做变换刷新",
-                            totals.transform_targets
-                        ),
+                        &format!("{} 个位姿目标只做变换刷新", totals.transform_targets),
                         "",
                         "不重建网格；容器目标连带整棵子树",
                         t.text_muted,
@@ -3010,7 +3007,11 @@ mod tests {
         // 一行都没排也要说得清是为什么——不然人只会以为按钮没反应。
         let idle: Enqueued =
             serde_json::from_str(r#"{"scanned":3,"up_to_date":3}"#).expect("空回执也要解得出来");
-        assert!(idle.summary().contains("3 个已是最新"), "{}", idle.summary());
+        assert!(
+            idle.summary().contains("3 个已是最新"),
+            "{}",
+            idle.summary()
+        );
     }
 
     /// 回执里的五个去向要与 `scanned` 算得平。

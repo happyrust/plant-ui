@@ -152,7 +152,10 @@ pub enum Cmd {
     /// 它不排新的数据批次：服务端只把这一行的 `attempts` 清零、`revision` 加一，
     /// 再叫醒调度器，下一轮空闲积压消化会把它重新取到。所以按完之后队列面板上
     /// 不会立刻多出一行，变化要等下一拍轮询。
-    RetryPendingUnit { dbnum: u32, root_refno: String },
+    RetryPendingUnit {
+        dbnum: u32,
+        root_refno: String,
+    },
     /// 重开队列视图的明细长连接。断线降级的是明细区，队列行走轮询不受影响。
     ReconnectQueueFeed,
     /// 点击三维视口；坐标是离屏渲染纹理的归一化 UV。

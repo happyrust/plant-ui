@@ -890,7 +890,10 @@ pub fn not_running(vm: &Vm) -> Vec<&DbnumStatus> {
 /// 一个 84px 的框里滚着两百多行而标题只说「本期不执行」，等于没说（施工单 Q3）。
 pub fn not_running_tally(rows: &[&DbnumStatus]) -> String {
     let blocked = rows.iter().filter(|db| db.blocked).count();
-    let unreachable = rows.iter().filter(|db| !db.blocked && db.not_in_project).count();
+    let unreachable = rows
+        .iter()
+        .filter(|db| !db.blocked && db.not_in_project)
+        .count();
     let excluded = rows.len() - blocked - unreachable;
     let mut parts = Vec::new();
     if blocked > 0 {
