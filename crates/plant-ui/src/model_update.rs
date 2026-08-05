@@ -170,6 +170,13 @@ pub struct PendingModelUnit {
     pub attempts: u32,
     #[serde(default)]
     pub last_error: Option<String>,
+    /// 已达服务端的重试上限：自动路径**永不再碰**它，只有人按一下才会动。
+    ///
+    /// 判定必须由服务端给——上限是它那边的常量，本端拿着 `attempts` 判不出来。
+    /// 缺省 false 是有意的：老服务端不带这个字段，那时候少标一行「已放弃」，
+    /// 比凭空标一行安全。
+    #[serde(default)]
+    pub dead: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -425,10 +432,25 @@ impl Preview {
         t
     }
 
+    /// 本次运行会一并处理的待重试单元。**死信不在其中**——执行侧按服务端的
+    /// 重试上限封顶，到顶的行只出现在检查视图里，一次都不会跑。
+    pub fn retries_to_run(&self) -> impl Iterator<Item = &PendingModelUnit> {
+        self.pending_model_retries.iter().filter(|u| !u.dead)
+    }
+
+    /// 已放弃的那些。它们同样在列表里，但要分开数、分开说：混进「将合并」等于
+    /// 承诺一件本次不会发生的事。
+    pub fn dead_retries(&self) -> impl Iterator<Item = &PendingModelUnit> {
+        self.pending_model_retries.iter().filter(|u| u.dead)
+    }
+
     /// 有没有值得按下「开始更新」的东西。待重试单元自己就够成一次运行——
     /// 契约明写没有新 sesno 也要显示并允许重试。
+    ///
+    /// 但只有**还会跑的**那些算数：一个项目攒下几个死信之后，这里若照旧算进去，
+    /// 「开始更新」会永远亮着，按下去扫一圈什么也不做，而死信一个都没动。
     pub fn executable(&self) -> bool {
-        self.dbnums.iter().any(DbPreview::will_run) || !self.pending_model_retries.is_empty()
+        self.dbnums.iter().any(DbPreview::will_run) || self.retries_to_run().next().is_some()
     }
 }
 
@@ -1773,22 +1795,47 @@ fn hints_block(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, totals: &
         ui.add_space(d.px(10.0));
     }
 
-    if !preview.pending_model_retries.is_empty() {
-        any = true;
-        let list = preview
-            .pending_model_retries
-            .iter()
+    fn listed<'a>(units: impl Iterator<Item = &'a PendingModelUnit>) -> String {
+        units
             .map(|u| format!("{} {}（已尝试 {} 次）", u.noun, u.root_refno, u.attempts))
             .collect::<Vec<_>>()
-            .join("；");
+            .join("；")
+    }
+
+    let to_run = preview.retries_to_run().count();
+    if to_run > 0 {
+        any = true;
         note_card(
             ui,
             t,
             d,
             Status::Info,
             ph::ARROW_COUNTER_CLOCKWISE,
-            &format!("{} 个待重试单元将合并", preview.pending_model_retries.len()),
-            &format!("{list}。上次生成失败，本次按最新状态只生成一次。"),
+            &format!("{to_run} 个待重试单元将合并"),
+            &format!(
+                "{}。上次生成失败，本次按最新状态只生成一次。",
+                listed(preview.retries_to_run())
+            ),
+        );
+        ui.add_space(d.px(10.0));
+    }
+
+    // 死信不许混进上面那张卡：说「将合并」就是承诺一件本次不会发生的事。
+    // 它们的出路只有队列面板行内那枚「立刻重试」。
+    let dead = preview.dead_retries().count();
+    if dead > 0 {
+        any = true;
+        note_card(
+            ui,
+            t,
+            d,
+            Status::Error,
+            ph::X_CIRCLE,
+            &format!("{dead} 个单元已放弃重试，本次不会碰"),
+            &format!(
+                "{}。已达重试上限，自动路径不再取它们；模型停在旧几何，要在任务队列里逐个复活。",
+                listed(preview.dead_retries())
+            ),
         );
         ui.add_space(d.px(10.0));
     }
@@ -1890,10 +1937,12 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
             },
         );
 
+        let dead = preview.dead_retries().count();
         let not_running = totals.blocked
             + totals.excluded
             + totals.not_in_project
-            + usize::from(totals.no_generation > 0);
+            + usize::from(totals.no_generation > 0)
+            + usize::from(dead > 0);
         card_titled(
             ui,
             t,
@@ -1959,6 +2008,19 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
                         t.warn,
                     );
                 }
+                // 死信摆在这张卡而不是上面那张：它们确实在列表里，但这一次一个都不跑。
+                if dead > 0 {
+                    line(
+                        ui,
+                        t,
+                        d,
+                        Dot::Glyph(ph::X_CIRCLE, t.danger),
+                        &format!("{dead} 个单元已放弃重试"),
+                        "",
+                        "已达重试上限 · 要在任务队列里逐个复活",
+                        t.danger,
+                    );
+                }
                 if not_running == 0 {
                     ui.label(
                         RichText::new("没有阻断，也没有被排除的库。")
@@ -1969,7 +2031,8 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
             },
         );
 
-        if !preview.pending_model_retries.is_empty() {
+        let to_run = preview.retries_to_run().count();
+        if to_run > 0 {
             card_titled(
                 ui,
                 t,
@@ -1977,9 +2040,9 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
                 ph::ARROW_COUNTER_CLOCKWISE,
                 t.accent,
                 "会一并处理",
-                &format!("{} 个待重试单元", preview.pending_model_retries.len()),
+                &format!("{to_run} 个待重试单元"),
                 |ui| {
-                    for unit in &preview.pending_model_retries {
+                    for unit in preview.retries_to_run() {
                         line(
                             ui,
                             t,
@@ -2701,6 +2764,63 @@ mod tests {
         assert_eq!(totals.excluded, 1);
         assert_eq!(totals.batches, 0);
         assert!(!preview.executable());
+    }
+
+    /// 死信不算「将合并」，也撑不起一次运行。
+    ///
+    /// 执行侧按服务端的重试上限封顶，到顶的行一次都不会跑；照旧算进去的话，
+    /// 「开始更新」在一个只剩死信的项目上会永远亮着，按下去扫一圈什么也没动，
+    /// 而那几个根的模型一直停在旧几何。
+    #[test]
+    fn dead_letters_are_neither_merged_nor_enough_to_start_a_run() {
+        let alive = PendingModelUnit {
+            root_refno: "24381/1".into(),
+            attempts: 2,
+            ..Default::default()
+        };
+        let dead = PendingModelUnit {
+            root_refno: "24381/2".into(),
+            attempts: 5,
+            dead: true,
+            ..Default::default()
+        };
+
+        let both = Preview {
+            pending_model_retries: vec![alive, dead.clone()],
+            ..Default::default()
+        };
+        assert_eq!(both.retries_to_run().count(), 1);
+        assert_eq!(both.dead_retries().count(), 1);
+        assert!(both.executable(), "还有活着的待重试单元就该能跑");
+
+        let only_dead = Preview {
+            pending_model_retries: vec![dead],
+            ..Default::default()
+        };
+        assert_eq!(only_dead.retries_to_run().count(), 0);
+        assert!(
+            !only_dead.executable(),
+            "只剩死信时按钮不该亮：这一次它一个都不会碰"
+        );
+    }
+
+    /// 契约里那面 `dead` 旗必须真解得出来。
+    ///
+    /// 它带 `serde(default)`（老服务端不给这个字段），所以服务端一旦改名，
+    /// 客户端不会报错、只会静默把每一行都当成「还在自动重试」——正是这次要修的
+    /// 那句假话。这里断的是「真解出来了」，不是「解得动」。
+    #[test]
+    fn the_dead_letter_flag_survives_deserialization() {
+        let units: Vec<PendingModelUnit> = serde_json::from_str(
+            r#"[{"dbnum":7997,"root_refno":"24381/2","noun":"BRAN",
+                 "source_end_sesno":42,"attempts":5,"last_error":"boom","dead":true},
+                {"dbnum":7997,"root_refno":"24381/3","noun":"EQUI",
+                 "source_end_sesno":42,"attempts":1}]"#,
+        )
+        .expect("契约要解得出来");
+        assert!(units[0].dead);
+        assert_eq!(units[0].last_error.as_deref(), Some("boom"));
+        assert!(!units[1].dead, "老 payload 缺字段时缺省不许标成已放弃");
     }
 
     /// 「排除」与「阻断」来自契约的不同位置，汇总里也得分开数。

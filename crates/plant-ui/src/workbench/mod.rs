@@ -79,6 +79,12 @@ impl WorkbenchState {
             let _ = self.dock.set_active_tab(path);
         }
     }
+
+    /// 复活死信的请求没发出去。成功那一半队列面板自己按快照收口，只有失败要宿主
+    /// 说一声——否则那枚按钮会一直灰着等一个永远不会来的变化。
+    pub fn queue_retry_failed(&mut self, root_refno: &str) {
+        self.queue.retry_failed(root_refno);
+    }
 }
 
 /// 画一帧主工作台。用嵌套面板而不是手算高度：dock 会把分配给它的空间吃满，

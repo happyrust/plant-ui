@@ -53,6 +53,14 @@ pub enum Req {
     QueuePoll { base: String },
     /// 暂停 / 恢复出队。
     QueueSetPaused { base: String, paused: bool },
+    /// 复活一行死信。它不排新的数据批次，结果一律等下一拍轮询。
+    RetryPendingUnit {
+        base: String,
+        project: String,
+        mdb: String,
+        namespace: String,
+        root_refno: String,
+    },
     DataPublish {
         base: String,
         request: PublishRequest,
@@ -109,6 +117,8 @@ pub enum Evt {
     QueuePoll(anyhow::Result<QueuePoll>),
     /// 暂停 / 恢复的回执。真值仍以下一次轮询的快照为准，这里只负责把失败说出来。
     QueueSetPaused(bool, anyhow::Result<()>),
+    /// 复活死信的回执，带上是哪一个根。真值同样等下一拍快照。
+    RetryPendingUnit(String, anyhow::Result<()>),
     DataPublish(PublishRequest, anyhow::Result<String>),
     /// 队列视图的逐单元明细，带发生在哪个任务上。
     ///
@@ -337,6 +347,24 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
                     Req::QueueSetPaused { base, paused } => {
                         let result = crate::model_update_api::set_queue_paused(&base, paused).await;
                         let _ = evt_tx.send(Evt::QueueSetPaused(paused, result));
+                        ctx.request_repaint();
+                    }
+                    Req::RetryPendingUnit {
+                        base,
+                        project,
+                        mdb,
+                        namespace,
+                        root_refno,
+                    } => {
+                        let result = crate::model_update_api::retry_pending_unit(
+                            &base,
+                            &project,
+                            &mdb,
+                            &namespace,
+                            &root_refno,
+                        )
+                        .await;
+                        let _ = evt_tx.send(Evt::RetryPendingUnit(root_refno, result));
                         ctx.request_repaint();
                     }
                     Req::DataPublish { base, request } => {

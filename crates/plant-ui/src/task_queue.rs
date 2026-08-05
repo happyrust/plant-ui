@@ -766,6 +766,15 @@ pub fn filtered_out(vm: &Vm) -> usize {
     active + history
 }
 
+/// 已达重试上限、自动路径永不再碰的交付单元数。
+///
+/// 它与「欠着」是两回事，摆在一起会把「等着自愈」和「不会自愈」讲成一件事。
+/// 房间轮早就有同名的分项计数（`RoomCounts.dead_letters`），regen_root 这一侧
+/// 一直没有——于是一个根永久停在旧几何这件事，界面上一个数都指不出来。
+pub fn dead_letters(vm: &Vm) -> usize {
+    vm.pending.iter().filter(|unit| unit.dead).count()
+}
+
 /// 状态栏那一格要的几个数。与面板共用同一份行推导——同一组数字两处各数各的，
 /// 迟早会对不上。
 pub fn status(vm: &Vm) -> crate::vm::QueueStatusVm {
@@ -775,6 +784,7 @@ pub fn status(vm: &Vm) -> crate::vm::QueueStatusVm {
         paused: vm.paused(),
         filtered_out: filtered_out(vm),
         malformed: malformed(vm),
+        dead_letters: dead_letters(vm),
         known: vm.loaded,
     }
 }
@@ -897,6 +907,20 @@ pub struct State {
     pub search: String,
     /// 显式点过的展开箭头。默认展开与否按行的形态定，这里只记「与默认相反」的那些。
     toggled: std::collections::HashSet<String>,
+    /// 已经按下复活、还没在快照里看到结果的死信（按 `root_refno` 记）。
+    ///
+    /// 复活是一次写请求，回执 202 只表示「行改好了」，不表示生成跑完了——真值要等
+    /// 下一拍轮询。中间这一拍按钮必须置灰：不灰的话人会连按，每按一次都是一次
+    /// `revision + 1`，而界面上一点变化都没有。
+    in_flight: std::collections::HashSet<String>,
+}
+
+impl State {
+    /// 复活请求压根没发出去。成功那一半由快照自己收口（见 [`show`]），只有失败
+    /// 需要宿主说一声——不然那枚按钮会一直灰着等一个永远不会来的变化。
+    pub fn retry_failed(&mut self, root_refno: &str) {
+        self.in_flight.remove(root_refno);
+    }
 }
 
 impl State {
@@ -923,6 +947,12 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, state: &mut State, cmd
         if !vm.loaded {
             return not_connected(ui, t, d, vm);
         }
+
+        // 复活成功的行自己会从死信里消失（`attempts` 清零 → `dead` 变 false），
+        // 所以「已提交」这个短暂态按快照收口就够，不必让宿主再通知一次。
+        state
+            .in_flight
+            .retain(|root| vm.pending.iter().any(|u| &u.root_refno == root && u.dead));
 
         service_status_banners(ui, t, d, vm);
         if vm.paused() {
@@ -971,10 +1001,11 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, state: &mut State, cmd
                     if open {
                         // 明细里的控件也按 task_id 定号，理由同 `row_id`：那枚「重试」
                         // 按错行不是显示问题，服务端会真的去重跑一遍生成。
+                        let in_flight = &mut state.in_flight;
                         ui.scope_builder(
                             egui::UiBuilder::new()
                                 .id(egui::Id::new(("task-queue-detail", row.task_id.as_str()))),
-                            |ui| row_detail(ui, t, d, vm, row),
+                            |ui| row_detail(ui, t, d, vm, row, in_flight, cmds),
                         );
                     }
                 }
@@ -1189,6 +1220,12 @@ fn summary_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, all: &[RowVm], cmds
     if let Some(rooms) = vm.rooms_pending() {
         ui.add_space(d.px(8.0));
         count_dot(&mut ui, t, d, t.warn, &format!("房间待收敛 {rooms}"));
+    }
+    // 死信不与「排队」并列：那一格是「等着轮到」，这一格是「不会再轮到了」。
+    let dead = dead_letters(vm);
+    if dead > 0 {
+        ui.add_space(d.px(8.0));
+        count_dot(&mut ui, t, d, t.danger, &format!("已放弃 {dead}"));
     }
 
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1754,7 +1791,15 @@ fn queue_row(
 }
 
 /// 行内明细：逐单元事件、并入会话、欠着的单元、断线时缺了多少条。
-fn row_detail(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, row: &RowVm) {
+fn row_detail(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    vm: &Vm,
+    row: &RowVm,
+    in_flight: &mut std::collections::HashSet<String>,
+    cmds: &mut Vec<Cmd>,
+) {
     let indent = d.px(28.0);
     egui::Frame::new()
         .inner_margin(Margin {
@@ -1839,7 +1884,7 @@ fn row_detail(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, row: &RowVm) {
             let owed: Vec<&PendingModelUnit> =
                 vm.pending.iter().filter(|u| u.dbnum == row.dbnum).collect();
             for unit in &owed {
-                pending_line(ui, t, d, unit);
+                pending_line(ui, t, d, vm, unit, in_flight, cmds);
             }
 
             if detail.is_none_or(|x| x.units.is_empty()) && owed.is_empty() {
@@ -1885,36 +1930,83 @@ fn detail_line(ui: &mut Ui, t: &Tokens, d: Density, line: DetailLine<'_>) {
     }
 }
 
-/// 欠着的交付单元由后台 worker 自动重试；界面只展示状态，不另起生成链。
-fn pending_line(ui: &mut Ui, t: &Tokens, d: Density, unit: &PendingModelUnit) {
+/// 欠着的交付单元。**两种形态必须分开说**：还在自动重试的那些等着就行，已经
+/// 到重试上限的那些自动路径永不再碰——对它们说「后台自动重试」是字面错误，
+/// 模型会一直停在旧几何而没人知道。
+///
+/// 死信那一行是本视图唯一的出路，所以按钮就摆在这里；它走的是复活端点，不排新批次。
+fn pending_line(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    vm: &Vm,
+    unit: &PendingModelUnit,
+    in_flight: &mut std::collections::HashSet<String>,
+    cmds: &mut Vec<Cmd>,
+) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), d.px(30.0)), Sense::hover());
-    let mut ui = child(ui, rect, Align::Center);
-    ui.spacing_mut().item_spacing.x = d.px(8.0);
-    let (mark, _) = ui.allocate_exact_size(vec2(d.px(13.0), d.px(13.0)), Sense::hover());
-    glyph(
-        &ui,
-        mark.center(),
-        ph::ARROW_COUNTER_CLOCKWISE,
-        d.px(12.0),
-        t.warn,
-    );
-    ui.label(
+    let tone = if unit.dead { t.danger } else { t.warn };
+    let mut line = child(ui, rect, Align::Center);
+    line.spacing_mut().item_spacing.x = d.px(8.0);
+    let (mark, _) = line.allocate_exact_size(vec2(d.px(13.0), d.px(13.0)), Sense::hover());
+    let icon = if unit.dead {
+        ph::X_CIRCLE
+    } else {
+        ph::ARROW_COUNTER_CLOCKWISE
+    };
+    glyph(&line, mark.center(), icon, d.px(12.0), tone);
+    line.label(
         RichText::new(format!("{} {}", unit.noun, unit.root_refno))
             .font(Font::mono_meta(d))
             .color(t.text_secondary),
     );
-    ui.label(
-        RichText::new(format!("欠着 · 已尝试 {} 次", unit.attempts))
-            .font(Font::micro(d))
-            .color(t.warn),
-    );
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        ui.label(
-            RichText::new("后台自动重试")
-                .font(Font::micro(d))
-                .color(t.text_muted),
-        );
+    let state = if unit.dead {
+        format!("已放弃 · 尝试 {} 次后自动路径不再碰它", unit.attempts)
+    } else {
+        format!("欠着 · 已尝试 {} 次", unit.attempts)
+    };
+    line.label(RichText::new(state).font(Font::micro(d)).color(tone));
+
+    let submitted = in_flight.contains(&unit.root_refno);
+    line.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        if !unit.dead {
+            ui.label(
+                RichText::new("后台自动重试")
+                    .font(Font::micro(d))
+                    .color(t.text_muted),
+            );
+            return;
+        }
+        if submitted {
+            ui.label(
+                RichText::new("已提交 · 等下一拍")
+                    .font(Font::micro(d))
+                    .color(t.text_muted),
+            );
+            return;
+        }
+        if ui
+            .add_enabled(
+                vm.can_mutate(),
+                widgets::button(t, d, "立刻重试").icon(ph::ARROW_COUNTER_CLOCKWISE),
+            )
+            .on_hover_text("清零重试次数并叫醒调度器；不排新的数据批次，结果等下一拍轮询")
+            .on_disabled_hover_text("当前数据源身份未就绪，或与模型服务固定范围不一致")
+            .clicked()
+        {
+            in_flight.insert(unit.root_refno.clone());
+            cmds.push(Cmd::RetryPendingUnit {
+                dbnum: unit.dbnum,
+                root_refno: unit.root_refno.clone(),
+            });
+        }
     });
+
+    // 「为什么失败」只在这里说得出口：WS 明细活在进程内存里，重连即失；
+    // 持久表这一份跨重启仍在，不画就等于没有。
+    if let Some(error) = unit.last_error.as_deref() {
+        sub_line(ui, t, d, error, unit.dead);
+    }
 }
 
 fn sub_line(ui: &mut Ui, t: &Tokens, d: Density, text: &str, danger: bool) {
@@ -2269,6 +2361,35 @@ mod tests {
         let all = rows(&model);
         let order = visible(&all, Filter::All, "");
         assert_eq!(all[order[0]].dbnum, 9);
+    }
+
+    /// 死信自己一格，不并进「还有活没干完」。
+    ///
+    /// `active` 数的是「还会被干掉的活」，而死信恰恰是「不会再有人干它了」。混起来
+    /// 的后果是队列跑空、状态栏显示「队列 0」，而几个根永远停在旧几何——最容易
+    /// 以为都干完了的那一刻，恰恰是最需要这个数在的时候。
+    #[test]
+    fn dead_letters_are_counted_apart_from_the_work_that_still_moves() {
+        let mut model = vm(Vec::new(), Vec::new());
+        model.loaded = true;
+        model.pending.push(PendingModelUnit {
+            dbnum: 7997,
+            root_refno: "24381/1".into(),
+            attempts: 2,
+            ..Default::default()
+        });
+        model.pending.push(PendingModelUnit {
+            dbnum: 7997,
+            root_refno: "24381/2".into(),
+            attempts: 5,
+            dead: true,
+            ..Default::default()
+        });
+
+        assert_eq!(dead_letters(&model), 1);
+        let bar = status(&model);
+        assert_eq!(bar.dead_letters, 1);
+        assert_eq!(bar.active, 0, "死信不是「还有活没干完」");
     }
 
     /// 只画当前项目，且**过滤要出声**：别的项目那几条不显示，但计数说得出来。

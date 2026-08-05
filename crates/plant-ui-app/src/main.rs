@@ -1474,6 +1474,20 @@ impl App {
                         self.logs.error(&mut self.vm.logs, what, &error, None);
                     }
                 },
+                data::Evt::RetryPendingUnit(root_refno, result) => match result {
+                    Ok(()) => self.poll_queue_now(),
+                    Err(error) => {
+                        // 失败了就把在途标记撤掉，否则那枚按钮会一直灰着——
+                        // 下一拍快照清 `in_flight` 的前提是「提交成功了」。
+                        self.state.queue_retry_failed(&root_refno);
+                        self.logs.error(
+                            &mut self.vm.logs,
+                            format!("复活 {root_refno} 失败"),
+                            &error,
+                            None,
+                        );
+                    }
+                },
                 data::Evt::DataPublish(request, result) => match result {
                     Ok(response) => self.logs.info(
                         &mut self.vm.logs,
@@ -1737,6 +1751,25 @@ impl App {
                     let _ = self.bridge.req.send(data::Req::QueueSetPaused {
                         base: self.model_api_url.clone(),
                         paused,
+                    });
+                }
+                // 死信只有人按这一下才会再动一次。它不入队，所以按完不会立刻多出
+                // 一行——变化要等下一拍轮询，界面上那句「已提交 · 等下一拍」说的
+                // 就是这件事。
+                Cmd::RetryPendingUnit { dbnum, root_refno } => {
+                    if !self.model_service_writable() {
+                        continue;
+                    }
+                    self.logs.info(
+                        &mut self.vm.logs,
+                        format!("已提交复活 db{dbnum} 的 {root_refno}：重试次数清零，等调度器下一轮取它"),
+                    );
+                    let _ = self.bridge.req.send(data::Req::RetryPendingUnit {
+                        base: self.model_api_url.clone(),
+                        project: self.vm.project.clone(),
+                        mdb: self.mdb.clone(),
+                        namespace: self.namespace.clone(),
+                        root_refno,
                     });
                 }
                 Cmd::ReconnectQueueFeed => self.reopen_queue_feed(ctx),

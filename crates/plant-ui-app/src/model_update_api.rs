@@ -133,6 +133,34 @@ pub async fn set_queue_paused(base: &str, paused: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 复活一行死信。自动路径到了重试上限就永不再碰它，这是唯一的出路。
+///
+/// 服务端只改那一行（`attempts` 清零、`revision` 加一、清 `last_error`）再叫醒
+/// 调度器，**不排新的数据批次**——所以回执里没有 task_id 可跟，结果一律等下一拍
+/// 轮询。行不存在回 404，那多半是它刚被别人复活并跑掉了。
+pub async fn retry_pending_unit(
+    base: &str,
+    project: &str,
+    mdb: &str,
+    namespace: &str,
+    root_refno: &str,
+) -> anyhow::Result<()> {
+    let body = serde_json::json!({
+        "target_refno": root_refno,
+        "project": project,
+        "mdb": mdb,
+        "namespace": namespace,
+    });
+    let _: serde_json::Value = post(
+        base,
+        "/api/v1/update/pending-units/retry",
+        body.to_string(),
+        Duration::from_secs(15),
+    )
+    .await?;
+    Ok(())
+}
+
 async fn get<T: DeserializeOwned>(base: &str, path: &str) -> anyhow::Result<T> {
     let mut req = ehttp::Request::get(format!("{base}{path}"));
     req.timeout = Some(Duration::from_secs(15));

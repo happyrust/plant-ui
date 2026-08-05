@@ -346,6 +346,15 @@ fn queue_count(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
                 .color(t.warn),
         );
     }
+    // 死信不进「队列 N」：那一格数的是还会被干掉的活，而这些非人工不动。
+    // 队列空成 0 的时候它更要在——那正是最容易以为「都干完了」的一刻。
+    if queue.dead_letters > 0 {
+        ui.label(
+            RichText::new(format!("{} 个单元已放弃重试", queue.dead_letters))
+                .font(Font::micro(d))
+                .color(t.danger),
+        );
+    }
 }
 
 // ---------------------------------------------------------------- 小零件

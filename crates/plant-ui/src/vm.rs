@@ -101,6 +101,9 @@ pub struct QueueStatusVm {
     /// 本项目的历史行里缺 dbnum、连行都拼不出来的条数。契约破损不许无声——
     /// 它与跨项目过滤是两回事，分开报。
     pub malformed: usize,
+    /// 已达重试上限、自动路径永不再碰的交付单元数。**不并进 `active`**：
+    /// 那一格是「还有活在干」，而死信恰恰是「不会再有人干它了」，非人工不动。
+    pub dead_letters: usize,
     /// 读到过队列快照没有。没有的话这一格整个不画，不摆一个假的 0。
     pub known: bool,
 }

@@ -140,8 +140,8 @@
 | 失败单元标识 | `EQUI /P-1201B` | 契约 | `ModelUnitResult.noun` + `root_refno` |
 | 尝试次数 | `第 3 次尝试` | 契约 | `ModelUnitResult.attempts`（跨重试累计） |
 | 失败原因 | 一句话 | 契约 | `ModelUnitResult.message` |
-| 「重试」按钮 | | 契约 | `POST /api/v1/model/ensure { refno }`，幂等，**无需后端改动** |
-| 「模型树就地刷新」 | | 契约 | `ModelUnitResult.old_owner` / `new_owner`（现在的实现完全忽略了这两个字段） |
+| 「重试」按钮 | | 契约 | **已实现**（2026-08-05），但落在队列面板的行内明细而非这张板上——第三步随 ADR-0011 退役之后，欠账单元的唯一去处就是那里。走的也不是 `model/ensure` 而是 `POST /api/v1/update/pending-units/retry`：那个端点只复活已存在的行（`attempts` 清零、`revision + 1`、清 `last_error`）再叫醒调度器，不排新批次；`model/ensure` 会绕开队列另起一条生成通道，而 `model_update_pending` 上还没有 claim/lease |
+| 「模型树就地刷新」 | | 契约 | **已实现**：`ModelUnitResult.old_owner` / `new_owner` 经 `Outcome::refresh_units` 交给宿主的 `refresh_for_units`，只重查真正会变的分支 |
 | no_generation 行 | `14 处` | 契约 | `ManualUpdateResult.warnings[]`，原文是「N 个变更无法解析合法生成根，跳过模型生成（样例: …）」 |
 
 ---
@@ -201,6 +201,8 @@
 | `DeliveryUnitSummary.name` | 只用了 `noun + root_refno`，人可读的名字没显示 |
 | `DbnumPreview.zones[]`（含 `ZoneSummary.model_affecting`） | 曾经画过，`docs/adr/0011` 之后整组退役。契约字段保留，反序列化仍在守（`model_update_api` 的解码用例），但界面不再用它分组 |
 | ~~`FileAnomaly` 五种只画了 `Rollback`~~ | **五种已在 S2-E 画齐**；还欠的是把它们接进 S2 的树行与右栏阻断卡（现在只有 `Rollback` 一种有卡片形态） |
-| `PendingModelUnit.last_error` / `source_end_sesno` | 待重试单元的上次错误与来源会话号，没画 |
+| ~~`PendingModelUnit.last_error`~~ | **已画**（2026-08-05）：队列面板行内明细每条欠账单元下面摆一行原因。它是「为什么失败」唯一跨得过重启的来源——WS 明细活在进程内存里、重连即失，`Outcome.units[].message` 只活在 `/tasks` 的 200 条窗口内 |
+| `PendingModelUnit.source_end_sesno` | 来源会话号只在 S2-B「会一并处理」卡里露过脸，队列面板的欠账行没有 |
+| `PendingModelUnit.dead`（**新增字段**，2026-08-05） | 服务端按 `attempts >= MAX_ATTEMPTS` 算出来随行带出。上限是服务端常量、不在契约里，客户端拿 `attempts` 判不出死没死——少了它，界面对每一行都只能说「后台自动重试」，而那句话对死信是字面错误。三处消费：队列面板行内文案与「立刻重试」按钮、状态栏「N 个单元已放弃重试」、S2 / S2-B 把死信从「将合并」里摘出来 |
 | `ManualUpdatePreview.warnings[]` | 预览期的非致命告警（读不了库头、遍历目录失败等）在 S2 上没有落脚点 |
 | `ManualUpdateStatus::Success` / `Failed` | 三种终态只画了 `partial`，另外两种没有画板 |
