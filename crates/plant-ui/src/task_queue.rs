@@ -1261,20 +1261,32 @@ fn summary_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, all: &[RowVm], cmds
             cmds.push(Cmd::ScanNow);
         }
         // 断线降级的是明细区，不是进度：计数走轮询，连接断了照样准（ADR-0007）。
-        if let Feed::Down(reason) = &vm.feed {
-            let behind: u64 = all.iter().map(|r| r.behind_events).sum();
-            if ui
-                .add(widgets::button(t, d, "重连明细").icon(ph::PLUGS))
-                .on_hover_text(reason.as_str())
-                .clicked()
-            {
-                cmds.push(Cmd::ReconnectQueueFeed);
+        match &vm.feed {
+            Feed::Down(reason) => {
+                let behind: u64 = all.iter().map(|r| r.behind_events).sum();
+                if ui
+                    .add(widgets::button(t, d, "重连明细").icon(ph::PLUGS))
+                    .on_hover_text(reason.as_str())
+                    .clicked()
+                {
+                    cmds.push(Cmd::ReconnectQueueFeed);
+                }
+                ui.label(
+                    RichText::new(format!("实时通道断开 · 本端落后 {behind} 条明细"))
+                        .font(Font::meta(d))
+                        .color(t.warn),
+                );
             }
-            ui.label(
-                RichText::new(format!("实时通道断开 · 本端落后 {behind} 条明细"))
-                    .font(Font::meta(d))
-                    .color(t.warn),
-            );
+            // 从来没订过就没有「重连」这回事，也没有「落后多少条」——那个数会等于
+            // 服务端发过的全部，摆出来是把「本来就不收」讲成「丢了」。
+            Feed::NotSubscribed(reason) => {
+                ui.label(
+                    RichText::new(format!("不订阅逐单元明细 · {reason}"))
+                        .font(Font::meta(d))
+                        .color(t.text_muted),
+                );
+            }
+            Feed::Connecting | Feed::Live => {}
         }
     });
 }
@@ -1840,19 +1852,18 @@ fn row_detail(
             }
 
             let detail = vm.details.get(&row.task_id);
-            if let Feed::Down(_) = vm.feed
-                && row.phase.running()
-            {
+            if let Some(notice) = feed_notice(&vm.feed, row.phase.running(), row.behind_events) {
+                let color = if notice.warn { t.warn } else { t.text_muted };
                 detail_line(
                     ui,
                     t,
                     d,
                     DetailLine {
-                        icon: ph::PLUGS,
-                        icon_color: t.warn,
-                        label: "断线期间没收到事件，不知道它开没开始",
-                        note: &format!("明细缺 {} 条", row.behind_events),
-                        note_color: t.warn,
+                        icon: notice.icon,
+                        icon_color: color,
+                        label: notice.label,
+                        note: &notice.note,
+                        note_color: color,
                     },
                 );
             }
@@ -1896,6 +1907,42 @@ fn row_detail(
                 ui.label(RichText::new(text).font(Font::micro(d)).color(t.text_muted));
             }
         });
+}
+
+/// 运行中的行在明细区上方那句降级提示。`None` = 不画。
+struct FeedNotice {
+    icon: &'static str,
+    label: &'static str,
+    note: String,
+    warn: bool,
+}
+
+/// 明细通道的状态怎么说给人听。**断线与从未订阅必须分开**，这个函数存在的
+/// 唯一理由就是钉住这件事。
+///
+/// 断线是「连过、掉了、中间那段确实漏了」，所以报得出缺多少条，也值得警示色；
+/// 从未订阅（wasm 构建）是「本来就不收」——说断线是在指控一次不存在的故障，
+/// 而它的 `behind_events` 恰好等于服务端发过的**全部**，摆成「明细缺 N 条」
+/// 会让人以为丢了一大批东西。
+fn feed_notice(feed: &Feed, running: bool, behind: u64) -> Option<FeedNotice> {
+    if !running {
+        return None;
+    }
+    match feed {
+        Feed::Down(_) => Some(FeedNotice {
+            icon: ph::PLUGS,
+            label: "断线期间没收到事件，不知道它开没开始",
+            note: format!("明细缺 {behind} 条"),
+            warn: true,
+        }),
+        Feed::NotSubscribed(_) => Some(FeedNotice {
+            icon: ph::PULSE,
+            label: "这个构建不收逐单元明细，进度按轮询走",
+            note: String::new(),
+            warn: false,
+        }),
+        Feed::Connecting | Feed::Live => None,
+    }
 }
 
 /// 明细区的一条行。图标色与行尾说明色分开取：同一条行上「这是什么」与
@@ -2361,6 +2408,35 @@ mod tests {
         let all = rows(&model);
         let order = visible(&all, Filter::All, "");
         assert_eq!(all[order[0]].dbnum, 9);
+    }
+
+    /// 「从来没订过」不许被讲成「断线」。
+    ///
+    /// wasm 构建的 Feed 是个桩，开局就报一次状态。它若混进 `Down`，每一条运行中的
+    /// 行都会挂上「断线期间没收到事件」——从来没连过，何来断线；而那句「明细缺 N 条」
+    /// 里的 N 恰好等于服务端发过的全部，把「本来就不收」讲成了「丢了一大批」。
+    #[test]
+    fn a_build_that_never_subscribes_is_not_reported_as_a_dropped_connection() {
+        let down = feed_notice(&Feed::Down("socket closed".into()), true, 47)
+            .expect("断线且在跑，要说出来");
+        assert!(down.warn);
+        assert!(down.label.contains("断线"));
+        assert_eq!(down.note, "明细缺 47 条");
+
+        let never = feed_notice(&Feed::NotSubscribed("走轮询".into()), true, 47)
+            .expect("没订阅也要说一句，不能默不作声");
+        assert!(!never.warn, "本来就不收，不是故障");
+        assert!(!never.label.contains("断线"), "{}", never.label);
+        assert!(
+            never.note.is_empty(),
+            "没订过就没有「缺了多少条」：{}",
+            never.note
+        );
+
+        // 没在跑的行与通道好着的时候都不画。
+        assert!(feed_notice(&Feed::NotSubscribed("走轮询".into()), false, 47).is_none());
+        assert!(feed_notice(&Feed::Live, true, 0).is_none());
+        assert!(feed_notice(&Feed::Connecting, true, 0).is_none());
     }
 
     /// 死信自己一格，不并进「还有活没干完」。

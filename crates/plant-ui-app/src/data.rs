@@ -131,6 +131,10 @@ pub enum Evt {
     QueueTaskChanged,
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     QueueFeedLive,
+    /// 这个构建压根不订阅逐单元明细（wasm 端）。与 `QueueFeedDown` 分开：
+    /// 断线是连过又掉了、可以重连、中间那段确实漏了；这一种从来没连过。
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    QueueFeedUnsubscribed(String),
     QueueFeedDown(String),
 }
 

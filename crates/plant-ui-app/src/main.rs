@@ -1516,6 +1516,10 @@ impl App {
                     // 没收到收尾事件的明细行说不清做没做完，别再显示「生成中」。
                     self.queue.mark_unknown();
                 }
+                // 没订过就没有半截的明细要收尾，`mark_unknown` 无事可做。
+                data::Evt::QueueFeedUnsubscribed(reason) => {
+                    self.queue.feed = ModelUpdateFeed::NotSubscribed(reason);
+                }
             }
         }
         if dirty {
