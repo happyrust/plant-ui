@@ -185,6 +185,13 @@ pub struct DbnumStatus {
     /// 与阻断**不是一回事**，界面上不许合成一行：混起来会把「出事了」讲成「本来就不跑」。
     #[serde(default)]
     pub excluded: bool,
+    /// 当前 MDB **声明了**这个库，但当前项目目录里没有它的文件。
+    ///
+    /// 与 `excluded` 恰好相反的意思，所以第三档必须单独有。缺省 false 是有意的：
+    /// 老服务端只给两档，那时候这些库压根不出现在 `/dbnums` 里——少一行比顶着
+    /// 一句反话出现好。
+    #[serde(default)]
+    pub not_in_project: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -872,10 +879,30 @@ pub fn not_running(vm: &Vm) -> Vec<&DbnumStatus> {
     let mut rows: Vec<&DbnumStatus> = vm
         .dbnums
         .iter()
-        .filter(|db| db.blocked || db.excluded)
+        .filter(|db| db.blocked || db.excluded || db.not_in_project)
         .collect();
     rows.sort_by_key(|db| (!db.blocked, db.dbnum));
     rows
+}
+
+/// 「本期不执行」按三个理由分开数。**不许合成一个总数**——三档的出路完全不同：
+/// 阻断要人去处理文件、够不着多半在别的项目目录里、排除本来就不在范围内。
+/// 一个 84px 的框里滚着两百多行而标题只说「本期不执行」，等于没说（施工单 Q3）。
+pub fn not_running_tally(rows: &[&DbnumStatus]) -> String {
+    let blocked = rows.iter().filter(|db| db.blocked).count();
+    let unreachable = rows.iter().filter(|db| !db.blocked && db.not_in_project).count();
+    let excluded = rows.len() - blocked - unreachable;
+    let mut parts = Vec::new();
+    if blocked > 0 {
+        parts.push(format!("{blocked} 个阻断"));
+    }
+    if unreachable > 0 {
+        parts.push(format!("{unreachable} 个够不着"));
+    }
+    if excluded > 0 {
+        parts.push(format!("{excluded} 个不在范围内"));
+    }
+    parts.join(" · ")
 }
 
 /// 筛选与搜索。**搜索时不受筛选芯片限制**——搜一个已完成的库却搜不到，
@@ -1479,10 +1506,17 @@ fn excluded_block(ui: &mut Ui, t: &Tokens, d: Density, rows: &[&DbnumStatus]) {
             .color(t.text_primary),
     );
     row.label(
-        RichText::new("这些库不入队，水位不动")
+        RichText::new(not_running_tally(rows))
             .font(Font::micro(d))
             .color(t.text_muted),
     );
+    row.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        ui.label(
+            RichText::new("这些库不入队，水位不动")
+                .font(Font::micro(d))
+                .color(t.text_muted),
+        );
+    });
 
     ScrollArea::vertical()
         .id_salt("task-queue-excluded")
@@ -1517,16 +1551,7 @@ fn excluded_row(ui: &mut Ui, t: &Tokens, d: Density, db: &DbnumStatus) {
         Font::mono(d),
         t.text_primary,
     );
-    // 排除有两种来源：类型不对，或者是 DESI 但当前 MDB 没声明它（ADR-0013）。一律写
-    // 「非 DESI」的话，后一种就是假话——那个库明明是 DESI，只是这一期的 MDB 没要它。
-    let reason = match (&db.anomaly, blocked) {
-        (Some(anomaly), _) => anomaly_brief(anomaly),
-        (None, true) => "阻断，原因未随契约给出".to_owned(),
-        (None, false) if db.db_type != "DESI" => {
-            format!("非 DESI（{}），不在本期范围", db.db_type)
-        }
-        (None, false) => "DESI，但不在当前 MDB 声明的名单里".to_owned(),
-    };
+    let reason = not_running_reason(db);
     text_at(
         ui,
         pos2(rect.left() + d.px(108.0), mid),
@@ -1534,8 +1559,15 @@ fn excluded_row(ui: &mut Ui, t: &Tokens, d: Density, db: &DbnumStatus) {
         Font::meta(d),
         if blocked { t.danger } else { t.text_muted },
     );
-    // 「阻断」与「排除」两个词分开摆：一个是出事了，一个是本来就不跑。
-    let tag = if blocked { "阻断" } else { "排除" };
+    // 三个词分开摆：阻断是出事了、排除是本来就不在范围里、够不着是范围里但这次
+    // 碰不到它。合成两档的时候「够不着」只能借「排除」那个词，而它俩意思相反。
+    let tag = if blocked {
+        "阻断"
+    } else if db.not_in_project {
+        "够不着"
+    } else {
+        "排除"
+    };
     let g = layout(ui, tag, Font::mono_micro(d));
     let pad = d.px(6.0);
     let box_rect = Rect::from_min_size(
@@ -1558,6 +1590,23 @@ fn excluded_row(ui: &mut Ui, t: &Tokens, d: Density, db: &DbnumStatus) {
     // 与预览那边 S2-E 用的是同一段文案，两处不许各说各话。
     if let Some(anomaly) = &db.anomaly {
         resp.on_hover_text(anomaly.to_string());
+    }
+}
+
+/// 「本期不执行」那一行的理由。**三档，不是两档。**
+///
+/// 「排除」与「够不着」的意思恰好相反：前者是当前 MDB 没声明它，后者是声明了、
+/// 当前项目目录里没有它的文件。契约只有 `excluded` 的那阵子，够不着的库只能借
+/// 「不在当前 MDB 声明的名单里」那句话出现，读起来正好是反的（施工单 Q5）。
+fn not_running_reason(db: &DbnumStatus) -> String {
+    match (&db.anomaly, db.blocked) {
+        (Some(anomaly), _) => anomaly_brief(anomaly),
+        (None, true) => "阻断，原因未随契约给出".to_owned(),
+        (None, false) if db.not_in_project => "MDB 声明了它，当前项目目录里没有这个文件".to_owned(),
+        (None, false) if db.db_type != "DESI" => {
+            format!("非 DESI（{}），不在本期范围", db.db_type)
+        }
+        (None, false) => "DESI，但不在当前 MDB 声明的名单里".to_owned(),
     }
 }
 
@@ -2408,6 +2457,73 @@ mod tests {
         let all = rows(&model);
         let order = visible(&all, Filter::All, "");
         assert_eq!(all[order[0]].dbnum, 9);
+    }
+
+    /// 「够不着」与「排除」意思相反，不许共用一句话。
+    ///
+    /// 契约只有 `excluded` 的那阵子，MDB 声明了、项目目录里却没文件的库只能借
+    /// 「不在当前 MDB 声明的名单里」那句话出现——读起来正好是反的（施工单 Q5）。
+    /// 标题那格也得按三个理由分开数：一个 84px 的框里滚两百多行而只说「本期不执行」
+    /// 等于没说（Q3）。
+    #[test]
+    fn unreachable_and_excluded_never_share_a_sentence() {
+        let unreachable = DbnumStatus {
+            dbnum: 7015,
+            db_type: "DESI".into(),
+            not_in_project: true,
+            ..Default::default()
+        };
+        let excluded = DbnumStatus {
+            dbnum: 8191,
+            db_type: "CATA".into(),
+            excluded: true,
+            ..Default::default()
+        };
+        let out_of_mdb = DbnumStatus {
+            dbnum: 8200,
+            db_type: "DESI".into(),
+            excluded: true,
+            ..Default::default()
+        };
+        let blocked = DbnumStatus {
+            dbnum: 8003,
+            db_type: "DESI".into(),
+            blocked: true,
+            anomaly: Some(FileAnomaly::Missing { path: "a".into() }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            not_running_reason(&unreachable),
+            "MDB 声明了它，当前项目目录里没有这个文件"
+        );
+        assert_eq!(
+            not_running_reason(&out_of_mdb),
+            "DESI，但不在当前 MDB 声明的名单里"
+        );
+        assert!(not_running_reason(&excluded).contains("非 DESI"));
+        assert!(not_running_reason(&blocked).contains("文件缺失"));
+
+        let mut model = vm(Vec::new(), Vec::new());
+        model.dbnums = vec![
+            unreachable,
+            excluded,
+            out_of_mdb,
+            blocked,
+            // 正常待更新的库不进这一格。
+            DbnumStatus {
+                dbnum: 7997,
+                db_type: "DESI".into(),
+                ..Default::default()
+            },
+        ];
+        let rows = not_running(&model);
+        assert_eq!(rows.len(), 4, "正常库不该混进「本期不执行」");
+        assert!(rows[0].blocked, "阻断排在前面");
+        assert_eq!(
+            not_running_tally(&rows),
+            "1 个阻断 · 1 个够不着 · 2 个不在范围内"
+        );
     }
 
     /// 「从来没订过」不许被讲成「断线」。
