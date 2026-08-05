@@ -510,8 +510,15 @@ pub struct BlockedDbnum {
 }
 
 impl Enqueued {
-    /// 一句能写进日志的回执。入队、并入、阻断三件事分开说——它们的出路不一样：
-    /// 排上的等着跑，并入的已经在别人那一行里，阻断的要人去处理文件。
+    /// 一句能写进日志的回执。五个去向分开说——它们的出路各不相同：排上的等着跑、
+    /// 并入的已经在别人那一行里、被覆盖的无需动作、已是最新的本来就没事、
+    /// 阻断的要人去处理文件。
+    ///
+    /// **五个数要与 `scanned` 算得平。** 早先的写法只在「一行都没排」那条兜底
+    /// 分支里报 `up_to_date` 与 `already_covered`，于是只要有任意一条入队，
+    /// 那两个数就整个消失：人按下确认看到「扫描 29 个库；已入队 2 个数据批次」，
+    /// 剩下 27 个去哪了说不出来。那与本仓自己坚持的「排除有两个理由，界面上必须
+    /// 分开数」「过滤不许无声」正好相反。
     pub fn summary(&self) -> String {
         let mut parts = Vec::new();
         if !self.enqueued.is_empty() {
@@ -538,6 +545,21 @@ impl Enqueued {
                 self.merged.len()
             ));
         }
+        if !self.already_covered.is_empty() {
+            let list = self
+                .already_covered
+                .iter()
+                .map(|dbnum| format!("db{dbnum}"))
+                .collect::<Vec<_>>()
+                .join("、");
+            parts.push(format!(
+                "{} 个已被排队中的批次覆盖（{list}）",
+                self.already_covered.len()
+            ));
+        }
+        if self.up_to_date > 0 {
+            parts.push(format!("{} 个已是最新", self.up_to_date));
+        }
         if !self.blocked.is_empty() {
             let list = self
                 .blocked
@@ -549,13 +571,27 @@ impl Enqueued {
         }
         if parts.is_empty() {
             return format!(
-                "扫描 {} 个库，没有需要入队的批次：{} 个已是最新，{} 个已被排队中的批次覆盖",
-                self.scanned,
-                self.up_to_date,
-                self.already_covered.len()
+                "扫描 {} 个库，没有需要入队的批次，回执也没说这些库各自是什么去向",
+                self.scanned
             );
         }
+        // 加不到 `scanned` 就把差额摆出来。契约上这五桶应当是它的一个划分，
+        // 但那是服务端的性质，不是本端能保证的事——差额说不出来的时候，
+        // 宁可承认「有 N 个库没交代」也不让那个数无声消失。
+        let unaccounted = self.scanned.saturating_sub(self.accounted());
+        if unaccounted > 0 {
+            parts.push(format!("另有 {unaccounted} 个库回执没交代去向"));
+        }
         format!("扫描 {} 个库；{}", self.scanned, parts.join("；"))
+    }
+
+    /// 回执把去向说清楚了的库数。与 `scanned` 的差就是说不清的那部分。
+    fn accounted(&self) -> usize {
+        self.enqueued.len()
+            + self.merged.len()
+            + self.already_covered.len()
+            + self.up_to_date
+            + self.blocked.len()
     }
 }
 
@@ -2967,7 +3003,46 @@ mod tests {
         // 一行都没排也要说得清是为什么——不然人只会以为按钮没反应。
         let idle: Enqueued =
             serde_json::from_str(r#"{"scanned":3,"up_to_date":3}"#).expect("空回执也要解得出来");
-        assert!(idle.summary().contains("没有需要入队的批次"));
+        assert!(idle.summary().contains("3 个已是最新"), "{}", idle.summary());
+    }
+
+    /// 回执里的五个去向要与 `scanned` 算得平。
+    ///
+    /// 早先只在「一行都没排」的兜底分支里报 `up_to_date` 与 `already_covered`，
+    /// 于是只要有任意一条入队，那两个数就整个消失：人看到「扫描 29 个库；
+    /// 已入队 2 个数据批次」，剩下 27 个去哪了说不出来。
+    #[test]
+    fn the_enqueue_receipt_accounts_for_every_scanned_dbnum() {
+        let mut receipt = Enqueued {
+            scanned: 29,
+            enqueued: vec![EnqueuedBatch {
+                dbnum: 7997,
+                position: 1,
+                ..Default::default()
+            }],
+            already_covered: vec![8000, 8001],
+            up_to_date: 25,
+            blocked: vec![BlockedDbnum {
+                dbnum: 8003,
+                reason: "文件回退".into(),
+            }],
+            ..Default::default()
+        };
+
+        let summary = receipt.summary();
+        assert!(summary.contains("已入队 1 个数据批次"), "{summary}");
+        assert!(summary.contains("2 个已被排队中的批次覆盖"), "{summary}");
+        assert!(summary.contains("25 个已是最新"), "{summary}");
+        assert!(summary.contains("1 个阻断未入队"), "{summary}");
+        assert!(
+            !summary.contains("没交代去向"),
+            "1 + 2 + 25 + 1 = 29，算得平就不该有差额：{summary}"
+        );
+
+        // 算不平的时候差额必须说出来，不许让那几个库无声消失。
+        receipt.up_to_date = 20;
+        let short = receipt.summary();
+        assert!(short.contains("另有 5 个库回执没交代去向"), "{short}");
     }
 
     /// 会话区间从**水位的下一号**起算。需初始化的库契约不为它解区间，
