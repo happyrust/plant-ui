@@ -663,26 +663,19 @@ pub fn prop_row_ui(ui: &mut Ui, t: &Tokens, d: Density, row: PropRow<'_>) -> Res
     let key_x = rect.left() + pad;
     let value_x = rect.left() + prop_value_x(d);
 
-    let kg = lay(ui, row.key, Font::meta(d));
     let key_clip = Rect::from_min_max(
         pos2(key_x, rect.top()),
         pos2(value_x - d.px(4.0), rect.bottom()),
     );
-    ui.painter().with_clip_rect(key_clip).galley(
-        pos2(key_x, rect.center().y - kg.size().y / 2.0),
-        kg,
-        t.text_muted,
+    selectable_at(
+        ui,
+        key_clip,
+        egui::RichText::new(row.key)
+            .font(Font::meta(d))
+            .color(t.text_muted),
+        true,
     );
 
-    let vg = lay(
-        ui,
-        row.value,
-        if row.mono {
-            Font::mono(d)
-        } else {
-            Font::label(d)
-        },
-    );
     let value_clip = Rect::from_min_max(
         pos2(value_x, rect.top()),
         pos2(rect.right() - pad, rect.bottom()),
@@ -692,10 +685,17 @@ pub fn prop_row_ui(ui: &mut Ui, t: &Tokens, d: Density, row: PropRow<'_>) -> Res
     } else {
         t.text_primary
     };
-    ui.painter().with_clip_rect(value_clip).galley(
-        pos2(value_x, rect.center().y - vg.size().y / 2.0),
-        vg,
-        fg,
+    selectable_at(
+        ui,
+        value_clip,
+        egui::RichText::new(row.value)
+            .font(if row.mono {
+                Font::mono(d)
+            } else {
+                Font::label(d)
+            })
+            .color(fg),
+        true,
     );
     resp
 }
