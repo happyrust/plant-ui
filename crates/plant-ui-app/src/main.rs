@@ -19,14 +19,18 @@ use bevy::prelude::{
     App as BevyApp, Camera2d, Commands, DefaultPlugins, PluginGroup, ResMut, Window, WindowPlugin,
 };
 #[cfg(not(target_arch = "wasm32"))]
-use bevy::prelude::{IntoScheduleConfigs, PostUpdate, Query, With};
+use bevy::prelude::{
+    Component, Entity, EventWriter, IntoScheduleConfigs, PostUpdate, Query, Trigger, With,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured};
 #[cfg(not(target_arch = "wasm32"))]
 use bevy::window::PrimaryWindow;
 use bevy_egui35::{
     EguiContexts, EguiGlobalSettings, EguiPlugin, EguiPrimaryContextPass, PrimaryEguiContext,
 };
 #[cfg(not(target_arch = "wasm32"))]
-use bevy_egui35::{EguiOutput, EguiPostUpdateSet};
+use bevy_egui35::{EguiFullOutput, EguiOutput, EguiPostUpdateSet, input::EguiInputEvent};
 use chrono::{DateTime, Utc};
 use command::ParsedCommand;
 use eframe::egui;
@@ -234,7 +238,12 @@ fn run(canvas: &str, asset_root: String) {
     #[cfg(not(target_arch = "wasm32"))]
     app.add_systems(
         PostUpdate,
-        sync_desktop_ime.after(EguiPostUpdateSet::ProcessOutput),
+        (
+            sync_desktop_ime.after(EguiPostUpdateSet::ProcessOutput),
+            dispatch_egui_screenshots
+                .after(EguiPostUpdateSet::EndPass)
+                .before(EguiPostUpdateSet::ProcessOutput),
+        ),
     );
     app.run();
 }
@@ -281,6 +290,90 @@ fn attach_inspection(ctx: &egui::Context) {
 
 #[cfg(target_arch = "wasm32")]
 fn attach_inspection(_ctx: &egui::Context) {}
+
+/// 一次已派发、正等底片回来的截图：`user_data` 是请求方认领它的号牌，
+/// `context` / `viewport` 说明回执该塞回哪。
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Component)]
+struct ScreenshotReplyTo {
+    user_data: egui::UserData,
+    context: Entity,
+    viewport: egui::ViewportId,
+}
+
+/// 把 egui 的 `ViewportCommand::Screenshot` 接到 Bevy 的窗口截图上。
+///
+/// 这条命令在 eframe 那半边由 winit 集成应答，而 `bevy_egui` 的
+/// `process_output_system` 只从 `viewport_output` 里取 `repaint_delay`，命令本身
+/// 整个丢掉。于是验收探针的 `inspect shot` 发出请求后没有任何人应答，
+/// `egui_inspection` 干等满 20 秒超时，报出来的却是「应用没在绘制，把窗口切到前台」
+/// —— 那句话在这里是假的：树和注入输入一直是通的，帧也一直在画。
+///
+/// 必须赶在 `EguiPostUpdateSet::ProcessOutput` 之前跑：那一步会把 `EguiFullOutput`
+/// 整个 `take` 走。
+#[cfg(not(target_arch = "wasm32"))]
+fn dispatch_egui_screenshots(mut commands: Commands, contexts: Query<(Entity, &EguiFullOutput)>) {
+    for (context, full_output) in &contexts {
+        let Some(output) = full_output.0.as_ref() else {
+            continue;
+        };
+        for (viewport, viewport_output) in output.viewport_output.iter() {
+            for command in &viewport_output.commands {
+                let egui::ViewportCommand::Screenshot(user_data) = command else {
+                    continue;
+                };
+                commands
+                    .spawn((
+                        Screenshot::primary_window(),
+                        ScreenshotReplyTo {
+                            user_data: user_data.clone(),
+                            context,
+                            viewport: *viewport,
+                        },
+                    ))
+                    .observe(reply_screenshot_to_egui);
+            }
+        }
+    }
+}
+
+/// 底片回来了：转成 egui 认的 `ColorImage`，按号牌塞回那个上下文的输入队列，
+/// 由 `egui_inspection` 的 `input_hook` 认领。
+///
+/// 回执要等下一帧的 `EguiInputSet::WriteEguiEvents` 才进 `EguiInput`，比请求晚两三帧
+/// —— 探针那边的超时是 20 秒，绰绰有余。
+#[cfg(not(target_arch = "wasm32"))]
+fn reply_screenshot_to_egui(
+    trigger: Trigger<ScreenshotCaptured>,
+    replies: Query<&ScreenshotReplyTo>,
+    mut egui_input: EventWriter<EguiInputEvent>,
+) {
+    let Some(target) = trigger.target() else {
+        return;
+    };
+    let Ok(reply) = replies.get(target) else {
+        return;
+    };
+    let dynamic = match trigger.event().0.clone().try_into_dynamic() {
+        Ok(dynamic) => dynamic,
+        Err(error) => {
+            eprintln!("截图格式无法解读，这一次请求作废：{error}");
+            return;
+        }
+    };
+    // 开着 HDR 时 alpha 通道装的是亮度而不是透明度，照搬会得到一张半透明的图；
+    // Bevy 自己的 `save_to_disk` 也是丢掉 alpha 的。
+    let rgb = dynamic.to_rgb8();
+    let size = [rgb.width() as usize, rgb.height() as usize];
+    egui_input.write(EguiInputEvent {
+        context: reply.context,
+        event: egui::Event::Screenshot {
+            viewport_id: reply.viewport,
+            user_data: reply.user_data.clone(),
+            image: std::sync::Arc::new(egui::ColorImage::from_rgb(size, rgb.as_raw())),
+        },
+    });
+}
 
 fn show_app(
     mut contexts: EguiContexts,
