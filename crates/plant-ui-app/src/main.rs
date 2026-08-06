@@ -680,6 +680,9 @@ struct App {
     /// 已经见过终态的数据批次。轮询靠它认出「这一拍新跑完了哪几个」——
     /// 终态之后快照还会带着它们好几拍，每拍都刷一次就是反复拆装同一批几何。
     queue_finished: HashSet<String>,
+    /// 正在现查祖先链、好找出「该刷新哪一层」的那些元素（新增子树的单元根 / OWNER）。
+    /// 记着是为了不重复发同一条查询，也为了把回来的链与定位那条路分开。
+    refresh_anchors: HashSet<RefU64>,
     /// 根层快照开始读取的时刻。首次队列快照只补这之后完成的批次。
     data_observed_at: Option<DateTime<Utc>>,
     /// 首份可与根层快照比较的队列快照是否已经登记。
@@ -689,6 +692,9 @@ struct App {
     /// 忙时又来的刷新只合并成下一次；`true` 表示至少有一次模型已生成完成，
     /// 下一次必须重载三维，`false` 只刷新树与属性。
     get_work_again: Option<bool>,
+    /// 当前 / 下一次取回工作完成后，可在终态行确认“模型树已就地刷新”的任务。
+    get_work_task_ids: HashSet<String>,
+    get_work_again_task_ids: HashSet<String>,
     /// 最近一次完整队列快照确认：没有数据任务，也没有模型欠账。
     model_reload_ready: bool,
     /// 数据已经应用，但三维仍在等后台模型全部生成完。
@@ -753,6 +759,17 @@ fn finished_after(finished_at: Option<&str>, observed_at: DateTime<Utc>) -> bool
 ///
 /// `None` = 链里没有落脚点，目标是树外元素。目标自己就是 SITE 根时返回空路径：
 /// 它那一行本来就在，不用展开谁。
+/// 新增子树该刷新哪一层：祖先链上**第一个已经展开过**的祖先。
+///
+/// 链是「自己 -> 上级 -> …」序，所以第一个命中的自然是离新元素最近、又确实在树上
+/// 画着的那一层——刷它一次，新元素就进了它的子层列表。
+///
+/// `None` = 整条链都没展开过。那时候什么也不做是对的：那条分支下次展开时本来就会
+/// 现查，现在去拉是把一次精确刷新做成一次预取。
+fn refresh_anchor(chain: &[RefU64], cached: impl Fn(RefU64) -> bool) -> Option<RefU64> {
+    chain.iter().copied().find(|a| cached(*a))
+}
+
 /// 展开定位路径时，这一节要不要（重新）打一次子层查询。
 ///
 /// 平时「缓存里有」就够了。但**目标的直接父那一节是个例外**：祖先链是刚从库里
@@ -904,10 +921,13 @@ impl App {
                 .unwrap_or_else(Instant::now),
             queue_poll_pending: false,
             queue_finished: HashSet::new(),
+            refresh_anchors: HashSet::new(),
             data_observed_at: None,
             queue_refresh_baselined: false,
             get_work_pending: false,
             get_work_again: None,
+            get_work_task_ids: HashSet::new(),
+            get_work_again_task_ids: HashSet::new(),
             model_reload_ready: false,
             model_reload_owed: false,
             model_reload_in_flight: false,
@@ -961,6 +981,7 @@ impl App {
                     self.data_observed_at = Some(info.observed_at);
                     self.queue_refresh_baselined = false;
                     self.queue_finished.clear();
+                    self.refresh_anchors.clear();
                     self.queue.project = self.vm.project.clone();
                     self.queue.mdb = self.mdb.clone();
                     self.queue.namespace = self.namespace.clone();
@@ -1268,9 +1289,13 @@ impl App {
                     }
                 },
                 data::Evt::Ancestors(refno, Ok(chain)) => {
+                    // 同一条链可能是两件事要的：一次定位，或者一次「新增子树该刷哪一层」
+                    // 的锚点解析。两边各取所需，互不干扰。
+                    dirty |= self.refresh_from_chain(refno, &chain);
                     dirty |= self.apply_ancestors(refno, chain);
                 }
                 data::Evt::Ancestors(refno, Err(error)) => {
+                    self.refresh_anchors.remove(&refno);
                     // 链查不动就没法展开，待滚动到此为止；选中与属性仍然留着。
                     let from_command = self
                         .pending_locate
@@ -1311,12 +1336,22 @@ impl App {
                 },
                 // 「扫描 + 入队」的回执。执行请求一律入队，回的是一组批次而不是
                 // 一个 task_id，所以这里不再开运行实例——进度在任务队列视图上。
-                data::Evt::ModelUpdateExecute(result) => {
+                data::Evt::ModelUpdateExecute {
+                    from_wizard,
+                    result,
+                } => {
                     // 只有向导发起的那次才动向导：队列面板上的「立刻扫一遍」打的是
                     // 同一个接口，但它不该把人手上那份预览清掉。
-                    let from_wizard = matches!(self.model_update, ModelUpdateVm::Starting);
+                    let wizard_preview = from_wizard.then(|| match &self.model_update {
+                        ModelUpdateVm::Starting(preview) => Some(preview.clone()),
+                        _ => None,
+                    });
+                    let wizard_preview = wizard_preview.flatten();
                     match result {
                         Ok(receipt) => {
+                            if let Some(preview) = wizard_preview.as_ref() {
+                                self.queue.remember_manual_preview(preview, &receipt);
+                            }
                             self.logs.info(&mut self.vm.logs, receipt.summary());
                             for warning in &receipt.warnings {
                                 self.logs
@@ -1351,6 +1386,12 @@ impl App {
                     let _ = self.bridge.req.send(data::Req::PendingSessions);
                     match result {
                         Ok(fresh) => {
+                            let refreshed = std::mem::take(&mut self.get_work_task_ids);
+                            if fresh.failed.is_empty() {
+                                for task_id in refreshed {
+                                    self.queue.mark_refreshed(&task_id);
+                                }
+                            }
                             let before = self.tree.element_count();
                             self.tree.roots = fresh.sites;
                             if fresh.reload_models {
@@ -1410,6 +1451,7 @@ impl App {
                             dirty = true;
                         }
                         Err(error) => {
+                            self.get_work_task_ids.clear();
                             restore_model_reload(
                                 &mut self.model_reload_owed,
                                 std::mem::take(&mut self.model_reload_in_flight),
@@ -1425,7 +1467,7 @@ impl App {
                     self.queue_poll_pending = false;
                     match result {
                         Ok(poll) => {
-                            let (data_applied, mut fresh) = self.newly_finished(&poll);
+                            let (data_applied, mut fresh, task_ids) = self.newly_finished(&poll);
                             fresh.extend(settled_pending_roots(
                                 self.queue.loaded,
                                 poll.pending_known,
@@ -1451,11 +1493,11 @@ impl App {
                             self.queue.adopt(poll);
                             self.model_reload_ready = models_settled;
                             if reload_due {
-                                self.get_work_with_models(true);
+                                self.get_work_with_models_for_tasks(true, task_ids);
                             } else if data_applied {
-                                self.get_work_with_models(false);
+                                self.get_work_with_models_for_tasks(false, task_ids);
                             } else {
-                                self.refresh_for_units(fresh);
+                                self.refresh_for_units(fresh, task_ids);
                             }
                         }
                         // 上一份快照留在界面上，横幅把「这份是旧的」说出来。
@@ -1718,7 +1760,7 @@ impl App {
                     self.model_update_state.open = true;
                     if !matches!(
                         self.model_update,
-                        ModelUpdateVm::Loading | ModelUpdateVm::Starting
+                        ModelUpdateVm::Loading | ModelUpdateVm::Starting(_)
                     ) {
                         self.refresh_model_update();
                     }
@@ -1736,13 +1778,17 @@ impl App {
                     if !self.model_service_writable() {
                         continue;
                     }
+                    let ModelUpdateVm::Ready(preview) = &self.model_update else {
+                        continue;
+                    };
                     self.model_reload_ready = false;
-                    self.model_update = ModelUpdateVm::Starting;
+                    self.model_update = ModelUpdateVm::Starting(preview.clone());
                     let _ = self.bridge.req.send(data::Req::ModelUpdateExecute {
                         base: self.model_api_url.clone(),
                         project: self.vm.project.clone(),
                         mdb: self.mdb.clone(),
                         namespace: self.namespace.clone(),
+                        from_wizard: true,
                     });
                 }
                 // 与「确认执行」打同一个接口。它不插队，作用只是别等服务端下一个
@@ -1757,6 +1803,7 @@ impl App {
                         project: self.vm.project.clone(),
                         mdb: self.mdb.clone(),
                         namespace: self.namespace.clone(),
+                        from_wizard: false,
                     });
                 }
                 Cmd::SetQueuePaused(paused) => {
@@ -2252,20 +2299,38 @@ impl App {
     }
 
     fn get_work_with_models(&mut self, reload_models: bool) {
-        let branches: Vec<RefU64> = self
-            .tree
-            .expanded
-            .iter()
-            .filter(|refno| self.tree.children.contains_key(refno))
-            .copied()
-            .collect();
-        self.start_get_work(branches, reload_models);
+        self.get_work_with_models_for_tasks(reload_models, Vec::new());
+    }
+
+    fn get_work_with_models_for_tasks(&mut self, reload_models: bool, task_ids: Vec<String>) {
+        // 带终态任务的刷新覆盖全部本地缓存分支，而不只覆盖此刻展开的分支：折起的
+        // children 仍会在下次展开时复用，漏掉它却标“已就地刷新”就是假完成。
+        let branches: Vec<RefU64> = if task_ids.is_empty() {
+            self.tree
+                .expanded
+                .iter()
+                .filter(|refno| self.tree.children.contains_key(refno))
+                .copied()
+                .collect()
+        } else {
+            self.tree.children.keys().copied().collect()
+        };
+        self.start_get_work_for_tasks(branches, reload_models, task_ids);
     }
 
     /// 发一次取回工作。`branches` 是要重查子层的分支，由调用方按自己掌握的线索
     /// 算好——菜单点进来的算不出线索、只能把已展开的全给上，更新跑完那条路则
     /// 有一份确切的清单。
     fn start_get_work(&mut self, branches: Vec<RefU64>, reload_models: bool) {
+        self.start_get_work_for_tasks(branches, reload_models, Vec::new());
+    }
+
+    fn start_get_work_for_tasks(
+        &mut self,
+        branches: Vec<RefU64>,
+        reload_models: bool,
+        task_ids: Vec<String>,
+    ) {
         if !self.vm.data_source_ok {
             return;
         }
@@ -2274,8 +2339,10 @@ impl App {
             reload_models,
             &mut self.get_work_again,
         ) {
+            self.get_work_again_task_ids.extend(task_ids);
             return;
         }
+        self.get_work_task_ids.extend(task_ids);
         self.set_get_work_busy(true);
         self.logs.info(
             &mut self.vm.logs,
@@ -2290,6 +2357,7 @@ impl App {
             })
             .is_ok();
         if !sent {
+            self.get_work_task_ids.clear();
             self.set_get_work_busy(false);
         } else if reload_models {
             self.model_reload_owed = false;
@@ -2308,13 +2376,14 @@ impl App {
     fn newly_finished(
         &mut self,
         poll: &plant_ui::task_queue::Poll,
-    ) -> (bool, Vec<model_update::RefreshUnit>) {
+    ) -> (bool, Vec<model_update::RefreshUnit>, Vec<String>) {
         let Some(observed_at) = self.data_observed_at else {
-            return (false, Vec::new());
+            return (false, Vec::new(), Vec::new());
         };
         let first = !self.queue_refresh_baselined;
         let mut data_applied = false;
         let mut units = Vec::new();
+        let mut task_ids = Vec::new();
         for task in &poll.tasks {
             if task.kind != plant_ui::task_queue::KIND_DATA_BATCH
                 || !task.terminal()
@@ -2329,11 +2398,15 @@ impl App {
             }
             if let Some(outcome) = task.result.as_ref() {
                 data_applied |= outcome.data_applied();
-                units.extend(outcome.refresh_units());
+                let refresh = outcome.refresh_units();
+                if !refresh.is_empty() {
+                    task_ids.push(task.task_id.clone());
+                }
+                units.extend(refresh);
             }
         }
         self.queue_refresh_baselined = true;
-        (data_applied, units)
+        (data_applied, units, task_ids)
     }
 
     /// 按一份确切的清单取回工作，人不用记得再去点一下菜单。
@@ -2342,8 +2415,12 @@ impl App {
     /// 分支——单元自己、它的原 OWNER、新 OWNER，外加树里记着的当前父节点
     /// （元素被移走时后端的 `old_owner` 未必解得出来，本端的缓存却还留着移动前
     /// 那一头）。模型刷新只会在后台欠账全部清零后走到这里。
-    fn refresh_for_units(&mut self, units: Vec<model_update::RefreshUnit>) {
+    fn refresh_for_units(&mut self, units: Vec<model_update::RefreshUnit>, task_ids: Vec<String>) {
         if units.is_empty() {
+            return;
+        }
+        if !task_ids.is_empty() {
+            self.get_work_with_models_for_tasks(true, task_ids);
             return;
         }
         let mut branches: HashSet<RefU64> = HashSet::new();
@@ -2355,8 +2432,49 @@ impl App {
         }
         // 只留子层已经在手里的分支。没展开过的下次展开时本来就会现查，现在去拉
         // 就是把一次精确刷新做成一次预取。
+        //
+        // 但**够不着的那些不能就这么丢掉**：整棵子树是新增的时候（粘贴 / 新建 /
+        // 导入），交付单元根与它的 OWNER 都是新元素、都不在缓存里，于是这一句会把
+        // 集合清空——而真正多了一个孩子的那一层比它们还高，客户端手上根本没有那条
+        // 链。gen-model issue #9 就是这个形状：数据全对，树上却不出现。
+        let unresolved: Vec<RefU64> = branches
+            .iter()
+            .copied()
+            .filter(|refno| !self.tree.children.contains_key(refno))
+            .collect();
         branches.retain(|refno| self.tree.children.contains_key(refno));
-        self.start_get_work(branches.into_iter().collect(), true);
+        for refno in unresolved {
+            self.resolve_refresh_anchor(refno);
+        }
+        self.start_get_work_for_tasks(branches.into_iter().collect(), true, task_ids);
+    }
+
+    /// 这个元素不在缓存里，现查一条祖先链，找出**第一个已经展开过的祖先**来刷新。
+    ///
+    /// 交付单元只走到「单元根 + 它的直接 OWNER」，新增子树的这两层都是新的；树形状
+    /// 变化发生在更高的那一层，只有链能说出它是谁。链回来之后落到
+    /// [`Self::refresh_from_chain`]。
+    fn resolve_refresh_anchor(&mut self, refno: RefU64) {
+        if self.refresh_anchors.insert(refno) {
+            let _ = self.bridge.req.send(data::Req::Ancestors(refno));
+        }
+    }
+
+    /// 祖先链回来了，找第一个已展开的祖先重查它的子层。
+    ///
+    /// 一个都找不到就什么也不做：那条分支从没展开过，下次展开时本来就会现查，
+    /// 现在去拉是把一次精确刷新做成一次预取。
+    fn refresh_from_chain(&mut self, refno: RefU64, chain: &[RefU64]) -> bool {
+        if !self.refresh_anchors.remove(&refno) {
+            return false;
+        }
+        let Some(anchor) =
+            refresh_anchor(chain, |ancestor| self.tree.children.contains_key(&ancestor))
+        else {
+            return false;
+        };
+        self.start_get_work(vec![anchor], true);
+        true
     }
 
     /// 重入闸门与界面上那句「正在取回工作…」共用一个真值，两者不许分开走。
@@ -2367,7 +2485,8 @@ impl App {
 
     fn run_deferred_get_work(&mut self) {
         if let Some(reload_models) = self.get_work_again.take() {
-            self.get_work_with_models(reload_models);
+            let task_ids = self.get_work_again_task_ids.drain().collect();
+            self.get_work_with_models_for_tasks(reload_models, task_ids);
         }
     }
 
@@ -2394,9 +2513,12 @@ impl App {
         self.queue.mdb.clear();
         self.queue.namespace.clear();
         self.queue_finished.clear();
+        self.refresh_anchors.clear();
         self.data_observed_at = None;
         self.queue_refresh_baselined = false;
         self.get_work_again = None;
+        self.get_work_task_ids.clear();
+        self.get_work_again_task_ids.clear();
         self.model_reload_ready = false;
         self.model_reload_owed = false;
         self.model_reload_in_flight = false;
@@ -2560,8 +2682,8 @@ mod tests {
         TreeRowVm, Window, background_models_settled, begin_get_work, cache_model_scope,
         claim_unloaded_model_refnos, finished_after, in_mdb_path, mark_model_scope_unavailable,
         model_progress_terminal, model_reload_due, model_visibility_plan, needs_children_query,
-        restore_model_reload, settle_pending_directions, settled_pending_roots, sync_ime_window,
-        task_matches_project,
+        refresh_anchor, restore_model_reload, settle_pending_directions, settled_pending_roots,
+        sync_ime_window, task_matches_project,
     };
     use chrono::{TimeZone, Utc};
     use plant_ui::model_update::PendingModelUnit;
@@ -3079,6 +3201,32 @@ mod tests {
         );
     }
 
+    /// 新增一整棵子树时，该刷新的那一层比交付单元的 OWNER 还高。
+    ///
+    /// gen-model issue #9 的第二半：粘贴一个 PIPE 进 ZONE，交付单元根是里面的 BRAN
+    /// （`DEFAULT_DELIVERY_UNIT_TYPES` 里没有 PIPE，ZONE 更是永远不能当生成根），
+    /// 而 `unit.new_owner` 只走到 PIPE——BRAN 与 PIPE 都是新元素、都没展开过，
+    /// 「只留缓存里有的分支」那一句会把刷新集清空，多了一个孩子的 ZONE 一次都没被
+    /// 重查。所以够不着的那些要现查一条链，取链上第一个展开过的祖先来刷。
+    #[test]
+    fn a_brand_new_subtree_refreshes_the_nearest_ancestor_that_is_actually_on_the_tree() {
+        let [bran, pipe, zone, site] =
+            refs(&["25688/76273", "25688/76272", "17496/171104", "17496/1"])
+                .try_into()
+                .unwrap();
+        // 链：BRAN -> PIPE -> ZONE -> SITE。只有 ZONE 与 SITE 展开过。
+        let chain = vec![bran, pipe, zone, site];
+        let cached = |r: RefU64| r == zone || r == site;
+
+        assert_eq!(
+            refresh_anchor(&chain, cached),
+            Some(zone),
+            "要取最近的那一层，取到 SITE 就是把整棵树重查一遍"
+        );
+        // 一层都没展开过就什么也不做：下次展开时本来就会现查。
+        assert_eq!(refresh_anchor(&chain, |_| false), None);
+    }
+
     #[test]
     fn the_ancestor_path_stops_at_the_site_root() {
         // `fn::ancestor` 给的是「自己 -> 上级 -> …」，末尾那些层在 WORLD 一侧，
@@ -3290,6 +3438,8 @@ impl App {
             d,
             &self.model_api_url,
             self.queue.applying(),
+            &self.mdb,
+            self.queue.health.as_ref().map(|health| health.sync_live),
             &self.model_update,
             &mut self.model_update_state,
         ));

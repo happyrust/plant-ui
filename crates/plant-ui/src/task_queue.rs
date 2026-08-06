@@ -10,7 +10,7 @@
 //! 本模块放在顶层而不是 `workbench/` 下，与 `model_update` 同源：那一层按模块注释
 //! 是「输入 &WorkbenchVm、输出 Vec<Cmd>」的纯绘制，而这里要连契约类型一起管。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use chrono::{DateTime, Local};
@@ -23,8 +23,10 @@ use serde::Deserialize;
 
 use crate::Cmd;
 use crate::model_update::{
-    Feed, FileAnomaly, PendingModelUnit, ProgressEvent, RowState, UnitStatus,
+    BatchStatus, Enqueued, Feed, FileAnomaly, PendingModelUnit, Preview, ProgressEvent, RowState,
+    UnitResult, UnitStatus,
 };
+use crate::style::group_number as group;
 use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Status, Tokens, radius};
 use crate::style::widgets;
@@ -258,6 +260,10 @@ pub struct Vm {
     pub error: Option<String>,
     /// 有没有成功取到过一次快照。没有的话画「还没连上」而不是画一个空队列。
     pub loaded: bool,
+    /// 只有手动向导能给出的比较基线；按 execute 回执里的 task_id 精确关联。
+    preview_changes: HashMap<String, u64>,
+    /// 本会话已经消费过刷新线索的终态任务。
+    refreshed: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,6 +274,23 @@ pub enum IdentityStatus {
 }
 
 impl Vm {
+    pub fn remember_manual_preview(&mut self, preview: &Preview, receipt: &Enqueued) {
+        let changes: HashMap<u32, u64> = preview
+            .dbnums
+            .iter()
+            .map(|db| (db.dbnum, u64::from(db.changes())))
+            .collect();
+        for batch in receipt.enqueued.iter().chain(&receipt.merged) {
+            if let Some(changed) = changes.get(&batch.dbnum) {
+                self.preview_changes.insert(batch.task_id.clone(), *changed);
+            }
+        }
+    }
+
+    pub fn mark_refreshed(&mut self, task_id: &str) {
+        self.refreshed.insert(task_id.to_owned());
+    }
+
     pub fn adopt(&mut self, poll: Poll) {
         self.queue = poll.queue;
         self.tasks = poll.tasks;
@@ -289,6 +312,14 @@ impl Vm {
         // 为准：那一份不封顶，而 `/tasks` 钳到 200——一个排了几百行的批次还没轮到
         // 进任务窗口，它的明细不该被当成垃圾收掉。
         self.details.retain(|task_id, _| {
+            self.queue.rows.iter().any(|r| &r.task_id == task_id)
+                || self.tasks.iter().any(|t| &t.task_id == task_id)
+        });
+        self.preview_changes.retain(|task_id, _| {
+            self.queue.rows.iter().any(|r| &r.task_id == task_id)
+                || self.tasks.iter().any(|t| &t.task_id == task_id)
+        });
+        self.refreshed.retain(|task_id| {
             self.queue.rows.iter().any(|r| &r.task_id == task_id)
                 || self.tasks.iter().any(|t| &t.task_id == task_id)
         });
@@ -462,6 +493,10 @@ impl Phase {
 
     fn running(self) -> bool {
         matches!(self, Self::Applying | Self::Generating)
+    }
+
+    fn terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Partial | Self::Failed)
     }
 }
 
@@ -691,18 +726,27 @@ pub fn rows(vm: &Vm) -> Vec<RowVm> {
             _ => Phase::Unknown,
         };
         let failed = entry.failed_units();
-        let note = match failed.first() {
-            Some(unit) if unit.attempts > 0 => format!(
-                "{} {} 第 {} 次尝试失败",
-                unit.noun, unit.root_refno, unit.attempts
-            ),
-            Some(unit) => format!("{} {} 未能生成", unit.noun, unit.root_refno),
-            None => entry
-                .result
-                .as_ref()
-                .and_then(|o| o.batch.as_ref())
-                .and_then(|b| b.message.clone())
-                .unwrap_or_default(),
+        let note = if phase == Phase::Succeeded {
+            match (entry.units_done, entry.total_units) {
+                (Some(done), Some(total)) if done == total => {
+                    format!("{total} 个交付单元全部生成")
+                }
+                _ => String::new(),
+            }
+        } else {
+            match failed.first() {
+                Some(unit) if unit.attempts > 0 => format!(
+                    "{} {} 第 {} 次尝试失败",
+                    unit.noun, unit.root_refno, unit.attempts
+                ),
+                Some(unit) => format!("{} {} 未能生成", unit.noun, unit.root_refno),
+                None => entry
+                    .result
+                    .as_ref()
+                    .and_then(|o| o.batch.as_ref())
+                    .and_then(|b| b.message.clone())
+                    .unwrap_or_default(),
+            }
         };
         out.push(RowVm {
             task_id: entry.task_id.clone(),
@@ -937,12 +981,12 @@ pub struct State {
     pub search: String,
     /// 显式点过的展开箭头。默认展开与否按行的形态定，这里只记「与默认相反」的那些。
     toggled: std::collections::HashSet<String>,
-    /// 已经按下复活、还没在快照里看到结果的死信（按 `root_refno` 记）。
+    /// 已经按下重试、还没在快照里看到结果的单元（root_refno → 提交前 attempts）。
     ///
     /// 复活是一次写请求，回执 202 只表示「行改好了」，不表示生成跑完了——真值要等
     /// 下一拍轮询。中间这一拍按钮必须置灰：不灰的话人会连按，每按一次都是一次
     /// `revision + 1`，而界面上一点变化都没有。
-    in_flight: std::collections::HashSet<String>,
+    in_flight: HashMap<String, u32>,
 }
 
 impl State {
@@ -950,6 +994,14 @@ impl State {
     /// 需要宿主说一声——不然那枚按钮会一直灰着等一个永远不会来的变化。
     pub fn retry_failed(&mut self, root_refno: &str) {
         self.in_flight.remove(root_refno);
+    }
+
+    fn settle_retries(&mut self, pending: &[PendingModelUnit]) {
+        self.in_flight.retain(|root, attempts| {
+            pending
+                .iter()
+                .any(|unit| &unit.root_refno == root && unit.attempts == *attempts)
+        });
     }
 }
 
@@ -978,11 +1030,8 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, state: &mut State, cmd
             return not_connected(ui, t, d, vm);
         }
 
-        // 复活成功的行自己会从死信里消失（`attempts` 清零 → `dead` 变 false），
-        // 所以「已提交」这个短暂态按快照收口就够，不必让宿主再通知一次。
-        state
-            .in_flight
-            .retain(|root| vm.pending.iter().any(|u| &u.root_refno == root && u.dead));
+        // 成功会清零 attempts；活跃欠账与死信都靠下一份快照的这个变化收口。
+        state.settle_retries(&vm.pending);
 
         service_status_banners(ui, t, d, vm);
         if vm.paused() {
@@ -1861,7 +1910,7 @@ fn row_detail(
     d: Density,
     vm: &Vm,
     row: &RowVm,
-    in_flight: &mut std::collections::HashSet<String>,
+    in_flight: &mut HashMap<String, u32>,
     cmds: &mut Vec<Cmd>,
 ) {
     let indent = d.px(28.0);
@@ -1875,6 +1924,18 @@ fn row_detail(
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = d.px(2.0);
+
+            if row.phase.terminal() {
+                egui::Frame::new()
+                    .fill(t.bg_header)
+                    .corner_radius(CornerRadius::same(radius::MD))
+                    .inner_margin(Margin::same(d.px(10.0) as i8))
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        terminal_detail(ui, t, d, vm, row, in_flight, cmds);
+                    });
+                return;
+            }
 
             if let Some(entry) = vm.task(&row.task_id)
                 && let Some(merged) = entry
@@ -1961,6 +2022,188 @@ fn row_detail(
         });
 }
 
+/// 终态只读 `/tasks` 与持久欠账；WS 明细跨重连不可靠，也会与结果重复。
+fn terminal_detail(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    vm: &Vm,
+    row: &RowVm,
+    in_flight: &mut HashMap<String, u32>,
+    cmds: &mut Vec<Cmd>,
+) {
+    let Some(entry) = vm.task(&row.task_id) else {
+        return;
+    };
+    let outcome = entry.result.as_ref();
+    let batch = outcome.and_then(|result| result.batch.as_ref());
+
+    if let Some(batch) = batch {
+        let (icon, color, label) = match batch.status {
+            BatchStatus::Applied => (
+                ph::CHECK_CIRCLE,
+                t.success,
+                format!(
+                    "{} · 已应用 · 水位推进至 {}",
+                    window(batch.start_sesno, batch.end_sesno),
+                    group(batch.end_sesno.into())
+                ),
+            ),
+            BatchStatus::Failed => (
+                ph::X_CIRCLE,
+                t.danger,
+                format!(
+                    "{} · 批次失败 · 水位不变",
+                    window(batch.start_sesno, batch.end_sesno)
+                ),
+            ),
+            BatchStatus::Skipped => (
+                ph::PROHIBIT,
+                t.text_muted,
+                format!("{} · 已跳过", window(batch.start_sesno, batch.end_sesno)),
+            ),
+        };
+        detail_line(
+            ui,
+            t,
+            d,
+            DetailLine {
+                icon,
+                icon_color: color,
+                label: &label,
+                note: "",
+                note_color: color,
+            },
+        );
+
+        if !batch.merged_sesnos.is_empty() {
+            let listed = batch
+                .merged_sesnos
+                .iter()
+                .map(|sesno| group((*sesno).into()))
+                .collect::<Vec<_>>()
+                .join(" / ");
+            detail_line(
+                ui,
+                t,
+                d,
+                DetailLine {
+                    icon: ph::GIT_MERGE,
+                    icon_color: t.accent,
+                    label: &format!("预览后并入 {} 个会话", batch.merged_sesnos.len()),
+                    note: "",
+                    note_color: t.text_muted,
+                },
+            );
+            sub_line(ui, t, d, &listed, false);
+        }
+
+        let changed = match vm.preview_changes.get(&row.task_id) {
+            Some(previewed) => format!(
+                "{} 项变化（预览时 {}）",
+                group(batch.changed_elements as i64),
+                group(*previewed as i64)
+            ),
+            None => format!("{} 项变化", group(batch.changed_elements as i64)),
+        };
+        if batch.changed_elements > 0 {
+            sub_line(ui, t, d, &changed, false);
+        }
+
+        if batch.status == BatchStatus::Failed {
+            if let Some(message) = batch.message.as_deref() {
+                sub_line(ui, t, d, message, true);
+            }
+            sub_line(
+                ui,
+                t,
+                d,
+                "模型生成未开始——数据未落库，不产生待重试单元",
+                false,
+            );
+            sub_line(
+                ui,
+                t,
+                d,
+                "不用手动重排：下一轮扫描会按原水位区间重新入队",
+                false,
+            );
+        }
+    }
+
+    if batch.is_none_or(|batch| batch.status != BatchStatus::Failed) {
+        let units = outcome
+            .map(|result| result.units.as_slice())
+            .unwrap_or_default();
+        let generated = entry
+            .units_done
+            .map(|done| done as usize)
+            .unwrap_or_else(|| {
+                units
+                    .iter()
+                    .filter(|unit| unit.status == UnitStatus::Generated)
+                    .count()
+            });
+        let failed: Vec<_> = units
+            .iter()
+            .filter(|unit| unit.status == UnitStatus::Failed)
+            .collect();
+        if let Some(total) = entry.total_units {
+            let label = if failed.is_empty() {
+                format!("{generated} / {total} 个交付单元已生成")
+            } else {
+                format!("{generated} 成功 · {} 失败 · 共 {total}", failed.len())
+            };
+            sub_line(ui, t, d, &label, false);
+        }
+
+        for unit in failed {
+            if let Some(pending) = batch
+                .and_then(|batch| pending_for_task(&vm.pending, row.dbnum, batch.end_sesno, unit))
+            {
+                pending_line(ui, t, d, vm, pending, in_flight, cmds);
+            } else {
+                detail_line(
+                    ui,
+                    t,
+                    d,
+                    DetailLine {
+                        icon: ph::X_CIRCLE,
+                        icon_color: t.danger,
+                        label: &format!("{} {}", unit.noun, unit.root_refno),
+                        note: "生成失败",
+                        note_color: t.danger,
+                    },
+                );
+                if let Some(message) = unit.message.as_deref() {
+                    sub_line(ui, t, d, message, true);
+                }
+            }
+        }
+
+        if vm.refreshed.contains(&row.task_id) {
+            sub_line(ui, t, d, "模型树已就地刷新", false);
+        }
+    }
+
+    if let Some(times) = terminal_times(entry) {
+        sub_line(ui, t, d, &times, false);
+    }
+}
+
+fn pending_for_task<'a>(
+    pending: &'a [PendingModelUnit],
+    dbnum: u32,
+    end_sesno: i32,
+    unit: &UnitResult,
+) -> Option<&'a PendingModelUnit> {
+    pending.iter().find(|pending| {
+        pending.dbnum == dbnum
+            && pending.root_refno == unit.root_refno
+            && pending.source_end_sesno == end_sesno
+    })
+}
+
 /// 运行中的行在明细区上方那句降级提示。`None` = 不画。
 struct FeedNotice {
     icon: &'static str,
@@ -2040,7 +2283,7 @@ fn pending_line(
     d: Density,
     vm: &Vm,
     unit: &PendingModelUnit,
-    in_flight: &mut std::collections::HashSet<String>,
+    in_flight: &mut HashMap<String, u32>,
     cmds: &mut Vec<Cmd>,
 ) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), d.px(30.0)), Sense::hover());
@@ -2060,22 +2303,14 @@ fn pending_line(
             .color(t.text_secondary),
     );
     let state = if unit.dead {
-        format!("已放弃 · 尝试 {} 次后自动路径不再碰它", unit.attempts)
+        format!("已尝试 {} 次 · 已放弃重试", unit.attempts)
     } else {
-        format!("欠着 · 已尝试 {} 次", unit.attempts)
+        format!("第 {} 次尝试失败", unit.attempts)
     };
     line.label(RichText::new(state).font(Font::micro(d)).color(tone));
 
-    let submitted = in_flight.contains(&unit.root_refno);
+    let submitted = in_flight.contains_key(&unit.root_refno);
     line.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        if !unit.dead {
-            ui.label(
-                RichText::new("后台自动重试")
-                    .font(Font::micro(d))
-                    .color(t.text_muted),
-            );
-            return;
-        }
         if submitted {
             ui.label(
                 RichText::new("已提交 · 等下一拍")
@@ -2093,13 +2328,24 @@ fn pending_line(
             .on_disabled_hover_text("当前数据源身份未就绪，或与模型服务固定范围不一致")
             .clicked()
         {
-            in_flight.insert(unit.root_refno.clone());
+            in_flight.insert(unit.root_refno.clone(), unit.attempts);
             cmds.push(Cmd::RetryPendingUnit {
                 dbnum: unit.dbnum,
                 root_refno: unit.root_refno.clone(),
             });
         }
+        if !unit.dead {
+            ui.label(
+                RichText::new("后台仍会自动重试")
+                    .font(Font::micro(d))
+                    .color(t.text_muted),
+            );
+        }
     });
+
+    if unit.dead {
+        sub_line(ui, t, d, "不再自动重试，也不并入手动更新", true);
+    }
 
     // 「为什么失败」只在这里说得出口：WS 明细活在进程内存里，重连即失；
     // 持久表这一份跨重启仍在，不画就等于没有。
@@ -2109,13 +2355,17 @@ fn pending_line(
 }
 
 fn sub_line(ui: &mut Ui, t: &Tokens, d: Density, text: &str, danger: bool) {
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), d.px(18.0)), Sense::hover());
-    let mut ui = child(ui, rect.shrink2(vec2(d.px(21.0), 0.0)), Align::Center);
-    ui.label(RichText::new(text).font(Font::micro(d)).color(if danger {
-        t.danger
-    } else {
-        t.text_muted
-    }));
+    ui.horizontal(|ui| {
+        ui.add_space(d.px(21.0));
+        ui.add(
+            egui::Label::new(RichText::new(text).font(Font::micro(d)).color(if danger {
+                t.danger
+            } else {
+                t.text_muted
+            }))
+            .wrap(),
+        );
+    });
 }
 
 // ---------------------------------------------------------------- 绘制小工具
@@ -2171,19 +2421,6 @@ fn window(start: i32, end: i32) -> String {
     format!("sesno {} → {}", group(start as i64), group(end as i64))
 }
 
-fn group(value: i64) -> String {
-    let negative = value < 0;
-    let digits = value.abs().to_string();
-    let mut out = String::new();
-    for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(' ');
-        }
-        out.push(ch);
-    }
-    if negative { format!("-{out}") } else { out }
-}
-
 fn clock(elapsed: Duration) -> String {
     let s = elapsed.as_secs();
     if s < 3600 {
@@ -2210,6 +2447,21 @@ fn since(stamp: &str) -> Option<Duration> {
 
 fn hhmm(stamp: &str) -> Option<String> {
     Some(parse(stamp)?.format("%H:%M").to_string())
+}
+
+fn terminal_times(entry: &TaskEntry) -> Option<String> {
+    let started = entry.started_at.as_deref()?;
+    let finished = entry.finished_at.as_deref()?;
+    let elapsed = parse(finished)?
+        .signed_duration_since(parse(started)?)
+        .to_std()
+        .ok()?;
+    Some(format!(
+        "开跑 {} · 结束 {} · 用时 {}",
+        hhmm(started)?,
+        hhmm(finished)?,
+        clock(elapsed)
+    ))
 }
 
 /// 房间泳道的「已等待」按分钟报。秒级精度在这里没有意义——它衡量的是
@@ -2331,6 +2583,94 @@ mod tests {
         let batch = task.result.as_ref().unwrap().batch.as_ref().unwrap();
         assert_eq!(batch.merged_sesnos, vec![1032, 1034]);
         assert_eq!(task.failed_units()[0].attempts, 3);
+    }
+
+    #[test]
+    fn a_manual_preview_is_attached_only_to_the_tasks_named_by_the_receipt() {
+        let preview = Preview {
+            dbnums: vec![crate::model_update::DbPreview {
+                dbnum: 8000,
+                net_added: 10,
+                net_modified: 20,
+                net_deleted: 3,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let batch = |task_id: &str| crate::model_update::EnqueuedBatch {
+            task_id: task_id.into(),
+            dbnum: 8000,
+            ..Default::default()
+        };
+        let receipt = Enqueued {
+            enqueued: vec![batch("new")],
+            merged: vec![batch("merged")],
+            already_covered: vec![8000],
+            ..Default::default()
+        };
+        let mut model = Vm::default();
+
+        model.remember_manual_preview(&preview, &receipt);
+
+        assert_eq!(model.preview_changes.get("new"), Some(&33));
+        assert_eq!(model.preview_changes.get("merged"), Some(&33));
+        assert_eq!(
+            model.preview_changes.len(),
+            2,
+            "没有 task_id 的覆盖项不许猜"
+        );
+    }
+
+    #[test]
+    fn an_active_retry_stays_disabled_until_the_snapshot_changes() {
+        let mut state = State::default();
+        state.in_flight.insert("1/2".into(), 3);
+        let mut unit = PendingModelUnit {
+            root_refno: "1/2".into(),
+            attempts: 3,
+            ..Default::default()
+        };
+
+        state.settle_retries(std::slice::from_ref(&unit));
+        assert!(state.in_flight.contains_key("1/2"));
+        unit.attempts = 0;
+        state.settle_retries(&[unit]);
+        assert!(!state.in_flight.contains_key("1/2"));
+    }
+
+    #[test]
+    fn an_old_task_does_not_borrow_a_newer_failure_of_the_same_unit() {
+        let unit = UnitResult {
+            root_refno: "1/2".into(),
+            status: UnitStatus::Failed,
+            ..Default::default()
+        };
+        let pending = vec![PendingModelUnit {
+            dbnum: 8000,
+            root_refno: "1/2".into(),
+            source_end_sesno: 20,
+            attempts: 4,
+            ..Default::default()
+        }];
+
+        assert!(pending_for_task(&pending, 8000, 10, &unit).is_none());
+        assert_eq!(
+            pending_for_task(&pending, 8000, 20, &unit).map(|unit| unit.attempts),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn terminal_timing_needs_both_valid_timestamps() {
+        let mut task = entry("db-8000-1", 8000, "succeeded");
+        task.started_at = Some("2026-07-27T10:07:22+08:00".into());
+        task.finished_at = Some("2026-07-27T10:12:00+08:00".into());
+        assert_eq!(
+            terminal_times(&task).as_deref(),
+            Some("开跑 10:07 · 结束 10:12 · 用时 04:38")
+        );
+        task.finished_at = Some("bad".into());
+        assert!(terminal_times(&task).is_none());
     }
 
     /// 房间轮的 `detail` 与数据批次的 `result` 是两种形状，不能互相踩。

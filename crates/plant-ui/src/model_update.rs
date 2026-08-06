@@ -23,6 +23,7 @@ use egui::{
 use egui_phosphor::regular as ph;
 use serde::Deserialize;
 
+use crate::style::group_number;
 use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Status, Tokens, radius};
 use crate::style::widgets;
@@ -225,9 +226,9 @@ impl std::fmt::Display for FileAnomaly {
             ),
             Self::Duplicate { paths } => write!(
                 f,
-                "项目内发现 {} 个同号文件，界面不替人挑：{}。",
+                "项目内发现 {} 个同号文件，不自动挑选；出路：人工挑一个。\n· {}",
                 paths.len(),
-                paths.join("、")
+                paths.join("\n· ")
             ),
             Self::Missing { path } => write!(
                 f,
@@ -870,7 +871,8 @@ pub enum Vm {
     Idle,
     Loading,
     Ready(Preview),
-    Starting,
+    /// 正在把这份预览重新扫描并入队。保留它，供终态行显示“预览时 N 项”。
+    Starting(Preview),
     Failed(Failure),
 }
 
@@ -881,7 +883,7 @@ impl Vm {
             Self::Idle => 0,
             Self::Loading => 1,
             Self::Ready(_) => 2,
-            Self::Starting => 3,
+            Self::Starting(_) => 3,
             Self::Failed(_) => 4,
         }
     }
@@ -996,6 +998,8 @@ pub fn show(
     d: Density,
     api_url: &str,
     applying: usize,
+    scope_mdb: &str,
+    sync_live: Option<bool>,
     vm: &Vm,
     state: &mut State,
 ) -> Vec<Cmd> {
@@ -1020,7 +1024,7 @@ pub fn show(
         )
         .show(ctx, |ui| {
             ui.spacing_mut().item_spacing = Vec2::ZERO;
-            header(ui, t, d, vm, state);
+            header(ui, t, d, scope_mdb, sync_live, vm, state);
             steps(ui, t, d, state.step);
 
             let footer_h = d.px(56.0);
@@ -1031,13 +1035,13 @@ pub fn show(
                 match vm {
                     Vm::Idle => idle_body(ui, t, d),
                     Vm::Loading => previewing_body(ui, t, d, state),
-                    Vm::Starting => center_note(
+                    Vm::Starting(_) => center_note(
                         ui,
                         t,
                         d,
                         None,
                         "正在提交增量更新任务…",
-                        "服务端接下这次运行之后，这里会换成逐批次、逐单元的执行进度。",
+                        "服务端接下任务后，本窗会关闭并切到任务队列。",
                     ),
                     Vm::Failed(failure) => failure_body(ui, t, d, failure, state),
                     Vm::Ready(preview) if preview.up_to_date => up_to_date_body(ui, t, d, state),
@@ -1053,8 +1057,16 @@ pub fn show(
     cmds
 }
 
-fn header(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, state: &mut State) {
-    let (title, sub, tone, icon) = header_text(vm, state);
+fn header(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    scope_mdb: &str,
+    sync_live: Option<bool>,
+    vm: &Vm,
+    state: &mut State,
+) {
+    let (title, sub, tone, icon) = header_text(vm, state, scope_mdb, sync_live);
     let rect = bar(ui, d.px(52.0), t.bg_chrome, Corner::Top);
     let mut ui = child(ui, rect.shrink2(vec2(d.px(16.0), 0.0)), Align::Center);
     ui.spacing_mut().item_spacing.x = d.px(12.0);
@@ -1092,42 +1104,61 @@ fn header(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, state: &mut State) {
     });
 }
 
-fn header_text(vm: &Vm, state: &State) -> (String, String, Status, &'static str) {
+fn header_text(
+    vm: &Vm,
+    state: &State,
+    scope_mdb: &str,
+    sync_live: Option<bool>,
+) -> (String, String, Status, &'static str) {
     let project = project_of(vm, state);
+    let identity = |mdb: &str| {
+        let mut parts = vec![project.clone()];
+        if !mdb.is_empty() {
+            parts.push(format!("MDB {mdb}"));
+        }
+        if let Some(live) = sync_live {
+            parts.push(if live {
+                "自动同步已开启".to_owned()
+            } else {
+                "自动同步已关闭".to_owned()
+            });
+        }
+        parts.join(" · ")
+    };
     match vm {
         Vm::Idle => (
             "模型更新".into(),
-            format!("{project} · 尚未预览"),
+            format!("{} · 尚未预览", identity(scope_mdb)),
             Status::Neutral,
             ph::ARROWS_CLOCKWISE,
         ),
         Vm::Loading => (
             "模型更新 · 正在预览".into(),
-            format!("{project} · 只读扫描"),
+            format!("{} · 只读扫描", identity(scope_mdb)),
             Status::Info,
             ph::ARROWS_CLOCKWISE,
         ),
-        Vm::Starting => (
+        Vm::Starting(preview) => (
             "模型更新 · 正在提交".into(),
-            format!("{project} · 等待服务端接下任务"),
+            format!("{} · 等待服务端接下任务", identity(&preview.mdb)),
             Status::Info,
             ph::ARROWS_CLOCKWISE,
         ),
         Vm::Failed(failure) => (
             format!("模型更新 · {}", failure.form().title()),
-            format!("{project} · {}", failure.code),
+            format!("{} · {}", identity(scope_mdb), failure.code),
             failure.form().tone(),
             failure.form().icon(),
         ),
         Vm::Ready(preview) if preview.up_to_date => (
             "模型更新 · 已是最新".into(),
-            format!("{project} · 没有可更新的内容"),
+            format!("{} · 没有可更新的内容", identity(&preview.mdb)),
             Status::Success,
             ph::CHECK_CIRCLE,
         ),
-        Vm::Ready(_) if state.step == Step::Confirm => (
+        Vm::Ready(preview) if state.step == Step::Confirm => (
             "模型更新 · 确认执行".into(),
-            format!("{project} · 开始后不可中途取消"),
+            format!("{} · 开始后不可中途取消", identity(&preview.mdb)),
             Status::Warn,
             ph::SEAL_WARNING,
         ),
@@ -1135,10 +1166,7 @@ fn header_text(vm: &Vm, state: &State) -> (String, String, Status, &'static str)
         // `mdb_name`，只说「仅扫描当前项目」的话，两边错开时界面一声不响。
         Vm::Ready(preview) => (
             "模型更新".into(),
-            match preview.mdb.as_str() {
-                "" => format!("{project} · 仅扫描当前项目"),
-                mdb => format!("{project} · MDB {mdb} · 仅扫描当前项目"),
-            },
+            identity(&preview.mdb),
             Status::Info,
             ph::ARROWS_CLOCKWISE,
         ),
@@ -1147,7 +1175,9 @@ fn header_text(vm: &Vm, state: &State) -> (String, String, Status, &'static str)
 
 fn project_of(vm: &Vm, state: &State) -> String {
     match vm {
-        Vm::Ready(preview) if !preview.project.is_empty() => preview.project.clone(),
+        Vm::Ready(preview) | Vm::Starting(preview) if !preview.project.is_empty() => {
+            preview.project.clone()
+        }
         _ => state
             .cached()
             .map(|p| p.project.clone())
@@ -1295,7 +1325,7 @@ fn footer_actions(
                 cmds.push(Cmd::CancelModelUpdatePreview);
             }
         }
-        Vm::Starting => {}
+        Vm::Starting(_) => {}
         Vm::Ready(preview) if preview.up_to_date => {
             if ui
                 .add(widgets::button(t, d, "重新预览").icon(ph::ARROWS_CLOCKWISE))
@@ -1766,6 +1796,51 @@ fn summary_block(ui: &mut Ui, t: &Tokens, d: Density, applying: usize, totals: &
     }
 }
 
+fn anomaly_copy(anomaly: &FileAnomaly) -> (&'static str, String) {
+    match anomaly {
+        FileAnomaly::Rollback {
+            file_latest_sesno,
+            applied_sesno,
+        } => (
+            "会话号回退，本次跳过",
+            format!(
+                "原因：文件最新会话号 {} 低于已应用 {}。\n影响：水位不回退，其他库照常执行。\n出路：换回正确文件。",
+                group_number((*file_latest_sesno).into()),
+                group_number((*applied_sesno).into())
+            ),
+        ),
+        FileAnomaly::PathMigrated { old_path, new_path } => (
+            "路径迁移，照常执行",
+            format!(
+                "原因：同号同类型且水位未变，文件从 {old_path} 移到 {new_path}。\n影响：本批次照常执行。\n出路：登记路径自动更新。"
+            ),
+        ),
+        FileAnomaly::TypeChanged {
+            stored_db_type,
+            observed_db_type,
+        } => (
+            "库类型变化，本次跳过",
+            format!(
+                "原因：登记为 {stored_db_type}，本次读到 {observed_db_type}。\n影响：身份不自动覆盖，水位不变。\n出路：人工确认正确库类型。"
+            ),
+        ),
+        FileAnomaly::Duplicate { paths } => (
+            "发现同号文件，本次跳过",
+            format!(
+                "原因：项目内发现 {} 个同号文件：\n· {}\n影响：不自动挑选，水位不变。\n出路：人工保留正确文件。",
+                paths.len(),
+                paths.join("\n· ")
+            ),
+        ),
+        FileAnomaly::Missing { path } => (
+            "登记文件缺失，本次跳过",
+            format!(
+                "原因：登记路径找不到文件：{path}\n影响：本库不执行，水位不变。\n出路：放回文件或注销登记。"
+            ),
+        ),
+    }
+}
+
 fn hints_block(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, totals: &Totals) {
     section(ui, t, d, "阻断与提示");
     ui.add_space(d.px(10.0));
@@ -1773,18 +1848,18 @@ fn hints_block(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, totals: &
 
     for db in preview.dbnums.iter().filter(|db| db.form().blocks()) {
         any = true;
-        let form = db.form();
+        let (title, body) = db.anomaly.as_ref().map(anomaly_copy).unwrap_or((
+            "文件异常，本次跳过",
+            "影响：水位不变。\n出路：检查项目文件。".into(),
+        ));
         note_card(
             ui,
             t,
             d,
             Status::Error,
             ph::WARNING_CIRCLE,
-            &format!("db{} {}，本次跳过", db.dbnum, form.label()),
-            &db.anomaly
-                .as_ref()
-                .map(FileAnomaly::to_string)
-                .unwrap_or_else(|| "文件异常，本次不执行这个 dbnum。水位不变。".into()),
+            &format!("db{} · {title}", db.dbnum),
+            &body,
         );
         ui.add_space(d.px(10.0));
     }
@@ -1795,17 +1870,19 @@ fn hints_block(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, totals: &
         .filter(|db| db.form() == DbForm::PathMigrated)
     {
         any = true;
+        let (title, body) = db
+            .anomaly
+            .as_ref()
+            .map(anomaly_copy)
+            .unwrap_or(("路径迁移，照常执行", String::new()));
         note_card(
             ui,
             t,
             d,
             Status::Warn,
             ph::GIT_MERGE,
-            &format!("db{} 路径迁移，照常执行", db.dbnum),
-            &db.anomaly
-                .as_ref()
-                .map(FileAnomaly::to_string)
-                .unwrap_or_default(),
+            &format!("db{} · {title}", db.dbnum),
+            &body,
         );
         ui.add_space(d.px(10.0));
     }
@@ -1846,39 +1923,30 @@ fn hints_block(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, totals: &
     }
 
     let to_run = preview.retries_to_run().count();
-    if to_run > 0 {
+    let dead = preview.dead_retries().count();
+    if to_run + dead > 0 {
         any = true;
+        let mut detail = Vec::new();
+        if to_run > 0 {
+            detail.push(format!(
+                "将合并：{}。按最新状态只生成一次。",
+                listed(preview.retries_to_run())
+            ));
+        }
+        if dead > 0 {
+            detail.push(format!(
+                "已放弃：{}。不再自动重试，也不并入手动更新；可在任务队列逐个重试。",
+                listed(preview.dead_retries())
+            ));
+        }
         note_card(
             ui,
             t,
             d,
             Status::Info,
             ph::ARROW_COUNTER_CLOCKWISE,
-            &format!("{to_run} 个待重试单元将合并"),
-            &format!(
-                "{}。上次生成失败，本次按最新状态只生成一次。",
-                listed(preview.retries_to_run())
-            ),
-        );
-        ui.add_space(d.px(10.0));
-    }
-
-    // 死信不许混进上面那张卡：说「将合并」就是承诺一件本次不会发生的事。
-    // 它们的出路只有队列面板行内那枚「立刻重试」。
-    let dead = preview.dead_retries().count();
-    if dead > 0 {
-        any = true;
-        note_card(
-            ui,
-            t,
-            d,
-            Status::Error,
-            ph::X_CIRCLE,
-            &format!("{dead} 个单元已放弃重试，本次不会碰"),
-            &format!(
-                "{}。已达重试上限，自动路径不再取它们；模型停在旧几何，要在任务队列里逐个复活。",
-                listed(preview.dead_retries())
-            ),
+            &format!("{to_run} 个将合并 · {dead} 个已放弃"),
+            &detail.join("\n"),
         );
         ui.add_space(d.px(10.0));
     }
@@ -1934,7 +2002,7 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
                         &format!("db{} · {}", db.dbnum, db.db_type),
                         &db.window(),
                         &if db.initialization_required {
-                            "首次导入 · 全量建立水位".to_owned()
+                            "需初始化 · 整库生成 · 建立水位".to_owned()
                         } else {
                             format!("{} 个会话 · {} 项变化", db.sessions.len(), db.changes())
                         },
@@ -1948,7 +2016,7 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
                     Dot::Glyph(ph::STACK, t.accent),
                     &format!("{} 个最小交付单元将重新生成", totals.generating),
                     "",
-                    "本期执行范围：当前 MDB 声明的 DESI 库 + sesno",
+                    "按变化归并；初始化库的整库生成单元不计入此数",
                     t.text_muted,
                 );
                 if totals.transform_targets > 0 {
@@ -1981,8 +2049,7 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
         let not_running = totals.blocked
             + totals.excluded
             + totals.not_in_project
-            + usize::from(totals.no_generation > 0)
-            + usize::from(dead > 0);
+            + usize::from(totals.no_generation > 0);
         card_titled(
             ui,
             t,
@@ -2048,19 +2115,6 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
                         t.warn,
                     );
                 }
-                // 死信摆在这张卡而不是上面那张：它们确实在列表里，但这一次一个都不跑。
-                if dead > 0 {
-                    line(
-                        ui,
-                        t,
-                        d,
-                        Dot::Glyph(ph::X_CIRCLE, t.danger),
-                        &format!("{dead} 个单元已放弃重试"),
-                        "",
-                        "已达重试上限 · 要在任务队列里逐个复活",
-                        t.danger,
-                    );
-                }
                 if not_running == 0 {
                     ui.label(
                         RichText::new("没有阻断，也没有被排除的库。")
@@ -2072,7 +2126,7 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
         );
 
         let to_run = preview.retries_to_run().count();
-        if to_run > 0 {
+        if to_run + dead > 0 {
             card_titled(
                 ui,
                 t,
@@ -2080,7 +2134,7 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
                 ph::ARROW_COUNTER_CLOCKWISE,
                 t.accent,
                 "会一并处理",
-                &format!("{to_run} 个待重试单元"),
+                &format!("{to_run} 个将合并 · {dead} 个已放弃"),
                 |ui| {
                     for unit in preview.retries_to_run() {
                         line(
@@ -2095,6 +2149,18 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
                             ),
                             "按最新状态只生成一次",
                             t.text_secondary,
+                        );
+                    }
+                    for unit in preview.dead_retries() {
+                        line(
+                            ui,
+                            t,
+                            d,
+                            Dot::Tone(t.danger),
+                            &format!("{} {}", unit.noun, unit.root_refno),
+                            &format!("已尝试 {} 次", unit.attempts),
+                            "已放弃 · 本次不执行 · 可在任务队列立刻重试",
+                            t.danger,
                         );
                     }
                 },
@@ -3113,15 +3179,31 @@ mod tests {
             mdb: "/ALL".into(),
             ..Default::default()
         });
-        let (_, sub, _, _) = header_text(&scoped, &state);
+        let (_, sub, _, _) = header_text(&scoped, &state, "/ALL", None);
         assert!(sub.contains("AMS-8009") && sub.contains("/ALL"), "{sub}");
+
+        let (_, sub, _, _) = header_text(&Vm::Loading, &state, "/ALL", Some(true));
+        assert!(
+            sub.contains("MDB /ALL") && sub.contains("自动同步已开启"),
+            "{sub}"
+        );
+
+        let starting = Vm::Starting(match &scoped {
+            Vm::Ready(preview) => preview.clone(),
+            _ => unreachable!(),
+        });
+        let (_, sub, _, _) = header_text(&starting, &state, "/ALL", Some(false));
+        assert!(
+            sub.contains("/ALL") && sub.contains("自动同步已关闭"),
+            "{sub}"
+        );
 
         // 服务端没回显时不许编一个出来。
         let bare = Vm::Ready(Preview {
             project: "AMS-8009".into(),
             ..Default::default()
         });
-        let (_, sub, _, _) = header_text(&bare, &state);
+        let (_, sub, _, _) = header_text(&bare, &state, "", None);
         assert!(!sub.contains("MDB"), "回显缺席时不许摆一个假 MDB：{sub}");
     }
 

@@ -37,6 +37,8 @@ pub enum Req {
         project: String,
         mdb: String,
         namespace: String,
+        /// `true` 只表示模型更新向导的确认按钮；队列里的即时扫描为 `false`。
+        from_wizard: bool,
     },
     /// 取回工作：丢缓存，重查 SITE 根层与这些已展开分支的子层。
     ///
@@ -108,7 +110,10 @@ pub enum Evt {
     Ancestors(RefU64, anyhow::Result<Vec<RefU64>>),
     ModelUpdatePreview(anyhow::Result<Preview>),
     /// 「扫描 + 入队」的回执。合流之后它不再是单个 task_id。
-    ModelUpdateExecute(anyhow::Result<Enqueued>),
+    ModelUpdateExecute {
+        from_wizard: bool,
+        result: anyhow::Result<Enqueued>,
+    },
     /// 取回工作的整批结果。根层查不动就是整次失败——根层没了树无从谈起。
     GetWork(anyhow::Result<GetWork>),
     /// 设计库水位。查不动就不显示那行提示，不值得为它报错。
@@ -323,11 +328,15 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
                         project,
                         mdb,
                         namespace,
+                        from_wizard,
                     } => {
                         let result =
                             crate::model_update_api::execute(&base, &project, &mdb, &namespace)
                                 .await;
-                        let _ = evt_tx.send(Evt::ModelUpdateExecute(result));
+                        let _ = evt_tx.send(Evt::ModelUpdateExecute {
+                            from_wizard,
+                            result,
+                        });
                         ctx.request_repaint();
                     }
                     Req::GetWork {
