@@ -753,6 +753,10 @@ fn finished_after(finished_at: Option<&str>, observed_at: DateTime<Utc>) -> bool
 ///
 /// `None` = 链里没有落脚点，目标是树外元素。目标自己就是 SITE 根时返回空路径：
 /// 它那一行本来就在，不用展开谁。
+fn needs_children_query(is_freshly_resolved_parent: bool, cached: bool) -> bool {
+    is_freshly_resolved_parent || !cached
+}
+
 fn in_mdb_path(chain: &[RefU64], is_root: impl Fn(RefU64) -> bool) -> Option<Vec<RefU64>> {
     let anchor = chain.iter().position(|ancestor| is_root(*ancestor))?;
     Some(chain[1..=anchor].to_vec())
@@ -1956,7 +1960,7 @@ impl App {
     fn locate(&mut self, refno: RefU64, from_command: bool) -> Locate {
         self.select(refno);
         if let Some(chain) = self.tree.ancestors(refno) {
-            self.expand_path(&chain);
+            self.expand_path(&chain, false);
             self.pending_locate = Some(PendingLocate {
                 target: refno,
                 path: chain,
@@ -1983,10 +1987,13 @@ impl App {
     ///
     /// 只补直接子层，不预载整棵树：为一次定位把模型树整个拉下来，代价是几万行
     /// 无人看的节点。
-    fn expand_path(&mut self, path: &[RefU64]) {
-        for &ancestor in path {
+    fn expand_path(&mut self, path: &[RefU64], from_fresh_chain: bool) {
+        for (i, &ancestor) in path.iter().enumerate() {
             self.tree.expanded.insert(ancestor);
-            if !self.tree.children.contains_key(&ancestor) && self.tree.loading.insert(ancestor) {
+            let cached = self.tree.children.contains_key(&ancestor);
+            if needs_children_query(from_fresh_chain && i == 0, cached)
+                && self.tree.loading.insert(ancestor)
+            {
                 let _ = self.bridge.req.send(data::Req::Children(ancestor));
             }
         }
@@ -2018,7 +2025,7 @@ impl App {
         for pair in chain[..=path.len()].windows(2) {
             self.tree.parent.insert(pair[0], pair[1]);
         }
-        self.expand_path(&path);
+        self.expand_path(&path, true);
         if let Some(pending) = &mut self.pending_locate {
             pending.path = path;
         }
@@ -2501,8 +2508,9 @@ mod tests {
         EleTreeNode, ModelVisibility, ModelVisibilityPlan, RefU64, RowVisibility, TreeModel,
         TreeRowVm, Window, background_models_settled, begin_get_work, cache_model_scope,
         claim_unloaded_model_refnos, finished_after, in_mdb_path, mark_model_scope_unavailable,
-        model_progress_terminal, model_reload_due, model_visibility_plan, restore_model_reload,
-        settle_pending_directions, settled_pending_roots, sync_ime_window, task_matches_project,
+        model_progress_terminal, model_reload_due, model_visibility_plan, needs_children_query,
+        restore_model_reload, settle_pending_directions, settled_pending_roots, sync_ime_window,
+        task_matches_project,
     };
     use chrono::{TimeZone, Utc};
     use plant_ui::model_update::PendingModelUnit;
@@ -3008,6 +3016,14 @@ mod tests {
         let site = chain[3];
         let path = in_mdb_path(&chain, |r| r == site).unwrap();
         assert_eq!(path, refs(&["24381/100600", "24381/100500", "24381/1"]));
+    }
+
+    #[test]
+    fn a_freshly_resolved_parent_is_requeried_even_when_its_children_are_cached() {
+        assert!(needs_children_query(true, true));
+        assert!(needs_children_query(true, false));
+        assert!(needs_children_query(false, false));
+        assert!(!needs_children_query(false, true));
     }
 
     #[test]
