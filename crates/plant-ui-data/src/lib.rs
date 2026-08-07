@@ -7,6 +7,8 @@ use anyhow::Result;
 pub use aios_core::pdms_types::EleTreeNode;
 pub use aios_core::{RefU64, RefnoEnum};
 
+pub mod room;
+
 /// 连接本地 SurrealDB（读取工作目录的 DbOption.toml，走 aios_core 全局句柄 SUL_DB）。
 pub async fn connect() -> Result<()> {
     aios_core::init_surreal().await
