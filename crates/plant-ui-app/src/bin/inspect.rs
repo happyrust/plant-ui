@@ -22,7 +22,20 @@ use std::net::TcpStream;
 use egui::{Key, Modifiers, MouseWheelUnit, PointerButton, Pos2, TouchPhase, pos2, vec2};
 use egui_inspection::protocol::{Request, Response, read_handshake, read_message, write_message};
 
-const ADDR: &str = "127.0.0.1:5719";
+const DEFAULT_ADDR: &str = "127.0.0.1:5719";
+
+/// 探针连哪个地址，读的是应用那一侧同一个 `EGUI_INSPECTION`（`egui_inspection`
+/// 的 `bind_addr_from_env` 也认这一格）。
+///
+/// 有它才能在开着两个实例时点名连自己那一个——默认端口只有先起来的那个占得到，
+/// 另一个连探针都挂不上。
+fn addr() -> String {
+    match std::env::var("EGUI_INSPECTION").as_deref().map(str::trim) {
+        Ok("1") | Ok("") | Err(_) => DEFAULT_ADDR.to_owned(),
+        Ok(value) if value.eq_ignore_ascii_case("true") => DEFAULT_ADDR.to_owned(),
+        Ok(value) => value.to_owned(),
+    }
+}
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -164,8 +177,9 @@ fn parse_key(name: &str) -> anyhow::Result<(Key, Modifiers)> {
 
 /// 每条命令开一条新连接：协议是一请求一应答，没有跨命令的会话状态。
 fn request(req: &Request) -> anyhow::Result<Response> {
-    let stream = TcpStream::connect(ADDR).map_err(|e| {
-        anyhow::anyhow!("连不上 {ADDR}（应用是否带 EGUI_INSPECTION=1 启动？）：{e}")
+    let addr = addr();
+    let stream = TcpStream::connect(&addr).map_err(|e| {
+        anyhow::anyhow!("连不上 {addr}（应用是否带 EGUI_INSPECTION=1 启动？）：{e}")
     })?;
     read_handshake(&stream)?;
     write_message(&stream, req)?;

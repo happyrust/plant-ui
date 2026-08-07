@@ -9,6 +9,8 @@ mod gallery;
 mod logs;
 mod model_update_api;
 mod model_update_ws;
+mod settings_store;
+mod sim;
 mod startup;
 
 use std::collections::{HashMap, HashSet};
@@ -42,13 +44,15 @@ use plant_ui::model_update::{
     self, Feed as ModelUpdateFeed, State as ModelUpdateState, Vm as ModelUpdateVm,
 };
 use plant_ui::project_picker::{self, State as ProjectPickerState};
+use plant_ui::room_browser::{self, State as RoomBrowserState, Vm as RoomBrowserVm};
 use plant_ui::settings::{self, State as SettingsState};
 use plant_ui::style::theme_tokens::{self, set_weight_families_ready};
 use plant_ui::style::tokens::{Density, Tokens};
 use plant_ui::task_queue;
 use plant_ui::vm::{
-    CommandLineKind, CommandLineVm, LogElement, ModelLoadVm, PropKind, PropRowVm, PropsDataVm,
-    PropsVm, RowVisibility, Selection, TreeRowVm, TreeVm, View3dVm, WorkbenchVm,
+    AccessPointVm, CommandLineKind, CommandLineVm, LogElement, ModelLoadVm, PropKind, PropRowVm,
+    PropsDataVm, PropsVm, RoomDetailDataVm, RoomDetailVm, RoomMemberVm, RoomRelationVm, RoomViewVm,
+    RoomVm, RoomsDataVm, RowVisibility, Selection, TreeRowVm, TreeVm, View3dVm, WorkbenchVm,
 };
 use plant_ui::workbench::{self, Pane, WorkbenchState};
 use plant_ui_data::{EleTreeNode, RefU64};
@@ -79,6 +83,7 @@ pub fn start(canvas: String, config_json: String) -> Result<(), wasm_bindgen::Js
         .map_err(|error| wasm_bindgen::JsValue::from_str(&format!("浏览器配置无效：{error:#}")))?;
     aios_core::set_db_option(config.db)
         .map_err(|error| wasm_bindgen::JsValue::from_str(&error.to_string()))?;
+    startup::record_config_source("宿主页面注入");
     if let Some(model_api_url) = config.model_api_url {
         model_update_api::set_base_url(model_api_url)
             .map_err(|error| wasm_bindgen::JsValue::from_str(&error.to_string()))?;
@@ -169,15 +174,68 @@ fn run_native() -> anyhow::Result<()> {
         )
         .with_context(|| format!("旧版项目配置无效：{}", legacy_path.display()))?;
         aios_core::set_db_option(config.db)?;
+        startup::record_config_source(legacy_path.display().to_string());
         data_publish_api::set_base_url(config.data_api_url)?;
         if config.auto_gen_mesh {
             eprintln!("旧配置的 auto_gen_mesh 由模型服务负责，客户端不会在本地生成 mesh");
         }
+    } else {
+        // 没有项目配置，`get_db_option()` 会静默回落去读工作目录的 DbOption.toml。
+        // 这一步只是把这条回落记下来——它照样会发生，区别只是界面说不说得出口。
+        let fallback = std::env::current_dir()
+            .unwrap_or_default()
+            .join("DbOption.toml");
+        startup::record_config_source(format!(
+            "{}（回落：没有 {}）",
+            fallback.display(),
+            legacy_path.display()
+        ));
     }
+
+    // 设置项要在起 Bevy 之前读出来：网格资产源必须早于 `AssetPlugin` 注册，
+    // 那时候界面还一帧都没画。
+    let mut warnings = Vec::new();
+    let stored = match settings_store::load() {
+        Ok(stored) => stored,
+        Err(error) => {
+            warnings.push(format!("{error:#}；这次先用默认设置"));
+            None
+        }
+    };
+    // 没有设置文件时，服务地址仍旧走环境变量 / 出厂默认那条老路；有文件时它说了算
+    // （ADR-0008 的优先级）。
+    let settings = stored.unwrap_or_else(|| settings::Settings {
+        model_api_url: model_update_api::base_url(),
+        data_api_url: data_publish_api::base_url(),
+        ..settings::Settings::default()
+    });
+    let default_mesh_dir =
+        settings_store::resolve_mesh_dir("", std::env::var_os(PLANT_MESH_DIR), &asset_root);
+    let mesh_dir = settings_store::resolve_mesh_dir(
+        &settings.mesh_dir,
+        std::env::var_os(PLANT_MESH_DIR),
+        &asset_root,
+    );
+    if !mesh_dir.is_dir() {
+        warnings.push(format!(
+            "网格目录不存在：{}；三维会一个网格都加载不出来，去设置里改",
+            mesh_dir.display()
+        ));
+    }
+    plant_ui_view3d::mesh_source::set_mesh_dir(&mesh_dir);
+    settings_store::set_startup(settings_store::Startup {
+        settings,
+        default_mesh_dir: default_mesh_dir.to_string_lossy().into_owned(),
+        warnings,
+    });
 
     run("#plant-ui", asset_root.to_string_lossy().into_owned());
     Ok(())
 }
+
+/// 网格目录的环境变量。夹在设置项与出厂默认之间（ADR-0008 的优先级）。
+#[cfg(not(target_arch = "wasm32"))]
+const PLANT_MESH_DIR: &str = "PLANT_MESH_DIR";
 
 #[cfg(not(target_arch = "wasm32"))]
 fn run_gallery() -> eframe::Result {
@@ -218,6 +276,18 @@ fn run(canvas: &str, asset_root: String) {
     let _ = canvas;
 
     let mut app = BevyApp::new();
+    // 网格走自己的资产源，根目录可以在设置里改。**必须先于 `AssetPlugin` 注册**：
+    // 源是在那个插件建起来的那一刻定型的，晚一步 Bevy 只会打一行 error 然后无视。
+    // 浏览器端没有本地目录，网格与字体贴图一样由站点供给，那一侧不注册这个源
+    // （见 `mesh_source::asset_path` 的两个分支）。
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use bevy::asset::AssetApp;
+        app.register_asset_source(
+            plant_ui_view3d::mesh_source::SOURCE_NAME,
+            plant_ui_view3d::mesh_source::source_builder(),
+        );
+    }
     app.add_plugins(
         DefaultPlugins
             .set(WindowPlugin {
@@ -421,6 +491,7 @@ fn show_app(
         measurement_active: false,
         camera_rot: view3d.camera_rot,
         axis_labels: view3d.axis_labels,
+        grid_cell_mm: view3d.grid_cell_mm,
     });
     let size = ctx.content_rect().size();
     egui::Area::new("plant-workbench".into())
@@ -438,6 +509,7 @@ fn show_app(
     for models in app.pending_incremental_models.drain(..) {
         view3d.append(models);
     }
+    let mut retried = 0;
     for command in app.view3d_commands.drain(..) {
         match command {
             Cmd::PickViewport(uv) => view3d.pick(uv),
@@ -448,8 +520,15 @@ fn show_app(
                 view3d.set_background(top, bottom, grid)
             }
             Cmd::SnapView { forward, up, fit } => view3d.snap(forward, up, fit),
+            Cmd::RetryFailedMeshes => retried = view3d.retry_failed_meshes(),
             _ => unreachable!("只缓存三维命令"),
         }
+    }
+    if retried > 0 {
+        app.logs.info(
+            &mut app.vm.logs,
+            format!("正在重试 {retried} 个加载失败的网格"),
+        );
     }
     Ok(())
 }
@@ -754,6 +833,9 @@ struct App {
     state: WorkbenchState,
     model_update: ModelUpdateVm,
     model_update_state: ModelUpdateState,
+    /// 房间浏览器的全表数据（重查询，只在打开浮窗 / 手动刷新时拉）。
+    rooms_overview: RoomBrowserVm,
+    room_browser_state: RoomBrowserState,
     data_publish_state: DataPublishState,
     project_picker_state: ProjectPickerState,
     settings_state: SettingsState,
@@ -794,6 +876,18 @@ struct App {
     model_reload_owed: bool,
     /// 已经发出一次为清偿欠账的模型刷新；失败时必须把欠账恢复。
     model_reload_in_flight: bool,
+    /// 还没回包的那一次房间视图请求（`Cmd::FocusRoom` -> `Req::RoomDetail`）。
+    /// 同时只留一个：连点两间房只聚焦最后一间，晚到的旧详情靠它认出来丢掉。
+    focus_room_pending: Option<RefU64>,
+    /// 模型还在路上、等它落地就取景的那间房（`Cmd::ShowRoomModel`）。
+    ///
+    /// 取景不能跟着指令一起下发：视口的包围盒来自模型查询回包里的 `world_aabb`，
+    /// 范围查询还没回来时它手上没有这间房的任何包围盒，`FocusGroup` 会判成
+    /// 「一个都没加载」而不动相机。同时只留一个，连点两间房只取景最后一间。
+    pending_room_frame: Option<RefU64>,
+    /// 「房间」页签当前聚焦的房间。与上面那个分开：视口那半回包即清（一次性
+    /// 动作），页签这半要一直立着——切换选中或重连才归零。
+    room_pane_focus: Option<RefU64>,
     bridge: data::Bridge,
     tree: TreeModel,
     /// 还没落地的那一次树定位。同时只留一个：连续定位只完成最后一次。
@@ -811,6 +905,16 @@ struct App {
     model_scope_failures: usize,
     model_progress_until: Option<Instant>,
     view3d_commands: Vec<Cmd>,
+    /// 上一次真的落到文件系统上校验过的那个网格目录草稿。
+    ///
+    /// 逐帧去问一次盘，在网络盘上会把界面拖住；对着这份留底比对，只有字面变过
+    /// 才重新校验一次。
+    #[cfg(not(target_arch = "wasm32"))]
+    checked_mesh_dir: Option<String>,
+    /// 正开着的目录对话框。对话框是阻塞的，只能在别的线程上等，结果经这条
+    /// 一次性通道回来。
+    #[cfg(not(target_arch = "wasm32"))]
+    mesh_dir_pick: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
     font_weights_pending: bool,
     /// 上一次发给三维视口的主题配色。视口的渐变背景画在宿主侧（拷问定案第 2 题），
     /// 主题一换就要把新颜色送下去；对着这份留底比对，别把同一套颜色每帧发一遍。
@@ -916,6 +1020,22 @@ fn model_visibility_plan(
     plan
 }
 
+/// 房间边只挂叶子构件；隐含直管则以 BRAN/HANG refno 渲染。把已经加载的、
+/// 且与房间成员相交的模型范围一并纳入隔离，避免隔离动作把同支管直段藏掉。
+fn expand_room_model_targets(
+    targets: Vec<RefU64>,
+    scopes: &HashMap<RefU64, Vec<RefU64>>,
+) -> Vec<RefU64> {
+    let mut seen: HashSet<RefU64> = targets.iter().copied().collect();
+    let mut expanded = targets;
+    for models in scopes.values() {
+        if models.iter().any(|refno| seen.contains(refno)) {
+            expanded.extend(models.iter().copied().filter(|refno| seen.insert(*refno)));
+        }
+    }
+    expanded
+}
+
 fn cache_model_scope(scopes: &mut HashMap<RefU64, Vec<RefU64>>, target: RefU64, model: RefU64) {
     let models = scopes.entry(target).or_default();
     if !models.contains(&model) {
@@ -975,6 +1095,33 @@ fn settled_pending_roots(
         .collect()
 }
 
+/// 解出这一刻**实际生效**的接入点。
+///
+/// 走 `try_get_db_option`：`get_db_option` 读不着配置时会 panic，而「读不着」恰恰是这块
+/// 面板要说清楚的情形之一——为它崩掉整个界面说不过去。解不出来就留空，面板照画，
+/// 每一格显示「未配置」。
+fn access_point_vm(model_api_url: &str, data_api_url: &str) -> AccessPointVm {
+    let mut vm = AccessPointVm {
+        model_api_url: model_api_url.to_owned(),
+        data_api_url: data_api_url.to_owned(),
+        source: startup::config_source().unwrap_or("未记录").to_owned(),
+        ..Default::default()
+    };
+    if let Ok(db) = aios_core::try_get_db_option() {
+        vm.db_url = db.get_version_db_conn_str();
+        vm.namespace = db.surreal_ns.clone();
+        vm.database = db.project_name.clone();
+        // 与 `plant_ui_data::project_identity` 同一把尺子：配空时回空串，
+        // 不摆一个谁都不是的 `/`。
+        vm.mdb = match db.mdb_name.trim() {
+            "" => String::new(),
+            name => aios_core::helper::to_e3d_name(name).into_owned(),
+        };
+        vm.user = db.v_user.clone();
+    }
+    vm
+}
+
 impl App {
     fn new(
         ctx: egui::Context,
@@ -982,23 +1129,35 @@ impl App {
         font_weights_pending: bool,
         tasks: &bevy_wasm_tasks::Tasks<'_>,
     ) -> Self {
-        let model_api_url = model_update_api::base_url();
-        let data_api_url = data_publish_api::base_url();
+        let startup = settings_store::startup();
+        let mut adopted = startup
+            .map(|startup| startup.settings.clone())
+            .unwrap_or_default();
+        if startup.is_none() {
+            // 宿主没交底（浏览器端）：服务地址仍旧由 `base_url()` 那条链解出来。
+            adopted.model_api_url = model_update_api::base_url();
+            adopted.data_api_url = data_publish_api::base_url();
+        }
+        let model_api_url = adopted.model_api_url.clone();
+        let data_api_url = adopted.data_api_url.clone();
         let mut settings_state = SettingsState::default();
-        settings_state.adopt(settings::Settings {
-            model_api_url: model_api_url.clone(),
-            data_api_url: data_api_url.clone(),
-            ..settings_state.saved.clone()
-        });
+        settings_state.mesh_dir_hint = startup
+            .map(|startup| startup.default_mesh_dir.clone())
+            .unwrap_or_default();
+        settings_state.adopt(adopted);
         let mut app = Self {
             // 连接前不摆任何工程数据：项目 / 库标识等 Ready 事件带真实值。
+            // 接入点是例外——它说的是「这次冲着谁去」，连不上时反而最该看得见。
             vm: WorkbenchVm {
                 user: std::env::var("USERNAME").unwrap_or_else(|_| "user".into()),
+                access_point: access_point_vm(&model_api_url, &data_api_url),
                 ..Default::default()
             },
             state: WorkbenchState::default(),
             model_update: ModelUpdateVm::default(),
             model_update_state: ModelUpdateState::default(),
+            rooms_overview: RoomBrowserVm::default(),
+            room_browser_state: RoomBrowserState::default(),
             data_publish_state: DataPublishState::default(),
             project_picker_state: ProjectPickerState::new(Vec::new(), false),
             settings_state,
@@ -1024,6 +1183,9 @@ impl App {
             model_reload_ready: false,
             model_reload_owed: false,
             model_reload_in_flight: false,
+            focus_room_pending: None,
+            pending_room_frame: None,
+            room_pane_focus: None,
             bridge: data::spawn(ctx.clone(), tasks),
             tree: TreeModel::default(),
             pending_locate: None,
@@ -1039,6 +1201,10 @@ impl App {
             model_scope_failures: 0,
             model_progress_until: None,
             view3d_commands: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            checked_mesh_dir: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            mesh_dir_pick: None,
             font_weights_pending,
             sent_viewport_bg: None,
         };
@@ -1047,6 +1213,9 @@ impl App {
         app.reopen_queue_feed(&ctx);
         for w in font_warnings {
             app.logs.warn(&mut app.vm.logs, w);
+        }
+        for w in startup.iter().flat_map(|startup| &startup.warnings) {
+            app.logs.warn(&mut app.vm.logs, w.clone());
         }
         app.logs.info(&mut app.vm.logs, "正在连接数据源…");
         app
@@ -1138,6 +1307,139 @@ impl App {
                     };
                 }
                 data::Evt::Props(..) => {}
+                // 晚到的旧选中结果直接丢弃，房间归属只认当前选中（与属性同一条规矩）。
+                data::Evt::ElementRooms(refno, result)
+                    if self.vm.selection.primary() == Some(refno) =>
+                {
+                    self.vm.rooms = match result {
+                        Ok(relations) => RoomVm::Ready(build_rooms(refno, relations)),
+                        Err(e) => {
+                            let el = self.tree.element(refno);
+                            self.logs.error_of(
+                                &mut self.vm.logs,
+                                el,
+                                "房间归属查询失败",
+                                &e,
+                                None,
+                            );
+                            RoomVm::Failed(format!(
+                                "房间归属查询失败：{}",
+                                logs::error_chain(&e)
+                            ))
+                        }
+                    };
+                }
+                data::Evt::ElementRooms(..) => {}
+                // 房间详情回来了，两个消费者各取所需：视口那半（隔离 + 取景，
+                // 一次点击的下半程）与「房间」页签那半（详情数据）。谁都不认的
+                // 是晚到的旧结果，直接丢。
+                data::Evt::RoomDetail(room, result)
+                    if self.focus_room_pending == Some(room)
+                        || self.room_pane_focus == Some(room) =>
+                {
+                    let for_viewport = self.focus_room_pending == Some(room);
+                    let for_pane = self.room_pane_focus == Some(room);
+                    if for_viewport {
+                        self.focus_room_pending = None;
+                    }
+                    match result {
+                        Ok(Some(detail)) => {
+                            if for_pane {
+                                self.vm.room_detail =
+                                    RoomDetailVm::Ready(build_room_detail(&detail));
+                            }
+                            // 独立壳（无实时渲染器）里不排视口动作：那支队列没有
+                            // 消费者，塞进去只会越攒越多；数据那半已经交给页签。
+                            let live = self.vm.view3d.is_some_and(|v| v.live);
+                            if for_viewport && live {
+                                // 面板在前成员在后；同一个 refno 两边都出现时只留一份。
+                                let mut seen: HashSet<RefU64> = HashSet::new();
+                                let targets: Vec<RefU64> = detail
+                                    .panels
+                                    .iter()
+                                    .chain(&detail.member_refnos)
+                                    .copied()
+                                    .filter(|refno| seen.insert(*refno))
+                                    .collect();
+                                let targets =
+                                    expand_room_model_targets(targets, &self.model_scopes);
+                                if targets.is_empty() {
+                                    self.logs.warn(
+                                        &mut self.vm.logs,
+                                        format!(
+                                            "房间 {} 没有面板也没有成员，无处取景",
+                                            detail.room_num
+                                        ),
+                                    );
+                                } else {
+                                    self.view3d_commands.push(Cmd::Model(
+                                        plant_ui::ModelAction::Isolate {
+                                            refnos: targets.clone(),
+                                        },
+                                    ));
+                                    self.view3d_commands.push(Cmd::Model(
+                                        plant_ui::ModelAction::FocusGroup { refnos: targets },
+                                    ));
+                                    self.logs.info(
+                                        &mut self.vm.logs,
+                                        format!(
+                                            "房间视图：{} · 面板 {} · 成员 {}（已加载的关联直段一并显示）",
+                                            detail.room_num,
+                                            detail.panels.len(),
+                                            detail.member_count,
+                                        ),
+                                    );
+                                    self.vm.room_view = Some(RoomViewVm {
+                                        room,
+                                        room_num: detail.room_num.clone(),
+                                        member_count: detail.member_count,
+                                    });
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            if for_pane {
+                                self.vm.room_detail = RoomDetailVm::Failed(format!(
+                                    "房间 {room} 在库里查不到，可能已被删除"
+                                ));
+                            }
+                            self.logs.warn(
+                                &mut self.vm.logs,
+                                format!("房间 {room} 在库里查不到，可能已被删除"),
+                            );
+                        }
+                        Err(e) => {
+                            if for_pane {
+                                self.vm.room_detail = RoomDetailVm::Failed(format!(
+                                    "房间详情查询失败：{}",
+                                    logs::error_chain(&e)
+                                ));
+                            }
+                            self.logs.error(
+                                &mut self.vm.logs,
+                                "房间详情查询失败",
+                                &e,
+                                None,
+                            );
+                        }
+                    }
+                }
+                data::Evt::RoomDetail(..) => {}
+                data::Evt::RoomsOverview(result) => {
+                    self.rooms_overview = match result {
+                        Ok(rows) => RoomBrowserVm::Ready(
+                            rows.into_iter().map(build_overview_row).collect(),
+                        ),
+                        Err(e) => {
+                            self.logs
+                                .error(&mut self.vm.logs, "房间总览查询失败", &e, None);
+                            RoomBrowserVm::Failed(format!(
+                                "房间总览查询失败：{}",
+                                logs::error_chain(&e)
+                            ))
+                        }
+                    };
+                }
                 data::Evt::Models(true, _)
                     if self.model_reload_in_flight && !self.model_reload_ready =>
                 {
@@ -1230,6 +1532,9 @@ impl App {
                             self.logs
                                 .warn_of(&mut self.vm.logs, element, "未找到已生成模型");
                             self.finish_model_progress("模型加载完成");
+                            // 这间房没有已生成模型，取景的账就地销掉——留着它，
+                            // 下一个范围回包会替它把相机带走。
+                            self.pending_room_frame.take_if(|room| *room == target);
                             dirty = true;
                         }
                         Ok(models) => {
@@ -1338,10 +1643,19 @@ impl App {
                             }
                             self.view3d_commands.push(Cmd::Model(
                                 plant_ui::ModelAction::SetVisible {
-                                    refnos: refs,
+                                    refnos: refs.clone(),
                                     visible,
                                 },
                             ));
+                            // 「显示房间模型」的下半程。包围盒来自这一批回包里的
+                            // `world_aabb`，而视口那边装模型的系统排在执行命令之前，
+                            // 所以同一帧「装进场景 + 取景」是成立的，不必再等网格文件。
+                            if self.pending_room_frame == Some(target) {
+                                self.pending_room_frame = None;
+                                self.view3d_commands.push(Cmd::Model(
+                                    plant_ui::ModelAction::FocusGroup { refnos: refs },
+                                ));
+                            }
                             dirty = true;
                         }
                         Err(error) => {
@@ -1360,6 +1674,7 @@ impl App {
                                 None,
                             );
                             self.finish_model_progress("模型加载完成");
+                            self.pending_room_frame.take_if(|room| *room == target);
                             dirty = true;
                         }
                     }
@@ -1821,6 +2136,11 @@ impl App {
                     self.refetch_props(refno)
                 }
                 Cmd::RetryProps(_) => {}
+                Cmd::RetryRooms(refno) if self.vm.selection.primary() == Some(refno) => {
+                    self.refetch_rooms(refno)
+                }
+                // 选中早就挪走：重查回来也过不了回包那道陈旧门，不发。
+                Cmd::RetryRooms(_) => {}
                 Cmd::RetryLog(id) => match self.logs.retry_of(id) {
                     Some(Retry::Connect) => self.reconnect(),
                     Some(Retry::Children(refno)) => {
@@ -1867,7 +2187,7 @@ impl App {
                         "已放弃等待预览结果；服务端的扫描不受影响，重新预览即可",
                     );
                 }
-                Cmd::ExecuteModelUpdate => {
+                Cmd::ExecuteModelUpdate { dbnums } => {
                     if !self.model_service_writable() {
                         continue;
                     }
@@ -1881,6 +2201,7 @@ impl App {
                         project: self.vm.project.clone(),
                         mdb: self.mdb.clone(),
                         namespace: self.namespace.clone(),
+                        dbnums,
                         from_wizard: true,
                     });
                 }
@@ -1891,11 +2212,13 @@ impl App {
                         continue;
                     }
                     self.model_reload_ready = false;
+                    // 队列面板的即时扫描没有勾选语境，走全范围（ADR-020 缺省）。
                     let _ = self.bridge.req.send(data::Req::ModelUpdateExecute {
                         base: self.model_api_url.clone(),
                         project: self.vm.project.clone(),
                         mdb: self.mdb.clone(),
                         namespace: self.namespace.clone(),
+                        dbnums: None,
                         from_wizard: false,
                     });
                 }
@@ -1930,101 +2253,32 @@ impl App {
                     });
                 }
                 Cmd::ReconnectQueueFeed => self.reopen_queue_feed(ctx),
+                Cmd::FocusRoom(room) => self.focus_room(room),
+                Cmd::ShowRoomModel(room) => {
+                    self.show_room_model(room);
+                    dirty = true;
+                }
+                Cmd::ShowRooms(refno) => {
+                    // 归属数据跟着主选中预取；对准的不是当前主选中时先把选中切
+                    // 过去，页签一亮出来就有内容而不是一句「查询中」。
+                    if self.vm.selection.primary() != Some(refno) {
+                        self.set_selection(Selection::single(refno));
+                    }
+                    self.state.focus(Pane::Room);
+                }
+                Cmd::FocusPane(pane) => self.state.focus(pane),
+                Cmd::OpenRoomBrowser => {
+                    self.room_browser_state.open = true;
+                    // 全表在途时只开窗不重发：这查询几十秒级，叠一份是纯浪费。
+                    if !self.rooms_overview.loading() {
+                        self.rooms_overview.begin_query();
+                        let _ = self.bridge.req.send(data::Req::RoomsOverview);
+                    }
+                }
                 Cmd::Model(action) => {
                     match action {
                         plant_ui::ModelAction::SetVisible { refnos, visible } => {
-                            // 只记方向，不动 eye：图标要等三维真的画成这样再变。
-                            for refno in &refnos {
-                                let previous = self.tree.visibility_for(*refno, &self.model_scopes);
-                                self.tree
-                                    .pending_visibility
-                                    .entry(*refno)
-                                    .or_insert(previous);
-                                self.tree.visibility_unavailable.remove(refno);
-                                self.tree.pending_direction.insert(*refno, visible);
-                            }
-                            let plan = model_visibility_plan(
-                                &refnos,
-                                &self.model_scopes,
-                                &self.model_scope_pending,
-                            );
-                            if !plan.resolved.is_empty() {
-                                self.view3d_commands.push(Cmd::Model(
-                                    plant_ui::ModelAction::SetVisible {
-                                        refnos: plan.resolved,
-                                        visible,
-                                    },
-                                ));
-                                if visible
-                                    && (self.pending_models.is_some()
-                                        || !self.pending_incremental_models.is_empty()
-                                        || self.latest_mesh_progress.is_some())
-                                {
-                                    let (done, total) = self
-                                        .latest_mesh_progress
-                                        .as_ref()
-                                        .map_or((0, 0), |progress| (progress.done, progress.total));
-                                    self.model_show_waiting.extend(refnos.iter().copied());
-                                    self.model_progress_until = None;
-                                    self.vm.model_load = Some(ModelLoadVm::Loading {
-                                        label: "加载模型网格".into(),
-                                        done,
-                                        total,
-                                    });
-                                }
-                                let still_loading = refnos
-                                    .iter()
-                                    .any(|refno| self.model_show_waiting.contains(refno));
-                                if !still_loading {
-                                    let verb = if visible { "显示" } else { "隐藏" };
-                                    self.logs.info(
-                                        &mut self.vm.logs,
-                                        format!("模型{verb}完成：{} 个目标", refnos.len()),
-                                    );
-                                    self.finish_model_progress(format!("模型{verb}完成"));
-                                }
-                            }
-                            if !plan.query.is_empty() {
-                                if self.model_scope_pending.is_empty()
-                                    && self.model_show_waiting.is_empty()
-                                {
-                                    self.model_scope_failures = 0;
-                                }
-                                self.model_scope_pending.extend(plan.query.iter().copied());
-                                let verb = if visible { "显示" } else { "隐藏" };
-                                self.logs.info(
-                                    &mut self.vm.logs,
-                                    format!("开始查询并{verb}模型：{} 个目标", plan.query.len()),
-                                );
-                                self.model_progress_until = None;
-                                self.vm.model_load =
-                                    Some(ModelLoadVm::Resolving("解析模型范围…".into()));
-                                let targets = plan.query;
-                                if self
-                                    .bridge
-                                    .req
-                                    .send(data::Req::ModelScopes {
-                                        epoch: self.model_scope_epoch,
-                                        targets: targets.clone(),
-                                    })
-                                    .is_err()
-                                {
-                                    for target in targets {
-                                        self.model_scope_pending.remove(&target);
-                                        self.tree.pending_direction.remove(&target);
-                                        self.tree.visibility_unavailable.insert(target);
-                                    }
-                                    self.model_scope_failures += 1;
-                                    let error = anyhow::anyhow!("数据查询线程已停止");
-                                    self.logs.error(
-                                        &mut self.vm.logs,
-                                        "已有模型查询失败",
-                                        &error,
-                                        None,
-                                    );
-                                    self.finish_model_progress("模型加载完成");
-                                }
-                            }
+                            self.set_model_visible(refnos, visible)
                         }
                         // 全局的两条只作用于**已加载**的模型：eye 照样等 View3d
                         // 回执。在途的那些点击把方向改成全局这一次的——它就是
@@ -2046,6 +2300,15 @@ impl App {
                             self.view3d_commands
                                 .push(Cmd::Model(plant_ui::ModelAction::ShowAll));
                         }
+                        // 退出房间视图：徽章立即摘下，可见性恢复由视口按快照执行。
+                        // 隔离/恢复不写树的 pending 方向账——真实可见性会沿
+                        // render_dirty 那条既有链路流回眼睛（ADR-0016）。
+                        plant_ui::ModelAction::ExitIsolate => {
+                            self.vm.room_view = None;
+                            self.focus_room_pending = None;
+                            self.view3d_commands
+                                .push(Cmd::Model(plant_ui::ModelAction::ExitIsolate));
+                        }
                         action => self.view3d_commands.push(Cmd::Model(action)),
                     }
                     dirty = true;
@@ -2054,7 +2317,8 @@ impl App {
                 | Cmd::Camera(_)
                 | Cmd::ResizeViewport(_)
                 | Cmd::SetViewportBackground { .. }
-                | Cmd::SnapView { .. }) => self.view3d_commands.push(command),
+                | Cmd::SnapView { .. }
+                | Cmd::RetryFailedMeshes) => self.view3d_commands.push(command),
             }
         }
         if dirty {
@@ -2367,9 +2631,21 @@ impl App {
         let before = self.vm.selection.primary();
         self.vm.selection = selection;
         match self.vm.selection.primary() {
-            Some(refno) if before != Some(refno) => self.refetch_props(refno),
+            Some(refno) if before != Some(refno) => {
+                self.refetch_props(refno);
+                self.refetch_rooms(refno);
+                // 换了元素，上一个元素聚焦的房间不再作数——详情回到「还没点
+                // 过房间」，页签只画新元素的归属列表。
+                self.room_pane_focus = None;
+                self.vm.room_detail = RoomDetailVm::Uninit;
+            }
             // 全都取消选中了，属性回到「还没轮到它」而不是留着上一个的残影。
-            None => self.vm.props = PropsVm::Uninit,
+            None => {
+                self.vm.props = PropsVm::Uninit;
+                self.vm.rooms = RoomVm::Uninit;
+                self.room_pane_focus = None;
+                self.vm.room_detail = RoomDetailVm::Uninit;
+            }
             _ => {}
         }
     }
@@ -2377,6 +2653,131 @@ impl App {
     fn refetch_props(&mut self, refno: RefU64) {
         self.vm.props.begin_query();
         let _ = self.bridge.req.send(data::Req::Props(refno));
+    }
+
+    /// 房间归属随选中预取（计划决定 5）：查询极轻，右键菜单打开的瞬间就有现成数据。
+    fn refetch_rooms(&mut self, refno: RefU64) {
+        self.vm.rooms.begin_query();
+        let _ = self.bridge.req.send(data::Req::ElementRooms(refno));
+    }
+
+    /// 房间视图的上半程：记下在途目标，去数据层解析全量成员集。
+    /// 下半程在 `Evt::RoomDetail` 到达时展开成隔离 + 取景（有实时渲染器时），
+    /// 并把详情填进「房间」页签——同一次往返喂两个消费者。
+    fn focus_room(&mut self, room: RefU64) {
+        self.focus_room_pending = Some(room);
+        self.room_pane_focus = Some(room);
+        self.vm.room_detail.begin_query();
+        let _ = self.bridge.req.send(data::Req::RoomDetail(room));
+    }
+
+    /// 「显示房间模型」：把这间房自己的几何取回来显示，再取景到它。
+    ///
+    /// 走的就是显示模型那条既有链路——房间 FRMW 当作一个范围目标交给
+    /// [`Self::set_model_visible`]，没缓存过的范围由它去查、把面板几何取回来。
+    /// 与 [`Self::focus_room`] 的分工见 `Cmd::ShowRoomModel` 的文档。
+    ///
+    /// 取景分两种情形：范围早就缓存过（这间房刚显示过一次）时不会再有
+    /// `Evt::ModelScope` 回包，包围盒此刻就在视口手上，当场下发；否则记下这间房，
+    /// 等范围落地那一刻再补取景。
+    fn show_room_model(&mut self, room: RefU64) {
+        self.set_model_visible(vec![room], true);
+        match self.model_scopes.get(&room) {
+            Some(refnos) => {
+                let refnos = refnos.clone();
+                self.pending_room_frame = None;
+                self.view3d_commands
+                    .push(Cmd::Model(plant_ui::ModelAction::FocusGroup { refnos }));
+            }
+            None => self.pending_room_frame = Some(room),
+        }
+    }
+
+    /// 显示 / 隐藏一批模型：记下方向、把已知范围下发给视口、未知范围排队去查。
+    ///
+    /// `Cmd::Model(SetVisible)` 与 [`Self::show_room_model`] 共用它——房间模型
+    /// 与树上点眼睛是同一件事，加载与进度反馈那一整套没有第二份的道理。
+    fn set_model_visible(&mut self, refnos: Vec<RefU64>, visible: bool) {
+        // 只记方向，不动 eye：图标要等三维真的画成这样再变。
+        for refno in &refnos {
+            let previous = self.tree.visibility_for(*refno, &self.model_scopes);
+            self.tree
+                .pending_visibility
+                .entry(*refno)
+                .or_insert(previous);
+            self.tree.visibility_unavailable.remove(refno);
+            self.tree.pending_direction.insert(*refno, visible);
+        }
+        let plan = model_visibility_plan(&refnos, &self.model_scopes, &self.model_scope_pending);
+        if !plan.resolved.is_empty() {
+            self.view3d_commands
+                .push(Cmd::Model(plant_ui::ModelAction::SetVisible {
+                    refnos: plan.resolved,
+                    visible,
+                }));
+            if visible
+                && (self.pending_models.is_some()
+                    || !self.pending_incremental_models.is_empty()
+                    || self.latest_mesh_progress.is_some())
+            {
+                let (done, total) = self
+                    .latest_mesh_progress
+                    .as_ref()
+                    .map_or((0, 0), |progress| (progress.done, progress.total));
+                self.model_show_waiting.extend(refnos.iter().copied());
+                self.model_progress_until = None;
+                self.vm.model_load = Some(ModelLoadVm::Loading {
+                    label: "加载模型网格".into(),
+                    done,
+                    total,
+                });
+            }
+            let still_loading = refnos
+                .iter()
+                .any(|refno| self.model_show_waiting.contains(refno));
+            if !still_loading {
+                let verb = if visible { "显示" } else { "隐藏" };
+                self.logs.info(
+                    &mut self.vm.logs,
+                    format!("模型{verb}完成：{} 个目标", refnos.len()),
+                );
+                self.finish_model_progress(format!("模型{verb}完成"));
+            }
+        }
+        if !plan.query.is_empty() {
+            if self.model_scope_pending.is_empty() && self.model_show_waiting.is_empty() {
+                self.model_scope_failures = 0;
+            }
+            self.model_scope_pending.extend(plan.query.iter().copied());
+            let verb = if visible { "显示" } else { "隐藏" };
+            self.logs.info(
+                &mut self.vm.logs,
+                format!("开始查询并{verb}模型：{} 个目标", plan.query.len()),
+            );
+            self.model_progress_until = None;
+            self.vm.model_load = Some(ModelLoadVm::Resolving("解析模型范围…".into()));
+            let targets = plan.query;
+            if self
+                .bridge
+                .req
+                .send(data::Req::ModelScopes {
+                    epoch: self.model_scope_epoch,
+                    targets: targets.clone(),
+                })
+                .is_err()
+            {
+                for target in targets {
+                    self.model_scope_pending.remove(&target);
+                    self.tree.pending_direction.remove(&target);
+                    self.tree.visibility_unavailable.insert(target);
+                }
+                self.model_scope_failures += 1;
+                let error = anyhow::anyhow!("数据查询线程已停止");
+                self.logs
+                    .error(&mut self.vm.logs, "已有模型查询失败", &error, None);
+                self.finish_model_progress("模型加载完成");
+            }
+        }
     }
 
     /// 取回工作：把库里此刻的样子取到界面上来。
@@ -2595,6 +2996,7 @@ impl App {
         self.latest_mesh_progress = None;
         self.model_scope_failures = 0;
         self.model_progress_until = None;
+        self.pending_room_frame = None;
         self.vm.model_load = None;
         self.tree = TreeModel::default();
         self.vm.data_source_ok = false;
@@ -2623,6 +3025,19 @@ impl App {
         self.pending_locate = None;
         self.vm.tree = TreeVm::Loading;
         self.vm.props = PropsVm::Uninit;
+        self.vm.rooms = RoomVm::Uninit;
+        self.vm.room_detail = RoomDetailVm::Uninit;
+        self.vm.room_view = None;
+        self.focus_room_pending = None;
+        self.pending_room_frame = None;
+        self.room_pane_focus = None;
+        // 换库了，旧库的房间总览不作数。窗口开着就顺手重拉，关着就等下次打开。
+        if self.room_browser_state.open {
+            self.rooms_overview.begin_query();
+            let _ = self.bridge.req.send(data::Req::RoomsOverview);
+        } else {
+            self.rooms_overview = RoomBrowserVm::Idle;
+        }
         self.logs.info(&mut self.vm.logs, "正在重连数据源…");
         let _ = self.bridge.req.send(data::Req::Reconnect);
     }
@@ -2659,6 +3074,13 @@ impl App {
     /// 已经缺掉的那些补不回，界面上「落后 N 条」照旧成立。
     fn reopen_queue_feed(&mut self, ctx: &egui::Context) {
         self.queue.feed = ModelUpdateFeed::Connecting;
+        // sim 模式没有 WebSocket 可连：明细由引擎经同一条事件通道推送，
+        // 通道状态直接置 Live，不去连一个不存在的服务再报断线。
+        if sim::enabled() {
+            let _ = self.bridge.evt_tx.send(data::Evt::QueueFeedLive);
+            ctx.request_repaint();
+            return;
+        }
         self.queue_feed = Some(model_update_ws::Feed::open(
             &self.model_api_url,
             self.bridge.evt_tx.clone(),
@@ -2773,10 +3195,10 @@ mod tests {
     use super::{
         EleTreeNode, ModelVisibility, ModelVisibilityPlan, RefU64, RowVisibility, TreeModel,
         TreeRowVm, Window, background_models_settled, begin_get_work, cache_model_scope,
-        claim_unloaded_model_refnos, finished_after, in_mdb_path, mark_model_scope_unavailable,
-        model_progress_terminal, model_reload_due, model_visibility_plan, needs_children_query,
-        refresh_anchor, restore_model_reload, settle_pending_directions, settled_pending_roots,
-        sync_ime_window, task_matches_project,
+        claim_unloaded_model_refnos, expand_room_model_targets, finished_after, in_mdb_path,
+        mark_model_scope_unavailable, model_progress_terminal, model_reload_due,
+        model_visibility_plan, needs_children_query, refresh_anchor, restore_model_reload,
+        settle_pending_directions, settled_pending_roots, sync_ime_window, task_matches_project,
     };
     use chrono::{TimeZone, Utc};
     use plant_ui::model_update::PendingModelUnit;
@@ -2853,6 +3275,22 @@ mod tests {
 
         assert_eq!(kept, 3);
         assert_eq!(loaded, HashSet::from([branch, already_loaded]));
+    }
+
+    #[test]
+    fn room_isolate_keeps_the_loaded_straight_tube_from_its_branch_scope() {
+        let member = RefU64(10);
+        let branch = RefU64(11);
+        let unrelated = RefU64(12);
+        let scopes = HashMap::from([
+            (branch, vec![member, branch]),
+            (unrelated, vec![unrelated]),
+        ]);
+
+        assert_eq!(
+            expand_room_model_targets(vec![member], &scopes),
+            vec![member, branch]
+        );
     }
 
     fn node(refno: RefU64, noun: &str, children: u16) -> EleTreeNode {
@@ -3470,6 +3908,65 @@ mod tests {
     }
 }
 
+/// 数据层的总览行 -> 浏览器镜像。逐字段拷贝，排序沿用数据层（房号升序）。
+fn build_overview_row(row: plant_ui_data::room::RoomOverviewRow) -> room_browser::Row {
+    room_browser::Row {
+        room: row.room,
+        name: row.name,
+        room_num: row.room_num,
+        room_code: row.room_code,
+        valid_name: row.valid_name,
+        panel_count: row.panel_count,
+        member_count: row.member_count,
+        pending_recalc: row.pending_recalc,
+    }
+}
+
+/// 数据层的房间详情 -> 绘制层镜像。取引用不取所有权：视口那半还要用同一份
+/// 详情算隔离目标集。
+fn build_room_detail(detail: &plant_ui_data::room::RoomDetail) -> RoomDetailDataVm {
+    RoomDetailDataVm {
+        room: detail.room,
+        name: detail.name.clone(),
+        room_num: detail.room_num.clone(),
+        room_code: detail.room_code.clone(),
+        panels: detail.panels.clone(),
+        member_count: detail.member_count,
+        member_refnos: detail.member_refnos.clone(),
+        members: detail
+            .members
+            .iter()
+            .map(|member| RoomMemberVm {
+                refno: member.refno,
+                name: member.name.clone(),
+                noun: member.noun.clone(),
+                inside_count: member.inside_count,
+            })
+            .collect(),
+        pending_recalc: detail.pending_recalc,
+    }
+}
+
+/// 数据层的房间归属 -> 绘制层镜像。逐字段拷贝，顺序原样保留（数据层已按
+/// ADR-010 §5 排好，绘制层不重排）。
+fn build_rooms(refno: RefU64, relations: Vec<plant_ui_data::room::RoomRelation>) -> RoomsDataVm {
+    RoomsDataVm {
+        refno,
+        relations: relations
+            .into_iter()
+            .map(|r| RoomRelationVm {
+                room: r.room,
+                room_num: r.room_num,
+                room_code: r.room_code,
+                panel: r.panel,
+                inside_count: r.inside_count,
+                center_dist: r.center_dist,
+                via_member: r.via_member,
+            })
+            .collect(),
+    }
+}
+
 /// 数据层的属性形态 -> 绘制层的控件选择。数据层的 `Unset` / `Opaque` 在 UI 侧
 /// 都只是「不给控件」，合成一个 `ReadOnly`。
 fn prop_kind(kind: plant_ui_data::AttrKind) -> PropKind {
@@ -3495,6 +3992,112 @@ fn db_label(ns: &str, db_nums: &[u32]) -> String {
             .join(",");
         format!("ns {ns} / db {nums}")
     }
+}
+
+/// 目录对话框开着的时候主窗口收不到输入，不自己叫醒自己的话，选完的路径要等到
+/// 下一次鼠标划过才落地。
+#[cfg(not(target_arch = "wasm32"))]
+const MESH_DIR_PICK_POLL: Duration = Duration::from_millis(120);
+
+/// 设置窗里与本地文件系统打交道的那几件事。浏览器端整节不适用：那里既没有本地
+/// 目录可选，也没有地方存这份设置——设置窗上那一行是灰的。
+#[cfg(not(target_arch = "wasm32"))]
+impl App {
+    /// 草稿改过就重新校验一次网格目录。
+    fn refresh_mesh_dir_status(&mut self) {
+        if !self.settings_state.open {
+            return;
+        }
+        let draft = self.settings_state.mesh_dir_draft().to_owned();
+        if self.checked_mesh_dir.as_deref() == Some(draft.as_str()) {
+            return;
+        }
+        self.settings_state
+            .set_mesh_dir_status(settings_store::check_mesh_dir(&draft));
+        self.checked_mesh_dir = Some(draft);
+    }
+
+    /// 开系统目录对话框。
+    ///
+    /// 必须离开主线程：对话框是阻塞的，开在渲染循环里整个应用会僵住，连它自己的
+    /// 窗口都不重绘。
+    fn browse_mesh_dir(&mut self) {
+        if self.mesh_dir_pick.is_some() {
+            // 已经开着一个了。再点也只会是同一个对话框，不该再起一个线程。
+            return;
+        }
+        let start = [
+            self.settings_state.mesh_dir_draft(),
+            self.settings_state.mesh_dir_hint.as_str(),
+        ]
+        .into_iter()
+        .map(str::trim)
+        .find(|dir| !dir.is_empty() && std::path::Path::new(dir).is_dir())
+        .map(std::path::PathBuf::from);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut dialog = rfd::FileDialog::new().set_title("选择网格目录");
+            if let Some(start) = start {
+                dialog = dialog.set_directory(start);
+            }
+            let _ = tx.send(dialog.pick_folder());
+        });
+        self.mesh_dir_pick = Some(rx);
+    }
+
+    fn poll_mesh_dir_pick(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.mesh_dir_pick else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(picked) => {
+                if let Some(dir) = picked {
+                    self.settings_state
+                        .set_mesh_dir_draft(dir.to_string_lossy().into_owned());
+                }
+                self.mesh_dir_pick = None;
+                ctx.request_repaint();
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(MESH_DIR_PICK_POLL)
+            }
+            // 线程没了却没送回东西，只能当这次没选。挂着不放的话「浏览…」再也点不动。
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.mesh_dir_pick = None,
+        }
+    }
+
+    /// 存盘，并把网格目录换过去。
+    fn persist_settings(&mut self, saved: &settings::Settings) {
+        if let Err(error) = settings_store::save(saved) {
+            self.logs.warn(
+                &mut self.vm.logs,
+                format!("{error:#}；这次的改动只在本次会话里有效"),
+            );
+        }
+        let wanted = std::path::PathBuf::from(if saved.mesh_dir.trim().is_empty() {
+            self.settings_state.mesh_dir_hint.clone()
+        } else {
+            saved.mesh_dir.clone()
+        });
+        if wanted == plant_ui_view3d::mesh_source::mesh_dir() {
+            return;
+        }
+        plant_ui_view3d::mesh_source::set_mesh_dir(&wanted);
+        self.logs.info(
+            &mut self.vm.logs,
+            format!("网格目录已切换到 {}", wanted.display()),
+        );
+        // 已经加载成功的网格不用重来：文件名是内容哈希，换个目录取到的是同一份内容。
+        self.view3d_commands.push(Cmd::RetryFailedMeshes);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl App {
+    fn refresh_mesh_dir_status(&mut self) {}
+    fn browse_mesh_dir(&mut self) {}
+    fn poll_mesh_dir_pick(&mut self, _ctx: &egui::Context) {}
+    fn persist_settings(&mut self, _saved: &settings::Settings) {}
 }
 
 impl App {
@@ -3536,23 +4139,40 @@ impl App {
             &self.model_update,
             &mut self.model_update_state,
         ));
+        cmds.extend(room_browser::show(
+            ui.ctx(),
+            &t,
+            d,
+            &self.rooms_overview,
+            &mut self.room_browser_state,
+        ));
         cmds.extend(project_picker::show(
             ui.ctx(),
             &t,
             d,
             &mut self.project_picker_state,
         ));
-        if let Some(saved) = settings::show(ui.ctx(), &t, d, &mut self.settings_state) {
+        self.refresh_mesh_dir_status();
+        let saved = settings::show(ui.ctx(), &t, d, &mut self.settings_state);
+        if self.settings_state.take_browse_request() {
+            self.browse_mesh_dir();
+        }
+        self.poll_mesh_dir_pick(ui.ctx());
+        if let Some(saved) = saved {
             theme_tokens::apply(ui.ctx(), &saved.theme.tokens(), saved.density);
             let moved = self.model_api_url != saved.model_api_url;
-            self.model_api_url = saved.model_api_url;
-            self.data_api_url = saved.data_api_url;
+            self.model_api_url = saved.model_api_url.clone();
+            self.data_api_url = saved.data_api_url.clone();
+            // 接入点面板报的必须是这一刻真正在用的地址，而不是启动时解出来那份。
+            self.vm.access_point.model_api_url = self.model_api_url.clone();
+            self.vm.access_point.data_api_url = self.data_api_url.clone();
             // 换了服务地址，那条长连接还挂在旧地址上——不重开的话队列明细会一直
             // 指着一台没人管的服务。
             if moved {
                 self.reopen_queue_feed(ui.ctx());
                 self.poll_queue_now();
             }
+            self.persist_settings(&saved);
             ui.ctx().request_repaint();
         }
         // 绘制层只读、消费不掉自己的滚动请求，所以由这里判断它落地没有。

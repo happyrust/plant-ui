@@ -75,19 +75,35 @@ pub async fn preview(
 
 /// 扫描 + 入队。合流之后它**一律入队**，回执是入队的批次数组而不是单个 task_id
 /// ——进度去任务队列视图看（ADR-0011）。范围口径与 [`preview`] 同源。
+///
+/// `dbnums` 是勾选集折算的范围内子集（gen-model ADR-020）：`None` 不发该字段，
+/// 服务端按全范围走（老服务端也认识这份请求体）；`Some` 时未勾选的库不入队、
+/// 水位不动，范围外的号被服务端拒进回执 warnings。
 pub async fn execute(
     base: &str,
     project: &str,
     mdb: &str,
     namespace: &str,
+    dbnums: Option<&[u32]>,
 ) -> anyhow::Result<Enqueued> {
     post(
         base,
         "/api/v1/update/execute",
-        serde_json::json!({ "project": project, "mdb": mdb, "namespace": namespace }).to_string(),
+        execute_body(project, mdb, namespace, dbnums),
         Duration::from_secs(60),
     )
     .await
+}
+
+/// `None` 必须**整个不发** `dbnums` 键——发 `null` 或空表都不行：老服务端的
+/// 请求体解析没有这个字段，多出来的键无害，但语义上 `Some([])` 是「一个批次
+/// 都不排」，与「全范围」是两个相反的东西，混了会把勾选门变成摆设。
+fn execute_body(project: &str, mdb: &str, namespace: &str, dbnums: Option<&[u32]>) -> String {
+    let mut body = serde_json::json!({ "project": project, "mdb": mdb, "namespace": namespace });
+    if let Some(dbnums) = dbnums {
+        body["dbnums"] = serde_json::json!(dbnums);
+    }
+    body.to_string()
 }
 
 /// 队列面板的一次轮询。
@@ -99,9 +115,14 @@ pub async fn execute(
 /// `/tasks` 只补计时、单元计数与终态历史，它服务端那边 `limit` 钳到 200。
 pub async fn poll_queue(base: &str) -> anyhow::Result<Poll> {
     let queue: QueueSnapshot = get(base, "/api/v1/queue").await?;
-    let tasks: TaskList = get(base, "/api/v1/tasks?limit=200").await?;
-    // 后两份取不到不该让整次轮询作废：队列行已经在手上了，缺的只是「队列已重建」
-    // 横幅与「欠 N 个单元」，各自缺席时那一格不画就是了。
+    // `/tasks` 之后的几份取不到都不该让整次轮询作废：队列行已经在手上了。
+    // 任务表失败只退化计时与终态历史（沿用上一份快照，`Vm::adopt` 负责保留），
+    // 一条解不动的 result 不许把整个面板冻在旧快照上。
+    let tasks = get::<TaskList>(base, "/api/v1/tasks?limit=200").await;
+    let (tasks, tasks_error) = match tasks {
+        Ok(list) => (list.tasks, None),
+        Err(error) => (Vec::new(), Some(crate::logs::error_chain(&error))),
+    };
     let health = get::<Health>(base, "/api/v1/health").await.ok();
     let pending = get::<PendingUnits>(base, "/api/v1/update/pending-units").await;
     let pending_known = pending.is_ok();
@@ -114,7 +135,8 @@ pub async fn poll_queue(base: &str) -> anyhow::Result<Poll> {
         .unwrap_or_default();
     Ok(Poll {
         queue,
-        tasks: tasks.tasks,
+        tasks,
+        tasks_error,
         health,
         pending,
         pending_known,
@@ -242,6 +264,25 @@ struct ErrorResponse {
 mod tests {
     use super::*;
     use plant_ui::model_update::FailForm;
+
+    /// ADR-020 勾选子集的客户端半边：`None` 整个不发键（老服务端兼容 + 全范围），
+    /// `Some` 原样上送——**包括空表**，那是「全不勾」而不是「没选择」。
+    #[test]
+    fn the_execute_body_only_carries_dbnums_when_a_subset_was_chosen() {
+        let full: serde_json::Value =
+            serde_json::from_str(&execute_body("ProjAMS", "/ALL", "hd", None)).unwrap();
+        assert!(full.get("dbnums").is_none(), "None = 不发键，不是 null");
+        assert_eq!(full["project"], "ProjAMS");
+
+        let subset: serde_json::Value =
+            serde_json::from_str(&execute_body("ProjAMS", "/ALL", "hd", Some(&[8000, 8021])))
+                .unwrap();
+        assert_eq!(subset["dbnums"], serde_json::json!([8000, 8021]));
+
+        let none_checked: serde_json::Value =
+            serde_json::from_str(&execute_body("ProjAMS", "/ALL", "hd", Some(&[]))).unwrap();
+        assert_eq!(none_checked["dbnums"], serde_json::json!([]));
+    }
 
     /// 错误包封按 `code` 分型；`code` 缺席时才按状态码兜底。
     ///

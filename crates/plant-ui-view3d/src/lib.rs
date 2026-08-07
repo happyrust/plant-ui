@@ -31,9 +31,17 @@ use bevy::transform::TransformSystems;
 use bevy_egui35::{EguiUserTextures, egui};
 use plant_ui::{CameraGesture, CameraMotion, ModelAction};
 
+pub mod mesh_source;
+
 const INITIAL_SIZE: UVec2 = UVec2::new(1200, 700);
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(120);
+/// 模型单位（PDMS 毫米）到世界单位：1 mm = 0.01 世界单位，也就是
+/// **1 世界单位 = 100 mm**。它只挂在 `SceneRoot` 上，所以场景里任何表示
+/// 「多长」的数都要过这一层才有物理意义。
 const MODEL_SCALE: f32 = 0.01;
+/// 上一行的倒数。网格与三轴按真实长度反推世界尺寸走它，两个方向同源，
+/// 改比例只动 `MODEL_SCALE` 一处。
+const MM_PER_WORLD: f32 = 1.0 / MODEL_SCALE;
 const HEADLIGHT_LIFT: f32 = 0.6;
 const HEADLIGHT_SIDE: f32 = 0.35;
 
@@ -46,7 +54,18 @@ const GRID_MAJOR_EVERY: i32 = 5;
 /// 主 / 次网格线的线心不透明度；顶点色让线端渐隐到 0，充当「随距离淡出」。
 const GRID_MAJOR_ALPHA: f32 = 0.5;
 const GRID_MINOR_ALPHA: f32 = 0.22;
-/// 原点三轴长（单位：格）。轴比网格短，尖端落在格子里而不是伸出场外。
+/// 视野里横着大致铺多少格；格距按它从相机距离反推。
+const GRID_CELLS_ACROSS: f32 = 12.0;
+/// 格距的上下限，用**真实长度**（毫米）表述：下界是模型自身的精度量级，
+/// 上界够装下整个厂区。两端都取在档位上（1×10⁰ / 1×10⁶），所以夹过之后
+/// 再落档不会又被推出界。
+const GRID_MIN_MM: f32 = 1.0;
+const GRID_MAX_MM: f32 = 1_000_000.0;
+/// 开机档位：一格 1 世界单位。首帧 `update_grid` 就按相机距离改写它，这个值
+/// 只决定「相机第一帧就位之前」那一瞬间的网格。
+const INITIAL_GRID_LEVEL: f32 = 1.0;
+/// 原点三轴长（单位：格）。轴比网格短，尖端落在格子里而不是伸出场外；
+/// 格距既然是圆整的真实长度，轴长就是它的 `AXIS_CELLS` 倍。
 const AXIS_CELLS: f32 = 6.0;
 /// X / Y / Z 轴的世界方向：PDMS 的 X、Y、Z 过了装载旋转就是这三条。
 const AXIS_DIRS: [Vec3; 3] = [Vec3::X, Vec3::NEG_Z, Vec3::Y];
@@ -84,6 +103,7 @@ impl Plugin for View3dPlugin {
                 (
                     load_models,
                     update_mesh_progress,
+                    retry_meshes,
                     apply_resize,
                     apply_commands,
                     apply_selection,
@@ -111,10 +131,21 @@ pub struct View3d {
     pub camera_rot: [[f32; 3]; 3],
     /// X / Y / Z 轴端标签在渲染纹理上的归一化 UV；出画或在相机身后为 None。
     pub axis_labels: [Option<[f32; 2]>; 3],
+    /// 当前地面网格的格距，**真实长度（毫米）**。HUD 的比例读数用它。
+    /// 读数与网格必须是同一个数：另算一遍迟早与眼睛看见的格子对不上。
+    pub grid_cell_mm: f32,
     image: Handle<Image>,
     commands: VecDeque<ViewCommand>,
     pending_models: VecDeque<ModelBatch>,
     loading_meshes: Vec<LoadingMesh>,
+    /// 加载失败的网格，**一直留到重试成功为止**。
+    ///
+    /// 与 `loading_meshes` 那份「装完即清」的账不同：换过网格目录之后要重来的正是
+    /// 这些，清掉就无从下手了。
+    failed_meshes: Vec<LoadingMesh>,
+    /// 已经重新发出、还没有结果的那些。
+    retrying_meshes: Vec<RetryingMesh>,
+    retry_requested: bool,
     mesh_progress: Option<MeshLoadProgress>,
     desired_visibility: HashMap<RefU64, bool>,
     /// 每个模型在场景里的**实际**渲染结果。与 `desired_visibility` 分开记：
@@ -127,6 +158,9 @@ pub struct View3d {
     selected: HashSet<RefU64>,
     selection_dirty: bool,
     bounds: HashMap<RefU64, (Vec3, Vec3)>,
+    /// 隔离前的可见性快照（refno -> 是否可见）。`Some` = 正处于隔离中。
+    /// 只记第一次：连续隔离退出时回到隔离前的世界，而不是上一间房。
+    isolate_restore: Option<HashMap<RefU64, bool>>,
 }
 
 impl View3d {
@@ -207,6 +241,23 @@ impl View3d {
 
     pub fn take_picked(&mut self) -> Option<RefU64> {
         self.picked.take()
+    }
+
+    /// 加载失败、还没重试成功的网格数。
+    pub fn failed_mesh_count(&self) -> usize {
+        self.failed_meshes.len()
+    }
+
+    /// 重来一遍那些失败的网格。换过网格目录之后由宿主发起。
+    ///
+    /// 只碰失败的那些：网格文件名是内容哈希，已经加载成功的换个目录取到的还是同一份
+    /// 内容，重来一遍只是白花时间。返回这一轮重发了几个。
+    pub fn retry_failed_meshes(&mut self) -> usize {
+        if self.failed_meshes.is_empty() {
+            return 0;
+        }
+        self.retry_requested = true;
+        self.failed_meshes.len()
     }
 
     /// 取一拍 mesh 文件加载进度；终态只交付一次。
@@ -304,6 +355,27 @@ struct LoadingMesh {
     refno: RefU64,
     path: String,
     handle: Handle<Mesh>,
+}
+
+/// 重发之后等结果的一个网格。
+struct RetryingMesh {
+    mesh: LoadingMesh,
+    asked_at: Instant,
+    /// 有没有亲眼见过它离开失败态。
+    started: bool,
+}
+
+/// 重发之后多久，还没见它动过就认账。
+///
+/// `AssetServer::reload` 不给回执，只能等状态自己翻。没有这道兜底的话，一个压根
+/// 没被重发的网格会永远挂在重试队列里，界面上那个红点也就永远不落地。
+const RETRY_GRACE: Duration = Duration::from_secs(3);
+
+impl RetryingMesh {
+    /// 这一刻的失败态算不算数。
+    fn settling(&self) -> bool {
+        self.started || self.asked_at.elapsed() >= RETRY_GRACE
+    }
 }
 
 enum ModelBatch {
@@ -509,10 +581,14 @@ fn setup(
         size: INITIAL_SIZE,
         camera_rot: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
         axis_labels: [None; 3],
+        grid_cell_mm: INITIAL_GRID_LEVEL * MM_PER_WORLD,
         image: image.clone(),
         commands: VecDeque::new(),
         pending_models: VecDeque::new(),
         loading_meshes: Vec::new(),
+        failed_meshes: Vec::new(),
+        retrying_meshes: Vec::new(),
+        retry_requested: false,
         mesh_progress: None,
         desired_visibility: HashMap::new(),
         render_states: HashMap::new(),
@@ -522,6 +598,7 @@ fn setup(
         selected: HashSet::new(),
         selection_dirty: false,
         bounds: HashMap::new(),
+        isolate_restore: None,
     });
     commands.insert_resource(OrbitCamera::default());
 
@@ -597,10 +674,10 @@ fn setup(
     ));
 
     // 地面网格（PDMS Z=0，过装载旋转即世界 y=0 面）与原点三色轴。
-    let grid_mesh = meshes.add(build_grid_mesh(1.0, DEFAULT_GRID));
+    let grid_mesh = meshes.add(build_grid_mesh(INITIAL_GRID_LEVEL, DEFAULT_GRID));
     commands.insert_resource(GridMesh(grid_mesh.clone()));
     commands.insert_resource(GridState {
-        level: 1.0,
+        level: INITIAL_GRID_LEVEL,
         color: DEFAULT_GRID,
         rebuild: false,
     });
@@ -721,11 +798,39 @@ fn build_grid_mesh(cell: f32, color: Color) -> Mesh {
     mesh
 }
 
-/// 相机离焦点多远，格距取几：10 的整幂，视野里保持十来格的密度。
-/// 上下限把「相机贴脸」与「拉到平流层」两头都夹住。
+/// 相机离焦点多远，格距取多少**真实长度**（毫米）。
+///
+/// 换档判断全在毫米上做。在世界单位上取 10 的整幂得出的是「一格 100 mm」
+/// 这种没人报得出口的数，而界面上又没有地方说明一格多长；落到
+/// 1/2/5×10ⁿ 这套工程与地图通用的档位上，每一档都是能直接念出来的长度，
+/// 相邻档之间也只差 2～2.5 倍，不像纯 10 次幂那样一跳就是十倍。
+fn grid_cell_mm(dist: f32) -> f32 {
+    // 先夹再落档：夹的是真实长度，且两端本身就在档位上，落档不会再推出界。
+    // 夹在前面还顺带挡掉 `dist = 0` 时的退化对数。
+    let wanted =
+        ((dist.max(0.0) / GRID_CELLS_ACROSS) * MM_PER_WORLD).clamp(GRID_MIN_MM, GRID_MAX_MM);
+    snap_grid_step(wanted)
+}
+
+/// 同上，换算成网格与三轴直接使用的世界单位。
 fn grid_level(dist: f32) -> f32 {
-    let raw = (dist.max(0.001) / 12.0).log10().round() as i32;
-    10f32.powi(raw).clamp(0.001, 1_000_000.0)
+    grid_cell_mm(dist) * MODEL_SCALE
+}
+
+/// 把一个真实长度落到最近的 1/2/5×10ⁿ 档。
+///
+/// 档位边界取相邻两档的**几何**中点：拉远与拉近的换档时机因此对称。用算术
+/// 中点的话同一个格距在放大时和缩小时会在不同的距离上跳档，来回滚一次滚轮
+/// 就能看出网格在同一位置上闪。
+fn snap_grid_step(mm: f32) -> f32 {
+    let decade = 10f32.powi(mm.max(f32::MIN_POSITIVE).log10().floor() as i32);
+    match mm / decade {
+        mantissa if mantissa < std::f32::consts::SQRT_2 => decade,
+        // √10 与 √50：1↔2、2↔5、5↔10 三处交界。
+        mantissa if mantissa < 3.162_277_7 => decade * 2.0,
+        mantissa if mantissa < 7.071_068 => decade * 5.0,
+        _ => decade * 10.0,
+    }
 }
 
 fn headlight_aim(camera: &Transform) -> Option<Vec3> {
@@ -764,6 +869,7 @@ fn publish_camera(
         m.y_axis.to_array(),
         m.z_axis.to_array(),
     ];
+    view.grid_cell_mm = grid.level * MM_PER_WORLD;
     let tip = (AXIS_CELLS + 0.9) * grid.level;
     for (axis, dir) in AXIS_DIRS.into_iter().enumerate() {
         view.axis_labels[axis] = camera
@@ -831,6 +937,9 @@ fn load_models(
     if replace {
         view.bounds.clear();
         view.loading_meshes.clear();
+        // 整场换掉，上一场的失败连同它指向的实体一起作废。
+        view.failed_meshes.clear();
+        view.retrying_meshes.clear();
         view.mesh_progress = None;
         view.render_states.clear();
         view.render_dirty.clear();
@@ -924,7 +1033,7 @@ fn load_models(
                 .spawn((model.world_trans, visibility, ModelRoot { refno, owner }))
                 .with_children(|element| {
                     for inst in model.insts {
-                        let path = format!("meshes/{}.mesh", inst.geo_hash);
+                        let path = mesh_source::asset_path(&inst.geo_hash);
                         let handle = assets.load(path.clone());
                         loading_meshes.push(LoadingMesh {
                             refno,
@@ -1014,8 +1123,76 @@ fn update_mesh_progress(mut view: ResMut<View3d>, assets: Res<AssetServer>) {
         errors,
     });
     if done == total {
-        view.loading_meshes.clear();
+        // 整批有了结果：失败的那些挑出来留着。换过网格目录之后要重来的就是它们，
+        // 跟着 `loading_meshes` 一起清掉就无从下手了。
+        let failed: Vec<LoadingMesh> = view
+            .loading_meshes
+            .drain(..)
+            .filter(|mesh| {
+                matches!(
+                    assets.get_load_state(&mesh.handle),
+                    Some(LoadState::Failed(_))
+                )
+            })
+            .collect();
+        view.failed_meshes.extend(failed);
     }
+}
+
+/// 重发上一轮失败的网格，并推进正在重试的那些。
+///
+/// 与 [`update_mesh_progress`] 分开走：那一份每帧从 `loading_meshes` 从头重算整批
+/// 计数，而重试只补个别网格——混进同一份账里会把同一个模型早先成功的那些数抹掉。
+fn retry_meshes(mut view: ResMut<View3d>, assets: Res<AssetServer>) {
+    if view.retry_requested {
+        view.retry_requested = false;
+        let asked_at = Instant::now();
+        let retrying: Vec<_> = view
+            .failed_meshes
+            .drain(..)
+            .map(|mesh| RetryingMesh {
+                mesh,
+                asked_at,
+                started: false,
+            })
+            .collect();
+        let mut reloaded = HashSet::new();
+        for entry in &retrying {
+            // 一个网格文件可以被许多实例共用，重发一次就够。
+            if reloaded.insert(entry.mesh.path.clone()) {
+                assets.reload(entry.mesh.path.as_str());
+            }
+        }
+        view.retrying_meshes.extend(retrying);
+    }
+    if view.retrying_meshes.is_empty() {
+        return;
+    }
+    let mut settled_now = Vec::new();
+    let mut still_failed = Vec::new();
+    let mut in_flight = Vec::new();
+    for mut entry in std::mem::take(&mut view.retrying_meshes) {
+        match assets.get_load_state(&entry.mesh.handle) {
+            Some(LoadState::Loaded) => {
+                if let Some(state) = view.render_states.get_mut(&entry.mesh.refno) {
+                    state.mesh_loaded += 1;
+                    state.mesh_failed = state.mesh_failed.saturating_sub(1);
+                }
+                settled_now.push(entry.mesh.refno);
+            }
+            // 还是失败态，但重发是丢进 IO 任务池的，状态要过几帧才翻——在亲眼见到
+            // 它离开失败态之前，这个 `Failed` 说的还是上一轮的事，不是这次的结论。
+            Some(LoadState::Failed(_)) if entry.settling() => still_failed.push(entry.mesh),
+            Some(LoadState::Failed(_)) => in_flight.push(entry),
+            _ => {
+                entry.started = true;
+                in_flight.push(entry);
+            }
+        }
+    }
+    view.retrying_meshes = in_flight;
+    view.failed_meshes.extend(still_failed);
+    view.render_dirty.extend(settled_now);
 }
 
 fn apply_resize(mut view: ResMut<View3d>, mut images: ResMut<Assets<Image>>) {
@@ -1145,6 +1322,72 @@ fn apply_commands(
                     if let Some(&(min, max)) = view.bounds.get(&refno) {
                         orbit.anim = None;
                         frame_bounds(min, max, &mut orbit, &mut camera_transform, &mut projection);
+                    }
+                }
+                ModelAction::FocusGroup { refnos } => {
+                    let mut min = Vec3::splat(f32::INFINITY);
+                    let mut max = Vec3::splat(f32::NEG_INFINITY);
+                    for refno in &refnos {
+                        if let Some(&(group_min, group_max)) = view.bounds.get(refno) {
+                            min = min.min(group_min);
+                            max = max.max(group_max);
+                        }
+                    }
+                    // 一个都没加载就不动相机：飞到原点比不动更糟。
+                    if min.is_finite() && max.is_finite() {
+                        orbit.anim = None;
+                        frame_bounds(min, max, &mut orbit, &mut camera_transform, &mut projection);
+                    }
+                }
+                ModelAction::Isolate { refnos } => {
+                    if view.isolate_restore.is_none() {
+                        view.isolate_restore = Some(
+                            roots
+                                .iter()
+                                .map(|(root, visibility)| {
+                                    (root.refno, *visibility != Visibility::Hidden)
+                                })
+                                .collect(),
+                        );
+                    }
+                    let mut shown = Vec::new();
+                    let mut hidden = Vec::new();
+                    for (root, mut visibility) in &mut roots {
+                        let keep = refnos.contains(&root.refno) || refnos.contains(&root.owner);
+                        *visibility = if keep {
+                            Visibility::Visible
+                        } else {
+                            Visibility::Hidden
+                        };
+                        if keep {
+                            shown.push(root.refno);
+                        } else {
+                            hidden.push(root.refno);
+                        }
+                    }
+                    record_applied_visibility(&mut view, shown, true);
+                    record_applied_visibility(&mut view, hidden, false);
+                }
+                ModelAction::ExitIsolate => {
+                    if let Some(snapshot) = view.isolate_restore.take() {
+                        let mut shown = Vec::new();
+                        let mut hidden = Vec::new();
+                        for (root, mut visibility) in &mut roots {
+                            // 快照之后才加载进来的模型不在账上，按可见处理。
+                            let visible = snapshot.get(&root.refno).copied().unwrap_or(true);
+                            *visibility = if visible {
+                                Visibility::Visible
+                            } else {
+                                Visibility::Hidden
+                            };
+                            if visible {
+                                shown.push(root.refno);
+                            } else {
+                                hidden.push(root.refno);
+                            }
+                        }
+                        record_applied_visibility(&mut view, shown, true);
+                        record_applied_visibility(&mut view, hidden, false);
                     }
                 }
                 ModelAction::FitAll => {
@@ -1389,10 +1632,14 @@ mod tests {
             size: UVec2::new(16, 16),
             camera_rot: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             axis_labels: [None; 3],
+            grid_cell_mm: INITIAL_GRID_LEVEL * MM_PER_WORLD,
             image: Handle::default(),
             commands: VecDeque::new(),
             pending_models: VecDeque::new(),
             loading_meshes: Vec::new(),
+            failed_meshes: Vec::new(),
+            retrying_meshes: Vec::new(),
+            retry_requested: false,
             mesh_progress: None,
             desired_visibility: HashMap::new(),
             render_states: HashMap::new(),
@@ -1402,6 +1649,75 @@ mod tests {
             selected: HashSet::new(),
             selection_dirty: false,
             bounds: HashMap::new(),
+            isolate_restore: None,
+        }
+    }
+
+    /// 档位表：1/2/5×10ⁿ 毫米，夹在格距上下限之内。
+    fn ladder_mm() -> Vec<f32> {
+        (0..=6)
+            .flat_map(|exp| {
+                let decade = 10f32.powi(exp);
+                [1.0, 2.0, 5.0].map(move |step| step * decade)
+            })
+            .filter(|mm| (GRID_MIN_MM..=GRID_MAX_MM).contains(mm))
+            .collect()
+    }
+
+    #[test]
+    fn every_grid_cell_is_a_round_real_length() {
+        let ladder = ladder_mm();
+        for step in 0..=400 {
+            let dist = 10f32.powf(-2.0 + step as f32 * 0.03);
+            let mm = grid_cell_mm(dist);
+            assert!(
+                ladder.iter().any(|rung| (rung - mm).abs() <= rung * 1e-4),
+                "相机距离 {dist} 处格距 {mm} mm 不在 1/2/5×10ⁿ 档上"
+            );
+        }
+    }
+
+    #[test]
+    fn the_grid_stays_between_a_millimetre_and_a_kilometre() {
+        // 相机贴到构件表面，以及 `dist` 退化成 0：都落到下界，不会算出 0 或负数
+        // 格距——那会让 `build_grid_mesh` 画出一堆重合线，也会把三轴缩成一点。
+        assert_eq!(grid_cell_mm(0.0), GRID_MIN_MM);
+        assert_eq!(grid_cell_mm(1e-6), GRID_MIN_MM);
+        assert_eq!(grid_cell_mm(f32::MAX), GRID_MAX_MM);
+    }
+
+    #[test]
+    fn pulling_the_camera_back_never_shrinks_the_grid() {
+        let mut previous = 0.0;
+        for step in 0..=300 {
+            let dist = 10f32.powf(-1.0 + step as f32 * 0.04);
+            let mm = grid_cell_mm(dist);
+            assert!(mm >= previous, "距离 {dist} 处格距回缩：{previous} -> {mm}");
+            previous = mm;
+        }
+    }
+
+    /// 世界单位与毫米之间只有 `MODEL_SCALE` 一处换算。谁把网格或三轴那一边
+    /// 改成另写的常数，这条就红——两个尺度各自漂移是本次要根治的病。
+    #[test]
+    fn world_units_and_millimetres_meet_at_one_conversion() {
+        assert_eq!(MM_PER_WORLD * MODEL_SCALE, 1.0);
+        for dist in [0.5f32, 5.0, 50.0, 500.0, 5_000.0] {
+            assert_eq!(grid_level(dist), grid_cell_mm(dist) * MODEL_SCALE);
+        }
+    }
+
+    /// 换到 1/2/5 阶梯不能把密度带跑偏。落档最多偏到相邻两档的几何中点，
+    /// 视野里的格数因此稳定在十来格——这是「格距跟着相机走」的全部意义。
+    #[test]
+    fn the_cell_keeps_about_a_dozen_cells_across_the_view() {
+        for step in 0..=285 {
+            let dist = 10f32.powf(-0.7 + step as f32 * 0.02);
+            let cells = dist / grid_level(dist);
+            assert!(
+                (GRID_CELLS_ACROSS / 2.0..=GRID_CELLS_ACROSS * 2.0).contains(&cells),
+                "距离 {dist} 处视野里 {cells} 格，离 {GRID_CELLS_ACROSS} 太远"
+            );
         }
     }
 
@@ -1557,15 +1873,55 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        let progress = app
-            .world()
-            .resource::<View3d>()
-            .mesh_progress
-            .as_ref()
-            .unwrap();
+        let view = app.world().resource::<View3d>();
+        let progress = view.mesh_progress.as_ref().unwrap();
         assert_eq!((progress.done, progress.total), (1, 1));
         assert_eq!(progress.errors.len(), 1);
         assert!(progress.errors[0].contains(path));
+        // 装完的那一批清掉了，但失败的这个要留着——换过网格目录之后要重来的就是它。
+        assert!(view.loading_meshes.is_empty());
+        assert_eq!(view.failed_mesh_count(), 1);
+    }
+
+    /// 重发是丢进 IO 任务池的，状态要过几帧才翻。在亲眼见到它离开失败态之前，
+    /// 那一刻的 `Failed` 说的还是上一轮的事——照单全收的话重试会当场自我否定。
+    #[test]
+    fn a_stale_failure_does_not_settle_a_fresh_retry() {
+        let mut entry = RetryingMesh {
+            mesh: LoadingMesh {
+                refno: RefU64::from(1),
+                path: "meshes://a.mesh".into(),
+                handle: Handle::default(),
+            },
+            asked_at: Instant::now(),
+            started: false,
+        };
+        assert!(!entry.settling());
+        entry.started = true;
+        assert!(entry.settling());
+
+        // 兜底：压根没被重发的那些不能永远挂着，宽限期一过就认账。
+        let stale = RetryingMesh {
+            asked_at: Instant::now() - RETRY_GRACE - Duration::from_millis(1),
+            started: false,
+            ..entry
+        };
+        assert!(stale.settling());
+    }
+
+    #[test]
+    fn retrying_needs_something_to_retry() {
+        let mut view = test_view();
+        assert_eq!(view.retry_failed_meshes(), 0);
+        assert!(!view.retry_requested);
+
+        view.failed_meshes.push(LoadingMesh {
+            refno: RefU64::from(1),
+            path: "meshes://a.mesh".into(),
+            handle: Handle::default(),
+        });
+        assert_eq!(view.retry_failed_meshes(), 1);
+        assert!(view.retry_requested);
     }
 
     /// 网格还在装的模型不回执：eye 不许抢在画面前面变成「已显示」。
@@ -1846,13 +2202,20 @@ mod tests {
         );
     }
 
-    /// 格距永远是 10 的整幂，距离归零也有下限——网格换档表是显示稳定性的根。
+    /// 换档表逐档钉死。它既是显示稳定性的根，也是 HUD 那句「一格 x」的唯一
+    /// 出处——档位一改，用户读到的尺寸就跟着改，所以拿具体距离对具体读数。
     #[test]
-    fn grid_level_snaps_to_powers_of_ten() {
+    fn grid_cells_snap_to_the_one_two_five_ladder() {
+        assert_eq!(grid_cell_mm(12.0), 100.0);
+        assert_eq!(grid_cell_mm(30.0), 200.0);
+        assert_eq!(grid_cell_mm(50.0), 500.0);
+        assert_eq!(grid_cell_mm(100.0), 1_000.0);
+        assert_eq!(grid_cell_mm(1_200.0), 10_000.0);
+        // 相机贴到构件表面：停在 1 mm，模型自身的精度量级。
+        assert_eq!(grid_cell_mm(0.0), GRID_MIN_MM);
+        // 网格与三轴收到的是同一档过一次 `MODEL_SCALE` 的世界单位。
         assert_eq!(grid_level(12.0), 1.0);
-        assert_eq!(grid_level(1.0), 0.1);
         assert_eq!(grid_level(1_200.0), 100.0);
-        assert_eq!(grid_level(0.0), 0.001);
     }
 
     /// 渐变面片的顶点色：下两枚是 bottom、上两枚是 top。铺反了渐变就头脚倒置，

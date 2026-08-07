@@ -293,7 +293,7 @@ pub(super) fn element_menu(
     if grouped {
         ui.separator();
     }
-    room_menu_section(ui, t, d, refno, rooms, cmds);
+    room_menu_section(ui, t, d, refno, rooms, live, cmds);
     ui.separator();
     if ui
         .button(format!("{}  复制 REFNO{suffix}", ph::COPY_SIMPLE))
@@ -322,11 +322,12 @@ fn room_menu_section(
     d: Density,
     refno: aios_core::RefU64,
     rooms: &RoomVm,
+    live: bool,
     cmds: &mut Vec<Cmd>,
 ) {
     ui.menu_button(format!("{}  查看所属房间", ph::DOOR_OPEN), |ui| {
         ui.set_min_width(d.px(220.0));
-        room_menu_items(ui, t, d, refno, rooms, cmds);
+        room_menu_items(ui, t, d, refno, rooms, live, cmds);
         ui.separator();
         // 浏览器看的是全部房间，不依赖这个元素的归属，所以哪个分支里都有它。
         if ui
@@ -339,13 +340,14 @@ fn room_menu_section(
     });
 }
 
-/// 子菜单里随元素归属而变的那部分（房间行 + 页签入口 / 三种占位态）。
+/// 子菜单里随元素归属而变的那部分（房间行 + 显示房间模型 + 页签入口 / 三种占位态）。
 fn room_menu_items(
     ui: &mut Ui,
     t: &Tokens,
     d: Density,
     refno: aios_core::RefU64,
     rooms: &RoomVm,
+    live: bool,
     cmds: &mut Vec<Cmd>,
 ) {
     let data = match rooms {
@@ -423,6 +425,22 @@ fn room_menu_items(
         resp.on_disabled_hover_text("面板不在册（陈旧归属边），无法聚焦");
     }
     ui.separator();
+    // 只给主归属那一间：右键菜单答的是「这个构件在哪」，一键直达最强那间房就够了。
+    // 跨房构件要看第二间，去「房间」页签点中它再按同名芯片——那里本来就摆着
+    // 全部归属，不必把这份列表在菜单里再展开一遍。
+    if live && let Some(primary) = data.relations.first() {
+        let resp = ui.add_enabled(
+            primary.room.is_some(),
+            egui::Button::new(format!("{}  显示房间模型（{}）", ph::CUBE, primary.room_num)),
+        );
+        if resp.clicked()
+            && let Some(room) = primary.room
+        {
+            cmds.push(Cmd::ShowRoomModel(room));
+            ui.close();
+        }
+        resp.on_disabled_hover_text("面板不在册（陈旧归属边），取不到房间模型");
+    }
     if ui
         .button(format!("{}  在「房间」页签中查看", ph::SIDEBAR_SIMPLE))
         .clicked()

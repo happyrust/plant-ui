@@ -69,16 +69,17 @@ fn vm(running: Option<&str>) -> Vm {
             task(id, dbnum, state)
         })
         .collect();
-    Vm {
-        project: PROJECT.into(),
-        queue: QueueSnapshot {
-            paused: false,
-            rows,
-        },
-        tasks,
-        loaded: true,
-        ..Default::default()
-    }
+    // `Vm` 有库内私有的记账字段（`preview_changes` / `refreshed`），库外的
+    // 结构体字面量连 `..Default::default()` 都过不了可见性检查——逐字段赋值。
+    let mut vm = Vm::default();
+    vm.project = PROJECT.into();
+    vm.queue = QueueSnapshot {
+        paused: false,
+        rows,
+    };
+    vm.tasks = tasks;
+    vm.loaded = true;
+    vm
 }
 
 /// 画几帧，返回每一行按 id 取到的矩形。取不到就是 `None`。

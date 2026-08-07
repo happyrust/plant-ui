@@ -822,6 +822,42 @@ pub async fn get_children_ele_nodes(refno: RefnoEnum) -> anyhow::Result<Vec<EleT
     Ok(nodes)
 }
 
+/// [`get_children_ele_nodes`] 的模型树精简版：去掉两个逐行子查询——
+/// `order`（逐子反查自己的 pe_owner 边）与 `mod_cnt`（逐子把 his_pe 的整条
+/// refnos 数组拉回来取长度）。这两列只有旧壳的树在用，模型树只吃
+/// refno / noun / name / children_count；769 子的 ZONE 实测 330ms → ~190ms。
+/// `owner` / `op` / `status_code` 是记录自带字段（不额外走边），留着喂
+/// `EleTreeNode` 的非默认字段。
+pub async fn get_children_tree_nodes(refno: RefnoEnum) -> anyhow::Result<Vec<EleTreeNode>> {
+    let sql = format!(
+        r#"
+        select in.refno as refno, in.noun as noun, in.name as name, in.owner as owner,
+                in.op?:0 as op,
+                array::len(in<-pe_owner) as children_count,
+                in.status_code as status_code
+            from {}<-pe_owner where in.id!=none and record::exists(in.id) and !in.deleted
+        "#,
+        refno.to_pe_key()
+    );
+    let mut response = SUL_DB.query(sql).await?;
+    let mut nodes: Vec<EleTreeNode> = response.take(0)?;
+    // 无名节点补默认名，规则与 get_children_ele_nodes 保持一字不差。
+    let mut hashmap: HashMap<&str, i32> = HashMap::new();
+    for node in &mut nodes {
+        if node.name.is_empty() {
+            let mut n = 1;
+            if let Some(k) = hashmap.get_mut(&node.noun.as_str()) {
+                *k += 1;
+                n = *k;
+            } else {
+                hashmap.insert(node.noun.as_str(), 1);
+            }
+            node.name = format!("{} {}", node.noun.as_str(), n);
+        }
+    }
+    Ok(nodes)
+}
+
 pub async fn clear_all_caches(refno: RefnoEnum) {
     clear_all_caches_batch(std::slice::from_ref(&refno)).await;
 }

@@ -215,20 +215,7 @@ pub fn status_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
                         .font(Font::micro(d))
                         .color(t.text_muted),
                 );
-                if !vm.project.is_empty() {
-                    divider(ui, t, d);
-                    meta_icon(ui, d, ph::DATABASE, t.accent);
-                    ui.label(
-                        RichText::new(format!("项目名 {}", vm.project))
-                            .font(Font::micro(d))
-                            .color(t.text_secondary),
-                    );
-                    ui.label(
-                        RichText::new(format!("项目代号 {}", vm.project_code))
-                            .font(Font::mono_micro(d))
-                            .color(t.text_muted),
-                    );
-                }
+                access_point_chip(ui, t, d, vm);
                 divider(ui, t, d);
                 meta_icon(ui, d, ph::CURSOR, t.text_secondary);
                 // 多选时报主选中加余量：状态栏这一格只有一行，列不下整批，
@@ -302,6 +289,96 @@ fn model_load_progress(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
             .animate(fraction.is_none())
             .text(RichText::new(text).font(Font::micro(d))),
     );
+}
+
+/// 状态栏那枚数据库芯片。点开是当前接入点的完整交代。
+///
+/// **连上之前也画。** 「连不上」正是最需要知道自己冲着谁去的那一刻，而那时候摆的是
+/// 配置里的库名而不是项目名——项目名要连上才算数，不许拿配置里的字面值冒充。
+fn access_point_chip(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
+    let ap = &vm.access_point;
+    let connected = !vm.project.is_empty();
+    if !connected && ap.db_url.trim().is_empty() {
+        return;
+    }
+    divider(ui, t, d);
+    let icon = ui.label(
+        RichText::new(ph::DATABASE)
+            .font(egui::FontId::new(
+                d.px(12.0),
+                egui::FontFamily::Proportional,
+            ))
+            .color(if connected { t.accent } else { t.text_muted }),
+    );
+    let response = if connected {
+        let name = ui.label(
+            RichText::new(format!("项目名 {}", vm.project))
+                .font(Font::micro(d))
+                .color(t.text_secondary),
+        );
+        let code = ui.label(
+            RichText::new(format!("项目代号 {}", vm.project_code))
+                .font(Font::mono_micro(d))
+                .color(t.text_muted),
+        );
+        icon.union(name).union(code)
+    } else {
+        let label = if ap.database.trim().is_empty() {
+            "接入点".to_owned()
+        } else {
+            format!("接入点 {}", ap.database)
+        };
+        let name = ui.label(
+            RichText::new(label)
+                .font(Font::micro(d))
+                .color(t.text_muted),
+        );
+        icon.union(name)
+    };
+    let response = response
+        .interact(Sense::click())
+        .on_hover_text("点击查看当前接入点");
+    egui::Popup::menu(&response).show(|ui| access_point_detail(ui, t, d, ap));
+}
+
+fn access_point_detail(ui: &mut Ui, t: &Tokens, d: Density, ap: &crate::vm::AccessPointVm) {
+    ui.set_min_width(d.px(420.0));
+    for (label, value) in [
+        ("模型本体库", ap.db_url.as_str()),
+        ("命名空间", ap.namespace.as_str()),
+        ("数据库", ap.database.as_str()),
+        ("MDB", ap.mdb.as_str()),
+        ("用户", ap.user.as_str()),
+        ("模型服务", ap.model_api_url.as_str()),
+        ("数据中心", ap.data_api_url.as_str()),
+    ] {
+        access_point_row(ui, t, d, label, value);
+    }
+    ui.separator();
+    // 这一行是整块面板存在的理由：没有它，静默回落到工作目录 `DbOption.toml` 的那次
+    // 启动与正常启动在界面上一模一样。
+    access_point_row(ui, t, d, "配置来自", &ap.source);
+}
+
+fn access_point_row(ui: &mut Ui, t: &Tokens, d: Density, label: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.set_width(d.px(72.0));
+            ui.label(
+                RichText::new(label)
+                    .font(Font::micro(d))
+                    .color(t.text_muted),
+            );
+        });
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let (text, color) = if value.trim().is_empty() {
+                ("未配置".to_owned(), t.text_muted)
+            } else {
+                (value.to_owned(), t.text_secondary)
+            };
+            ui.label(RichText::new(text).font(Font::mono_micro(d)).color(color));
+        });
+    });
 }
 
 /// 队列计数。队列视图被折起时由它叫住人，**不重复面板上的明细**——同一组数字

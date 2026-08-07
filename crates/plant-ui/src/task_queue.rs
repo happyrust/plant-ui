@@ -99,11 +99,23 @@ pub struct TaskEntry {
     #[serde(default)]
     pub events_seen: u64,
     /// 房间轮的 `{panels, elements, dead_letters}`；数据批次没有这一格。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub detail: Option<RoomCounts>,
     /// 终态结果；queued / running 时缺席。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub result: Option<crate::model_update::Outcome>,
+}
+
+/// `result` / `detail` 按 kind 承载不同形状（数据批次的终态摘要、房间轮的
+/// `{done,total}`、absorbed 收口……），这两格解不动只丢**这一格**，不许把整条
+/// `/tasks` 响应连坐掉——一条毒行冻住整个队列面板，比少一格明细贵得多。
+fn lenient<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 impl TaskEntry {
@@ -208,6 +220,9 @@ pub struct DbnumReport {
 pub struct Poll {
     pub queue: QueueSnapshot,
     pub tasks: Vec<TaskEntry>,
+    /// `/tasks` 没取到（或没解动）时的原因。它失败不作废整次轮询：队列行、health、
+    /// 欠账、dbnums 照常换代，计时与终态历史沿用上一份快照，界面要把这句说出来。
+    pub tasks_error: Option<String>,
     pub health: Option<Health>,
     pub pending: Vec<PendingModelUnit>,
     /// pending 接口是否成功。失败不能冒充“欠账清零”，否则会过早替换旧三维。
@@ -258,6 +273,9 @@ pub struct Vm {
     pub feed: Feed,
     /// 轮询失败的原因。进度与行都停在上一份快照上，界面要说出来。
     pub error: Option<String>,
+    /// 任务表单独失败的原因（队列行照常换代）。计时、进度分母与终态历史
+    /// 停在上一份快照上，横幅要把降级范围说清楚。
+    pub tasks_error: Option<String>,
     /// 有没有成功取到过一次快照。没有的话画「还没连上」而不是画一个空队列。
     pub loaded: bool,
     /// 只有手动向导能给出的比较基线；按 execute 回执里的 task_id 精确关联。
@@ -293,7 +311,12 @@ impl Vm {
 
     pub fn adopt(&mut self, poll: Poll) {
         self.queue = poll.queue;
-        self.tasks = poll.tasks;
+        // 任务表取不到时保留上一份：一条 result 解不动不许把计时与终态历史
+        // 整个清空——排队与运行中的行以 `/queue` 为准，本来就不靠它。
+        if poll.tasks_error.is_none() {
+            self.tasks = poll.tasks;
+        }
+        self.tasks_error = poll.tasks_error;
         self.health = poll.health;
         if poll.pending_known {
             self.pending = poll.pending;
@@ -726,12 +749,19 @@ pub fn rows(vm: &Vm) -> Vec<RowVm> {
             _ => Phase::Unknown,
         };
         let failed = entry.failed_units();
+        let absorbed = entry.result.as_ref().is_some_and(|o| o.is_absorbed());
         let note = if phase == Phase::Succeeded {
-            match (entry.units_done, entry.total_units) {
-                (Some(done), Some(total)) if done == total => {
-                    format!("{total} 个交付单元全部生成")
+            if absorbed {
+                // ADR-011 §5 的 absorbed 收口：这一行没跑，工作在运行中那一批里。
+                // 不说这句的话，一条「已完成」却没有任何单元计数的行解释不了自己。
+                "入队后被运行中批次覆盖，未单独执行".to_owned()
+            } else {
+                match (entry.units_done, entry.total_units) {
+                    (Some(done), Some(total)) if done == total => {
+                        format!("{total} 个交付单元全部生成")
+                    }
+                    _ => String::new(),
                 }
-                _ => String::new(),
             }
         } else {
             match failed.first() {
@@ -1048,6 +1078,18 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, state: &mut State, cmd
                 Status::Warn,
                 ph::WARNING,
                 &format!("队列状态查询暂时失败：{error}。下面这份是上一次取到的快照。"),
+            );
+        }
+        if let Some(error) = vm.tasks_error.as_deref() {
+            hint_banner(
+                ui,
+                t,
+                d,
+                Status::Warn,
+                ph::WARNING,
+                &format!(
+                    "任务表暂时读不到：{error}。队列行是新的；计时、进度分母与终态历史沿用上一份快照。"
+                ),
             );
         }
 
@@ -2037,6 +2079,28 @@ fn terminal_detail(
     };
     let outcome = entry.result.as_ref();
     let batch = outcome.and_then(|result| result.batch.as_ref());
+
+    if outcome.is_some_and(|result| result.is_absorbed()) {
+        detail_line(
+            ui,
+            t,
+            d,
+            DetailLine {
+                icon: ph::GIT_MERGE,
+                icon_color: t.accent,
+                label: "已被运行中批次吸收",
+                note: "",
+                note_color: t.text_muted,
+            },
+        );
+        sub_line(
+            ui,
+            t,
+            d,
+            "冻结重扫把这一窗口并进了运行中的批次，这一行无需单独执行",
+            false,
+        );
+    }
 
     if let Some(batch) = batch {
         let (icon, color, label) = match batch.status {

@@ -906,7 +906,10 @@ pub fn log_row_ui<R>(
 
 /// 在指定矩形里左对齐地放一段可选中文本。`truncate` 为真时按矩形宽度截断并加省略号
 /// ——整段被选中时 egui 复制的是未截断原文，所以截断不影响抄走完整内容。
-fn selectable_at(ui: &mut Ui, rect: Rect, text: egui::RichText, truncate: bool) -> Response {
+///
+/// 凡是「已经自己算好矩形、只差把字放进去」的地方都该走它，而不是
+/// `painter().galley`：画上去的字形选不中，也就复制不走。
+pub fn selectable_at(ui: &mut Ui, rect: Rect, text: egui::RichText, truncate: bool) -> Response {
     ui.scope_builder(
         egui::UiBuilder::new()
             .max_rect(rect)

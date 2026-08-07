@@ -16,9 +16,10 @@
 `gen-model/docs/adr/ADR-011-one-data-batch-queue-for-manual-and-auto.md`（服务端）。
 下文的「ADR-011 §N」一律指后者。
 
-画板在 `design/plant-ui.pen`：**S12** 是常态，**S12-B** 收拢暂停、队列重建与断线降级三种形态；
+画板在 `design/plant-ui.pen`：**S12** 是常态，**S12-B** 收拢暂停、队列重建与断线降级三种形态，
+**S12-C** 收拢三种终态的行内明细（2026-08-05 补，见 §1.5）；
 行由组件 `C/QueueRow` 铺，七个列位（状态点 / 设计库 / 类型 / 会话区间 / 状态 / 进度与说明 / 计时）
-逐实例覆盖。下表的「示例」一律取自这两张画板上的真实文案，两处不许各说各话。
+逐实例覆盖。下表的「示例」一律取自这几张画板上的真实文案，两处不许各说各话。
 
 ---
 
@@ -41,10 +42,13 @@
 | 欠 N 个单元 | `欠 2 个单元` | 契约 + **待修** | `GET /update/pending-units` 按 dbnum 过滤计数。它走持久表，**不依赖任务历史**（ADR-011 §11）。但那张表今天会残留，见表下那段 |
 | 失败单元标识 | `EQUI /P-1201B` | 契约 | `ModelUnitResult.noun` + `root_refno`，或 `PendingModelUnit` 同名字段 |
 | 尝试次数 | `第 3 次尝试` | 契约 | `ModelUnitResult.attempts` / `PendingModelUnit.attempts`（跨重试累计）|
-| 「重试」按钮 | | 契约 + **待修** | `POST /api/v1/model/ensure { refno }`，幂等。**「无需后端改动」这句已经不成立**——空单元回 500，见表下那段 |
+| 「立刻重试」按钮 | | 契约 | `POST /api/v1/update/pending-units/retry`（2026-08-05 起改走此端点，不再直接打 `/model/ensure`）：只复活已存在的行——`attempts` 清零、`revision + 1`、清 `last_error`——再叫醒调度器，不排新批次；死信从同一入口复活。空单元 500 是 `/model/ensure` 通道的问题（见表下那段），与此按钮已无关 |
 | 上次结果 | `上次 partial · 10:04` | 契约 | 该 dbnum 最近一条终态 `TaskEntry` 的 `state` + `finished_at`。分层保留策略保证它一定还在（ADR-011 §11）|
 
-**那枚「重试」在空交付单元上今天必然误导**（2026-07-27 实测，rollout 六之六 G4）：
+> 注（2026-08-05）：行内「立刻重试」已改走 `pending-units/retry`，下面这段是
+> `/model/ensure` 通道的已知问题——按需生成、生成回放仍会踩到，保留备查。
+
+**那枚（ensure 通道的）「重试」在空交付单元上今天必然误导**（2026-07-27 实测，rollout 六之六 G4）：
 无子件的 BRAN 之类生成后 0 实例，`/model/ensure` 回
 `500 {"code":"internal","message":"已生成生成根 …，但请求构件 … 没有落下任何模型实例"}`，
 而规格 `web-service-api.md` §4.5 定义此形态应是 200 + `NoRenderableGeometry`。
@@ -66,6 +70,29 @@
 让旁路生成也能收敛队列。在那之前，这一格只在「从没被旁路生成碰过的库」上准，
 而那件事**界面判断不了**。所以这里**不加任何「可能偏大」的标注**——本表第 4 节给预览
 加标注是因为那个 N 由快照本地算得出；这里算不出偏大多少，一句说不清来路的提示比不提更差。
+
+---
+
+## 1.5 终态行内明细（S12-C）
+
+行内明细默认折叠、只有运行中默认展开（ADR-0011）；终态行点开后是下面这块。
+`TaskState` 三种终态已在契约里（`task_registry.rs`：`succeeded` / `partial` / `failed`）。
+
+| 元素 | 示例 | 来源 | 出处 |
+|---|---|---|---|
+| 行状态 · 已完成 | `已完成` + 说明位 `24 个交付单元全部生成` | 契约 | `TaskState::Succeeded`：批次 `Applied` 且全部单元 `Generated` |
+| 行状态 · 失败 | `失败` + 说明位 `应用会话 7 时写入失败` | 契约 | `TaskState::Failed`：`BatchStatus::Failed`，契约明写**水位未动**；说明位取 `DataBatchResult.message` |
+| 会话窗与水位落点 | `sesno 1 024 → 1 034 · 已应用 · 水位推进至 1 034` | 契约 | `DataBatchResult.start_sesno / end_sesno` + `status` |
+| 并入会话 | `预览后并入 3 个会话：1 032 / 1 033 / 1 034` | 契约 | `DataBatchResult.merged_sesnos`——契约明写必须逐条列出 |
+| 变化项数 | `512 项变化（预览时 487）` | 契约 + 本地 | `changed_elements`；括号里的差值来自缓存的上一份预览 |
+| 单元计数 | `24 / 24 个交付单元已生成` | 契约 | `TaskEntry.units_done / total_units` |
+| 模型树刷新 | `模型树已就地刷新` | 契约 | `ModelUnitResult.old_owner / new_owner` 经 `refresh_for_units` 消费（已实现） |
+| 计时 | `开跑 10:07 · 结束 10:12 · 用时 04:38` | 契约 + 本地 | `TaskEntry.started_at / finished_at`；用时是两者之差 |
+| 失败 · 不产生欠账 | `模型生成未开始——数据未落库，不产生待重试单元` | 契约 | 两阶段设计：批次失败则阶段二不开始，`units` 为空 |
+| 失败 · 自动回队 | `不用手动重排：队列按水位派生，下一轮扫描会照原区间重新入队` | 契约 | ADR-011 §6（30s 轮询）+ §9（派生态，不做取消） |
+| 欠账单元行 | `EQUI /P-1201B · 第 3 次尝试 · 写入生成结果失败：目标分支被占用` | 契约 | `PendingModelUnit.noun / root_refno / attempts / last_error` |
+| 死信行 | `BRAN /100-B7 · 已尝试 5 次 · 已放弃重试：不再自动重试，也不并入手动更新` | 契约 | `PendingModelUnit.dead`（判死上限是服务端常量，客户端只认这个布尔） |
+| 「立刻重试」 | 欠账行与死信行行尾各一枚 | 契约 | 见 §1「立刻重试」按钮：`pending-units/retry`，死信同一入口复活 |
 
 ---
 

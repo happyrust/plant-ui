@@ -59,6 +59,29 @@ pub struct WorkbenchVm {
     pub model_load: Option<ModelLoadVm>,
     /// 任务队列在状态栏上的那一格。
     pub queue: QueueStatusVm,
+    /// 当前项目接入点（状态栏那枚数据库芯片点开后的内容）。
+    pub access_point: AccessPointVm,
+}
+
+/// 一个项目接入点在界面上的样子：这一刻**实际生效**的那组地址与身份。
+///
+/// 全部由宿主从运行配置解出来填进来，不是任何一份配置文件的字面值——两者本来就
+/// 可能不一样，而分辨它们正是这块面板存在的理由。口令不进这里，界面任何一处都
+/// 不显示它。
+#[derive(Debug, Clone, Default)]
+pub struct AccessPointVm {
+    /// 模型本体库的实际连接串。
+    pub db_url: String,
+    pub namespace: String,
+    pub database: String,
+    /// 当前 MDB 名（带前导 `/`）。配空时为空串，不摆一个谁都不是的 `/`。
+    pub mdb: String,
+    pub user: String,
+    pub model_api_url: String,
+    pub data_api_url: String,
+    /// 这组配置来自哪儿。`get_db_option()` 在没人注入配置时会**静默回落**去读工作
+    /// 目录的 `DbOption.toml`——不把来源说出来，人就没法知道自己连到了哪儿。
+    pub source: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,6 +263,10 @@ pub struct View3dVm {
     /// X / Y / Z 轴端标签在渲染纹理上的归一化 UV；轴尖出画或在相机身后时为 None。
     /// 投影只有宿主的相机做得了，绘制层拿到的已经是算完的位置。
     pub axis_labels: [Option<[f32; 2]>; 3],
+    /// 地面网格一格代表多长，单位**毫米**（模型的真实尺度，不是渲染的世界单位）。
+    /// 宿主的网格换档就按这个数落档，HUD 把它原样念出来——两边同源，读数才不会
+    /// 与眼睛看见的格子对不上。独立壳没有网格，给 0 表示「无读数」。
+    pub grid_cell_mm: f32,
 }
 
 /// 应用运行日志数据。

@@ -135,7 +135,7 @@ pub enum Status {
 }
 
 /// 界面密度。基准字号同时决定所有控件高度，改这一个值整套界面跟着缩放。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Density {
     Compact,
     Standard,

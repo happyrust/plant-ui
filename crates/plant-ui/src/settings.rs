@@ -15,10 +15,31 @@ pub const DEFAULT_MODEL_API_URL: &str = "http://127.0.0.1:8021";
 /// 数据中心服务地址。它与模型更新服务是两个独立进程，不能复用 8021。
 pub const DEFAULT_DATA_API_URL: &str = "http://127.0.0.1:9099";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 浏览器端那一行为什么是灰的。按住不放才看得到，所以话要说全。
+const WEB_MESH_DIR_HINT: &str = "浏览器端的网格与字体贴图一样由站点供给，不读本地目录";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Theme {
     Light,
     Dark,
+}
+
+/// 网格目录的校验结果。
+///
+/// 绘制层不碰文件系统——两端共用一份代码，浏览器那边压根没有目录可查——所以这一项
+/// 由宿主算好填进来，这里只负责把它画出来。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum MeshDirStatus {
+    /// 还没校验过，或者这一侧不适用。
+    #[default]
+    Unknown,
+    /// 目录在，里面确实有网格文件。
+    Ok,
+    /// 目录在，但一个 `.mesh` 都没有。最常见的成因是选错一层——指到了资产根，
+    /// 而网格在它底下的 `meshes` 里。
+    NoMeshFiles,
+    /// 路径不存在、不是目录，或者读不动。
+    Unreachable(String),
 }
 
 impl Theme {
@@ -30,12 +51,20 @@ impl Theme {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Settings {
     pub theme: Theme,
     pub density: Density,
     pub model_api_url: String,
     pub data_api_url: String,
+    /// 网格文件所在的目录。**空串是明确的「我没指定」**，那一格让给环境变量，
+    /// 再退到出厂默认 `<资产根>/meshes`；解出来的实际路径由宿主放进
+    /// [`State::mesh_dir_hint`] 当占位提示显示。
+    ///
+    /// 绘制层不知道资产根在哪，所以这里存不了一个「默认的绝对路径」——存了也是把
+    /// 宿主那一层知识抄进绘制层，换一种部署方式就对不上。
+    pub mesh_dir: String,
 }
 
 impl Default for Settings {
@@ -45,25 +74,20 @@ impl Default for Settings {
             density: Density::Standard,
             model_api_url: DEFAULT_MODEL_API_URL.to_owned(),
             data_api_url: DEFAULT_DATA_API_URL.to_owned(),
+            mesh_dir: String::new(),
         }
     }
 }
 
+#[derive(Default)]
 pub struct State {
     pub open: bool,
     pub saved: Settings,
+    /// 「跟随资产根」时网格实际会去哪个目录取。宿主算好放进来，只作占位提示。
+    pub mesh_dir_hint: String,
     draft: Settings,
-}
-
-impl Default for State {
-    fn default() -> Self {
-        let saved = Settings::default();
-        Self {
-            open: false,
-            draft: saved.clone(),
-            saved,
-        }
-    }
+    mesh_dir_status: MeshDirStatus,
+    browse_requested: bool,
 }
 
 impl State {
@@ -77,6 +101,26 @@ impl State {
     pub fn adopt(&mut self, settings: Settings) {
         self.draft = settings.clone();
         self.saved = settings;
+    }
+
+    /// 草稿里此刻的网格目录。宿主拿它去校验。
+    pub fn mesh_dir_draft(&self) -> &str {
+        &self.draft.mesh_dir
+    }
+
+    /// 宿主选完目录之后填回草稿。
+    pub fn set_mesh_dir_draft(&mut self, dir: impl Into<String>) {
+        self.draft.mesh_dir = dir.into();
+    }
+
+    /// 宿主校验完把结论交回来。
+    pub fn set_mesh_dir_status(&mut self, status: MeshDirStatus) {
+        self.mesh_dir_status = status;
+    }
+
+    /// 「浏览…」被点过没有。绘制层不开系统对话框，只把这个意图挂在这儿等宿主取走。
+    pub fn take_browse_request(&mut self) -> bool {
+        std::mem::take(&mut self.browse_requested)
     }
 }
 
@@ -158,6 +202,44 @@ pub fn show(ctx: &egui::Context, t: &Tokens, d: Density, state: &mut State) -> O
             );
 
             ui.add_space(12.0);
+            ui.label(RichText::new("资产").strong().color(t.text_secondary));
+            // 浏览器端整行不适用：禁用而不是隐藏，两端的设置窗才长得一样
+            // （与模型树菜单里「取回工作」同一条房规）。
+            let local_files = cfg!(not(target_arch = "wasm32"));
+            let hint = state.mesh_dir_hint.clone();
+            setting_row(
+                ui,
+                t,
+                "网格目录",
+                "三维网格文件所在的目录；留空则使用灰字那个默认目录",
+                |ui| {
+                    let browse = ui.add_enabled(local_files, widgets::button(t, d, "浏览…"));
+                    if browse.clicked() {
+                        state.browse_requested = true;
+                    }
+                    browse.on_disabled_hover_text(WEB_MESH_DIR_HINT);
+                    ui.add_enabled(
+                        local_files,
+                        TextEdit::singleline(&mut state.draft.mesh_dir)
+                            .desired_width(300.0)
+                            .font(Font::mono(d))
+                            .hint_text(hint.as_str()),
+                    )
+                    .on_disabled_hover_text(WEB_MESH_DIR_HINT);
+                },
+            );
+            if local_files && let Some((notice, color)) = mesh_dir_notice(t, &state.mesh_dir_status)
+            {
+                // 外面这层 `horizontal` 不能省：`with_layout` 会把剩下的竖直空间整块吃掉，
+                // 这一行就飘到窗口底部去了，离它解释的那个输入框十万八千里。
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new(notice).small().color(color));
+                    });
+                });
+            }
+
+            ui.add_space(12.0);
             ui.label(RichText::new("服务").strong().color(t.text_secondary));
             setting_row(
                 ui,
@@ -182,11 +264,32 @@ pub fn show(ctx: &egui::Context, t: &Tokens, d: Density, state: &mut State) -> O
     if save {
         state.draft.model_api_url = normalize_api_url(&state.draft.model_api_url);
         state.draft.data_api_url = normalize_data_api_url(&state.draft.data_api_url);
+        state.draft.mesh_dir = normalize_mesh_dir(&state.draft.mesh_dir);
         state.saved = state.draft.clone();
         state.open = false;
         return Some(state.saved.clone());
     }
     None
+}
+
+/// 校验结论那一行的文案与颜色；没什么可说的时候不画。
+fn mesh_dir_notice(t: &Tokens, status: &MeshDirStatus) -> Option<(String, egui::Color32)> {
+    match status {
+        MeshDirStatus::Unknown => None,
+        MeshDirStatus::Ok => Some(("已找到网格文件".to_owned(), t.success)),
+        MeshDirStatus::NoMeshFiles => Some((
+            "这个目录里没有网格文件；网格通常在资产根底下的 meshes 里".to_owned(),
+            t.warn,
+        )),
+        MeshDirStatus::Unreachable(reason) => Some((reason.clone(), t.danger)),
+    }
+}
+
+/// 资源管理器的「复制文件地址」给的是带引号的路径，直接粘进来会多一对引号，
+/// 而带引号的路径在任何一层都打不开。顺手剥掉，省得人对着一个看不出错在哪的
+/// 「目录不存在」发呆。
+fn normalize_mesh_dir(raw: &str) -> String {
+    raw.trim().trim_matches('"').trim().to_owned()
 }
 
 /// 地址拼接是 `{base}{path}`，尾斜杠会拼出 `//api/v1`；清空则退回出厂默认，
@@ -257,6 +360,47 @@ mod tests {
     }
 
     #[test]
+    fn mesh_dir_defaults_to_following_the_asset_root() {
+        assert_eq!(Settings::default().mesh_dir, "");
+    }
+
+    #[test]
+    fn normalizing_strips_the_quotes_explorer_pastes() {
+        assert_eq!(
+            normalize_mesh_dir("  \"D:\\models\\meshes\"  "),
+            "D:\\models\\meshes"
+        );
+        assert_eq!(normalize_mesh_dir("   "), "");
+    }
+
+    #[test]
+    fn browse_request_is_taken_once() {
+        let mut state = State::default();
+        assert!(!state.take_browse_request());
+        state.browse_requested = true;
+        assert!(state.take_browse_request());
+        assert!(!state.take_browse_request());
+    }
+
+    #[test]
+    fn only_a_checked_mesh_dir_says_anything() {
+        let t = Tokens::light();
+        assert!(mesh_dir_notice(&t, &MeshDirStatus::Unknown).is_none());
+        assert_eq!(
+            mesh_dir_notice(&t, &MeshDirStatus::Ok).map(|(_, color)| color),
+            Some(t.success)
+        );
+        assert_eq!(
+            mesh_dir_notice(&t, &MeshDirStatus::NoMeshFiles).map(|(_, color)| color),
+            Some(t.warn)
+        );
+        assert_eq!(
+            mesh_dir_notice(&t, &MeshDirStatus::Unreachable("读不动".into())),
+            Some(("读不动".to_owned(), t.danger))
+        );
+    }
+
+    #[test]
     fn adopt_syncs_draft_so_the_dialog_opens_on_the_host_value() {
         let mut state = State::default();
         state.adopt(Settings {
@@ -269,15 +413,16 @@ mod tests {
         assert_eq!(state.saved.data_api_url, "http://10.0.0.9:9099");
     }
 
-    #[test]
-    fn settings_window_height_stays_stable_after_opening() {
+    /// 开着设置窗转 8 帧，逐帧记下窗口高度。
+    fn window_heights(status: MeshDirStatus) -> Vec<f32> {
         let ctx = egui::Context::default();
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0));
         let window_id = egui::Id::new("plant-settings-window");
         let mut state = State::default();
         state.open();
+        state.set_mesh_dir_status(status);
 
-        let heights = (0..8)
+        (0..8)
             .map(|_| {
                 let input = egui::RawInput {
                     screen_rect: Some(screen),
@@ -288,13 +433,26 @@ mod tests {
                 let _ = ctx.end_pass();
                 ctx.memory(|memory| memory.area_rect(window_id).unwrap().height())
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
 
-        assert!(
-            heights[2..]
-                .windows(2)
-                .all(|pair| (pair[1] - pair[0]).abs() < f32::EPSILON),
-            "设置窗口高度逐帧增长：{heights:?}"
-        );
+    /// 挂着校验提示的那一档也要测：这一行是条件出现的，多一个分支就多一次
+    /// 布局嵌套出错的机会。
+    #[test]
+    fn settings_window_height_stays_stable_after_opening() {
+        for status in [
+            MeshDirStatus::Unknown,
+            MeshDirStatus::Ok,
+            MeshDirStatus::NoMeshFiles,
+            MeshDirStatus::Unreachable("目录不存在".into()),
+        ] {
+            let heights = window_heights(status.clone());
+            assert!(
+                heights[2..]
+                    .windows(2)
+                    .all(|pair| (pair[1] - pair[0]).abs() < f32::EPSILON),
+                "{status:?} 下设置窗口高度逐帧增长：{heights:?}"
+            );
+        }
     }
 }
