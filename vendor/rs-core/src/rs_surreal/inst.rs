@@ -193,6 +193,61 @@ pub async fn query_insts(
     Ok(geom_insts)
 }
 
+/// 任意根子树的全部可见实例 refno：`inst_relate` 上一条 `anc CONTAINS $root`
+/// 索引查询（层级查询优化方案 P2，gen-model
+/// `docs/plans/2026-08-07-inst-relate-anc-u64-hierarchy-query-plan.md`）。
+///
+/// 替代「`query_deep_visible_inst_refnos`：两遍 12 层 `<-pe_owner<-` 深遍历 +
+/// 巨型 IN 内联」的旧解析形态。`anc` 是 gen-model 写入侧物化的 RefU64 打包
+/// 祖先链（含自身，向上到顶），配普通索引 `idx_inst_relate_anc`；根可以是
+/// SITE/ZONE/PIPE/BRAN 乃至叶子元素本身，无需先辨类型。
+///
+/// **刻意只回 id 列表**：投影仍走既有的分批 [`query_insts`]（500/批）。整根
+/// 全投影一条响应在大 SITE 上会撑爆单条 WS 消息（AMS 41 根实测直接把连接
+/// 打死），id 列表则再大的根也只有百 KB 级。
+///
+/// 回填完成前的旧行 `anc = NONE`，CONTAINS 天然不命中——调用方先用
+/// [`inst_relate_anc_ready`] 探测覆盖，再决定走本函数还是旧路径。
+pub async fn query_inst_refnos_by_root_anc(root: RefnoEnum) -> anyhow::Result<Vec<RefnoEnum>> {
+    let root_u64 = root.refno().0;
+    let mut response = SUL_DB
+        .query(format!(
+            "select value in.id from inst_relate where anc contains {root_u64} and aabb.d != none"
+        ))
+        .await?;
+    Ok(response.take(0)?)
+}
+
+/// 任意根子树里**带直管段**的 BRAN/HANG refno：`tubi_relate` 上同款
+/// `anc CONTAINS $root` 索引查询（与 [`query_inst_refnos_by_root_anc`] 配对）。
+/// 替代「深遍历过滤子树全部 BRAN/HANG」的旧解析形态；边投影仍走既有的
+/// [`query_tubi_insts_by_brans`]（500 支管/批）。`tubi_relate.anc` 由 gen-model
+/// 建边时按所属 BRAN 的祖先链写入。
+pub async fn query_bran_refnos_by_root_anc(root: RefnoEnum) -> anyhow::Result<Vec<RefnoEnum>> {
+    let root_u64 = root.refno().0;
+    let mut response = SUL_DB
+        .query(format!(
+            "return array::distinct((select value in.id from tubi_relate \
+             where anc contains {root_u64} and leave.id != none));"
+        ))
+        .await?;
+    Ok(response.take(0)?)
+}
+
+/// `anc` 回填覆盖探测：库里是否已有带祖先链的 `inst_relate` 行。
+///
+/// gen-model 的启动序列会对存量行做幂等回填（`backfill_inst_relate_anc`）；
+/// 在那之前 anc 全为 NONE，`anc CONTAINS` 查什么都是空集。读侧在选路前
+/// 探一次（`LIMIT 1`，最坏整表扫一遍 id，3.8 万行毫秒级），空库（0 行）视作
+/// 就绪——两条路径都只能回空，走新路径省掉深遍历。
+pub async fn inst_relate_anc_ready() -> anyhow::Result<bool> {
+    let sql = "return array::len((select value id from inst_relate limit 1)) == 0 \
+               || array::len((select value id from inst_relate where anc != none limit 1)) > 0;";
+    let mut response = SUL_DB.query(sql).await?;
+    let ready: Option<bool> = response.take(0)?;
+    Ok(ready.unwrap_or(false))
+}
+
 // 根据历史refno查询历史insts
 // pub async fn query_history_insts(
 //     refnos: impl IntoIterator<Item = &RefnoEnum>,

@@ -6789,6 +6789,7 @@ version = "0.1.4"
 dependencies = [
  "aios_core",
  "anyhow",
+ "futures",
  "glam",
  "tokio",
 ]

@@ -53,21 +53,14 @@ pub async fn ancestor_refnos(refno: RefnoEnum) -> Result<Vec<RefU64>> {
 /// 网格文件仍由 Bevy AssetServer 从 `assets/meshes` 加载。
 ///
 /// **这是整个界面里最贵的一次查询**，而调用点（`Req::Models`）在它之前刚
-/// `invalidate_all` 过，所以每次都是冷的。AvevaMarineSample / MDB ALL 上实测
-/// 一次冷启动 88 秒，构成是：
+/// `invalidate_all` 过，所以每次都是冷的。旧路径在 AvevaMarineSample / MDB ALL
+/// 上实测一次冷启动 88 秒，八成时间花在按根串行解可见实例集
+/// （`query_deep_visible_inst_refnos`，69.9 s / 79%）。
 ///
-/// | 阶段 | 耗时 | 占比 |
-/// |---|---|---|
-/// | `query_deep_visible_inst_refnos` | 69.9 s | 79% |
-/// | `query_insts`（107 批 × 500） | 15.9 s | 18% |
-/// | `query_filter_deep_children` | 2.2 s | 2.5% |
-/// | `query_tubi_insts_by_brans` | 0.2 s | 0.2% |
-/// | `get_self_and_owner_type_name` | ~0 s | 0% |
-///
-/// 19 个根、53373 个可见 refno、38048 个实例。**贵的不是这里的循环结构**：
-/// 「每个 root 多打两次库」那两次合起来占 2.5%，深子树过滤也不是瓶颈；
-/// 八成时间花在按根逐个解可见实例集上，而那 19 次调用是串行的。真要优化就从
-/// 那一层入手（并发发起，或者由查询侧一次解完多个根），改这里的调用次数没用。
+/// 现在默认走 anc 索引路径（见 [`model_instances_anc`]）：解析成本归零，
+/// 剩下的地板是实例投影本身；根间 8 路并发。合成 AMS 量级对拍实测
+/// 346 s → 16 s（gen-model `docs/plans/2026-08-07-inst-relate-anc-u64-
+/// hierarchy-query-plan.md` P2 前置验证节）。
 pub async fn model_instances(roots: &[RefU64]) -> Result<Vec<aios_core::GeomInstQuery>> {
     model_instances_with_progress(roots, |_, _| {}).await
 }
@@ -85,10 +78,93 @@ fn branch_query(noun: &str) -> BranchQuery {
     }
 }
 
-/// 查询已经生成好的模型，并在范围解析完成后按查询分块报告进度。
+/// 强制走旧深遍历路径的运维开关（现场回退用，一个版本后随旧路径一起退役）。
+fn legacy_model_query_forced() -> bool {
+    std::env::var("PLANT_UI_LEGACY_MODEL_QUERY").is_ok_and(|v| v == "1")
+}
+
+/// 查询已经生成好的模型，并按查询分块报告进度。
 ///
-/// 这里仍然只读 SurrealDB；mesh 文件由 View3d 的 AssetLoader 消费，不会触发模型生成。
+/// 自动选路：`inst_relate.anc` 已回填 → [`model_instances_anc`]（每根一条
+/// `anc CONTAINS` 索引查询，根间并发）；未回填（gen-model 新版启动会自愈回填）
+/// 或探测失败 → [`model_instances_legacy`]。`PLANT_UI_LEGACY_MODEL_QUERY=1`
+/// 强制旧路径。这里仍然只读 SurrealDB；mesh 文件由 View3d 的 AssetLoader 消费，
+/// 不会触发模型生成。
 pub async fn model_instances_with_progress(
+    roots: &[RefU64],
+    progress: impl FnMut(usize, usize),
+) -> Result<Vec<aios_core::GeomInstQuery>> {
+    if legacy_model_query_forced() {
+        return model_instances_legacy(roots, progress).await;
+    }
+    match aios_core::inst_relate_anc_ready().await {
+        Ok(true) => model_instances_anc(roots, progress).await,
+        Ok(false) => {
+            eprintln!(
+                "inst_relate.anc 未回填（升级 gen-model 并启动一次即自愈），本次走旧深遍历路径"
+            );
+            model_instances_legacy(roots, progress).await
+        }
+        Err(error) => {
+            eprintln!("anc 覆盖探测失败（{error}），本次走旧深遍历路径");
+            model_instances_legacy(roots, progress).await
+        }
+    }
+}
+
+/// 新路径（层级查询优化 P2）：每根一条 `anc CONTAINS $root` 索引查询解出
+/// 实例/支管 refno 列表（替代深遍历解析，id 列表载荷百 KB 级封顶），投影仍走
+/// 久经考验的分批 `query_insts` / `query_tubi_insts_by_brans`（500/批——整根
+/// 全投影一条响应在大 SITE 上会撑爆单条 WS 消息，AMS 实测教训）。根间 8 路
+/// 并发（`buffered` 保输入序，结果顺序确定）。根类型无关——SITE/ZONE/PIPE/
+/// BRAN/叶子一律同一条查询，不再需要辨名词、SITE→ZONE 中转与深遍历。
+///
+/// 进度口径：每根完成算 1 步（旧路径按 500 行分块计步，粒度不同但语义同为
+/// 「已完成/总数」）。pub 供对拍验收（`tests/anc_model_query_parity.rs`）
+/// 与排障直接调用。
+pub async fn model_instances_anc(
+    roots: &[RefU64],
+    mut progress: impl FnMut(usize, usize),
+) -> Result<Vec<aios_core::GeomInstQuery>> {
+    use futures::stream::StreamExt;
+    const ROOT_CONCURRENCY: usize = 8;
+    let total = roots.len();
+    let mut done = 0;
+    progress(done, total);
+    let queries = roots.iter().copied().map(|root| async move {
+        let root: aios_core::RefnoEnum = root.into();
+        let (inst_refnos, bran_refnos) = futures::future::try_join(
+            aios_core::query_inst_refnos_by_root_anc(root),
+            aios_core::query_bran_refnos_by_root_anc(root),
+        )
+        .await?;
+        let mut models = Vec::new();
+        for chunk in inst_refnos.chunks(500) {
+            models.extend(aios_core::query_insts(chunk.iter(), false).await?);
+        }
+        for chunk in bran_refnos.chunks(500) {
+            models.extend(
+                aios_core::query_tubi_insts_by_brans(chunk)
+                    .await?
+                    .into_iter()
+                    .map(tubi_to_geom),
+            );
+        }
+        anyhow::Ok(models)
+    });
+    let mut models = Vec::new();
+    let mut stream = futures::stream::iter(queries).buffered(ROOT_CONCURRENCY);
+    while let Some(result) = stream.next().await {
+        models.extend(result?);
+        done += 1;
+        progress(done, total);
+    }
+    Ok(models)
+}
+
+/// 旧路径：深遍历解可见实例集 + 分批 `query_insts`。保留一个版本作现场回退
+/// 与对拍基线（anc 回填完成、AMS 对拍通过后随开关一起退役）。
+pub async fn model_instances_legacy(
     roots: &[RefU64],
     mut progress: impl FnMut(usize, usize),
 ) -> Result<Vec<aios_core::GeomInstQuery>> {
@@ -134,30 +210,36 @@ pub async fn model_instances_with_progress(
             aios_core::query_tubi_insts_by_brans(chunk)
                 .await?
                 .into_iter()
-                .map(|tubi| {
-                    let refno = tubi.refno;
-                    aios_core::GeomInstQuery {
-                        refno,
-                        old_refno: tubi.old_refno,
-                        owner: refno,
-                        world_aabb: tubi.world_aabb,
-                        world_trans: tubi.world_trans,
-                        insts: vec![aios_core::ModelHashInst {
-                            geo_hash: tubi.geo_hash,
-                            transform: Default::default(),
-                            is_tubi: true,
-                        }],
-                        has_neg: false,
-                        generic: tubi.generic.unwrap_or_else(|| "PIPE".into()),
-                        pts: None,
-                        date: tubi.date,
-                    }
-                }),
+                .map(tubi_to_geom),
         );
         done += 1;
         progress(done, total);
     }
     Ok(models)
+}
+
+/// 直管段实例 → 几何实例的统一换装（新旧路径共用；`owner` 取自身、单实例
+/// `is_tubi`、generic 缺省 PIPE 都是旧路径的既有口径）。
+fn tubi_to_geom(
+    tubi: aios_core::rs_surreal::inst::TubiInstQuery,
+) -> aios_core::GeomInstQuery {
+    let refno = tubi.refno;
+    aios_core::GeomInstQuery {
+        refno,
+        old_refno: tubi.old_refno,
+        owner: refno,
+        world_aabb: tubi.world_aabb,
+        world_trans: tubi.world_trans,
+        insts: vec![aios_core::ModelHashInst {
+            geo_hash: tubi.geo_hash,
+            transform: Default::default(),
+            is_tubi: true,
+        }],
+        has_neg: false,
+        generic: tubi.generic.unwrap_or_else(|| "PIPE".into()),
+        pts: None,
+        date: tubi.date,
+    }
 }
 
 #[cfg(test)]
