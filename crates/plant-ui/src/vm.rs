@@ -40,6 +40,11 @@ pub struct WorkbenchVm {
     pub tree: TreeVm,
     /// 属性视图（M1-3）。
     pub props: PropsVm,
+    /// 选中元素的房间归属（右键「查看所属房间」子菜单与「房间」页签共用），
+    /// 随 `selection.primary` 与属性同拍预取。
+    pub rooms: RoomVm,
+    /// 「房间」页签聚焦房间的详情，`Cmd::FocusRoom` 后由宿主填。
+    pub room_detail: RoomDetailVm,
     /// 命令交互视图。
     pub command: CommandVm,
     /// 应用运行日志。
@@ -47,6 +52,9 @@ pub struct WorkbenchVm {
     /// 三维视口的画面（M1-5 是占位纹理，M3 换成 Bevy 的渲染目标）。
     /// `None` = 还没有可画的东西。
     pub view3d: Option<View3dVm>,
+    /// 正在进行的房间视图（隔离 + 取景）。`Some` 时视口 HUD 挂房间徽章与
+    /// 「退出」入口；退出隔离或重连时由宿主清掉。
+    pub room_view: Option<RoomViewVm>,
     /// eye 查询和增量 mesh 装载的短状态；完成/失败由宿主延时清除。
     pub model_load: Option<ModelLoadVm>,
     /// 任务队列在状态栏上的那一格。
@@ -517,6 +525,124 @@ impl PropKind {
     pub fn editable(self) -> bool {
         self != PropKind::ReadOnly
     }
+}
+
+/// 房间归属数据状态（跟随 `WorkbenchVm::selection` 的 primary），四态语义与
+/// [`PropsVm`] 相同。有「空」态语义：`Ready` 且 `relations` 为空 = 查过了、
+/// 确实不属于任何房间。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum RoomVm {
+    /// 尚未选中任何元素。
+    #[default]
+    Uninit,
+    /// 查询在途。切换元素时保留上一份数据供绘制，避免闪烁；首次查询为 None。
+    Loading(Option<RoomsDataVm>),
+    Ready(RoomsDataVm),
+    Failed(String),
+}
+
+impl RoomVm {
+    /// 开始查询下一份归属，防闪烁语义同 [`PropsVm::begin_query`]。
+    pub fn begin_query(&mut self) {
+        let previous = match std::mem::take(self) {
+            Self::Ready(data) | Self::Loading(Some(data)) => Some(data),
+            _ => None,
+        };
+        *self = Self::Loading(previous);
+    }
+}
+
+/// 一次房间视图（隔离 + 取景）的身份牌：HUD 徽章与退出入口的数据源。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoomViewVm {
+    /// 房间 FRMW。
+    pub room: RefU64,
+    /// 房号（如 R301），HUD 徽章文案用。
+    pub room_num: String,
+    /// 去重后的成员总数。
+    pub member_count: usize,
+}
+
+/// 一个元素的房间归属数据。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RoomsDataVm {
+    pub refno: RefU64,
+    /// 已按归属强度排好序（inside_count 降序 -> center_dist 升序 -> 房号升序，
+    /// ADR-010 §5），首条即「主归属」。
+    pub relations: Vec<RoomRelationVm>,
+}
+
+/// 一条房间归属（数据层 `room::RoomRelation` 的绘制层镜像，字段语义见彼处）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoomRelationVm {
+    /// 房间 FRMW；面板不在册（陈旧边）时为 None。
+    pub room: Option<RefU64>,
+    pub room_num: String,
+    /// 如 `1RX-R301`；算不出时不显示。
+    pub room_code: Option<String>,
+    /// 归属经由的面板。
+    pub panel: RefU64,
+    /// 0-8，越大归属越强。
+    pub inside_count: u8,
+    pub center_dist: f32,
+    /// 归属来自直接子层成员而非元素自身（容器元素的聚合口径）。
+    pub via_member: bool,
+}
+
+/// 「房间」页签聚焦房间的详情状态。四态语义同 [`PropsVm`]，但多一层含义：
+/// `Uninit` 不是错，是「还没点过任何房间」——页签此时只画归属列表与提示。
+/// 聚焦目标由宿主持有（`Cmd::FocusRoom` 设置），选中元素一换就归零。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum RoomDetailVm {
+    /// 还没聚焦任何房间。
+    #[default]
+    Uninit,
+    /// 查询在途。切换房间时保留上一份撑住布局，避免闪烁。
+    Loading(Option<RoomDetailDataVm>),
+    Ready(RoomDetailDataVm),
+    Failed(String),
+}
+
+impl RoomDetailVm {
+    /// 开始查询下一间房，防闪烁语义同 [`PropsVm::begin_query`]。
+    pub fn begin_query(&mut self) {
+        let previous = match std::mem::take(self) {
+            Self::Ready(data) | Self::Loading(Some(data)) => Some(data),
+            _ => None,
+        };
+        *self = Self::Loading(previous);
+    }
+}
+
+/// 一间房的详情（数据层 `room::RoomDetail` 的绘制层镜像）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoomDetailDataVm {
+    pub room: RefU64,
+    /// 房间 FRMW 全名（如 `/1RX-RM03-R301`）。
+    pub name: String,
+    pub room_num: String,
+    pub room_code: Option<String>,
+    /// 在册面板。「缩放到房间」的取景目标集要面板参与——房间的空间范围
+    /// 由墙面板围出来，光取成员会把相机贴到设备堆上。
+    pub panels: Vec<RefU64>,
+    /// 去重后的成员总数。
+    pub member_count: usize,
+    /// 全量成员 refno，按归属强度排序（隔离 / 取景用，预览截断后凑不齐）。
+    pub member_refnos: Vec<RefU64>,
+    /// 成员预览（前若干个）。
+    pub members: Vec<RoomMemberVm>,
+    /// 这间房是否在待重算队列里（S12 房间泳道同源）。
+    pub pending_recalc: bool,
+}
+
+/// 房间成员预览行。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoomMemberVm {
+    pub refno: RefU64,
+    pub name: String,
+    pub noun: String,
+    /// 0-8，对这间房的归属强度。
+    pub inside_count: u8,
 }
 
 #[cfg(test)]

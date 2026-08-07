@@ -5,6 +5,7 @@ pub mod data_publish;
 pub mod fonts;
 pub mod model_update;
 pub mod project_picker;
+pub mod room_browser;
 pub mod settings;
 pub mod style;
 pub mod task_queue;
@@ -43,6 +44,16 @@ pub enum ModelAction {
     /// refno。塞一组进去的结果是定位到其中某一个、还说不清是哪一个。定位本来
     /// 就是「带我到它跟前」，作用于主选中是说得清的语义。
     Focus(aios_core::RefU64),
+    /// 相机覆盖一组元素的合并包围盒（房间取景用）。与 `Focus` 分开：房间 FRMW
+    /// 自身没有几何实体，能取景的只有它的面板与成员；合并**已加载**那部分的
+    /// 包围盒，没加载的不参与，一个都没加载时不动相机。
+    FocusGroup { refnos: Vec<aios_core::RefU64> },
+    /// 隔离显示：目标可见、其余全部隐藏。首次隔离时视口记下隔离前的可见性
+    /// 快照，供 [`Self::ExitIsolate`] 恢复；连续隔离（房间 A -> 房间 B）不覆盖
+    /// 快照——退出回到隔离前的世界，而不是上一间房。
+    Isolate { refnos: Vec<aios_core::RefU64> },
+    /// 退出隔离，恢复隔离前的可见性快照；没有快照时是无操作。
+    ExitIsolate,
     /// 相机拉远到覆盖当前所有可见模型。
     FitAll,
     /// 进入 / 退出距离测量。
@@ -109,6 +120,21 @@ pub enum Cmd {
     /// 所以直接说重做哪件事——一块面板的失败只有一种来源，说得出来。
     Reconnect,
     RetryProps(aios_core::RefU64),
+    RetryRooms(aios_core::RefU64),
+    /// 房间视图：隔离该房间（面板 + 成员）并取景到它，同时把这间房的详情
+    /// 填进「房间」页签。宿主先经数据层解析成员集（一拍往返），再展开为
+    /// `Model(Isolate)` + `Model(FocusGroup)`；没有实时渲染器时视口那一半
+    /// 自然缺席，详情照常。
+    FocusRoom(aios_core::RefU64),
+    /// 打开「房间」页签并对准该元素：元素不是当前主选中时先把选中切过去
+    /// （归属数据跟着选中预取，页签一亮出来就有内容）。
+    ShowRooms(aios_core::RefU64),
+    /// 打开房间浏览器浮窗并（重新）拉取全表。全表是全库扫描级的重查询，
+    /// 所以由这条命令按需触发，不进启动路径；查询在途时再按只开窗不重发。
+    OpenRoomBrowser,
+    /// 把某个常驻视图切到前台（如待重算横幅 -> 任务队列）。找不到该页签时
+    /// 宿主是无操作——用户可以把页签拖走，那是他的布局。
+    FocusPane(workbench::Pane),
     /// 清空日志缓冲。
     ClearLogs,
     /// 提交一条命令；解析与执行由宿主负责。

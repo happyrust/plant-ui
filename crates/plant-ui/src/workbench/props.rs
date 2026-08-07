@@ -26,7 +26,7 @@ use crate::style::tokens::{Density, Tokens, radius, space};
 use crate::style::widgets::{
     self, PaneNote, PaneState, PropRow, prop_row_edit, prop_row_ui, toggle,
 };
-use crate::vm::{PropKind, PropRowVm, PropsDataVm, PropsVm, WorkbenchVm};
+use crate::vm::{PropKind, PropRowVm, PropsDataVm, PropsVm, RoomVm, WorkbenchVm};
 
 pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Vec<Cmd>) {
     match &vm.props {
@@ -46,7 +46,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
         PropsVm::Loading(Some(data)) => {
             // 上一份属性数据只负责撑住布局；查询未完成前产生的编辑命令不能落到旧元素。
             let mut ignored = Vec::new();
-            ready(ui, t, d, data, &mut ignored);
+            ready(ui, t, d, data, &vm.rooms, &mut ignored);
         }
         // 重查的是当前选中元素；选中已经挪走的话 App 侧会把这条丢掉。
         PropsVm::Failed(reason) => {
@@ -56,16 +56,23 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                 cmds.push(Cmd::RetryProps(refno));
             }
         }
-        PropsVm::Ready(data) => ready(ui, t, d, data, cmds),
+        PropsVm::Ready(data) => ready(ui, t, d, data, &vm.rooms, cmds),
     }
 }
 
-fn ready(ui: &mut Ui, t: &Tokens, d: Density, data: &PropsDataVm, cmds: &mut Vec<Cmd>) {
+fn ready(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    data: &PropsDataVm,
+    rooms: &RoomVm,
+    cmds: &mut Vec<Cmd>,
+) {
     egui::Frame::new().fill(t.bg_panel).show(ui, |ui| {
         ui.set_min_size(ui.available_size());
         // 头部、下边框、分组行之间不能有间距，否则边框会被推离头部。
         ui.spacing_mut().item_spacing.y = 0.0;
-        current_element(ui, t, d, data);
+        current_element(ui, t, d, data, rooms, cmds);
         ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -79,8 +86,15 @@ fn ready(ui: &mut Ui, t: &Tokens, d: Density, data: &PropsDataVm, cmds: &mut Vec
     });
 }
 
-/// 「当前元素」头：类型图标 + 「NOUN 名称」+ refno 芯片。
-fn current_element(ui: &mut Ui, t: &Tokens, d: Density, data: &PropsDataVm) {
+/// 「当前元素」头：类型图标 + 「NOUN 名称」+ refno 芯片 + 房号芯片。
+fn current_element(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    data: &PropsDataVm,
+    rooms: &RoomVm,
+    cmds: &mut Vec<Cmd>,
+) {
     egui::Frame::new()
         .fill(t.bg_header)
         .inner_margin(egui::Margin::same(space::S3 as i8))
@@ -104,30 +118,88 @@ fn current_element(ui: &mut Ui, t: &Tokens, d: Density, data: &PropsDataVm) {
                         .color(t.text_primary),
                 );
             });
-            refno_chip(ui, t, d, &data.refno.to_string());
+            ui.horizontal(|ui| {
+                refno_chip(ui, t, d, &data.refno.to_string());
+                room_chip(ui, t, d, data, rooms, cmds);
+            });
         });
     super::chrome::hairline(ui, t);
 }
 
-/// refno 芯片：高 20、bg-input 底、11 等宽次级色。设计稿把 refno 放在头部，
-/// 所以通用属性组里不再重复一行。
-fn refno_chip(ui: &mut Ui, t: &Tokens, d: Density, refno: &str) {
+/// 标识行的房号芯片（S13-B 稿，计划决定 6）：最强归属那间房，点击打开
+/// 「房间」页签。归属数据跟着选中走，与面板正显示的元素对不上号（切换中的
+/// 过渡帧）或没有归属时不画——芯片指错房间比少一枚芯片糟得多。
+fn room_chip(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    data: &PropsDataVm,
+    rooms: &RoomVm,
+    cmds: &mut Vec<Cmd>,
+) {
+    let strongest = match rooms {
+        RoomVm::Ready(rooms) | RoomVm::Loading(Some(rooms)) if rooms.refno == data.refno => {
+            rooms.relations.first()
+        }
+        _ => None,
+    };
+    let Some(rel) = strongest else {
+        return;
+    };
+    let label = format!("{}  {}", ph::DOOR_OPEN, rel.room_num);
     let pad = d.px(8.0);
     let g = ui
         .painter()
-        .layout_no_wrap(refno.to_owned(), Font::mono_meta(d), t.text_secondary);
-    let (rect, _) =
-        ui.allocate_exact_size(vec2(g.size().x + pad * 2.0, d.px(20.0)), Sense::hover());
+        .layout_no_wrap(label, Font::mono_meta(d), t.accent);
+    let (rect, resp) =
+        ui.allocate_exact_size(vec2(g.size().x + pad * 2.0, d.px(20.0)), Sense::click());
+    if ui.is_rect_visible(rect) {
+        ui.painter().rect_filled(
+            rect,
+            CornerRadius::same(radius::SM),
+            if resp.hovered() {
+                t.bg_hover
+            } else {
+                t.accent_bg
+            },
+        );
+        ui.painter().galley(
+            egui::pos2(rect.left() + pad, rect.center().y - g.size().y / 2.0),
+            g,
+            t.accent,
+        );
+    }
+    let resp = resp
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text("最强归属房间，点击在「房间」页签中查看");
+    if resp.clicked() {
+        cmds.push(Cmd::ShowRooms(data.refno));
+    }
+}
+
+/// refno 芯片：高 20、bg-input 底、11 等宽次级色。设计稿把 refno 放在头部，
+/// 所以通用属性组里不再重复一行。
+///
+/// 字走真控件而不是 `painter().galley`：refno 是这一屏最常被抄去别处（命令行、
+/// 日志、工单）的一串字符，画上去的字形选不中，也就复制不走。芯片按文字宽度
+/// 撑开，因此不截断——截断的 refno 抄出去是废的。
+fn refno_chip(ui: &mut Ui, t: &Tokens, d: Density, refno: &str) {
+    let pad = d.px(8.0);
+    let text = RichText::new(refno)
+        .font(Font::mono_meta(d))
+        .color(t.text_secondary);
+    let width = ui
+        .painter()
+        .layout_no_wrap(refno.to_owned(), Font::mono_meta(d), t.text_secondary)
+        .size()
+        .x;
+    let (rect, _) = ui.allocate_exact_size(vec2(width + pad * 2.0, d.px(20.0)), Sense::hover());
     if !ui.is_rect_visible(rect) {
         return;
     }
     ui.painter()
         .rect_filled(rect, CornerRadius::same(radius::SM), t.bg_input);
-    ui.painter().galley(
-        egui::pos2(rect.left() + pad, rect.center().y - g.size().y / 2.0),
-        g,
-        t.text_secondary,
-    );
+    widgets::selectable_at(ui, rect.shrink2(vec2(pad, 0.0)), text, false);
 }
 
 /// 分组头（高 30：折叠箭头 13 + 标题 11/600 + 右侧行数 10 等宽）+ 组内行。

@@ -8,6 +8,7 @@ pub mod command_line;
 pub mod logs;
 pub mod panes;
 pub mod props;
+pub mod room;
 pub mod tree;
 pub mod view3d;
 pub mod viewcube;
@@ -55,7 +56,9 @@ impl Default for WorkbenchState {
             let surface = dock.main_surface_mut();
             let [center, _left] =
                 surface.split_left(NodeIndex::root(), 0.19, vec![Pane::ModelTree]);
-            let [center, _right] = surface.split_right(center, 0.76, vec![Pane::Properties]);
+            // 房间与属性同一格页签（S13-B 的右侧面板分组）。
+            let [center, _right] =
+                surface.split_right(center, 0.76, vec![Pane::Properties, Pane::Room]);
             let [_center, bottom] = surface.split_below(center, 0.7, vec![Pane::CommandLine]);
             let [_command, _logs] =
                 surface.split_right(bottom, 0.4, vec![Pane::Logs, Pane::TaskQueue]);
