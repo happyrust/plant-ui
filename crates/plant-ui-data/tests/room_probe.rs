@@ -49,6 +49,11 @@ async fn probe_room_queries_round_trip() {
         detail.member_count, target.member_count,
         "detail 与 overview 的去重成员数不一致"
     );
+    assert_eq!(
+        detail.member_refnos.len(),
+        detail.member_count,
+        "全量成员清单与去重计数不一致"
+    );
     assert!(detail.members.len() <= 5, "预览超出上限");
 
     // 拿预览里最强的成员反查它的房间，必须能查到这间房，且排序键一致。

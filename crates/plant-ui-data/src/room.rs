@@ -53,6 +53,9 @@ pub struct RoomDetail {
     pub panels: Vec<RefU64>,
     /// 去重后的成员总数（同一构件跨多面板只算一个）。
     pub member_count: usize,
+    /// 去重后的**全量**成员 refno，按归属强度排序。房间视图的隔离 / 取景
+    /// 目标集用它（预览截断后就凑不齐了）。
+    pub member_refnos: Vec<RefU64>,
     /// 成员预览，按强度排序，长度受调用方 `preview` 上限约束。
     pub members: Vec<RoomMemberPreview>,
     /// 整间重算是否在队（只查 `room_recalc_panel` 的面板目标；元素目标反查
@@ -66,6 +69,9 @@ pub struct RoomOverviewRow {
     pub room: RefU64,
     pub name: String,
     pub room_num: String,
+    /// `{前缀}-{归一化房号}`，与 `fn::room_code` 同构；算不出时为 `None`
+    /// （命名不合规的房间通常连码也解不出来）。
+    pub room_code: Option<String>,
     /// 房号是否通过命名校验（不合规的不参与归属计算，仅在浏览器里暴露）。
     pub valid_name: bool,
     pub panel_count: usize,
@@ -152,6 +158,7 @@ pub async fn room_detail(room: RefnoEnum, preview: usize) -> Result<Option<RoomD
     ranked.sort_by(|a, b| {
         strength_cmp((a.1, a.2), (b.1, b.2)).then_with(|| a.0.to_pdms_str().cmp(&b.0.to_pdms_str()))
     });
+    let member_refnos: Vec<RefU64> = ranked.iter().map(|(refno, _, _)| *refno).collect();
     ranked.truncate(preview);
 
     let (member_names, pending_recalc) = if ranked.is_empty() && panels.is_empty() {
@@ -193,6 +200,7 @@ pub async fn room_detail(room: RefnoEnum, preview: usize) -> Result<Option<RoomD
         room_num,
         panels,
         member_count,
+        member_refnos,
         members,
         pending_recalc,
     }))
@@ -244,6 +252,7 @@ pub async fn rooms_overview() -> Result<Vec<RoomOverviewRow>> {
             RoomOverviewRow {
                 room,
                 valid_name: valid_room_num(&room_num),
+                room_code: room_code_of(&name, &room_num),
                 room_num,
                 name,
                 panel_count: panels.len(),
