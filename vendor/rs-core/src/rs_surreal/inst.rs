@@ -193,6 +193,64 @@ pub async fn query_insts(
     Ok(geom_insts)
 }
 
+/// [`query_insts`] 的热路径瘦身版（层级查询优化 P2+）：只投影 UI 真正消费的
+/// 字段——refno（直接取边上的 `in` 链接，**不解引用 pe 行**）、generic、anc、
+/// `aabb.d` / `world_trans.d`、insts 子查询。owner 从写入时物化的 `anc[1]`
+/// 还原（省一次 pe 解引用）；old_refno / pts / dt / has_neg 一律缺省——
+/// plant-ui 全链路无消费者，要这些字段的调用方仍走 [`query_insts`]。
+///
+/// AMS 实库整表探针（53,582 行）：旧全投影 ~14.1s，本投影 ~11.1s。省下的是
+/// 每行 3 次 pe 解引用（in.id / in.old_pe / in.owner）与 ptset 链走读；剩余
+/// 大头是 insts 子查询（~8.7s，图跳 + 每边 trans/meshed 解引用）与 aabb/trans
+/// 解引用（~2.0s），那两档只有写时物化能消掉（列为后续项）。
+pub async fn query_insts_slim(
+    refnos: impl IntoIterator<Item = &RefnoEnum>,
+) -> anyhow::Result<Vec<GeomInstQuery>> {
+    #[derive(Deserialize)]
+    struct SlimInstRow {
+        refno: RefnoEnum,
+        anc: Option<Vec<u64>>,
+        generic: Option<String>,
+        world_aabb: Aabb,
+        world_trans: Transform,
+        insts: Vec<ModelHashInst>,
+    }
+    let refnos = refnos.into_iter().cloned().collect::<Vec<_>>();
+    let inst_keys = get_inst_relate_keys(&refnos);
+    let sql = format!(
+        r#"
+        select
+            in as refno, anc, generic, aabb.d as world_aabb, world_trans.d as world_trans,
+            (select trans.d as transform, record::id(out) as geo_hash from out->geo_relate where visible && out.meshed && trans.d != none && geo_type='Pos') as insts
+        from {inst_keys} where aabb.d != none "#
+    );
+    let mut response = SUL_DB.query(sql).await?;
+    let rows: Vec<SlimInstRow> = response.take(0)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let owner = row
+                .anc
+                .as_ref()
+                .and_then(|anc| anc.get(1).copied())
+                .map(|packed| RefnoEnum::from(RefU64(packed)))
+                .unwrap_or(row.refno);
+            GeomInstQuery {
+                refno: row.refno,
+                old_refno: None,
+                owner,
+                world_aabb: row.world_aabb,
+                world_trans: row.world_trans,
+                insts: row.insts,
+                has_neg: false,
+                generic: row.generic.unwrap_or_default(),
+                pts: None,
+                date: None,
+            }
+        })
+        .collect())
+}
+
 /// 任意根子树的全部可见实例 refno：`inst_relate` 上一条 `anc CONTAINS $root`
 /// 索引查询（层级查询优化方案 P2，gen-model
 /// `docs/plans/2026-08-07-inst-relate-anc-u64-hierarchy-query-plan.md`）。

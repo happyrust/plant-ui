@@ -12,18 +12,23 @@
 
 use std::collections::BTreeMap;
 
-/// 一个实例的对拍身份：refno + 排序后的网格 hash 集（网格集合不同也算不一致）。
+/// 一个实例的对拍身份：refno → (owner, 排序后的网格 hash 集)。
+///
+/// owner 也纳入对拍：新路径的 owner 由写入时物化的 `anc[1]` 还原，旧路径是
+/// 实时 `in.owner` 解引用——两者不一致即说明 anc 链已陈旧（搬家维护漏修）。
 fn identity_map(
     models: &[aios_core::GeomInstQuery],
-) -> BTreeMap<u64, Vec<String>> {
-    let mut map: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+) -> BTreeMap<u64, (u64, Vec<String>)> {
+    let mut map: BTreeMap<u64, (u64, Vec<String>)> = BTreeMap::new();
     for model in models {
-        let entry = map.entry(model.refno.refno().0).or_default();
+        let entry = map
+            .entry(model.refno.refno().0)
+            .or_insert_with(|| (model.owner.refno().0, Vec::new()));
         for inst in &model.insts {
-            entry.push(inst.geo_hash.clone());
+            entry.1.push(inst.geo_hash.clone());
         }
     }
-    for hashes in map.values_mut() {
+    for (_, hashes) in map.values_mut() {
         hashes.sort();
     }
     map

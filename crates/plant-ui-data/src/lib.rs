@@ -140,7 +140,9 @@ pub async fn model_instances_anc(
         .await?;
         let mut models = Vec::new();
         for chunk in inst_refnos.chunks(500) {
-            models.extend(aios_core::query_insts(chunk.iter(), false).await?);
+            // 瘦身投影：只取 UI 消费的字段，owner 由 anc[1] 还原（省每行 3 次
+            // pe 解引用与 ptset 走读；AMS 实测整表 14.1s → 11.1s）。
+            models.extend(aios_core::query_insts_slim(chunk.iter()).await?);
         }
         for chunk in bran_refnos.chunks(500) {
             models.extend(
