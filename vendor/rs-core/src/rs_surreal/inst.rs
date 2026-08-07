@@ -251,6 +251,130 @@ pub async fn query_insts_slim(
         .collect())
 }
 
+/// P4 平表读连接池：全场景重载的响应载荷在**单条 WS 连接的响应流上串行**——
+/// AMS 实测根间 8 路并发下平表阶段的 wall time 几乎等于各批串行之和，管道本身
+/// 是瓶颈。4 条只读连接让服务端多核参与序列化，解析与平表投影轮转分摊。
+/// 惰性建立；建不出来（配置缺失/服务不可达）回落主连接 `SUL_DB`，只慢不错。
+static FLAT_READ_POOL: tokio::sync::OnceCell<Vec<surrealdb::Surreal<surrealdb::engine::any::Any>>> =
+    tokio::sync::OnceCell::const_new();
+static FLAT_READ_CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+async fn flat_read_db() -> &'static surrealdb::Surreal<surrealdb::engine::any::Any> {
+    async fn build_one()
+    -> anyhow::Result<surrealdb::Surreal<surrealdb::engine::any::Any>> {
+        let db_option = crate::try_get_db_option()?;
+        let config = surrealdb::opt::Config::default().ast_payload();
+        let db = surrealdb::engine::any::connect((db_option.get_version_db_conn_str(), config))
+            .await?;
+        db.use_ns(&db_option.surreal_ns)
+            .use_db(&db_option.project_name)
+            .await?;
+        db.signin(surrealdb::opt::auth::Root {
+            username: &db_option.v_user,
+            password: &db_option.v_password,
+        })
+        .await?;
+        Ok(db)
+    }
+    async fn build() -> anyhow::Result<Vec<surrealdb::Surreal<surrealdb::engine::any::Any>>> {
+        // 并行握手：connect+signin 单条约 2s（signin 服务端验密不便宜），串行
+        // 建 4 条就是首轮 8s 的延迟尖刺——AMS 实测踩过。
+        const POOL: usize = 4;
+        futures::future::try_join_all((0..POOL).map(|_| build_one())).await
+    }
+    let pool = FLAT_READ_POOL
+        .get_or_init(|| async {
+            match build().await {
+                Ok(pool) => pool,
+                Err(error) => {
+                    eprintln!("平表读连接池建立失败（回落主连接，只慢不错）: {error}");
+                    Vec::new()
+                }
+            }
+        })
+        .await;
+    if pool.is_empty() {
+        &SUL_DB
+    } else {
+        let i = FLAT_READ_CURSOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        &pool[i % pool.len()]
+    }
+}
+
+/// 预热平表读连接池（应用启动/连库时后台调一次）：把 4 条连接的握手+签入成本
+/// 从首次整场重载挪到启动期。并发调用安全——`OnceCell` 会让后来者等同一次
+/// 初始化，不会重复建池。
+pub async fn prewarm_flat_read_pool() {
+    let _ = flat_read_db().await;
+}
+
+/// [`query_insts_slim`] 的平表版（层级查询优化 P4 写时物化，读侧两段式第一段）：
+/// gen-model 写入侧把 `aabb.d` / `world_trans.d` 的行内副本（`aabb_d` /
+/// `world_trans_d`）与 insts 子查询的派生缓存（`insts_flat`）物化在
+/// `inst_relate` 行上，三件齐活的行**零解引用零子查询**直接成型——服务端只剩
+/// 按 id 取行。缺任一副本的行（清扫未及的新行、pre-P4 存量）把 refno 交回
+/// 调用方，聚拢后走 [`query_insts_slim`] 现值兜底：**正确性不依赖物化覆盖率，
+/// 覆盖率只买速度**。
+///
+/// AMS 实库成本画像（53,582 行）：slim 投影 ~11.1s 里 insts 子查询占 ~8.7s、
+/// aabb/trans 解引用占 ~2.0s——平表版把这两档都归零，只剩 ~0.7s 的平表读。
+pub async fn query_insts_flat(
+    refnos: impl IntoIterator<Item = &RefnoEnum>,
+) -> anyhow::Result<(Vec<GeomInstQuery>, Vec<RefnoEnum>)> {
+    #[derive(Deserialize)]
+    struct FlatInstRow {
+        refno: RefnoEnum,
+        owner_packed: Option<u64>,
+        generic: Option<String>,
+        #[serde(default)]
+        has_aabb: bool,
+        aabb_d: Option<Aabb>,
+        world_trans_d: Option<Transform>,
+        insts_flat: Option<Vec<ModelHashInst>>,
+    }
+    let refnos = refnos.into_iter().cloned().collect::<Vec<_>>();
+    let inst_keys = get_inst_relate_keys(&refnos);
+    // 全程零解引用：`aabb != NONE` 只判链接字段在不在，不取 aabb 记录。可见性
+    // 判定三分法在客户端完成——副本齐活直接成型；仅链接在而副本缺（清扫未及/
+    // pre-P4 存量）走 slim 现值兜底；连链接都没有的行（从未进过读者视野）丢弃。
+    // owner 只需要 `anc[1]` 一个值，不搬整条链（载荷 -25%，51k 行省近 1s）。
+    let sql = format!(
+        "select in as refno, anc[1] as owner_packed, generic, aabb != NONE as has_aabb, \
+         aabb_d, world_trans_d, insts_flat from {inst_keys}"
+    );
+    let mut response = flat_read_db().await.query(sql).await?;
+    let rows: Vec<FlatInstRow> = response.take(0)?;
+    let mut ready = Vec::with_capacity(rows.len());
+    let mut missing = Vec::new();
+    for row in rows {
+        let (Some(world_aabb), Some(world_trans), Some(insts)) =
+            (row.aabb_d, row.world_trans_d, row.insts_flat)
+        else {
+            if row.has_aabb {
+                missing.push(row.refno);
+            }
+            continue;
+        };
+        let owner = row
+            .owner_packed
+            .map(|packed| RefnoEnum::from(RefU64(packed)))
+            .unwrap_or(row.refno);
+        ready.push(GeomInstQuery {
+            refno: row.refno,
+            old_refno: None,
+            owner,
+            world_aabb,
+            world_trans,
+            insts,
+            has_neg: false,
+            generic: row.generic.unwrap_or_default(),
+            pts: None,
+            date: None,
+        });
+    }
+    Ok((ready, missing))
+}
+
 /// 任意根子树的全部可见实例 refno：`inst_relate` 上一条 `anc CONTAINS $root`
 /// 索引查询（层级查询优化方案 P2，gen-model
 /// `docs/plans/2026-08-07-inst-relate-anc-u64-hierarchy-query-plan.md`）。
@@ -268,9 +392,16 @@ pub async fn query_insts_slim(
 /// [`inst_relate_anc_ready`] 探测覆盖，再决定走本函数还是旧路径。
 pub async fn query_inst_refnos_by_root_anc(root: RefnoEnum) -> anyhow::Result<Vec<RefnoEnum>> {
     let root_u64 = root.refno().0;
-    let mut response = SUL_DB
+    // 纯索引扫描，零解引用（P4）：可见性（aabb 在不在）不在这里判——原先的
+    // `and aabb.d != none` 是对每条命中行的一次记录点查（整场 ~2s）。判定挪到
+    // [`query_insts_flat`] 的三分法（链接判空 + 副本齐活检查 + slim 兜底），
+    // 最终集合与旧口径逐行一致。取 `in` 而非 `in.id`——`.id` 会取 pe 行再读
+    // 字段（AMS 实测 2k 行差 ~34ms，整场 ~0.9s），`in` 直接回链接本身。
+    // 走平表读连接池：id 列表载荷同样受单管道串行之害。
+    let mut response = flat_read_db()
+        .await
         .query(format!(
-            "select value in.id from inst_relate where anc contains {root_u64} and aabb.d != none"
+            "select value in from inst_relate where anc contains {root_u64}"
         ))
         .await?;
     Ok(response.take(0)?)

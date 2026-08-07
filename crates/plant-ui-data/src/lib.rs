@@ -11,7 +11,12 @@ pub mod room;
 
 /// 连接本地 SurrealDB（读取工作目录的 DbOption.toml，走 aios_core 全局句柄 SUL_DB）。
 pub async fn connect() -> Result<()> {
-    aios_core::init_surreal().await
+    aios_core::init_surreal().await?;
+    // 平表读连接池后台预热（P4）：4 条连接的握手+签入约 2s，放启动期消化，
+    // 首次整场重载不再吃这口冷启动（并发安全，重载若抢先会等同一次初始化）。
+    #[cfg(not(target_arch = "wasm32"))]
+    tokio::spawn(aios_core::prewarm_flat_read_pool());
+    Ok(())
 }
 
 /// M0-4 验收：读一批带名称的元素（refno, name, noun）。
@@ -31,8 +36,12 @@ pub async fn site_nodes() -> Result<Vec<EleTreeNode>> {
 }
 
 /// 任意元素的直接子层（无名节点由查询侧按 noun 补默认名）。
+///
+/// 走 [`aios_core::get_children_tree_nodes`] 精简查询：模型树只吃
+/// refno / noun / name / children_count，旧壳树才用的 `order` / `mod_cnt`
+/// 两个逐行子查询占了近半耗时（769 子的 ZONE 实测 330ms → ~190ms）。
 pub async fn child_nodes(refno: RefnoEnum) -> Result<Vec<EleTreeNode>> {
-    aios_core::get_children_ele_nodes(refno).await
+    aios_core::get_children_tree_nodes(refno).await
 }
 
 /// 元素到库顶的祖先链，顺序是「自己 -> 上级 -> …」（第 0 项就是它本人）。
@@ -127,41 +136,114 @@ pub async fn model_instances_anc(
     mut progress: impl FnMut(usize, usize),
 ) -> Result<Vec<aios_core::GeomInstQuery>> {
     use futures::stream::StreamExt;
-    const ROOT_CONCURRENCY: usize = 8;
+    const CONCURRENCY: usize = 8;
     let total = roots.len();
     let mut done = 0;
     progress(done, total);
-    let queries = roots.iter().copied().map(|root| async move {
-        let root: aios_core::RefnoEnum = root.into();
-        let (inst_refnos, bran_refnos) = futures::future::try_join(
-            aios_core::query_inst_refnos_by_root_anc(root),
-            aios_core::query_bran_refnos_by_root_anc(root),
-        )
-        .await?;
-        let mut models = Vec::new();
-        for chunk in inst_refnos.chunks(500) {
-            // 瘦身投影：只取 UI 消费的字段，owner 由 anc[1] 还原（省每行 3 次
-            // pe 解引用与 ptset 走读；AMS 实测整表 14.1s → 11.1s）。
-            models.extend(aios_core::query_insts_slim(chunk.iter()).await?);
+
+    // 1) 解析：每根两条 anc 索引查询（8 路真任务）。
+    let resolutions = roots.iter().copied().map(|root| {
+        spawn_query(async move {
+            let root: aios_core::RefnoEnum = root.into();
+            futures::future::try_join(
+                aios_core::query_inst_refnos_by_root_anc(root),
+                aios_core::query_bran_refnos_by_root_anc(root),
+            )
+            .await
+        })
+    });
+    let resolved: Vec<(Vec<aios_core::RefnoEnum>, Vec<aios_core::RefnoEnum>)> =
+        futures::stream::iter(resolutions)
+            .buffered(CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<_>>()?;
+
+    // 2) 全局块队列：跨根摊平再并行。按根并发时，巨型 SITE 的十几个批在自己根
+    //    的 future 里串成链、成为整场的尾巴（AMS 实测根偏斜让 8 路根并发几乎
+    //    白并）；摊平后所有块在同一池子里跑，尾巴只剩最后一个块。
+    enum Job {
+        Inst(usize, Vec<aios_core::RefnoEnum>),
+        Bran(usize, Vec<aios_core::RefnoEnum>),
+    }
+    let mut jobs = Vec::new();
+    let mut remaining = vec![0usize; total];
+    for (idx, (inst_refnos, bran_refnos)) in resolved.iter().enumerate() {
+        // 平表行很瘦（~0.4KB），1500/批约 600KB 一响应，离 WS 单条上限很远
+        // （撑爆上限的是整根全投影那种 MB 级载荷）。
+        for chunk in inst_refnos.chunks(1500) {
+            jobs.push(Job::Inst(idx, chunk.to_vec()));
+            remaining[idx] += 1;
         }
         for chunk in bran_refnos.chunks(500) {
-            models.extend(
-                aios_core::query_tubi_insts_by_brans(chunk)
-                    .await?
-                    .into_iter()
-                    .map(tubi_to_geom),
-            );
+            jobs.push(Job::Bran(idx, chunk.to_vec()));
+            remaining[idx] += 1;
         }
-        anyhow::Ok(models)
+    }
+    for &r in &remaining {
+        if r == 0 {
+            done += 1;
+        }
+    }
+    progress(done, total);
+
+    // 3) 执行：平表两段式（P4 写时物化）——第一段平表副本零解引用零子查询；
+    //    缺副本的行（清扫未及、pre-P4 存量）聚拢走 slim 现值兜底。正确性不依赖
+    //    物化覆盖率，覆盖率只买速度。
+    let executions = jobs.into_iter().map(|job| {
+        spawn_query(async move {
+            match job {
+                Job::Inst(idx, chunk) => {
+                    let (mut models, missing) =
+                        aios_core::query_insts_flat(chunk.iter()).await?;
+                    if !missing.is_empty() {
+                        models.extend(aios_core::query_insts_slim(missing.iter()).await?);
+                    }
+                    anyhow::Ok((idx, models))
+                }
+                Job::Bran(idx, chunk) => anyhow::Ok((
+                    idx,
+                    aios_core::query_tubi_insts_by_brans(&chunk)
+                        .await?
+                        .into_iter()
+                        .map(tubi_to_geom)
+                        .collect(),
+                )),
+            }
+        })
     });
     let mut models = Vec::new();
-    let mut stream = futures::stream::iter(queries).buffered(ROOT_CONCURRENCY);
+    let mut stream = futures::stream::iter(executions).buffered(CONCURRENCY);
     while let Some(result) = stream.next().await {
-        models.extend(result?);
-        done += 1;
-        progress(done, total);
+        let (idx, batch) = result?;
+        models.extend(batch);
+        remaining[idx] -= 1;
+        if remaining[idx] == 0 {
+            done += 1;
+            progress(done, total);
+        }
     }
     Ok(models)
+}
+
+/// 非 wasm 下把查询未来包进 `tokio::spawn` 真任务：`buffered` 本身是单任务
+/// 轮询，51k 行的响应反序列化会全部挤在一个线程上（release 实测 ~56µs/行，
+/// 单线程地板 ~3s）——spawn 让解析散到多线程运行时，与 rs-core 侧的平表读
+/// 连接池（4 条 WS）配对才能真并行。wasm 无多线程运行时，原样轮询。
+#[cfg(not(target_arch = "wasm32"))]
+fn spawn_query<F>(fut: F) -> impl std::future::Future<Output = F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let handle = tokio::spawn(fut);
+    async move { handle.await.expect("查询任务 join 失败") }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn spawn_query<F: std::future::Future>(fut: F) -> F {
+    fut
 }
 
 /// 旧路径：深遍历解可见实例集 + 分批 `query_insts`。保留一个版本作现场回退
