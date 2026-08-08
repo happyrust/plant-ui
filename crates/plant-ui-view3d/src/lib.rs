@@ -91,6 +91,8 @@ const MODEL_ROUGHNESS: f32 = 0.7;
 /// 选中高亮色：橙红描不上边框（无 outline 依赖），直接换 base_color 最稳。
 /// 与 rs-plant3-d outline 的 ORANGE_RED 同源。
 const SELECT_COLOR: Color = Color::srgb(1.0, 0.27, 0.0);
+/// 房间面板 X-Ray：淡蓝、约 25% 不透明度。
+const XRAY_COLOR: Color = Color::srgba_u8(89, 169, 255, 64);
 /// 开机默认配色（深色主题的 viewport tokens：#232F3A / #0E1318 / #46586A）。
 /// 首帧 App 就会按当前主题发 `SetViewportBackground` 盖掉，这里只求
 /// 「主题命令到达前别闪白」。
@@ -219,6 +221,9 @@ pub struct View3d {
     picked: Option<RefU64>,
     selected: HashSet<RefU64>,
     selection_dirty: bool,
+    /// 当前完整的 X-Ray 目标集；同时匹配模型 refno 与 owner。
+    xray: HashSet<RefU64>,
+    material_dirty: bool,
     bounds: HashMap<RefU64, (Vec3, Vec3)>,
     /// 隔离前的可见性快照（refno -> 是否可见）。`Some` = 正处于隔离中。
     /// 只记第一次：连续隔离退出时回到隔离前的世界，而不是上一间房。
@@ -557,6 +562,10 @@ struct ModelMesh {
 #[derive(Resource)]
 struct HighlightMaterial(Handle<StandardMaterial>);
 
+/// 房间面板共用的一枚半透明材质；换房间只替换目标集合。
+#[derive(Resource)]
+struct XRayMaterial(Handle<StandardMaterial>);
+
 /// 原点三轴的挂点；网格换级时改它的 scale，轴跟着格距伸缩。
 #[derive(Component)]
 struct AxesRoot;
@@ -678,6 +687,8 @@ fn setup(
         picked: None,
         selected: HashSet::new(),
         selection_dirty: false,
+        xray: HashSet::new(),
+        material_dirty: false,
         bounds: HashMap::new(),
         isolate_restore: None,
     });
@@ -755,6 +766,7 @@ fn setup(
     commands.insert_resource(HighlightMaterial(
         materials.add(model_material(SELECT_COLOR)),
     ));
+    commands.insert_resource(XRayMaterial(materials.add(xray_material())));
 
     // 地面网格（PDMS Z=0，过装载旋转即世界 y=0 面）与原点三色轴。
     let grid_mesh = meshes.add(build_grid_mesh(INITIAL_GRID_LEVEL, DEFAULT_GRID));
@@ -1000,6 +1012,17 @@ fn model_material(color: Color) -> StandardMaterial {
     }
 }
 
+fn xray_material() -> StandardMaterial {
+    StandardMaterial {
+        base_color: XRAY_COLOR,
+        alpha_mode: AlphaMode::Blend,
+        unlit: true,
+        double_sided: true,
+        cull_mode: None,
+        ..default()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn load_models(
     mut commands: Commands,
@@ -1010,6 +1033,7 @@ fn load_models(
     assets: Res<AssetServer>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     highlight: Res<HighlightMaterial>,
+    xray_material: Res<XRayMaterial>,
 ) {
     let Some(batch) = view.pending_models.pop_front() else {
         return;
@@ -1083,6 +1107,7 @@ fn load_models(
     // 同色（含 UNKOWN 兜底）只落一枚。
     let mut material_cache: HashMap<[u8; 4], Handle<StandardMaterial>> = HashMap::new();
     let selected = view.selected.clone();
+    let xray = view.xray.clone();
     let desired_visibility = view.desired_visibility.clone();
     let mut loading_meshes = Vec::new();
     let mut spawned: Vec<(RefU64, bool, usize)> = Vec::new();
@@ -1096,7 +1121,9 @@ fn load_models(
                 .entry(key)
                 .or_insert_with(|| materials.add(model_material(color)))
                 .clone();
-            let shown_material = if selected.contains(&refno) || selected.contains(&owner) {
+            let shown_material = if xray.contains(&refno) || xray.contains(&owner) {
+                xray_material.0.clone()
+            } else if selected.contains(&refno) || selected.contains(&owner) {
                 highlight.0.clone()
             } else {
                 material.clone()
@@ -1425,6 +1452,13 @@ fn apply_commands(
                 orbit.anim = Some(snap_anim(&camera_transform, focus, forward, up, dist));
             }
             ViewCommand::Model(action) => match action {
+                ModelAction::SetXRay { refnos } => {
+                    let xray: HashSet<_> = refnos.into_iter().collect();
+                    if view.xray != xray {
+                        view.xray = xray;
+                        view.material_dirty = true;
+                    }
+                }
                 ModelAction::SetVisible { refnos, visible } => {
                     let mut applied = Vec::new();
                     for (root, mut visibility) in &mut roots {
@@ -1613,14 +1647,18 @@ fn orbit_camera(camera: &mut Transform, focus: Vec3, x: f32, y: f32) {
 fn apply_selection(
     mut view: ResMut<View3d>,
     highlight: Res<HighlightMaterial>,
+    xray: Res<XRayMaterial>,
     mut meshes: Query<(&ModelMesh, &mut MeshMaterial3d<StandardMaterial>)>,
 ) {
-    if !view.selection_dirty {
+    if !view.selection_dirty && !view.material_dirty {
         return;
     }
     view.selection_dirty = false;
+    view.material_dirty = false;
     for (mesh, mut material) in &mut meshes {
-        material.0 = if view.selected.contains(&mesh.refno) || view.selected.contains(&mesh.owner) {
+        material.0 = if view.xray.contains(&mesh.refno) || view.xray.contains(&mesh.owner) {
+            xray.0.clone()
+        } else if view.selected.contains(&mesh.refno) || view.selected.contains(&mesh.owner) {
             highlight.0.clone()
         } else {
             mesh.base.clone()
@@ -1787,6 +1825,8 @@ mod tests {
             picked: None,
             selected: HashSet::new(),
             selection_dirty: false,
+            xray: HashSet::new(),
+            material_dirty: false,
             bounds: HashMap::new(),
             isolate_restore: None,
         }
@@ -2131,6 +2171,7 @@ mod tests {
             .insert_resource(view)
             .insert_resource(OrbitCamera::default())
             .insert_resource(HighlightMaterial(Handle::default()))
+            .insert_resource(XRayMaterial(Handle::default()))
             .insert_resource(Assets::<StandardMaterial>::default())
             .add_systems(Update, load_models);
         app.world_mut().spawn((
@@ -2392,6 +2433,7 @@ mod tests {
         view.selection_dirty = true;
         app.add_plugins(MinimalPlugins)
             .insert_resource(HighlightMaterial(highlight.clone()))
+            .insert_resource(XRayMaterial(Handle::default()))
             .insert_resource(view)
             .add_systems(Update, apply_selection);
         let entity = app
@@ -2406,6 +2448,86 @@ mod tests {
             ))
             .id();
 
+        app.update();
+        assert_eq!(
+            app.world()
+                .entity(entity)
+                .get::<MeshMaterial3d<StandardMaterial>>()
+                .unwrap()
+                .0,
+            highlight
+        );
+
+        {
+            let mut view = app.world_mut().resource_mut::<View3d>();
+            view.selected.clear();
+            view.selection_dirty = true;
+        }
+        app.update();
+        assert_eq!(
+            app.world()
+                .entity(entity)
+                .get::<MeshMaterial3d<StandardMaterial>>()
+                .unwrap()
+                .0,
+            base
+        );
+    }
+
+    #[test]
+    fn room_xray_overrides_selection_and_restores_the_highlight() {
+        let refno = RefU64::from(42);
+        let owner = RefU64::from(7);
+        let mut materials = Assets::<StandardMaterial>::default();
+        let base = materials.add(model_material(type_color("PIPE")));
+        let highlight = materials.add(model_material(SELECT_COLOR));
+        let xray_material_value = xray_material();
+        assert_eq!(
+            xray_material_value.base_color.to_srgba().to_u8_array(),
+            [89, 169, 255, 64]
+        );
+        assert_eq!(xray_material_value.alpha_mode, AlphaMode::Blend);
+        assert!(xray_material_value.unlit);
+        assert!(xray_material_value.double_sided);
+        assert_eq!(xray_material_value.cull_mode, None);
+        let xray = materials.add(xray_material_value);
+        let mut app = App::new();
+        let mut view = test_view();
+        view.selected.insert(owner);
+        view.xray.insert(refno);
+        view.material_dirty = true;
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(HighlightMaterial(highlight.clone()))
+            .insert_resource(XRayMaterial(xray.clone()))
+            .insert_resource(view)
+            .add_systems(Update, apply_selection);
+        let entity = app
+            .world_mut()
+            .spawn((
+                ModelMesh {
+                    refno,
+                    owner,
+                    base: base.clone(),
+                },
+                MeshMaterial3d(base.clone()),
+            ))
+            .id();
+
+        app.update();
+        assert_eq!(
+            app.world()
+                .entity(entity)
+                .get::<MeshMaterial3d<StandardMaterial>>()
+                .unwrap()
+                .0,
+            xray
+        );
+
+        {
+            let mut view = app.world_mut().resource_mut::<View3d>();
+            view.xray.clear();
+            view.material_dirty = true;
+        }
         app.update();
         assert_eq!(
             app.world()

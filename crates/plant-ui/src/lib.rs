@@ -27,6 +27,9 @@ pub enum ModelAction {
         refnos: Vec<aios_core::RefU64>,
         visible: bool,
     },
+    /// 原子替换当前 X-Ray 目标集。空集恢复全部模型的常态 / 选中材质。
+    /// 只改变材质，不改变可见性、隔离快照或相机。
+    SetXRay { refnos: Vec<aios_core::RefU64> },
     /// 隐藏当前已显示的全部模型。全局动作，只在工具栏出现。
     HideAll,
     /// 把已加载的模型全部显示回来，`HideAll` 的对偶。

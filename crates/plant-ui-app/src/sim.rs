@@ -1412,6 +1412,8 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
         Req::Props(refno) => Evt::Props(refno, Ok(engine.props(refno))),
         // 剧本里没有房间数据：空归属即「无所属房间」，界面照常走 Ready 空态。
         Req::ElementRooms(refno) => Evt::ElementRooms(refno, Ok(Vec::new())),
+        Req::PanelRoom(refno) => Evt::PanelRoom(refno, Ok(None)),
+        Req::RoomPanels(refno) => Evt::RoomPanels(refno, Ok(Vec::new())),
         // 同理，任何房间在剧本里都查不到。
         Req::RoomDetail(refno) => Evt::RoomDetail(refno, Ok(None)),
         // 剧本里没有房间：浏览器打开就是一张空表。

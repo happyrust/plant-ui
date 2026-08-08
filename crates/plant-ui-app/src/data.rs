@@ -21,6 +21,10 @@ pub enum Req {
     /// 选中元素的房间归属（右键「查看所属房间」子菜单与「房间」页签共用），
     /// 与 `Props` 同拍预取。
     ElementRooms(RefU64),
+    /// 选中对象若是一块在册 PANEL，返回它直属的房间；普通元素返回 None。
+    PanelRoom(RefU64),
+    /// X-Ray 专用轻量拓扑：一间房直属的全部 PANEL。
+    RoomPanels(RefU64),
     /// 一间房的详情。`Cmd::FocusRoom` 的展开靠它拿全量成员集。
     RoomDetail(RefU64),
     /// 房间浏览器的全表（重查询，全库扫描级；只在打开浮窗或手动刷新时发，
@@ -123,6 +127,8 @@ pub enum Evt {
         RefU64,
         anyhow::Result<Vec<plant_ui_data::room::RoomRelation>>,
     ),
+    PanelRoom(RefU64, anyhow::Result<Option<RefU64>>),
+    RoomPanels(RefU64, anyhow::Result<Vec<RefU64>>),
     /// 房间详情。`Ok(None)` = 这个 refno 在库里查不到（不是查询失败）。
     RoomDetail(
         RefU64,
@@ -285,6 +291,14 @@ async fn handle_read(req: Req, evt_tx: mpsc::Sender<Evt>, ctx: egui::Context) {
         Req::ElementRooms(refno) => {
             let r = plant_ui_data::room::element_rooms(refno.into()).await;
             let _ = evt_tx.send(Evt::ElementRooms(refno, r));
+        }
+        Req::PanelRoom(refno) => {
+            let r = plant_ui_data::room::panel_room(refno.into()).await;
+            let _ = evt_tx.send(Evt::PanelRoom(refno, r));
+        }
+        Req::RoomPanels(refno) => {
+            let r = plant_ui_data::room::room_panels(refno.into()).await;
+            let _ = evt_tx.send(Evt::RoomPanels(refno, r));
         }
         Req::RoomDetail(refno) => {
             // 成员预览条数与「房间」页签的列表容量对齐；隔离 / 取景

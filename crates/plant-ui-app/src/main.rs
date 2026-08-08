@@ -879,6 +879,12 @@ struct App {
     /// 还没回包的那一次房间视图请求（`Cmd::FocusRoom` -> `Req::RoomDetail`）。
     /// 同时只留一个：连点两间房只聚焦最后一间，晚到的旧详情靠它认出来丢掉。
     focus_room_pending: Option<RefU64>,
+    /// 选中 PANEL 后等待房间详情的 X-Ray 请求：(发起时的 PANEL, 房间)。
+    /// 选中一换立即清空；晚到的详情只有同时匹配这两个值才可改材质。
+    xray_room_pending: Option<(RefU64, RefU64)>,
+    xray_active_room: Option<RefU64>,
+    /// 已查过的房间 -> 全部在册面板。重复点同一间房不再打一次详情查询。
+    room_panel_cache: HashMap<RefU64, Vec<RefU64>>,
     /// 模型还在路上、等它落地就取景的那间房（`Cmd::ShowRoomModel`）。
     ///
     /// 取景不能跟着指令一起下发：视口的包围盒来自模型查询回包里的 `world_aabb`，
@@ -1190,6 +1196,9 @@ impl App {
             model_reload_owed: false,
             model_reload_in_flight: false,
             focus_room_pending: None,
+            xray_room_pending: None,
+            xray_active_room: None,
+            room_panel_cache: HashMap::new(),
             pending_room_frame: None,
             room_pane_focus: None,
             bridge: data::spawn(ctx.clone(), tasks),
@@ -1337,23 +1346,74 @@ impl App {
                     };
                 }
                 data::Evt::ElementRooms(..) => {}
+                data::Evt::PanelRoom(refno, result) => match result {
+                    Ok(room) => {
+                        match resolve_panel_room_reply(self.vm.selection.primary(), refno, room) {
+                            PanelRoomResolution::Ignore => {}
+                            PanelRoomResolution::Clear => self.clear_room_xray(),
+                            PanelRoomResolution::Enable { panel, room } => {
+                                self.begin_room_xray(panel, room)
+                            }
+                        }
+                    }
+                    Err(e) if self.vm.selection.primary() == Some(refno) => {
+                        self.clear_room_xray();
+                        let el = self.tree.element(refno);
+                        self.logs
+                            .error_of(&mut self.vm.logs, el, "PANEL 房间查询失败", &e, None);
+                    }
+                    Err(_) => {}
+                },
+                data::Evt::RoomPanels(room, result)
+                    if self
+                        .xray_room_pending
+                        .is_some_and(|(_, pending_room)| pending_room == room) =>
+                {
+                    let (panel, _) = self.xray_room_pending.expect("guarded above");
+                    match result {
+                        Ok(panels) => {
+                            self.room_panel_cache.insert(room, panels.clone());
+                            self.finish_room_xray(panel, room, panels);
+                        }
+                        Err(e) => {
+                            self.xray_room_pending = None;
+                            self.logs.error(
+                                &mut self.vm.logs,
+                                "房间 PANEL 查询失败",
+                                &e,
+                                None,
+                            );
+                        }
+                    }
+                }
+                data::Evt::RoomPanels(..) => {}
                 // 房间详情回来了，两个消费者各取所需：视口那半（隔离 + 取景，
                 // 一次点击的下半程）与「房间」页签那半（详情数据）。谁都不认的
                 // 是晚到的旧结果，直接丢。
                 data::Evt::RoomDetail(room, result)
                     if self.focus_room_pending == Some(room)
-                        || self.room_pane_focus == Some(room) =>
+                        || self.room_pane_focus == Some(room)
+                        || self
+                            .xray_room_pending
+                            .is_some_and(|(_, pending_room)| pending_room == room) =>
                 {
                     let for_viewport = self.focus_room_pending == Some(room);
                     let for_pane = self.room_pane_focus == Some(room);
+                    let for_xray = self
+                        .xray_room_pending
+                        .filter(|(_, pending_room)| *pending_room == room);
                     if for_viewport {
                         self.focus_room_pending = None;
                     }
                     match result {
                         Ok(Some(detail)) => {
+                            self.room_panel_cache.insert(room, detail.panels.clone());
                             if for_pane {
                                 self.vm.room_detail =
                                     RoomDetailVm::Ready(build_room_detail(&detail));
+                            }
+                            if let Some((panel, _)) = for_xray {
+                                self.finish_room_xray(panel, room, detail.panels.clone());
                             }
                             // 独立壳（无实时渲染器）里不排视口动作：那支队列没有
                             // 消费者，塞进去只会越攒越多；数据那半已经交给页签。
@@ -1405,6 +1465,9 @@ impl App {
                             }
                         }
                         Ok(None) => {
+                            if for_xray.is_some() {
+                                self.xray_room_pending = None;
+                            }
                             if for_pane {
                                 self.vm.room_detail = RoomDetailVm::Failed(format!(
                                     "房间 {room} 在库里查不到，可能已被删除"
@@ -1416,6 +1479,9 @@ impl App {
                             );
                         }
                         Err(e) => {
+                            if for_xray.is_some() {
+                                self.xray_room_pending = None;
+                            }
                             if for_pane {
                                 self.vm.room_detail = RoomDetailVm::Failed(format!(
                                     "房间详情查询失败：{}",
@@ -1855,9 +1921,12 @@ impl App {
                                 &mut self.vm.logs,
                                 format!("取回工作完成：已加载元素 {before} → {after}"),
                             );
-                            // 缓存刚被丢干净，面板上摆着的那份属性已经是旧的。
+                            // 数据缓存刚换代，属性、归属与房间面板集都不能继续沿用。
+                            self.clear_room_xray();
+                            self.room_panel_cache.clear();
                             if let Some(refno) = self.vm.selection.primary() {
                                 self.refetch_props(refno);
+                                self.refetch_rooms(refno);
                             }
                             if !fresh.reload_models {
                                 self.set_get_work_busy(false);
@@ -2681,6 +2750,9 @@ impl App {
         }
         let before = self.vm.selection.primary();
         self.vm.selection = selection;
+        if before != self.vm.selection.primary() {
+            self.clear_room_xray();
+        }
         match self.vm.selection.primary() {
             Some(refno) if before != Some(refno) => {
                 self.refetch_props(refno);
@@ -2710,6 +2782,53 @@ impl App {
     fn refetch_rooms(&mut self, refno: RefU64) {
         self.vm.rooms.begin_query();
         let _ = self.bridge.req.send(data::Req::ElementRooms(refno));
+        let _ = self.bridge.req.send(data::Req::PanelRoom(refno));
+    }
+
+    /// 主选中一换就先恢复旧房间。新的 PANEL 是否有效要等归属回包确认，不能让
+    /// 上一个房间的透明状态在查询期间冒充当前结果。
+    fn clear_room_xray(&mut self) {
+        self.xray_room_pending = None;
+        if self.xray_active_room.take().is_some() {
+            self.view3d_commands
+                .push(Cmd::Model(plant_ui::ModelAction::SetXRay {
+                    refnos: Vec::new(),
+                }));
+        }
+    }
+
+    fn begin_room_xray(&mut self, panel: RefU64, room: RefU64) {
+        self.xray_room_pending = Some((panel, room));
+        if let Some(panels) = self.room_panel_cache.get(&room).cloned() {
+            self.finish_room_xray(panel, room, panels);
+            return;
+        }
+
+        // RoomDetail 还要展开整间房的成员边，大房间可能很慢；X-Ray 只取直属面板。
+        // 若详情也在途，它的同一份 panels 回包仍会刷新缓存并受相同陈旧门保护。
+        let _ = self.bridge.req.send(data::Req::RoomPanels(room));
+    }
+
+    fn finish_room_xray(&mut self, panel: RefU64, room: RefU64, panels: Vec<RefU64>) {
+        if self.xray_room_pending != Some((panel, room))
+            || self.vm.selection.primary() != Some(panel)
+        {
+            return;
+        }
+        self.xray_room_pending = None;
+        if panels.is_empty() {
+            return;
+        }
+        let panel_count = panels.len();
+        self.view3d_commands
+            .push(Cmd::Model(plant_ui::ModelAction::SetXRay {
+                refnos: panels,
+            }));
+        self.xray_active_room = Some(room);
+        self.logs.info(
+            &mut self.vm.logs,
+            format!("房间 X-Ray 已启用：{room} · 面板 {panel_count} · 不透明度 25%"),
+        );
     }
 
     /// 房间视图的上半程：记下在途目标，去数据层解析全量成员集。
@@ -3037,6 +3156,8 @@ impl App {
 
     fn reconnect(&mut self) {
         // 新连接必须从空缓存开始：否则失败时状态栏和属性仍在说旧模型已经就绪。
+        self.clear_room_xray();
+        self.room_panel_cache.clear();
         self.model_scope_epoch = self.model_scope_epoch.wrapping_add(1);
         self.model_scopes.clear();
         self.tree.visibility_unavailable.clear();
@@ -3244,13 +3365,13 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{
-        EleTreeNode, ModelVisibility, ModelVisibilityPlan, RefU64, RowVisibility, TreeModel,
-        TreeRowVm, Window, background_models_settled, begin_get_work, cache_model_scope,
-        claim_unloaded_model_refnos, command_reply_is_current, expand_room_model_targets,
-        finished_after, in_mdb_path, mark_model_scope_unavailable, model_progress_terminal,
-        model_reload_due, model_visibility_plan, needs_children_query, refresh_anchor,
-        restore_model_reload, settle_pending_directions, settled_pending_roots, sync_ime_window,
-        task_matches_project,
+        EleTreeNode, ModelVisibility, ModelVisibilityPlan, PanelRoomResolution, RefU64,
+        RowVisibility, TreeModel, TreeRowVm, Window, background_models_settled, begin_get_work,
+        cache_model_scope, claim_unloaded_model_refnos, command_reply_is_current,
+        expand_room_model_targets, finished_after, in_mdb_path, mark_model_scope_unavailable,
+        model_progress_terminal, model_reload_due, model_visibility_plan, needs_children_query,
+        refresh_anchor, resolve_panel_room_reply, restore_model_reload, settle_pending_directions,
+        settled_pending_roots, sync_ime_window, task_matches_project,
     };
     use chrono::{TimeZone, Utc};
     use plant_ui::model_update::PendingModelUnit;
@@ -3310,6 +3431,26 @@ mod tests {
 
     fn refs(raw: &[&str]) -> Vec<RefU64> {
         raw.iter().map(|s| s.parse().unwrap()).collect()
+    }
+
+    #[test]
+    fn panel_room_reply_distinguishes_enable_clear_and_stale_results() {
+        let panel = RefU64(11);
+        let other = RefU64(12);
+        let room = RefU64(512);
+
+        assert_eq!(
+            resolve_panel_room_reply(Some(panel), panel, Some(room)),
+            PanelRoomResolution::Enable { panel, room }
+        );
+        assert_eq!(
+            resolve_panel_room_reply(Some(panel), panel, None),
+            PanelRoomResolution::Clear
+        );
+        assert_eq!(
+            resolve_panel_room_reply(Some(other), panel, Some(room)),
+            PanelRoomResolution::Ignore
+        );
     }
 
     #[test]
@@ -4023,6 +4164,29 @@ fn build_rooms(refno: RefU64, relations: Vec<plant_ui_data::room::RoomRelation>)
             })
             .collect(),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanelRoomResolution {
+    Ignore,
+    Clear,
+    Enable { panel: RefU64, room: RefU64 },
+}
+
+fn resolve_panel_room_reply(
+    current_selection: Option<RefU64>,
+    reply_for: RefU64,
+    room: Option<RefU64>,
+) -> PanelRoomResolution {
+    if current_selection != Some(reply_for) {
+        return PanelRoomResolution::Ignore;
+    }
+    room.map_or(PanelRoomResolution::Clear, |room| {
+        PanelRoomResolution::Enable {
+            panel: reply_for,
+            room,
+        }
+    })
 }
 
 /// 数据层的属性形态 -> 绘制层的控件选择。数据层的 `Unset` / `Opaque` 在 UI 侧
