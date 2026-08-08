@@ -3,10 +3,13 @@
 写给用的人看：每一条说的是**界面上会不一样的地方**，不是改了哪个函数。
 实现层的决策去 `docs/adr/`，施工顺序去 `docs/plans/`。
 
-版本口径按 `Cargo.toml` 的 `workspace.package.version`；`未发布` 一节收的是
-上一个发版包（`chore: prepare 0.1.4 release package`，2026-07-29）之后的改动。
+版本口径按 `Cargo.toml` 的 `workspace.package.version`。
 
 ## 未发布
+
+暂无。
+
+## 0.1.5 — 2026-08-08
 
 ### 模型增量更新
 

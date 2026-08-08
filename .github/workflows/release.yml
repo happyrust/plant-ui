@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Use network dependency sources
+        shell: pwsh
+        run: Rename-Item .cargo/config.toml config.local.toml
+
+      - name: Verify tag and build
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"$').Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF_NAME -ne "v$version") { throw "tag $env:GITHUB_REF_NAME does not match Cargo.toml $version" }
+          cargo build -p plant-ui-app --release --locked
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "plant-ui-$env:GITHUB_REF_NAME-windows-x64"
+          New-Item -ItemType Directory -Path $name | Out-Null
+          Copy-Item target/release/plant-ui-app.exe "$name/"
+          Copy-Item DbOption.toml "$name/"
+          Copy-Item resource "$name/resource" -Recurse
+          Compress-Archive -Path "$name/*" -DestinationPath "$name.zip"
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$env:GITHUB_REF_NAME" "plant-ui-$env:GITHUB_REF_NAME-windows-x64.zip" --verify-tag --generate-notes --title "Plant UI $env:GITHUB_REF_NAME"
