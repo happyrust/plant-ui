@@ -9,6 +9,10 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::f32::consts::FRAC_PI_2;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use web_time::{Duration, Instant};
 
 use std::str::FromStr;
@@ -21,12 +25,14 @@ use bevy::asset::{AssetLoader, AssetServer, Assets, LoadContext, LoadState};
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::prelude::*;
 use bevy::render::camera::{ClearColorConfig, RenderTarget, ScalingMode};
+use bevy::render::extract_resource::{ExtractResource, ExtractResourcePlugin};
 use bevy::render::mesh::{Indices, PrimitiveTopology};
 use bevy::render::render_asset::RenderAssetUsages;
 use bevy::render::render_resource::{
     Extent3d, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
 };
 use bevy::render::view::RenderLayers;
+use bevy::render::{Render, RenderApp, RenderSystems, renderer::render_system};
 use bevy::transform::TransformSystems;
 use bevy_egui35::{EguiUserTextures, egui};
 use plant_ui::{CameraGesture, CameraMotion, ModelAction};
@@ -96,7 +102,9 @@ pub struct View3dPlugin;
 
 impl Plugin for View3dPlugin {
     fn build(&self, app: &mut bevy::prelude::App) {
-        app.init_asset_loader::<MeshLoader>()
+        app.init_resource::<ViewportResizeSync>()
+            .add_plugins(ExtractResourcePlugin::<ViewportResizeSync>::default())
+            .init_asset_loader::<MeshLoader>()
             .add_systems(Startup, setup)
             .add_systems(
                 Update,
@@ -120,7 +128,55 @@ impl Plugin for View3dPlugin {
                     publish_camera.after(TransformSystems::Propagate),
                 ),
             );
+        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+            render_app.add_systems(
+                Render,
+                acknowledge_viewport_render
+                    .after(render_system)
+                    .in_set(RenderSystems::Render),
+            );
+        }
     }
+}
+
+/// 主世界把待切换代次提取到 Render world；Render world 只有在整张 render graph
+/// 跑完之后才确认该代次。两个原子量由两边共享，不把“过了一次 Update”误当成
+/// “离屏相机真的画完了一帧”。
+#[derive(Resource, Clone, ExtractResource)]
+struct ViewportResizeSync {
+    requested_generation: u64,
+    rendered_generation: Arc<AtomicU64>,
+    rendered_frames: Arc<AtomicU64>,
+}
+
+impl Default for ViewportResizeSync {
+    fn default() -> Self {
+        Self {
+            requested_generation: 0,
+            rendered_generation: Arc::new(AtomicU64::new(0)),
+            rendered_frames: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+impl ViewportResizeSync {
+    fn acknowledge_rendered(&self) {
+        self.rendered_generation
+            .store(self.requested_generation, Ordering::Release);
+        self.rendered_frames.fetch_add(1, Ordering::Release);
+    }
+
+    fn generation_is_rendered(&self, generation: u64) -> bool {
+        self.rendered_generation.load(Ordering::Acquire) >= generation
+    }
+
+    fn rendered_frames(&self) -> u64 {
+        self.rendered_frames.load(Ordering::Acquire)
+    }
+}
+
+fn acknowledge_viewport_render(sync: Res<ViewportResizeSync>) {
+    sync.acknowledge_rendered();
 }
 
 #[derive(Resource)]
@@ -154,6 +210,12 @@ pub struct View3d {
     /// 实际状态变过、还没被宿主取走的模型。
     render_dirty: HashSet<RefU64>,
     pending_resize: Option<(UVec2, Instant)>,
+    /// 已经改给离屏相机、但还没交给 egui 的新目标。至少让相机完整画过一帧再切，
+    /// 否则窗口相机会采到刚创建、内容尚空的 GPU 纹理。
+    prepared_resize: Option<PreparedResize>,
+    /// 已不再展示/写入、但上一帧的 egui paint job 或 render world 仍可能引用的目标。
+    /// 再等一个确认完成的渲染帧才同时注销 TextureId 与 Image asset。
+    retired_resize: VecDeque<RetiredResize>,
     picked: Option<RefU64>,
     selected: HashSet<RefU64>,
     selection_dirty: bool,
@@ -184,7 +246,8 @@ impl View3d {
 
     pub fn resize(&mut self, size: [u32; 2]) {
         let wanted = UVec2::new(size[0].max(16), size[1].max(16));
-        if wanted == self.size {
+        let prepared = self.prepared_resize.as_ref().map(|resize| resize.size);
+        if (wanted == self.size && prepared.is_none()) || prepared == Some(wanted) {
             self.pending_resize = None;
         } else if self.pending_resize.map(|(size, _)| size) != Some(wanted) {
             self.pending_resize = Some((wanted, Instant::now()));
@@ -296,6 +359,18 @@ impl View3d {
         });
         settled
     }
+}
+
+struct PreparedResize {
+    size: UVec2,
+    image: Handle<Image>,
+    texture: egui::TextureId,
+    generation: u64,
+}
+
+struct RetiredResize {
+    image: Handle<Image>,
+    remove_after_rendered_frame: u64,
 }
 
 /// 一个模型此刻在三维场景里的**实际**渲染结果。
@@ -567,6 +642,10 @@ fn viewport_image(size: UVec2) -> Image {
     image
 }
 
+/// 所有写入三维离屏目标的相机。换目标必须一起换，否则背景与模型会分写到两张图。
+#[derive(Component)]
+struct ViewportRenderCamera;
+
 fn setup(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
@@ -594,6 +673,8 @@ fn setup(
         render_states: HashMap::new(),
         render_dirty: HashSet::new(),
         pending_resize: None,
+        prepared_resize: None,
+        retired_resize: VecDeque::new(),
         picked: None,
         selected: HashSet::new(),
         selection_dirty: false,
@@ -640,6 +721,7 @@ fn setup(
         Transform::from_xyz(0.0, 0.0, 1.0).looking_at(Vec3::ZERO, Vec3::Y),
         Tonemapping::None,
         RenderLayers::layer(BACKGROUND_LAYER),
+        ViewportRenderCamera,
     ));
 
     commands.spawn((
@@ -652,6 +734,7 @@ fn setup(
         Transform::from_xyz(8.0, 6.0, 10.0).looking_at(Vec3::ZERO, Vec3::Y),
         Tonemapping::None,
         ViewCamera,
+        ViewportRenderCamera,
     ));
     commands.spawn((
         DirectionalLight {
@@ -1195,7 +1278,58 @@ fn retry_meshes(mut view: ResMut<View3d>, assets: Res<AssetServer>) {
     view.render_dirty.extend(settled_now);
 }
 
-fn apply_resize(mut view: ResMut<View3d>, mut images: ResMut<Assets<Image>>) {
+fn apply_resize(
+    mut view: ResMut<View3d>,
+    mut sync: ResMut<ViewportResizeSync>,
+    mut images: ResMut<Assets<Image>>,
+    mut egui_textures: ResMut<EguiUserTextures>,
+    mut cameras: Query<&mut Camera, With<ViewportRenderCamera>>,
+) {
+    let rendered_frame = sync.rendered_frames();
+    while view
+        .retired_resize
+        .front()
+        .is_some_and(|retired| retired.remove_after_rendered_frame <= rendered_frame)
+    {
+        let retired = view.retired_resize.pop_front().expect("刚检查过队首");
+        egui_textures.remove_image(&retired.image);
+        images.remove(&retired.image);
+    }
+
+    if let Some(prepared) = view.prepared_resize.take() {
+        // 在新目标预热这一帧里，dock 可能又被拖回当前尺寸。此时丢掉预热目标，
+        // 相机重新指回仍完整保留的展示纹理，避免下一帧无意义地来回切换。
+        if view.pending_resize.map(|(size, _)| size) == Some(view.size) {
+            for mut camera in &mut cameras {
+                camera.target = RenderTarget::Image(view.image.clone().into());
+            }
+            view.retired_resize.push_back(RetiredResize {
+                image: prepared.image,
+                remove_after_rendered_frame: rendered_frame + 1,
+            });
+            view.pending_resize = None;
+            return;
+        }
+
+        if !sync.generation_is_rendered(prepared.generation) {
+            view.prepared_resize = Some(prepared);
+            return;
+        }
+
+        // Render world 已在完整 render graph 之后确认过这个代次。现在发布它不会露出
+        // 未初始化/透明的一帧；旧目标再留一个渲染帧，等上一份 egui paint job 排空。
+        let old_image = std::mem::replace(&mut view.image, prepared.image);
+        view.texture = prepared.texture;
+        view.size = prepared.size;
+        view.retired_resize.push_back(RetiredResize {
+            image: old_image,
+            remove_after_rendered_frame: rendered_frame + 1,
+        });
+        if view.pending_resize.map(|(size, _)| size) == Some(view.size) {
+            view.pending_resize = None;
+        }
+    }
+
     let Some((wanted, asked_at)) = view.pending_resize else {
         return;
     };
@@ -1203,15 +1337,18 @@ fn apply_resize(mut view: ResMut<View3d>, mut images: ResMut<Assets<Image>>) {
         return;
     }
     view.pending_resize = None;
-    let Some(image) = images.get_mut(&view.image) else {
-        return;
-    };
-    image.resize(Extent3d {
-        width: wanted.x,
-        height: wanted.y,
-        ..default()
+    let image = images.add(viewport_image(wanted));
+    let texture = egui_textures.add_image(image.clone());
+    sync.requested_generation += 1;
+    for mut camera in &mut cameras {
+        camera.target = RenderTarget::Image(image.clone().into());
+    }
+    view.prepared_resize = Some(PreparedResize {
+        size: wanted,
+        image,
+        texture,
+        generation: sync.requested_generation,
     });
-    view.size = wanted;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1645,12 +1782,196 @@ mod tests {
             render_states: HashMap::new(),
             render_dirty: HashSet::new(),
             pending_resize: None,
+            prepared_resize: None,
+            retired_resize: VecDeque::new(),
             picked: None,
             selected: HashSet::new(),
             selection_dirty: false,
             bounds: HashMap::new(),
             isolate_restore: None,
         }
+    }
+
+    /// egui 正在采样的离屏纹理不能原地改尺寸：`Image::resize` 会让 wgpu 重建 GPU
+    /// 纹理并丢掉旧内容，而窗口相机与离屏相机没有显式的渲染图依赖，窗口可能先把
+    /// 这张尚未重画的空纹理采样出来，表现就是 dock 拖动时闪一下底色。
+    #[test]
+    fn resize_keeps_the_displayed_texture_alive_until_replacement_is_rendered() {
+        let old_size = UVec2::new(320, 180);
+        let wanted = UVec2::new(640, 360);
+        let mut app = App::new();
+        app.init_resource::<Assets<Image>>()
+            .init_resource::<EguiUserTextures>()
+            .init_resource::<ViewportResizeSync>();
+
+        let old_image = app
+            .world_mut()
+            .resource_mut::<Assets<Image>>()
+            .add(viewport_image(old_size));
+        let old_texture = app
+            .world_mut()
+            .resource_mut::<EguiUserTextures>()
+            .add_image(old_image.clone());
+        let mut view = test_view();
+        view.image = old_image.clone();
+        view.texture = old_texture;
+        view.size = old_size;
+        view.pending_resize = Some((wanted, Instant::now() - RESIZE_DEBOUNCE));
+        app.insert_resource(view).add_systems(Update, apply_resize);
+        for _ in 0..2 {
+            app.world_mut().spawn((
+                Camera {
+                    target: RenderTarget::Image(old_image.clone().into()),
+                    ..default()
+                },
+                ViewportRenderCamera,
+            ));
+        }
+
+        app.update();
+
+        let view = app.world().resource::<View3d>();
+        assert_eq!(view.image, old_image, "展示中的纹理句柄被提前换掉了");
+        assert_eq!(view.texture, old_texture, "egui 提前采样了新纹理");
+        assert_eq!(view.size, old_size, "展示尺寸在替代纹理就绪前就发布了");
+        assert_eq!(
+            app.world()
+                .resource::<Assets<Image>>()
+                .get(&old_image)
+                .expect("展示纹理仍应存在")
+                .size(),
+            old_size,
+            "展示中的纹理被原地 resize，旧画面已经丢失"
+        );
+        let (prepared_image, prepared_texture) = {
+            let prepared = view
+                .prepared_resize
+                .as_ref()
+                .expect("新目标应该已经开始预热");
+            assert_eq!(prepared.size, wanted);
+            (prepared.image.clone(), prepared.texture)
+        };
+        let camera_targets = {
+            let world = app.world_mut();
+            let mut cameras = world.query_filtered::<&Camera, With<ViewportRenderCamera>>();
+            cameras
+                .iter(world)
+                .map(|camera| match &camera.target {
+                    RenderTarget::Image(target) => target.handle.clone(),
+                    other => panic!("离屏相机被改到了非 Image 目标：{other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(camera_targets, vec![prepared_image.clone(); 2]);
+
+        // 只过 Update 没有任何资格冒充“已经渲染”：显式回执到达前一直展示旧目标。
+        app.update();
+        assert_eq!(app.world().resource::<View3d>().image, old_image);
+        app.world()
+            .resource::<ViewportResizeSync>()
+            .acknowledge_rendered();
+
+        // 收到 render_system 后的代次回执才切换；旧目标仍多活一个渲染帧，避免上一份
+        // egui paint job 或 render world 还引用它时 TextureId 被复用。
+        app.update();
+        let view = app.world().resource::<View3d>();
+        assert_eq!(view.image, prepared_image);
+        assert_eq!(view.texture, prepared_texture);
+        assert_eq!(view.size, wanted);
+        assert!(
+            app.world()
+                .resource::<Assets<Image>>()
+                .get(&old_image)
+                .is_some(),
+            "刚发布新目标就回收了旧目标"
+        );
+
+        app.world()
+            .resource::<ViewportResizeSync>()
+            .acknowledge_rendered();
+        app.update();
+        assert!(
+            app.world()
+                .resource::<Assets<Image>>()
+                .get(&old_image)
+                .is_none(),
+            "下一帧已经排空，旧目标仍未回收"
+        );
+    }
+
+    #[test]
+    fn resize_reversal_retargets_cameras_before_retiring_the_prepared_image() {
+        let old_size = UVec2::new(320, 180);
+        let mut app = App::new();
+        app.init_resource::<Assets<Image>>()
+            .init_resource::<EguiUserTextures>()
+            .init_resource::<ViewportResizeSync>();
+        let old_image = app
+            .world_mut()
+            .resource_mut::<Assets<Image>>()
+            .add(viewport_image(old_size));
+        let old_texture = app
+            .world_mut()
+            .resource_mut::<EguiUserTextures>()
+            .add_image(old_image.clone());
+        let mut view = test_view();
+        view.image = old_image.clone();
+        view.texture = old_texture;
+        view.size = old_size;
+        view.pending_resize = Some((UVec2::new(640, 360), Instant::now() - RESIZE_DEBOUNCE));
+        app.insert_resource(view).add_systems(Update, apply_resize);
+        let camera = app
+            .world_mut()
+            .spawn((
+                Camera {
+                    target: RenderTarget::Image(old_image.clone().into()),
+                    ..default()
+                },
+                ViewportRenderCamera,
+            ))
+            .id();
+
+        app.update();
+        let prepared_image = app
+            .world()
+            .resource::<View3d>()
+            .prepared_resize
+            .as_ref()
+            .expect("应该已经开始预热")
+            .image
+            .clone();
+        app.world_mut()
+            .resource_mut::<View3d>()
+            .resize(old_size.to_array());
+        app.update();
+
+        let view = app.world().resource::<View3d>();
+        assert_eq!(view.image, old_image);
+        assert!(view.prepared_resize.is_none());
+        let camera = app.world().entity(camera).get::<Camera>().expect("相机");
+        assert!(
+            matches!(&camera.target, RenderTarget::Image(target) if target.handle == old_image),
+            "取消预热后相机没有回到当前展示目标"
+        );
+        assert!(
+            app.world()
+                .resource::<Assets<Image>>()
+                .get(&prepared_image)
+                .is_some(),
+            "取消当帧就删除了 render world 仍可能引用的预热目标"
+        );
+
+        app.world()
+            .resource::<ViewportResizeSync>()
+            .acknowledge_rendered();
+        app.update();
+        assert!(
+            app.world()
+                .resource::<Assets<Image>>()
+                .get(&prepared_image)
+                .is_none(),
+            "相机回切并完成一帧后，取消的预热目标仍未回收"
+        );
     }
 
     /// 档位表：1/2/5×10ⁿ 毫米，夹在格距上下限之内。
