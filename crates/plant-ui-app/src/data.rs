@@ -79,6 +79,16 @@ pub enum Req {
         base: String,
         request: PublishRequest,
     },
+    CommandQuery {
+        epoch: u64,
+        label: String,
+        base: String,
+        project: String,
+        mdb: String,
+        namespace: String,
+        tool: String,
+        arguments: serde_json::Value,
+    },
 }
 
 /// 一次取回工作重新查回来的那部分树。
@@ -149,6 +159,11 @@ pub enum Evt {
     /// 复活死信的回执，带上是哪一个根。真值同样等下一拍快照。
     RetryPendingUnit(String, anyhow::Result<()>),
     DataPublish(PublishRequest, anyhow::Result<String>),
+    CommandQuery {
+        epoch: u64,
+        label: String,
+        result: anyhow::Result<crate::model_update_api::QueryReply>,
+    },
     /// 队列视图的逐单元明细，带发生在哪个任务上。
     ///
     /// 这三个只有原生端的 WebSocket 构造（`model_update_ws`）；wasm 的 Feed 是
@@ -351,6 +366,25 @@ async fn handle_read(req: Req, evt_tx: mpsc::Sender<Evt>, ctx: egui::Context) {
         Req::DataPublish { base, request } => {
             let result = crate::data_publish_api::submit(&base, &request).await;
             let _ = evt_tx.send(Evt::DataPublish(request, result));
+        }
+        Req::CommandQuery {
+            epoch,
+            label,
+            base,
+            project,
+            mdb,
+            namespace,
+            tool,
+            arguments,
+        } => {
+            let result =
+                crate::model_update_api::query(&base, &project, &mdb, &namespace, &tool, arguments)
+                    .await;
+            let _ = evt_tx.send(Evt::CommandQuery {
+                epoch,
+                label,
+                result,
+            });
         }
         Req::Reconnect | Req::GetWork { .. } => {
             unreachable!("全局手术在 worker 循环里独占处理")

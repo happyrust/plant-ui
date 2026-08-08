@@ -899,6 +899,8 @@ struct App {
     model_scopes: HashMap<RefU64, Vec<RefU64>>,
     model_scope_pending: HashSet<RefU64>,
     model_scope_epoch: u64,
+    /// `clear` bumps this generation so replies from the cleared session are ignored.
+    command_epoch: u64,
     loaded_models: HashSet<RefU64>,
     model_show_waiting: HashSet<RefU64>,
     latest_mesh_progress: Option<plant_ui_view3d::MeshLoadProgress>,
@@ -922,6 +924,10 @@ struct App {
 }
 
 const COMMAND_CAP: usize = 2000;
+
+fn command_reply_is_current(reply_epoch: u64, command_epoch: u64) -> bool {
+    reply_epoch == command_epoch
+}
 
 /// 队列里有活在跑时的轮询节奏，与 ADR-0005 / 0007 给进度定的那一拍一致。
 const QUEUE_POLL_BUSY: Duration = Duration::from_secs(1);
@@ -1195,6 +1201,7 @@ impl App {
             model_scopes: HashMap::new(),
             model_scope_pending: HashSet::new(),
             model_scope_epoch: 0,
+            command_epoch: 0,
             loaded_models: HashSet::new(),
             model_show_waiting: HashSet::new(),
             latest_mesh_progress: None,
@@ -1966,6 +1973,21 @@ impl App {
                         None,
                     ),
                 },
+                data::Evt::CommandQuery {
+                    epoch,
+                    label,
+                    result,
+                } if command_reply_is_current(epoch, self.command_epoch) => match result {
+                    Ok(reply) => self.command_output(format!(
+                        "[{label}]\n{}",
+                        command::format_query_result(&reply.tool, &reply.result)
+                    )),
+                    Err(error) => self.command_error(format!(
+                        "[{label}] 查询失败：{}",
+                        logs::error_chain(&error)
+                    )),
+                },
+                data::Evt::CommandQuery { .. } => {}
                 data::Evt::QueueProgress(task_id, event) => self.queue.apply(&task_id, event),
                 data::Evt::QueueTaskChanged => {
                     self.model_reload_ready = false;
@@ -2338,18 +2360,47 @@ impl App {
             ParsedCommand::Empty => false,
             ParsedCommand::Help => {
                 self.command_output(
-                    "help          显示帮助\nclear         清空命令会话\nq <属性>      查询当前元素属性\n/<名称>       按名称定位元素\n=<参考号>     按参考号定位元素",
+                    "help          显示帮助\nclear         清空命令会话\nq help        显示模型查询帮助\nq <属性>      查询当前元素属性\n/<名称>       按名称定位元素\n=<参考号>     按参考号定位元素",
                 );
                 false
             }
             ParsedCommand::Clear => {
                 self.vm.command.lines.clear();
+                self.command_epoch = self.command_epoch.wrapping_add(1);
                 false
             }
-            ParsedCommand::Query(attr) => {
-                match self.query_attr(&attr) {
-                    Ok(value) => self.command_output(value),
-                    Err(error) => self.command_error(error),
+            ParsedCommand::Query(query) => {
+                match query {
+                    command::QueryInput::Help => self.command_output(command::QUERY_HELP),
+                    command::QueryInput::Property(attr) => match self.query_attr(&attr) {
+                        Ok(value) => self.command_output(value),
+                        Err(error) => self.command_error(error),
+                    },
+                    command::QueryInput::Remote(query) => {
+                        match query.bind(self.vm.selection.primary()) {
+                            Ok(query) => {
+                                let label = query.label.clone();
+                                let request = data::Req::CommandQuery {
+                                    epoch: self.command_epoch,
+                                    label: query.label,
+                                    base: self.model_api_url.clone(),
+                                    project: self.vm.project.clone(),
+                                    mdb: self.mdb.clone(),
+                                    namespace: self.namespace.clone(),
+                                    tool: query.tool.into(),
+                                    arguments: query.arguments,
+                                };
+                                if self.bridge.req.send(request).is_err() {
+                                    self.command_error(format!(
+                                        "[{label}] 查询失败：数据线程已关闭"
+                                    ));
+                                } else {
+                                    self.command_output(format!("[{label}] 查询中…"));
+                                }
+                            }
+                            Err(error) => self.command_error(error),
+                        }
+                    }
                 }
                 false
             }
@@ -3195,10 +3246,11 @@ mod tests {
     use super::{
         EleTreeNode, ModelVisibility, ModelVisibilityPlan, RefU64, RowVisibility, TreeModel,
         TreeRowVm, Window, background_models_settled, begin_get_work, cache_model_scope,
-        claim_unloaded_model_refnos, expand_room_model_targets, finished_after, in_mdb_path,
-        mark_model_scope_unavailable, model_progress_terminal, model_reload_due,
-        model_visibility_plan, needs_children_query, refresh_anchor, restore_model_reload,
-        settle_pending_directions, settled_pending_roots, sync_ime_window, task_matches_project,
+        claim_unloaded_model_refnos, command_reply_is_current, expand_room_model_targets,
+        finished_after, in_mdb_path, mark_model_scope_unavailable, model_progress_terminal,
+        model_reload_due, model_visibility_plan, needs_children_query, refresh_anchor,
+        restore_model_reload, settle_pending_directions, settled_pending_roots, sync_ime_window,
+        task_matches_project,
     };
     use chrono::{TimeZone, Utc};
     use plant_ui::model_update::PendingModelUnit;
@@ -3905,6 +3957,12 @@ mod tests {
         assert_eq!(model_progress_terminal(1, 1), None);
         assert_eq!(model_progress_terminal(0, 1), Some(false));
         assert_eq!(model_progress_terminal(0, 0), Some(true));
+    }
+
+    #[test]
+    fn clear_generation_drops_late_query_replies() {
+        assert!(command_reply_is_current(7, 7));
+        assert!(!command_reply_is_current(6, 7));
     }
 }
 

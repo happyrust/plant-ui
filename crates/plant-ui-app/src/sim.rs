@@ -1329,6 +1329,77 @@ fn script() -> Vec<SimDb> {
 
 // ================================================================ 请求分发
 
+fn query_fixture(tool: &str, arguments: &serde_json::Value) -> crate::model_update_api::QueryReply {
+    let refno = arguments
+        .get("refno")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("24381/100819");
+    let result = match tool {
+        "e3d.element.identity" => serde_json::json!({
+            "refno": refno, "ce": "/PUMP-101", "noun": "EQUI", "name": "/PUMP-101"
+        }),
+        "e3d.element.owner_chain" => serde_json::json!({
+            "refno": refno,
+            "nodes": [
+                {"refno": refno, "noun": "EQUI", "name": "/PUMP-101"},
+                {"refno": "24381/100", "noun": "ZONE", "name": "/PROCESS"}
+            ],
+            "complete": true,
+            "truncated": false
+        }),
+        "e3d.element.attributes" => serde_json::json!({
+            "refno": refno, "name": "/PUMP-101", "noun": "EQUI",
+            "owner": "24381/100", "position_mm": [1200.0, 3400.0, 800.0],
+            "unsupported_fields": []
+        }),
+        "e3d.element.members" => serde_json::json!({
+            "refno": refno, "offset": arguments["offset"], "limit": arguments["limit"],
+            "total": 2, "truncated": false,
+            "items": [
+                {"index": 1, "refno": "24381/100820", "noun": "NOZZ", "value": "/N1"},
+                {"index": 2, "refno": "24381/100821", "noun": "NOZZ", "value": "/N2"}
+            ]
+        }),
+        "e3d.element.transform" => serde_json::json!({
+            "refno": refno, "position_mm": [1200.0, 3400.0, 800.0],
+            "orientation": "Y is N and Z is U", "unsupported_fields": []
+        }),
+        "e3d.geometry.parameters" => serde_json::json!({
+            "refno": refno, "noun": "CYLI", "values": {"diameter_mm": 600.0, "height_mm": 1200.0},
+            "unsupported_fields": []
+        }),
+        "e3d.catalog.references" => serde_json::json!({
+            "refno": refno,
+            "references": [{"kind": "spref", "value": "24380/42"}],
+            "unsupported_fields": []
+        }),
+        "e3d.room.lookup" => serde_json::json!({
+            "refno": refno,
+            "memberships": [{"room_num": "A-101", "room_refno": "24381/900", "panel_refno": "24381/901"}]
+        }),
+        "model.generation_root" => serde_json::json!({
+            "refno": refno, "root": refno, "noun": "EQUI", "name": "/PUMP-101", "kind": "delivery_unit"
+        }),
+        "model.change_impact" => serde_json::json!({
+            "attribute": arguments["attribute"], "effect": "transform", "affects_model": true,
+            "action": "transform"
+        }),
+        "model.pending_units" => serde_json::json!({
+            "offset": arguments["offset"], "limit": arguments["limit"], "total": 1,
+            "truncated": false, "dead_count": 0,
+            "units": [{"dbnum": 24381, "root_refno": "24381/100819", "noun": "EQUI", "attempts": 0, "dead": false, "last_error": null}]
+        }),
+        "model.spatial.bounds" => serde_json::json!({
+            "refno": refno, "min_mm": [900.0, 3100.0, 200.0], "max_mm": [1500.0, 3700.0, 1400.0], "source": "inst_relate"
+        }),
+        _ => serde_json::json!({}),
+    };
+    crate::model_update_api::QueryReply {
+        tool: tool.into(),
+        result,
+    }
+}
+
 /// sim 模式下数据线程的请求处理：与真实分支一一对应，回的都是同一批 `Evt`。
 ///
 /// `Models` / `ModelScopes` 不会到这里——它们在桥上就被送去专用模型通道，
@@ -1376,6 +1447,17 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
         Req::DataPublish { request, .. } => {
             Evt::DataPublish(request, Ok("模拟模式：已受理（未真正提交）".into()))
         }
+        Req::CommandQuery {
+            epoch,
+            label,
+            tool,
+            arguments,
+            ..
+        } => Evt::CommandQuery {
+            epoch,
+            label,
+            result: Ok(query_fixture(&tool, &arguments)),
+        },
         Req::Models(..) | Req::ModelScopes { .. } => {
             unreachable!("模型请求已在桥上路由到专用通道")
         }

@@ -1,5 +1,7 @@
 use anyhow::Context;
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde_json::Value;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -91,6 +93,37 @@ pub async fn execute(
         "/api/v1/update/execute",
         execute_body(project, mdb, namespace, dbnums),
         Duration::from_secs(60),
+    )
+    .await
+}
+
+#[derive(Debug, Deserialize)]
+pub struct QueryReply {
+    pub tool: String,
+    pub result: Value,
+}
+
+/// Execute one fixed read-only E3D/model query through the configured model service.
+pub async fn query(
+    base: &str,
+    project: &str,
+    mdb: &str,
+    namespace: &str,
+    tool: &str,
+    arguments: Value,
+) -> anyhow::Result<QueryReply> {
+    post(
+        base,
+        "/api/v1/query",
+        serde_json::json!({
+            "project": project,
+            "mdb": mdb,
+            "namespace": namespace,
+            "tool": tool,
+            "arguments": arguments,
+        })
+        .to_string(),
+        Duration::from_secs(1220),
     )
     .await
 }
