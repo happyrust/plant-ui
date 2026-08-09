@@ -120,6 +120,27 @@ pub async fn element_rooms(refno: RefnoEnum) -> Result<Vec<RoomRelation>> {
         .collect())
 }
 
+/// 一块在册 PANEL 直属的房间 FRMW。普通元素与陈旧面板返回 `None`。
+/// `room_panel_relate` 的方向固定为 `in = 房间, out = PANEL`。
+pub async fn panel_room(panel: RefnoEnum) -> Result<Option<RefU64>> {
+    let mut response = SUL_DB
+        .query(panel_room_sql(&panel.to_pe_key()))
+        .await?
+        .check()?;
+    let rooms: Vec<RefnoEnum> = response.take(0)?;
+    Ok(rooms.into_iter().next().map(|room| room.refno()))
+}
+
+/// 一间房直属的全部在册 PANEL。X-Ray 只需要这份轻量拓扑，不等待成员边全量展开。
+pub async fn room_panels(room: RefnoEnum) -> Result<Vec<RefU64>> {
+    let mut response = SUL_DB
+        .query(room_panels_sql(&room.to_pe_key()))
+        .await?
+        .check()?;
+    let panels: Vec<RefnoEnum> = response.take(0)?;
+    Ok(panels.into_iter().map(|panel| panel.refno()).collect())
+}
+
 /// 一间房的详情。`room` 不是 pe 里的记录时返回 `Ok(None)`。
 ///
 /// `preview` 是成员预览条数上限；`member_count` 始终是去重后的全量。
@@ -373,6 +394,14 @@ fn panel_rooms_sql(panel_keys: &[String]) -> String {
     )
 }
 
+fn panel_room_sql(panel_key: &str) -> String {
+    format!("SELECT VALUE in FROM room_panel_relate WHERE out = {panel_key} LIMIT 1;")
+}
+
+fn room_panels_sql(room_key: &str) -> String {
+    format!("SELECT VALUE out FROM room_panel_relate WHERE in = {room_key};")
+}
+
 fn room_detail_sql(room_key: &str) -> String {
     format!(
         "SELECT VALUE name FROM {room_key}; \
@@ -561,5 +590,22 @@ mod tests {
         assert!(overview.contains("noun = 'FRMW'"));
         assert!(overview.contains("string::contains(name, '-RM')"));
         assert!(overview.contains("SELECT VALUE [in, out] FROM room_relate"));
+    }
+
+    #[test]
+    fn panel_room_query_uses_the_canonical_topology_direction() {
+        let sql = panel_room_sql("pe:1_10");
+        assert!(sql.contains("SELECT VALUE in FROM room_panel_relate"));
+        assert!(sql.contains("WHERE out = pe:1_10"));
+        assert!(sql.contains("LIMIT 1"));
+    }
+
+    #[test]
+    fn room_panels_query_uses_the_canonical_topology_direction() {
+        let sql = room_panels_sql("pe:1_9");
+        assert_eq!(
+            sql,
+            "SELECT VALUE out FROM room_panel_relate WHERE in = pe:1_9;"
+        );
     }
 }
