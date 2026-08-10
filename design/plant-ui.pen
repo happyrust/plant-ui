@@ -3011,7 +3011,7 @@
                               "fill": "$accent"
                             },
                             "F9R0hh": {
-                              "content": "增量批次 db8000 sesno 1 024 → 1 027 已应用，3 个交付单元待生成",
+                              "content": "增量批次 db8000 已应用 4 次保存（08-07 09:26 → 14:10），3 个交付单元待生成",
                               "fill": "$text-secondary"
                             }
                           }
@@ -4073,7 +4073,7 @@
                   "id": "SPB0q",
                   "name": "T",
                   "fill": "$text-muted",
-                  "content": "已应用 sesno",
+                  "content": "最近应用",
                   "fontFamily": "$font-ui",
                   "fontSize": 11,
                   "fontWeight": "normal"
@@ -4083,7 +4083,7 @@
                   "id": "vngAV",
                   "name": "T",
                   "fill": "$text-secondary",
-                  "content": "1 027",
+                  "content": "08-07 14:10",
                   "fontFamily": "$font-mono",
                   "fontSize": 11,
                   "fontWeight": "normal"
@@ -8234,7 +8234,7 @@
                               "fill": "$accent"
                             },
                             "F9R0hh": {
-                              "content": "增量批次 db8000 sesno 1 024 → 1 027 已应用，3 个交付单元待生成",
+                              "content": "增量批次 db8000 已应用 4 次保存（08-07 09:26 → 14:10），3 个交付单元待生成",
                               "fill": "$text-secondary"
                             }
                           }
@@ -9296,7 +9296,7 @@
                   "id": "K5U2QP",
                   "name": "T",
                   "fill": "$text-muted",
-                  "content": "已应用 sesno",
+                  "content": "最近应用",
                   "fontFamily": "$font-ui",
                   "fontSize": 11,
                   "fontWeight": "normal"
@@ -9306,7 +9306,7 @@
                   "id": "mnXae",
                   "name": "T",
                   "fill": "$text-secondary",
-                  "content": "1 027",
+                  "content": "08-07 14:10",
                   "fontFamily": "$font-mono",
                   "fontSize": 11,
                   "fontWeight": "normal"
@@ -14703,7 +14703,7 @@
                           "id": "Bj7IT",
                           "name": "R",
                           "fill": "$text-muted",
-                          "content": "8 个待应用会话 · 487 项变化",
+                          "content": "8 次保存待应用 · 487 项变化",
                           "fontFamily": "$font-ui",
                           "fontSize": 11,
                           "fontWeight": "normal"
@@ -14975,7 +14975,7 @@
                   "fill": "$accent",
                   "textGrowth": "fixed-width",
                   "width": "fill_container",
-                  "content": "逐库比对会话，单库可达数分钟；超时重试即可，不会留下任何写入",
+                  "content": "逐库比对保存记录，单库可达数分钟；超时重试即可，不会留下任何写入",
                   "fontFamily": "$font-ui",
                   "fontSize": 11,
                   "fontWeight": "normal"
@@ -15019,7 +15019,7 @@
               "id": "HKdT1",
               "name": "Hint",
               "fill": "$text-muted",
-              "content": "预览为只读：不修改元素数据、模型或已应用会话号；关闭窗口不影响后台扫描",
+              "content": "预览为只读：不修改元素数据、模型或水位；关闭窗口不影响后台扫描",
               "fontFamily": "$font-ui",
               "fontSize": 11,
               "fontWeight": "normal"
@@ -15591,7 +15591,7 @@
                       "fill": "$text-secondary",
                       "textGrowth": "fixed-width",
                       "width": "fill_container",
-                      "content": "没有待应用的会话，也没有待重试的交付单元。这是正常结果不是错误，用 success 而不是灰色空屏；顺手给出上次扫描时间。",
+                      "content": "没有待应用的保存，也没有待重试的交付单元。这是正常结果不是错误，用 success 而不是灰色空屏；顺手给出上次扫描时间。",
                       "lineHeight": 1.5,
                       "fontFamily": "$font-ui",
                       "fontSize": 11,
@@ -16107,7 +16107,7 @@
                       "fill": "$text-secondary",
                       "textGrowth": "fixed-width",
                       "width": "fill_container",
-                      "content": "sesno 1 024 → 1 031，8 个会话 · 487 项变化。成功后水位推进到 1 031。",
+                      "content": "08-01 09:12 → 08-07 14:10，8 次保存 · 487 项变化。成功后水位推进至 08-07 14:10。",
                       "lineHeight": 1.5,
                       "fontFamily": "$font-ui",
                       "fontSize": 11,
@@ -16220,7 +16220,7 @@
                       "fill": "$text-secondary",
                       "textGrowth": "fixed-width",
                       "width": "fill_container",
-                      "content": "文件从未导入过，还没有权威水位。契约不会为它解会话区间，所以 net_* 全是 0 —— 但它确实会跑。绝不能显示成「无变化」。",
+                      "content": "文件从未导入过，还没有权威水位。契约不会为它解保存区间，所以 net_* 全是 0 —— 但它确实会跑。绝不能显示成「无变化」。",
                       "lineHeight": 1.5,
                       "fontFamily": "$font-ui",
                       "fontSize": 11,
@@ -16485,7 +16485,7 @@
                       "fill": "$text-secondary",
                       "textGrowth": "fixed-width",
                       "width": "fill_container",
-                      "content": "文件最新会话 812 低于已应用 1 005。水位只前进不后退，其他批次不受影响。出路：换回正确文件。",
+                      "content": "文件里最新的保存（07-01 10:00）早于已应用的保存（08-05 18:24）。水位只前进不后退，其他批次不受影响。出路：换回正确文件。",
                       "lineHeight": 1.5,
                       "fontFamily": "$font-ui",
                       "fontSize": 11,
@@ -18231,7 +18231,7 @@
           "type": "frame",
           "id": "e5egM",
           "name": "CellSes",
-          "width": 150,
+          "width": 180,
           "fill": "#00000000",
           "alignItems": "center",
           "children": [
@@ -18240,7 +18240,7 @@
               "id": "dmpUA",
               "name": "Ses",
               "fill": "$text-secondary",
-              "content": "sesno 1 024 → 1 034",
+              "content": "08-01 09:12 → 08-07 14:33",
               "fontFamily": "$font-mono",
               "fontSize": 11,
               "fontWeight": "normal"
@@ -18866,8 +18866,8 @@
             {
               "type": "frame",
               "id": "caFXA",
-              "name": "H-会话区间",
-              "width": 150,
+              "name": "H-保存窗口",
+              "width": 180,
               "fill": "#00000000",
               "alignItems": "center",
               "children": [
@@ -18876,7 +18876,7 @@
                   "id": "a7Rjrb",
                   "name": "T",
                   "fill": "$text-muted",
-                  "content": "会话区间",
+                  "content": "保存窗口",
                   "fontFamily": "$font-ui",
                   "fontSize": 11,
                   "fontWeight": "normal"
@@ -18980,7 +18980,7 @@
                   "content": "DESI"
                 },
                 "dmpUA": {
-                  "content": "sesno 1 024 → 1 038"
+                  "content": "08-01 09:12 → 08-07 15:07"
                 },
                 "gTI7E": {
                   "content": "生成中 · 14 / 24 个单元",
@@ -19023,7 +19023,7 @@
                   "content": "DESI"
                 },
                 "dmpUA": {
-                  "content": "sesno 1 039 → 1 041"
+                  "content": "08-07 15:19 → 08-07 15:42"
                 },
                 "gTI7E": {
                   "content": "排队中 · 第 1 位",
@@ -19031,7 +19031,7 @@
                 },
                 "xjpKz": {
                   "enabled": true,
-                  "content": "上一批已冻结，这是之后新存的会话"
+                  "content": "上一批已冻结，这是之后新存的保存"
                 },
                 "f6mO22": {
                   "enabled": false
@@ -19063,7 +19063,7 @@
                   "content": "DESI"
                 },
                 "dmpUA": {
-                  "content": "sesno 812 → 830"
+                  "content": "07-28 08:05 → 08-06 17:48"
                 },
                 "gTI7E": {
                   "content": "排队中 · 第 2 位",
@@ -19103,7 +19103,7 @@
                   "content": "DESI"
                 },
                 "dmpUA": {
-                  "content": "sesno 5 → 9"
+                  "content": "08-05 11:20 → 08-06 16:42"
                 },
                 "gTI7E": {
                   "content": "排队中 · 第 3 位",
@@ -19143,7 +19143,7 @@
                   "content": "DESI"
                 },
                 "dmpUA": {
-                  "content": "sesno 210 → 215"
+                  "content": "08-04 17:05 → 08-06 10:31"
                 },
                 "gTI7E": {
                   "content": "部分完成 · 欠 2 个单元",
@@ -19409,7 +19409,7 @@
                   "id": "Y3FxTL",
                   "name": "Reason",
                   "fill": "$text-secondary",
-                  "content": "文件回退 812 < 已应用 1 005",
+                  "content": "文件回退 · 最新保存 07-01 10:00 早于已应用 08-05 18:24",
                   "fontFamily": "$font-ui",
                   "fontSize": 11,
                   "fontWeight": "normal"
@@ -20211,8 +20211,8 @@
             {
               "type": "frame",
               "id": "M6yhUn",
-              "name": "H-会话区间",
-              "width": 150,
+              "name": "H-保存窗口",
+              "width": 180,
               "fill": "#00000000",
               "alignItems": "center",
               "children": [
@@ -20221,7 +20221,7 @@
                   "id": "S9F6U",
                   "name": "T",
                   "fill": "$text-muted",
-                  "content": "会话区间",
+                  "content": "保存窗口",
                   "fontFamily": "$font-ui",
                   "fontSize": 11,
                   "fontWeight": "normal"
@@ -20325,7 +20325,7 @@
                   "content": "DESI"
                 },
                 "dmpUA": {
-                  "content": "sesno 1 024 → 1 038"
+                  "content": "08-01 09:12 → 08-07 15:07"
                 },
                 "gTI7E": {
                   "content": "生成中 · 18 / 24 个单元",
@@ -20368,7 +20368,7 @@
                   "content": "DESI"
                 },
                 "dmpUA": {
-                  "content": "sesno 812 → 830"
+                  "content": "07-28 08:05 → 08-06 17:48"
                 },
                 "gTI7E": {
                   "content": "已暂停 · 第 1 位",
@@ -20408,7 +20408,7 @@
                   "content": "DESI"
                 },
                 "dmpUA": {
-                  "content": "sesno 5 → 9"
+                  "content": "08-05 11:20 → 08-06 16:42"
                 },
                 "gTI7E": {
                   "content": "已暂停 · 第 2 位",
@@ -20448,7 +20448,7 @@
                   "content": "DESI"
                 },
                 "dmpUA": {
-                  "content": "sesno 210 → 215"
+                  "content": "08-04 17:05 → 08-06 10:31"
                 },
                 "gTI7E": {
                   "content": "状态未知",
@@ -22523,7 +22523,7 @@
                           "fill": "$text-secondary",
                           "textGrowth": "fixed-width",
                           "width": "fill_container",
-                          "content": "文件最新会话号 812 低于已应用 1 005。水位不回退；出路：换回正确文件。",
+                          "content": "文件里最新的保存（07-01 10:00）早于已应用的保存（08-05 18:24）。水位不回退；出路：换回正确文件。",
                           "lineHeight": 1.5,
                           "fontFamily": "$font-ui",
                           "fontSize": 11,
@@ -23127,7 +23127,7 @@
                   "content": "DESI"
                 },
                 "dmpUA": {
-                  "content": "sesno 1 024 → 1 034"
+                  "content": "08-01 09:12 → 08-07 14:33"
                 },
                 "gTI7E": {
                   "content": "已完成",
@@ -23186,7 +23186,7 @@
                           "id": "qbbF4",
                           "name": "t",
                           "fill": "$text-secondary",
-                          "content": "sesno 1 024 → 1 034",
+                          "content": "08-01 09:12 → 08-07 14:33",
                           "fontFamily": "$font-mono",
                           "fontSize": 11,
                           "fontWeight": "normal"
@@ -23196,7 +23196,7 @@
                           "id": "CRD26",
                           "name": "t",
                           "fill": "$success",
-                          "content": "已应用 · 水位推进至 1 034",
+                          "content": "已应用 · 水位推进至 08-07 14:33",
                           "fontFamily": "$font-ui",
                           "fontSize": 11,
                           "fontWeight": "normal"
@@ -23216,7 +23216,7 @@
                           "id": "OwTbZ",
                           "name": "t",
                           "fill": "$text-secondary",
-                          "content": "预览后并入 3 个会话：1 032 / 1 033 / 1 034",
+                          "content": "预览后并入 3 次保存（08-07 14:21 / 14:27 / 14:33）",
                           "fontFamily": "$font-ui",
                           "fontSize": 11,
                           "fontWeight": "normal"
@@ -23296,7 +23296,7 @@
                           "id": "a9ycdS",
                           "name": "t",
                           "fill": "$text-muted",
-                          "content": "DataBatchResult.start/end_sesno · merged_sesnos逐条 · changed_elements（预览差值为本地量） · units_done/total_units · started_at/finished_at",
+                          "content": "DataBatchResult.start/end_sesno_time · merged 逐条时刻（ADR-0019） · changed_elements（预览差值为本地量） · units_done/total_units · started_at/finished_at",
                           "fontFamily": "$font-mono",
                           "fontSize": 11,
                           "fontWeight": "normal"
@@ -23367,7 +23367,7 @@
                   "content": "DESI"
                 },
                 "dmpUA": {
-                  "content": "sesno 5 → 9"
+                  "content": "08-05 11:20 → 08-06 16:42"
                 },
                 "gTI7E": {
                   "content": "失败",
@@ -23375,7 +23375,7 @@
                 },
                 "xjpKz": {
                   "enabled": true,
-                  "content": "应用会话 7 时写入失败"
+                  "content": "应用 08-06 09:15 的保存时写入失败"
                 },
                 "f6mO22": {
                   "enabled": false
@@ -23426,7 +23426,7 @@
                           "id": "X3JBIL",
                           "name": "t",
                           "fill": "$text-secondary",
-                          "content": "sesno 5 → 9",
+                          "content": "08-05 11:20 → 08-06 16:42",
                           "fontFamily": "$font-mono",
                           "fontSize": 11,
                           "fontWeight": "normal"
@@ -23456,7 +23456,7 @@
                           "id": "Atoo6",
                           "name": "t",
                           "fill": "$danger",
-                          "content": "应用会话 7 时写入失败：库文件被另一进程锁定",
+                          "content": "应用 08-06 09:15 的保存时写入失败：库文件被另一进程锁定",
                           "fontFamily": "$font-ui",
                           "fontSize": 11,
                           "fontWeight": "normal"
@@ -23587,7 +23587,7 @@
                   "content": "DESI"
                 },
                 "dmpUA": {
-                  "content": "sesno 210 → 215"
+                  "content": "08-04 17:05 → 08-06 10:31"
                 },
                 "gTI7E": {
                   "content": "部分完成 · 欠 2 个单元",
@@ -23646,7 +23646,7 @@
                           "id": "v7f7M",
                           "name": "t",
                           "fill": "$text-secondary",
-                          "content": "sesno 210 → 215",
+                          "content": "08-04 17:05 → 08-06 10:31",
                           "fontFamily": "$font-mono",
                           "fontSize": 11,
                           "fontWeight": "normal"
@@ -23656,7 +23656,7 @@
                           "id": "T8wa5l",
                           "name": "t",
                           "fill": "$success",
-                          "content": "已应用 · 水位推进至 215",
+                          "content": "已应用 · 水位推进至 08-06 10:31",
                           "fontFamily": "$font-ui",
                           "fontSize": 11,
                           "fontWeight": "normal"
@@ -26612,7 +26612,7 @@
                               "fill": "$accent"
                             },
                             "F9R0hh": {
-                              "content": "增量批次 db8000 sesno 1 024 → 1 027 已应用，3 个交付单元待生成",
+                              "content": "增量批次 db8000 已应用 4 次保存（08-07 09:26 → 14:10），3 个交付单元待生成",
                               "fill": "$text-secondary"
                             }
                           }
@@ -27674,7 +27674,7 @@
                   "id": "xnWMt",
                   "name": "T",
                   "fill": "$text-muted",
-                  "content": "已应用 sesno",
+                  "content": "最近应用",
                   "fontFamily": "$font-ui",
                   "fontSize": 11,
                   "fontWeight": "normal"
@@ -27684,7 +27684,7 @@
                   "id": "Vj3I5",
                   "name": "T",
                   "fill": "$text-secondary",
-                  "content": "1 027",
+                  "content": "08-07 14:10",
                   "fontFamily": "$font-mono",
                   "fontSize": 11,
                   "fontWeight": "normal"
@@ -31502,7 +31502,7 @@
                               "fill": "$accent"
                             },
                             "F9R0hh": {
-                              "content": "增量批次 db8000 sesno 1 024 → 1 027 已应用，3 个交付单元待生成",
+                              "content": "增量批次 db8000 已应用 4 次保存（08-07 09:26 → 14:10），3 个交付单元待生成",
                               "fill": "$text-secondary"
                             }
                           }
@@ -32962,7 +32962,7 @@
                   "id": "wuKXT",
                   "name": "T",
                   "fill": "$text-muted",
-                  "content": "已应用 sesno",
+                  "content": "最近应用",
                   "fontFamily": "$font-ui",
                   "fontSize": 11,
                   "fontWeight": "normal"
@@ -32972,7 +32972,7 @@
                   "id": "e94c1I",
                   "name": "T",
                   "fill": "$text-secondary",
-                  "content": "1 027",
+                  "content": "08-07 14:10",
                   "fontFamily": "$font-mono",
                   "fontSize": 11,
                   "fontWeight": "normal"
@@ -34465,7 +34465,7 @@
                           "id": "mgLf7",
                           "name": "DT",
                           "fill": "$text-muted",
-                          "content": "上次应用 07-30 18:24 → 文件最新 08-07 14:10 · 待应用 sesno 1 024 → 1 031（8 个会话）· 与 /1WCC-EQUI 同库联动",
+                          "content": "上次应用 07-30 18:24 → 文件最新 08-07 14:10 · 8 次保存待应用 · 与 /1WCC-EQUI 同库联动",
                           "fontFamily": "$font-mono",
                           "fontSize": 10,
                           "fontWeight": "normal"
@@ -34640,7 +34640,7 @@
                           "id": "cYdDs",
                           "name": "DT",
                           "fill": "$text-muted",
-                          "content": "上次应用 07-30 18:24 → 文件最新 08-07 14:10 · 待应用 sesno 1 024 → 1 031（8 个会话）· 与 /1WCC-PIPE 同库联动",
+                          "content": "上次应用 07-30 18:24 → 文件最新 08-07 14:10 · 8 次保存待应用 · 与 /1WCC-PIPE 同库联动",
                           "fontFamily": "$font-mono",
                           "fontSize": 10,
                           "fontWeight": "normal"
@@ -35318,7 +35318,7 @@
                               "fill": "$text-secondary",
                               "textGrowth": "fixed-width",
                               "width": "fill_container",
-                              "content": "文件最新会话号 812 低于已应用 1 005。水位不回退；出路：换回正确文件。",
+                              "content": "文件里最新的保存（07-01 10:00）早于已应用的保存（08-05 18:24）。水位不回退；出路：换回正确文件。",
                               "lineHeight": 1.5,
                               "fontFamily": "$font-ui",
                               "fontSize": 11,
@@ -35496,7 +35496,7 @@
               "id": "HQr6S",
               "name": "Hint",
               "fill": "$text-muted",
-              "content": "预览为只读：不修改元素数据、模型或已应用会话号",
+              "content": "预览为只读：不修改元素数据、模型或水位",
               "fontFamily": "$font-ui",
               "fontSize": 11,
               "fontWeight": "normal"
@@ -35922,7 +35922,7 @@
                       "id": "U5BF1n",
                       "name": "R",
                       "fill": "$text-muted",
-                      "content": "sesno 1 024 → 1 031",
+                      "content": "08-01 09:12 → 08-07 14:10",
                       "fontFamily": "$font-mono",
                       "fontSize": 11,
                       "fontWeight": "normal"
@@ -35940,7 +35940,7 @@
                       "id": "Bg54u",
                       "name": "St",
                       "fill": "$text-secondary",
-                      "content": "同库一批（db8000）· 11 个会话 · 487 项变化",
+                      "content": "同库一批（db8000）· 8 次保存 · 487 项变化",
                       "fontFamily": "$font-ui",
                       "fontSize": 11,
                       "fontWeight": "normal"
@@ -36084,7 +36084,7 @@
                       "fill": "$accent",
                       "textGrowth": "fixed-width",
                       "width": "fill_container",
-                      "content": "预览完成于 2 分钟前；开始时对勾选范围重新扫描，期间新产生的会话自动并入本批次，结果摘要里会逐条列出；未勾选的不扫描、不入队",
+                      "content": "预览完成于 2 分钟前；开始时对勾选范围重新扫描，期间新产生的保存自动并入本批次，结果摘要里会逐条列出；未勾选的不扫描、不入队",
                       "fontFamily": "$font-ui",
                       "fontSize": 11,
                       "fontWeight": "normal"
@@ -36190,7 +36190,7 @@
                       "id": "ShO2q",
                       "name": "R",
                       "fill": "$text-muted",
-                      "content": "sesno 2 118 → 2 121 · 3 个会话待应用",
+                      "content": "08-06 15:02 → 08-07 09:44 · 3 次保存待应用",
                       "fontFamily": "$font-mono",
                       "fontSize": 11,
                       "fontWeight": "normal"
@@ -36247,7 +36247,7 @@
                       "id": "S6VY2",
                       "name": "R",
                       "fill": "$text-muted",
-                      "content": "文件回退 sesno 812 < 已应用 1 005",
+                      "content": "文件回退 · 最新保存 07-01 10:00 早于已应用 08-05 18:24",
                       "fontFamily": "$font-mono",
                       "fontSize": 11,
                       "fontWeight": "normal"
@@ -36551,7 +36551,7 @@
                       "fill": "$text-secondary",
                       "textGrowth": "fixed-width",
                       "width": "fill_container",
-                      "content": "数据批次一旦成功，已应用会话号立即推进且不回滚；模型生成失败的单元转入待重试，不影响已写入的数据。关闭窗口不会停任务。",
+                      "content": "数据批次一旦成功，水位立即推进且不回滚；模型生成失败的单元转入待重试，不影响已写入的数据。关闭窗口不会停任务。",
                       "lineHeight": 1.5,
                       "fontFamily": "$font-ui",
                       "fontSize": 11,
