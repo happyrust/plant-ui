@@ -38,7 +38,8 @@ pub enum Req {
     ResolveName(String),
     /// 树定位目标的祖先链。目标不在已加载的树里时才发，见 ADR-0014。
     Ancestors(RefU64),
-    /// 重跑启动序列。连库失败后命令行上的「重试」走这条，结果仍走 `Evt::Ready`。
+    /// 丢查询缓存并重跑启动序列。连库失败后命令行上的「重试」走这条，结果仍走
+    /// `Evt::Ready`。
     Reconnect,
     ModelUpdatePreview {
         base: String,
@@ -521,6 +522,11 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
                     // 旧连接上的回包不该落在新会话后面）。
                     Req::Reconnect => {
                         while inflight.next().await.is_some() {}
+                        // 缓存先丢，理由与 `get_work` 同一条：根层与库编号那两条查询
+                        // 带 memoize，键里只有 MDB 与库类型，没有连接本身，重连也不
+                        // 会把它们冲掉。留着它，重连就是从内存里读上一次的那份——
+                        // 界面看着重连过了，这中间新增的 SITE 一个都不在。
+                        plant_ui_data::invalidate_all().await;
                         let _ = evt_tx.send(Evt::Ready(ready().await));
                         ctx.request_repaint();
                     }
