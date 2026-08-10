@@ -21,7 +21,9 @@ included_projects = ["AvevaMarineSample", "AvevaCatalogue", "ZDJ"]
 #project_dirs = ["AvevaMarineSample"]
 
 # ../gen-model 解析并生成的 AMS 7997 工作库。
-mdb_name = "ALL1"
+# 与 gen-model DbOption（mdb_name=ALL、http_api 8022）对齐，避免手动更新 identity_mismatch。
+# 原值 ALL1（仅声明 7997）；测完若要切回 ALL1 再改。
+mdb_name = "ALL"
 project_name = "AvevaMarineSample"
 project_code = 1516
 surreal_ns = 1516

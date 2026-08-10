@@ -15,6 +15,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
 
       - name: Use network dependency sources
         shell: pwsh
@@ -27,6 +29,10 @@ jobs:
           if ($env:GITHUB_REF_NAME -ne "v$version") { throw "tag $env:GITHUB_REF_NAME does not match Cargo.toml $version" }
           cargo build -p plant-ui-app --release --locked
 
+      - name: Build WASM
+        shell: pwsh
+        run: ./scripts/build-wasm.ps1
+
       - name: Package
         shell: pwsh
         run: |
@@ -37,8 +43,17 @@ jobs:
           Copy-Item resource "$name/resource" -Recurse
           Compress-Archive -Path "$name/*" -DestinationPath "$name.zip"
 
+          $wasmName = "plant-ui-$env:GITHUB_REF_NAME-wasm"
+          New-Item -ItemType Directory -Path $wasmName | Out-Null
+          Copy-Item web/public/* "$wasmName/" -Recurse
+          Compress-Archive -Path "$wasmName/*" -DestinationPath "$wasmName.zip"
+
       - name: Publish GitHub release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$env:GITHUB_REF_NAME" "plant-ui-$env:GITHUB_REF_NAME-windows-x64.zip" --verify-tag --generate-notes --title "Plant UI $env:GITHUB_REF_NAME"
+        run: |
+          gh release create "$env:GITHUB_REF_NAME" `
+            "plant-ui-$env:GITHUB_REF_NAME-windows-x64.zip" `
+            "plant-ui-$env:GITHUB_REF_NAME-wasm.zip" `
+            --verify-tag --generate-notes --title "Plant UI $env:GITHUB_REF_NAME"
