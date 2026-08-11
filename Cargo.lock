@@ -6741,7 +6741,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "plant-ui"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "aios_core",
  "chrono",
@@ -6756,7 +6756,7 @@ dependencies = [
 
 [[package]]
 name = "plant-ui-app"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "aios_core",
  "anyhow",
@@ -6788,7 +6788,7 @@ dependencies = [
 
 [[package]]
 name = "plant-ui-data"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "aios_core",
  "anyhow",
@@ -6799,7 +6799,7 @@ dependencies = [
 
 [[package]]
 name = "plant-ui-view3d"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "aios_core",
  "anyhow",
