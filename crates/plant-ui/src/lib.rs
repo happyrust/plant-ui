@@ -27,6 +27,12 @@ pub enum ModelAction {
         refnos: Vec<aios_core::RefU64>,
         visible: bool,
     },
+    /// Remove these model roots (or all roots owned by them) from the scene.
+    ///
+    /// Unlike hiding, unloading also forgets render, picking and retry state.
+    /// GET WORK uses this when the refreshed design tree proves an element was
+    /// deleted or moved out of the loaded hierarchy.
+    Unload { refnos: Vec<aios_core::RefU64> },
     /// 原子替换当前 X-Ray 目标集。空集恢复全部模型的常态 / 选中材质。
     /// 只改变材质，不改变可见性、隔离快照或相机。
     SetXRay { refnos: Vec<aios_core::RefU64> },

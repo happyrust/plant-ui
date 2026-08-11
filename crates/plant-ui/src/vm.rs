@@ -214,6 +214,20 @@ impl Selection {
         self.cursor = None;
     }
 
+    /// Drop selections that no longer exist after a tree refresh.
+    ///
+    /// If the anchor or primary selection disappears, move it to the last
+    /// surviving item, matching the existing Ctrl-toggle semantics.
+    pub fn retain(&mut self, mut keep: impl FnMut(RefU64) -> bool) {
+        self.items.retain(|refno| keep(*refno));
+        if self.anchor.is_some_and(|refno| !self.items.contains(&refno)) {
+            self.anchor = self.items.last().copied();
+        }
+        if self.cursor.is_some_and(|refno| !self.items.contains(&refno)) {
+            self.cursor = self.items.last().copied();
+        }
+    }
+
     pub fn contains(&self, refno: RefU64) -> bool {
         self.items.contains(&refno)
     }
@@ -697,6 +711,21 @@ mod tests {
         assert_eq!(s.primary(), Some(r(2)));
         s.toggle(r(2));
         assert_eq!(s.primary(), Some(r(1)));
+    }
+
+    #[test]
+    fn tree_refresh_retain_moves_primary_to_a_survivor_or_clears_it() {
+        let mut s = Selection::single(r(1));
+        s.toggle(r(2));
+        s.toggle(r(3));
+
+        s.retain(|refno| refno != r(3));
+        assert_eq!(s.to_vec(), vec![r(1), r(2)]);
+        assert_eq!(s.primary(), Some(r(2)));
+
+        s.retain(|_| false);
+        assert!(s.is_empty());
+        assert_eq!(s.primary(), None);
     }
 
     #[test]

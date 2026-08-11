@@ -776,13 +776,26 @@ impl TreeModel {
         self.roots.iter().any(|n| n.refno.refno() == refno)
     }
 
-    /// 取回工作之后的清扫：把从根层已经走不到的条目摘掉。
+    fn known_refnos(&self) -> HashSet<RefU64> {
+        let mut known: HashSet<_> = self
+            .roots
+            .iter()
+            .chain(self.children.values().flatten())
+            .map(|node| node.refno.refno())
+            .collect();
+        known.extend(self.children.keys().copied());
+        known.extend(self.parent.keys().copied());
+        known.extend(self.parent.values().copied());
+        known
+    }
+
+    /// 取回工作之后的清扫：把从根层已经走不到的条目摘掉，并返回消失的旧节点。
     ///
     /// 一次重查可以让整条分支消失——元素被删了，或者挪到了别的 OWNER 底下——
     /// 而它底下那些子层、`parent` 指向、展开标记还留在表里。不摘掉的话
     /// `ancestors` 会顺着 `parent` 走进一串已经不存在的祖先，状态栏的元素计数
     /// 也会一直虚高。
-    fn prune_unreachable(&mut self) {
+    fn prune_unreachable(&mut self, previously_known: &HashSet<RefU64>) -> Vec<RefU64> {
         let mut alive: HashSet<RefU64> = HashSet::new();
         let mut stack: Vec<RefU64> = self.roots.iter().map(|n| n.refno.refno()).collect();
         while let Some(refno) = stack.pop() {
@@ -794,12 +807,25 @@ impl TreeModel {
                 stack.extend(kids.iter().map(|n| n.refno.refno()));
             }
         }
+        let mut removed: Vec<_> = previously_known.difference(&alive).copied().collect();
+        removed.sort_by_key(|refno| refno.0);
+        let removed_set: HashSet<_> = removed.iter().copied().collect();
         self.children.retain(|refno, _| alive.contains(refno));
         self.parent.retain(|refno, _| alive.contains(refno));
         self.expanded.retain(|refno| alive.contains(refno));
         self.loading.retain(|refno| alive.contains(refno));
+        // Visibility is keyed by actual model roots. A model returned for a
+        // collapsed container can legitimately be absent from the materialized
+        // tree, so only forget roots proven to belong to removed tree nodes.
+        self.visibility
+            .retain(|refno, _| !removed_set.contains(refno));
+        self.pending_direction
+            .retain(|refno, _| !removed_set.contains(refno));
+        self.pending_visibility
+            .retain(|refno, _| !removed_set.contains(refno));
         self.visibility_unavailable
-            .retain(|refno| alive.contains(refno));
+            .retain(|refno| !removed_set.contains(refno));
+        removed
     }
 
     /// 从最近的父到 SITE 根的祖先链；不在已加载的树里就是 None。
@@ -1065,6 +1091,36 @@ fn claim_unloaded_model_refnos(
         .collect::<HashSet<_>>();
     loaded.extend(claimed.iter().copied());
     claimed
+}
+
+/// Forget model roots associated with tree nodes that disappeared during GET WORK.
+///
+/// A tree target can own several actual model roots. Return the full unload set so
+/// the renderer and the app-side dedup cache are invalidated together; otherwise a
+/// later refno reuse would be incorrectly treated as already loaded.
+fn forget_removed_models(
+    scopes: &mut HashMap<RefU64, Vec<RefU64>>,
+    loaded: &mut HashSet<RefU64>,
+    removed_tree_refnos: &[RefU64],
+) -> Vec<RefU64> {
+    let removed: HashSet<_> = removed_tree_refnos.iter().copied().collect();
+    let mut unload = removed.clone();
+    for (target, models) in scopes.iter() {
+        if removed.contains(target) {
+            unload.extend(models.iter().copied());
+        }
+    }
+    scopes.retain(|target, models| {
+        if removed.contains(target) {
+            return false;
+        }
+        models.retain(|model| !unload.contains(model));
+        !models.is_empty()
+    });
+    loaded.retain(|refno| !unload.contains(refno));
+    let mut unload: Vec<_> = unload.into_iter().collect();
+    unload.sort_by_key(|refno| refno.0);
+    unload
 }
 
 /// 查空、查失败：这次点击什么都没落到三维上，待执行方向撤掉，eye 留在未加载。
@@ -1544,8 +1600,10 @@ impl App {
                             self.loaded_models.clear();
                             for model in &models {
                                 let refno = model.refno.refno();
+                                let owner = model.owner.refno();
                                 self.loaded_models.insert(refno);
                                 cache_model_scope(&mut self.model_scopes, refno, refno);
+                                cache_model_scope(&mut self.model_scopes, owner, refno);
                             }
                             // 整场重载：旧的实际状态全作废，新的等 View3d 装完
                             // 网格再回执上来。这中间 eye 停在未加载而不是抢先
@@ -1618,10 +1676,12 @@ impl App {
                             let mut seen = HashSet::new();
                             for model in &models {
                                 let refno = model.refno.refno();
+                                let owner = model.owner.refno();
                                 if seen.insert(refno) {
                                     refs.push(refno);
                                 }
                                 cache_model_scope(&mut self.model_scopes, refno, refno);
+                                cache_model_scope(&mut self.model_scopes, owner, refno);
                             }
                             self.model_scopes.insert(target, refs.clone());
                             let element = self.tree.element(target);
@@ -1874,6 +1934,12 @@ impl App {
                                 }
                             }
                             let before = self.tree.element_count();
+                            let previously_known = self.tree.known_refnos();
+                            // Model-scope replies were computed against the old
+                            // design snapshot. Ignore every late reply, including
+                            // one for a node that this refresh is about to remove.
+                            self.model_scope_epoch = self.model_scope_epoch.wrapping_add(1);
+                            self.model_scope_pending.clear();
                             self.tree.roots = fresh.sites;
                             if fresh.reload_models {
                                 let roots = self
@@ -1912,7 +1978,33 @@ impl App {
                                     format!("子层重查失败，这一层保持原样：{reason}"),
                                 );
                             }
-                            self.tree.prune_unreachable();
+                            let removed = self.tree.prune_unreachable(&previously_known);
+                            let unload = forget_removed_models(
+                                &mut self.model_scopes,
+                                &mut self.loaded_models,
+                                &removed,
+                            );
+                            if !unload.is_empty() {
+                                let removed_set: HashSet<_> = removed.iter().copied().collect();
+                                let unload_set: HashSet<_> = unload.iter().copied().collect();
+                                self.model_scope_pending
+                                    .retain(|refno| !removed_set.contains(refno));
+                                self.model_show_waiting
+                                    .retain(|refno| !unload_set.contains(refno));
+                                self.view3d_commands.push(Cmd::Model(
+                                    plant_ui::ModelAction::Unload {
+                                        refnos: unload.clone(),
+                                    },
+                                ));
+                                self.logs.info(
+                                    &mut self.vm.logs,
+                                    format!(
+                                        "取回工作卸载：{} 个树节点消失，清理 {} 个模型引用",
+                                        removed.len(),
+                                        unload.len()
+                                    ),
+                                );
+                            }
                             // 清扫可以把待滚动路径上的某一节摘掉（元素被删或挪了
                             // OWNER）。那条路径已经通不到目标，待滚动跟着结束。
                             self.drop_locate_off_the_tree();
@@ -1924,7 +2016,19 @@ impl App {
                             // 数据缓存刚换代，属性、归属与房间面板集都不能继续沿用。
                             self.clear_room_xray();
                             self.room_panel_cache.clear();
-                            if let Some(refno) = self.vm.selection.primary() {
+                            let primary_before = self.vm.selection.primary();
+                            let removed_set: HashSet<_> = removed.iter().copied().collect();
+                            let mut selection = self.vm.selection.clone();
+                            selection.retain(|refno| !removed_set.contains(&refno));
+                            self.set_selection(selection);
+                            // 主选中没变时 set_selection 不重查；GET WORK 已让数据
+                            // 快照换代，仍需主动刷新。主选中改变时 set_selection 已查过。
+                            if let Some(refno) = self
+                                .vm
+                                .selection
+                                .primary()
+                                .filter(|refno| Some(*refno) == primary_before)
+                            {
                                 self.refetch_props(refno);
                                 self.refetch_rooms(refno);
                             }
@@ -3369,9 +3473,9 @@ mod tests {
         RowVisibility, TreeModel, TreeRowVm, Window, background_models_settled, begin_get_work,
         cache_model_scope, claim_unloaded_model_refnos, command_reply_is_current,
         expand_room_model_targets, finished_after, in_mdb_path, mark_model_scope_unavailable,
-        model_progress_terminal, model_reload_due, model_visibility_plan, needs_children_query,
-        refresh_anchor, resolve_panel_room_reply, restore_model_reload, settle_pending_directions,
-        settled_pending_roots, sync_ime_window, task_matches_project,
+        forget_removed_models, model_progress_terminal, model_reload_due, model_visibility_plan,
+        needs_children_query, refresh_anchor, resolve_panel_room_reply, restore_model_reload,
+        settle_pending_directions, settled_pending_roots, sync_ime_window, task_matches_project,
     };
     use chrono::{TimeZone, Utc};
     use plant_ui::model_update::PendingModelUnit;
@@ -3468,6 +3572,81 @@ mod tests {
 
         assert_eq!(kept, 3);
         assert_eq!(loaded, HashSet::from([branch, already_loaded]));
+    }
+
+    #[test]
+    fn get_work_reports_removed_subtree_and_clears_its_ui_state() {
+        let site = RefU64(1);
+        let zone = RefU64(2);
+        let equipment = RefU64(3);
+        let primitive = RefU64(4);
+        let collapsed_descendant_model = RefU64(99);
+        let mut tree = TreeModel {
+            roots: vec![node(site, "SITE", 1)],
+            ..Default::default()
+        };
+        tree.children.insert(site, vec![node(zone, "ZONE", 1)]);
+        tree.children.insert(zone, vec![node(equipment, "EQUI", 1)]);
+        tree.children
+            .insert(equipment, vec![node(primitive, "BOX", 0)]);
+        tree.parent
+            .extend([(zone, site), (equipment, zone), (primitive, equipment)]);
+        tree.expanded.extend([site, zone, equipment]);
+        tree.visibility.insert(
+            primitive,
+            ModelVisibility {
+                visible: true,
+                mesh_loaded: 1,
+                mesh_failed: 0,
+            },
+        );
+        tree.visibility.insert(
+            collapsed_descendant_model,
+            ModelVisibility {
+                visible: true,
+                mesh_loaded: 1,
+                mesh_failed: 0,
+            },
+        );
+        tree.pending_direction.insert(equipment, true);
+        tree.pending_visibility
+            .insert(equipment, RowVisibility::Shown);
+        tree.visibility_unavailable.insert(primitive);
+        let previously_known = tree.known_refnos();
+
+        // GET WORK says the equipment is no longer a child of the zone. Its cached
+        // primitive remains until reachability is recomputed from SITE.
+        tree.children.insert(zone, Vec::new());
+        let removed = tree.prune_unreachable(&previously_known);
+
+        assert_eq!(removed, vec![equipment, primitive]);
+        assert!(!tree.children.contains_key(&equipment));
+        assert!(!tree.parent.contains_key(&equipment));
+        assert!(!tree.parent.contains_key(&primitive));
+        assert!(!tree.expanded.contains(&equipment));
+        assert!(!tree.visibility.contains_key(&primitive));
+        assert!(tree.visibility.contains_key(&collapsed_descendant_model));
+        assert!(!tree.pending_direction.contains_key(&equipment));
+        assert!(!tree.pending_visibility.contains_key(&equipment));
+        assert!(!tree.visibility_unavailable.contains(&primitive));
+    }
+
+    #[test]
+    fn deleted_tree_target_forgets_owned_models_for_refno_reuse() {
+        let equipment = RefU64(3);
+        let primitive = RefU64(4);
+        let kept = RefU64(5);
+        let mut scopes = HashMap::from([
+            (equipment, vec![primitive]),
+            (kept, vec![kept]),
+        ]);
+        let mut loaded = HashSet::from([primitive, kept]);
+
+        let unload = forget_removed_models(&mut scopes, &mut loaded, &[equipment]);
+
+        assert_eq!(unload, vec![equipment, primitive]);
+        assert_eq!(scopes, HashMap::from([(kept, vec![kept])]));
+        assert_eq!(loaded, HashSet::from([kept]));
     }
 
     #[test]

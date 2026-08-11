@@ -264,6 +264,15 @@ impl View3d {
     }
 
     pub fn model(&mut self, action: ModelAction) {
+        if let ModelAction::Unload { refnos } = &action {
+            let removed: HashSet<_> = refnos.iter().copied().collect();
+            for batch in &mut self.pending_models {
+                batch.retain(|model| {
+                    !removed.contains(&model.refno.refno())
+                        && !removed.contains(&model.owner.refno())
+                });
+            }
+        }
         record_model_visibility(&action, &mut self.desired_visibility);
         self.commands.push_back(ViewCommand::Model(action));
     }
@@ -473,12 +482,23 @@ impl ModelBatch {
             Self::Replace(models) | Self::Append(models) => models,
         }
     }
+
+    fn retain(&mut self, keep: impl FnMut(&GeomInstQuery) -> bool) {
+        match self {
+            Self::Replace(models) | Self::Append(models) => models.retain(keep),
+        }
+    }
 }
 
 fn record_model_visibility(action: &ModelAction, desired: &mut HashMap<RefU64, bool>) {
     match action {
         ModelAction::SetVisible { refnos, visible } => {
             desired.extend(refnos.iter().copied().map(|refno| (refno, *visible)));
+        }
+        ModelAction::Unload { refnos } => {
+            for refno in refnos {
+                desired.remove(refno);
+            }
         }
         ModelAction::HideAll => desired.values_mut().for_each(|visible| *visible = false),
         ModelAction::ShowAll => desired.values_mut().for_each(|visible| *visible = true),
@@ -1378,15 +1398,38 @@ fn apply_resize(
     });
 }
 
+fn forget_model_state(view: &mut View3d, removed: &HashSet<RefU64>) {
+    view.desired_visibility
+        .retain(|refno, _| !removed.contains(refno));
+    view.render_states
+        .retain(|refno, _| !removed.contains(refno));
+    view.render_dirty.retain(|refno| !removed.contains(refno));
+    view.bounds.retain(|refno, _| !removed.contains(refno));
+    view.loading_meshes
+        .retain(|mesh| !removed.contains(&mesh.refno));
+    view.failed_meshes
+        .retain(|mesh| !removed.contains(&mesh.refno));
+    view.retrying_meshes
+        .retain(|mesh| !removed.contains(&mesh.mesh.refno));
+    view.selected.retain(|refno| !removed.contains(refno));
+    view.xray.retain(|refno| !removed.contains(refno));
+    if let Some(snapshot) = &mut view.isolate_restore {
+        snapshot.retain(|refno, _| !removed.contains(refno));
+    }
+    view.selection_dirty = true;
+    view.material_dirty = true;
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_commands(
+    mut commands: Commands,
     mut view: ResMut<View3d>,
     mut orbit: ResMut<OrbitCamera>,
     mut camera: Query<
         (&Camera, &GlobalTransform, &mut Transform, &mut Projection),
         With<ViewCamera>,
     >,
-    mut roots: Query<(&ModelRoot, &mut Visibility)>,
+    mut roots: Query<(Entity, &ModelRoot, &mut Visibility)>,
     meshes: Query<&ModelMesh>,
     mut mesh_params: ParamSet<(MeshRayCast, ResMut<Assets<Mesh>>)>,
     background: Res<BackgroundMesh>,
@@ -1434,7 +1477,7 @@ fn apply_commands(
                     // Home 键的「拉回全景」：与 FitAll 同一套可见包围盒。
                     let mut min = Vec3::splat(f32::INFINITY);
                     let mut max = Vec3::splat(f32::NEG_INFINITY);
-                    for (root, visibility) in &roots {
+                    for (_, root, visibility) in &roots {
                         if *visibility == Visibility::Hidden {
                             continue;
                         }
@@ -1459,9 +1502,25 @@ fn apply_commands(
                         view.material_dirty = true;
                     }
                 }
+                ModelAction::Unload { refnos } => {
+                    let targets: HashSet<_> = refnos.into_iter().collect();
+                    let mut removed = HashSet::new();
+                    let mut entities = Vec::new();
+                    for (entity, root, _) in &mut roots {
+                        if targets.contains(&root.refno) || targets.contains(&root.owner) {
+                            removed.insert(root.refno);
+                            entities.push(entity);
+                        }
+                    }
+                    for entity in entities {
+                        commands.entity(entity).despawn();
+                    }
+                    removed.extend(targets);
+                    forget_model_state(&mut view, &removed);
+                }
                 ModelAction::SetVisible { refnos, visible } => {
                     let mut applied = Vec::new();
-                    for (root, mut visibility) in &mut roots {
+                    for (_, root, mut visibility) in &mut roots {
                         if refnos.contains(&root.refno) || refnos.contains(&root.owner) {
                             *visibility = if visible {
                                 Visibility::Visible
@@ -1475,7 +1534,7 @@ fn apply_commands(
                 }
                 ModelAction::HideAll => {
                     let mut applied = Vec::new();
-                    for (root, mut visibility) in &mut roots {
+                    for (_, root, mut visibility) in &mut roots {
                         *visibility = Visibility::Hidden;
                         applied.push(root.refno);
                     }
@@ -1483,7 +1542,7 @@ fn apply_commands(
                 }
                 ModelAction::ShowAll => {
                     let mut applied = Vec::new();
-                    for (root, mut visibility) in &mut roots {
+                    for (_, root, mut visibility) in &mut roots {
                         *visibility = Visibility::Visible;
                         applied.push(root.refno);
                     }
@@ -1515,7 +1574,7 @@ fn apply_commands(
                         view.isolate_restore = Some(
                             roots
                                 .iter()
-                                .map(|(root, visibility)| {
+                                .map(|(_, root, visibility)| {
                                     (root.refno, *visibility != Visibility::Hidden)
                                 })
                                 .collect(),
@@ -1523,7 +1582,7 @@ fn apply_commands(
                     }
                     let mut shown = Vec::new();
                     let mut hidden = Vec::new();
-                    for (root, mut visibility) in &mut roots {
+                    for (_, root, mut visibility) in &mut roots {
                         let keep = refnos.contains(&root.refno) || refnos.contains(&root.owner);
                         *visibility = if keep {
                             Visibility::Visible
@@ -1543,7 +1602,7 @@ fn apply_commands(
                     if let Some(snapshot) = view.isolate_restore.take() {
                         let mut shown = Vec::new();
                         let mut hidden = Vec::new();
-                        for (root, mut visibility) in &mut roots {
+                        for (_, root, mut visibility) in &mut roots {
                             // 快照之后才加载进来的模型不在账上，按可见处理。
                             let visible = snapshot.get(&root.refno).copied().unwrap_or(true);
                             *visibility = if visible {
@@ -1564,7 +1623,7 @@ fn apply_commands(
                 ModelAction::FitAll => {
                     let mut min = Vec3::splat(f32::INFINITY);
                     let mut max = Vec3::splat(f32::NEG_INFINITY);
-                    for (root, visibility) in &roots {
+                    for (_, root, visibility) in &roots {
                         if *visibility == Visibility::Hidden {
                             continue;
                         }
@@ -2168,6 +2227,56 @@ mod tests {
             &mut desired,
         );
         assert_eq!(desired.get(&target), Some(&false));
+    }
+
+    #[test]
+    fn unloading_a_model_forgets_its_render_and_interaction_state() {
+        let removed = RefU64::from(42);
+        let kept = RefU64::from(43);
+        let mut view = test_view();
+        for refno in [removed, kept] {
+            view.desired_visibility.insert(refno, true);
+            view.render_states.insert(
+                refno,
+                RenderState {
+                    visible: true,
+                    mesh_total: 1,
+                    mesh_loaded: 1,
+                    mesh_failed: 0,
+                },
+            );
+            view.render_dirty.insert(refno);
+            view.bounds.insert(refno, (Vec3::ZERO, Vec3::ONE));
+            view.selected.insert(refno);
+            view.xray.insert(refno);
+        }
+        view.isolate_restore = Some(HashMap::from([(removed, true), (kept, false)]));
+
+        record_model_visibility(
+            &ModelAction::Unload {
+                refnos: vec![removed],
+            },
+            &mut view.desired_visibility,
+        );
+        forget_model_state(&mut view, &HashSet::from([removed]));
+
+        assert!(!view.desired_visibility.contains_key(&removed));
+        assert!(!view.render_states.contains_key(&removed));
+        assert!(!view.render_dirty.contains(&removed));
+        assert!(!view.bounds.contains_key(&removed));
+        assert!(!view.selected.contains(&removed));
+        assert!(!view.xray.contains(&removed));
+        assert!(
+            !view
+                .isolate_restore
+                .as_ref()
+                .unwrap()
+                .contains_key(&removed)
+        );
+        assert!(view.render_states.contains_key(&kept));
+        assert!(view.selected.contains(&kept));
+        assert!(view.selection_dirty);
+        assert!(view.material_dirty);
     }
 
     #[test]
