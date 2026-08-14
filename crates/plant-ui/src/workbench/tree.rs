@@ -96,6 +96,18 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                                     )
                                 })
                                 .inner;
+                            // 自动化只认真正的树行：AccessKit 角色负责排除命令历史、
+                            // 属性面板和状态栏，标签里的 refno 则提供跨重命名稳定身份。
+                            // 当前名称仍随数据刷新，便于同时断言 rename 的新旧语义。
+                            let accessible_label =
+                                tree_item_accessible_label(row.refno, row.name.as_str());
+                            ui.ctx().accesskit_node_builder(out.response.id, |node| {
+                                node.set_role(egui::accesskit::Role::TreeItem);
+                                node.set_label(accessible_label);
+                                if let Some(expanded) = row.expandable {
+                                    node.set_expanded(expanded);
+                                }
+                            });
                             // 点箭头只折叠 / 展开；点眼睛只切可见性；点行其他区域选中；
                             // 双击整行也展开。`clicked` / `double_clicked` 都只认主键，
                             // 右键落不进这几支——右键在下面单独处理。
@@ -152,6 +164,10 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                 });
         }
     }
+}
+
+fn tree_item_accessible_label(refno: aios_core::RefU64, name: &str) -> String {
+    format!("refno={refno}; name={name}")
 }
 
 /// Vm 的四态可见性翻成组件层的画法。两个枚举是同一件事在两层的说法——
@@ -487,4 +503,21 @@ fn note(ui: &mut Ui, t: &Tokens, d: Density, state: PaneState, icon: &str, text:
             retry: state == PaneState::Error,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tree_item_accessible_label;
+    use aios_core::RefU64;
+
+    #[test]
+    fn accessible_tree_identity_survives_rename_without_name_matching() {
+        let refno = RefU64(0x1234);
+        let before = tree_item_accessible_label(refno, "OLD-EQUI");
+        let after = tree_item_accessible_label(refno, "NEW-EQUI");
+        assert!(before.contains(&format!("refno={refno}")));
+        assert!(after.contains(&format!("refno={refno}")));
+        assert!(!after.contains("OLD-EQUI"));
+        assert!(after.contains("name=NEW-EQUI"));
+    }
 }

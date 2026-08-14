@@ -1,4 +1,5 @@
-//! 设置落盘：`<exe 旁>/config/settings.ron`。
+//! 设置落盘：生产默认 `<exe 旁>/config/settings.ron`；测试可用
+//! `PLANT_UI_SETTINGS_FILE=<absolute path>` 完全隔离。
 //!
 //! 位置沿用 `DbOption.toml` 那条房规——配置跟着发行包走，一份发行包一份设置。开发
 //! 构建落在 `target/debug/config/` 下，`cargo clean` 会一并带走；那是可接受的，
@@ -11,21 +12,36 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use plant_ui::settings::Settings;
 
 const DIR_NAME: &str = "config";
 const FILE_NAME: &str = "settings.ron";
 
-/// 设置文件的位置。读不到可执行文件路径时退回当前工作目录。
+const SETTINGS_FILE_ENV: &str = "PLANT_UI_SETTINGS_FILE";
+
+fn resolve_path(override_path: Option<OsString>, fallback: PathBuf) -> Result<PathBuf> {
+    let Some(raw) = override_path.filter(|value| !value.to_string_lossy().trim().is_empty()) else {
+        return Ok(fallback);
+    };
+    let path = PathBuf::from(raw);
+    if !path.is_absolute() {
+        bail!("{SETTINGS_FILE_ENV} 必须是绝对路径：{}", path.display());
+    }
+    Ok(path)
+}
+
+/// 设置文件的位置。读不到可执行文件路径时退回当前工作目录。测试覆盖只接受绝对路径，
+/// 避免 UI 工作目录变化时悄悄读写另一份开发者设置。
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-pub fn path() -> PathBuf {
-    std::env::current_exe()
+pub fn path() -> Result<PathBuf> {
+    let fallback = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf))
         .unwrap_or_default()
         .join(DIR_NAME)
-        .join(FILE_NAME)
+        .join(FILE_NAME);
+    resolve_path(std::env::var_os(SETTINGS_FILE_ENV), fallback)
 }
 
 /// 读一次设置。
@@ -35,7 +51,7 @@ pub fn path() -> PathBuf {
 /// 界面找半天。
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub fn load() -> Result<Option<Settings>> {
-    let path = path();
+    let path = path()?;
     if !path.is_file() {
         return Ok(None);
     }
@@ -48,7 +64,7 @@ pub fn load() -> Result<Option<Settings>> {
 
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub fn save(settings: &Settings) -> Result<()> {
-    let path = path();
+    let path = path()?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("创建设置目录失败：{}", dir.display()))?;
@@ -163,6 +179,17 @@ mod tests {
         let text =
             ron::ser::to_string_pretty(&settings, ron::ser::PrettyConfig::default()).unwrap();
         assert_eq!(ron::from_str::<Settings>(&text).unwrap(), settings);
+    }
+
+    #[test]
+    fn settings_file_override_is_absolute_and_isolated() {
+        let fallback = PathBuf::from("D:/release/config/settings.ron");
+        assert_eq!(
+            resolve_path(Some("D:/l3/run/settings.ron".into()), fallback.clone()).unwrap(),
+            PathBuf::from("D:/l3/run/settings.ron")
+        );
+        assert_eq!(resolve_path(None, fallback.clone()).unwrap(), fallback);
+        assert!(resolve_path(Some("run/settings.ron".into()), PathBuf::new()).is_err());
     }
 
     /// 存量文件里没有的字段要能补上默认值，不能整份读失败——否则一次升级就把
