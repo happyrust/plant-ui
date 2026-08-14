@@ -17,6 +17,9 @@ pub struct WorkbenchVm {
     pub user: String,
     /// 数据源是否就绪（状态栏指示点）。
     pub data_source_ok: bool,
+    /// 数据树、属性与三维都越过同一个增量刷新屏障后递增。自动化用它确认自己
+    /// 观察的不是数据批次结束前的旧一帧。
+    pub refresh_generation: u64,
     /// 有一次取回工作正在跑。菜单据此置灰，免得连点堆出几轮全量重载。
     pub get_work_busy: bool,
     /// 设计库里还没被应用到模型的会话数；`None` = 还没读到，那一行整个不画。

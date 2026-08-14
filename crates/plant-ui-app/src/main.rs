@@ -876,6 +876,8 @@ struct App {
     model_reload_owed: bool,
     /// 已经发出一次为清偿欠账的模型刷新；失败时必须把欠账恢复。
     model_reload_in_flight: bool,
+    /// 增量整场查询已经完成，正等 View3d 报 mesh/AABB 全部落地。
+    refresh_generation_pending: bool,
     /// 还没回包的那一次房间视图请求（`Cmd::FocusRoom` -> `Req::RoomDetail`）。
     /// 同时只留一个：连点两间房只聚焦最后一间，晚到的旧详情靠它认出来丢掉。
     focus_room_pending: Option<RefU64>,
@@ -995,8 +997,39 @@ fn in_mdb_path(chain: &[RefU64], is_root: impl Fn(RefU64) -> bool) -> Option<Vec
     Some(chain[1..=anchor].to_vec())
 }
 
-fn background_models_settled(pending_known: bool, pending_empty: bool, queue_empty: bool) -> bool {
-    pending_known && pending_empty && queue_empty
+fn background_models_settled(
+    pending_known: bool,
+    pending_empty: bool,
+    queue_empty: bool,
+    model_drains_known: bool,
+    model_drains_idle: bool,
+) -> bool {
+    pending_known && pending_empty && queue_empty && model_drains_known && model_drains_idle
+}
+
+fn model_drains_idle(tasks: &[task_queue::TaskEntry], project: &str) -> bool {
+    tasks.iter().all(|task| {
+        task.kind != task_queue::KIND_MODEL_DRAIN
+            || !task_matches_project(&task.project, project)
+            || task.terminal()
+    })
+}
+
+fn complete_refresh_generation(pending: &mut bool, generation: &mut u64) -> bool {
+    if !std::mem::take(pending) {
+        return false;
+    }
+    *generation = generation.saturating_add(1);
+    true
+}
+
+fn settle_refresh_generation(pending: &mut bool, generation: &mut u64, mesh_ok: bool) -> bool {
+    if mesh_ok {
+        complete_refresh_generation(pending, generation)
+    } else {
+        *pending = false;
+        false
+    }
 }
 
 fn model_reload_due(owed: &mut bool, refresh_observed: bool, models_settled: bool) -> bool {
@@ -1195,6 +1228,7 @@ impl App {
             model_reload_ready: false,
             model_reload_owed: false,
             model_reload_in_flight: false,
+            refresh_generation_pending: false,
             focus_room_pending: None,
             xray_room_pending: None,
             xray_active_room: None,
@@ -1535,6 +1569,7 @@ impl App {
                             self.run_deferred_get_work();
                             let mesh_count =
                                 models.iter().map(|model| model.insts.len()).sum::<usize>();
+                            self.refresh_generation_pending |= debt_reload;
                             self.pending_incremental_models.clear();
                             self.model_show_waiting.clear();
                             self.latest_mesh_progress = None;
@@ -1962,6 +1997,8 @@ impl App {
                                 poll.pending_known,
                                 poll.pending.is_empty(),
                                 poll.queue.rows.is_empty(),
+                                poll.tasks_error.is_none(),
+                                model_drains_idle(&poll.tasks, &self.vm.project),
                             );
                             let reload_due = model_reload_due(
                                 &mut self.model_reload_owed,
@@ -2120,7 +2157,27 @@ impl App {
 
     fn sync_mesh_progress(&mut self, progress: plant_ui_view3d::MeshLoadProgress) {
         self.latest_mesh_progress = (!progress.finished()).then(|| progress.clone());
+        if progress.finished() {
+            let before = self.vm.refresh_generation;
+            if settle_refresh_generation(
+                &mut self.refresh_generation_pending,
+                &mut self.vm.refresh_generation,
+                progress.errors.is_empty(),
+            ) {
+                self.log_refresh_generation();
+            }
+            debug_assert!(self.vm.refresh_generation >= before);
+        }
         if self.model_show_waiting.is_empty() {
+            if progress.finished() && !progress.errors.is_empty() {
+                let error = anyhow::anyhow!(progress.errors.join("\n"));
+                self.logs.error(
+                    &mut self.vm.logs,
+                    format!("增量刷新网格失败：{} 个", progress.errors.len()),
+                    &error,
+                    None,
+                );
+            }
             return;
         }
         self.model_progress_until = None;
@@ -2168,6 +2225,16 @@ impl App {
             self.model_scope_failures += progress.errors.len();
             self.finish_model_progress("模型加载完成");
         }
+    }
+
+    fn log_refresh_generation(&mut self) {
+        self.logs.info(
+            &mut self.vm.logs,
+            format!(
+                "UI 刷新屏障完成：generation {}（树、属性、mesh/AABB 已收敛）",
+                self.vm.refresh_generation
+            ),
+        );
     }
 
     /// 收下 View3d 的实际渲染回执，整批更新 eye。
@@ -3189,6 +3256,8 @@ impl App {
         self.model_reload_ready = false;
         self.model_reload_owed = false;
         self.model_reload_in_flight = false;
+        self.refresh_generation_pending = false;
+        self.vm.refresh_generation = 0;
         self.vm.project_code.clear();
         self.vm.element_count = 0;
         self.vm.selection.clear();
@@ -3368,9 +3437,10 @@ mod tests {
         EleTreeNode, ModelVisibility, ModelVisibilityPlan, PanelRoomResolution, RefU64,
         RowVisibility, TreeModel, TreeRowVm, Window, background_models_settled, begin_get_work,
         cache_model_scope, claim_unloaded_model_refnos, command_reply_is_current,
-        expand_room_model_targets, finished_after, in_mdb_path, mark_model_scope_unavailable,
-        model_progress_terminal, model_reload_due, model_visibility_plan, needs_children_query,
-        refresh_anchor, resolve_panel_room_reply, restore_model_reload, settle_pending_directions,
+        complete_refresh_generation, expand_room_model_targets, finished_after, in_mdb_path,
+        mark_model_scope_unavailable, model_drains_idle, model_progress_terminal, model_reload_due,
+        model_visibility_plan, needs_children_query, refresh_anchor, resolve_panel_room_reply,
+        restore_model_reload, settle_pending_directions, settle_refresh_generation,
         settled_pending_roots, sync_ime_window, task_matches_project,
     };
     use chrono::{TimeZone, Utc};
@@ -4039,10 +4109,59 @@ mod tests {
         let mut owed = false;
         assert!(!model_reload_due(&mut owed, true, false));
         assert!(owed);
-        assert!(!background_models_settled(false, true, true));
-        assert!(!background_models_settled(true, true, false));
-        assert!(background_models_settled(true, true, true));
+        assert!(!background_models_settled(false, true, true, true, true));
+        assert!(!background_models_settled(true, true, false, true, true));
+        assert!(!background_models_settled(true, true, true, false, true));
+        assert!(!background_models_settled(true, true, true, true, false));
+        assert!(background_models_settled(true, true, true, true, true));
         assert!(model_reload_due(&mut owed, false, true));
+    }
+
+    #[test]
+    fn a_running_model_drain_holds_the_ui_refresh_barrier_but_yielded_is_terminal() {
+        let mut drain = plant_ui::task_queue::TaskEntry {
+            task_id: "model-1".into(),
+            kind: plant_ui::task_queue::KIND_MODEL_DRAIN.into(),
+            state: "running".into(),
+            project: "P".into(),
+            ..Default::default()
+        };
+        assert!(!model_drains_idle(std::slice::from_ref(&drain), "P"));
+        assert!(model_drains_idle(std::slice::from_ref(&drain), "OTHER"));
+        drain.state = "yielded".into();
+        assert!(model_drains_idle(&[drain], "P"));
+    }
+
+    #[test]
+    fn refresh_generation_publishes_once_per_completed_barrier() {
+        let mut pending = true;
+        let mut generation = 7;
+        assert!(complete_refresh_generation(&mut pending, &mut generation));
+        assert_eq!(generation, 8);
+        assert!(!complete_refresh_generation(&mut pending, &mut generation));
+        assert_eq!(generation, 8);
+    }
+
+    #[test]
+    fn mesh_failure_consumes_the_pending_barrier_without_publishing_generation() {
+        let mut pending = true;
+        let mut generation = 7;
+        assert!(!settle_refresh_generation(
+            &mut pending,
+            &mut generation,
+            false
+        ));
+        assert!(!pending);
+        assert_eq!(generation, 7);
+        assert!(!settle_refresh_generation(
+            &mut pending,
+            &mut generation,
+            true
+        ));
+        assert_eq!(
+            generation, 7,
+            "later unrelated mesh success must not publish"
+        );
     }
 
     #[test]

@@ -243,6 +243,13 @@ pub fn status_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
 
                 queue_count(ui, t, d, vm);
 
+                divider(ui, t, d);
+                ui.label(
+                    RichText::new(format!("刷新 {}", vm.refresh_generation))
+                        .font(Font::mono_micro(d))
+                        .color(t.text_muted),
+                );
+
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(
                         RichText::new(vm.element_count.to_string())

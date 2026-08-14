@@ -167,7 +167,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
 }
 
 fn tree_item_accessible_label(refno: aios_core::RefU64, name: &str) -> String {
-    format!("refno={refno}; name={name}")
+    format!("refno={}; name={name}", refno.to_slash_string())
 }
 
 /// Vm 的四态可见性翻成组件层的画法。两个枚举是同一件事在两层的说法——
@@ -515,8 +515,9 @@ mod tests {
         let refno = RefU64(0x1234);
         let before = tree_item_accessible_label(refno, "OLD-EQUI");
         let after = tree_item_accessible_label(refno, "NEW-EQUI");
-        assert!(before.contains(&format!("refno={refno}")));
-        assert!(after.contains(&format!("refno={refno}")));
+        assert!(before.contains("refno=0/4660"));
+        assert!(after.contains("refno=0/4660"));
+        assert!(!after.contains("refno=0_4660"));
         assert!(!after.contains("OLD-EQUI"));
         assert!(after.contains("name=NEW-EQUI"));
     }

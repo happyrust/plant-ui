@@ -33,6 +33,8 @@ use crate::style::widgets;
 
 /// 数据批次任务。`manual_update` 那个 kind 随心脏改造退役，不再产生新行。
 pub const KIND_DATA_BATCH: &str = "data_batch";
+/// 数据阶段之后的持久模型工作消费者。它会因新数据让位，`yielded` 是终态而不是失败。
+pub const KIND_MODEL_DRAIN: &str = "model_drain";
 /// 房间归属重算轮。它与 dbnum 列表平级，不挂在任何 dbnum 行下（ADR-0011）。
 pub const KIND_ROOM_RECALC: &str = "room_recalc";
 
@@ -120,7 +122,10 @@ where
 
 impl TaskEntry {
     pub fn terminal(&self) -> bool {
-        matches!(self.state.as_str(), "succeeded" | "partial" | "failed")
+        matches!(
+            self.state.as_str(),
+            "succeeded" | "partial" | "failed" | "yielded"
+        )
     }
 
     /// 本批次里没能生成出来的交付单元。终态摘要给得出，不必等持久表。

@@ -1178,12 +1178,17 @@ fn load_models(
         view.render_dirty.insert(refno);
     }
     view.loading_meshes.extend(loading_meshes);
-    if !view.loading_meshes.is_empty() {
-        view.mesh_progress = Some(MeshLoadProgress {
-            done: 0,
-            total: view.loading_meshes.len(),
-            errors: Vec::new(),
-        });
+    // Even an empty replacement is observable only after this system has cleared the old
+    // scene. Reporting a terminal 0/0 batch here lets the host publish its refresh generation
+    // on the following frame instead of doing so before `View3d::load` is consumed.
+    view.mesh_progress = Some(begin_mesh_progress(view.loading_meshes.len()));
+}
+
+fn begin_mesh_progress(total: usize) -> MeshLoadProgress {
+    MeshLoadProgress {
+        done: 0,
+        total,
+        errors: Vec::new(),
     }
 }
 
@@ -2215,6 +2220,13 @@ mod tests {
 
         assert_eq!(view.take_mesh_progress().unwrap().errors.len(), 1);
         assert!(view.take_mesh_progress().is_none());
+    }
+
+    #[test]
+    fn an_empty_replacement_reports_terminal_progress_after_scene_consumption() {
+        let progress = begin_mesh_progress(0);
+        assert!(progress.finished());
+        assert!(progress.errors.is_empty());
     }
 
     #[test]
