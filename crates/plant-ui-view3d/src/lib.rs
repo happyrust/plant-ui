@@ -70,9 +70,13 @@ const GRID_MAX_MM: f32 = 1_000_000.0;
 /// 开机档位：一格 1 世界单位。首帧 `update_grid` 就按相机距离改写它，这个值
 /// 只决定「相机第一帧就位之前」那一瞬间的网格。
 const INITIAL_GRID_LEVEL: f32 = 1.0;
-/// 原点三轴长（单位：格）。轴比网格短，尖端落在格子里而不是伸出场外；
-/// 格距既然是圆整的真实长度，轴长就是它的 `AXIS_CELLS` 倍。
-const AXIS_CELLS: f32 = 6.0;
+/// 原点三轴长（单位：格）。整根轴挂在网格档位上等比缩放，取一格意味着它在
+/// 屏幕上恒定占 `1 / GRID_CELLS_ACROSS` 的宽度，不随远近变大；单臂长度也正好
+/// 等于 HUD 报的那句「一格 N m」，三轴顺带当比例尺。
+const AXIS_CELLS: f32 = 1.0;
+/// 轴端箭头高（同为格数）。箭头底面要严丝合缝接在杆末端、轴标签又要落在箭尖
+/// 之外，两处位置都从它推，别再各写各的常数。
+const AXIS_TIP_HEIGHT: f32 = 0.18;
 /// X / Y / Z 轴的世界方向：PDMS 的 X、Y、Z 过了装载旋转就是这三条。
 const AXIS_DIRS: [Vec3; 3] = [Vec3::X, Vec3::NEG_Z, Vec3::Y];
 /// X 红 / Y 绿 / Z 蓝（S1-B 稿取值）。egui 侧轴标签用同一组色，两处要一致。
@@ -786,10 +790,12 @@ fn setup(
         })),
         Transform::IDENTITY,
     ));
-    let rod_mesh = meshes.add(Cylinder::new(0.032, AXIS_CELLS));
+    // 杆径不跟着臂长等比走：臂长收到一格后按比例算出来的杆会细进亚像素，
+    // 这里单独定在屏幕上约 3px 的粗细上。
+    let rod_mesh = meshes.add(Cylinder::new(0.015, AXIS_CELLS));
     let tip_mesh = meshes.add(Cone {
-        radius: 0.11,
-        height: 0.45,
+        radius: 0.05,
+        height: AXIS_TIP_HEIGHT,
     });
     // 把「+Y 朝向」的圆柱掰到各轴的世界方向上：X 红、Y(PDMS) 绿即 -Z、Z(PDMS) 蓝即 +Y。
     let axis_rotations = [
@@ -816,7 +822,7 @@ fn setup(
                         arm.spawn((
                             Mesh3d(tip_mesh.clone()),
                             MeshMaterial3d(material),
-                            Transform::from_xyz(0.0, AXIS_CELLS + 0.22, 0.0),
+                            Transform::from_xyz(0.0, AXIS_CELLS + AXIS_TIP_HEIGHT / 2.0, 0.0),
                         ));
                     });
             }
@@ -965,7 +971,8 @@ fn publish_camera(
         m.z_axis.to_array(),
     ];
     view.grid_cell_mm = grid.level * MM_PER_WORLD;
-    let tip = (AXIS_CELLS + 0.9) * grid.level;
+    // 标签落在箭尖再往外一个箭头高的位置，跟轴端留出一点空隙。
+    let tip = (AXIS_CELLS + AXIS_TIP_HEIGHT * 2.0) * grid.level;
     for (axis, dir) in AXIS_DIRS.into_iter().enumerate() {
         view.axis_labels[axis] = camera
             .world_to_ndc(transform, dir * tip)
