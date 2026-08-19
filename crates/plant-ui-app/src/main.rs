@@ -870,12 +870,14 @@ struct App {
     /// 当前 / 下一次取回工作完成后，可在终态行确认“模型树已就地刷新”的任务。
     get_work_task_ids: HashSet<String>,
     get_work_again_task_ids: HashSet<String>,
-    /// 最近一次完整队列快照确认：没有数据任务，也没有模型欠账。
-    model_reload_ready: bool,
     /// 数据已经应用，但三维仍在等后台模型全部生成完。
     model_reload_owed: bool,
     /// 已经发出一次为清偿欠账的模型刷新；失败时必须把欠账恢复。
     model_reload_in_flight: bool,
+    /// 取回工作清场前的场景快照：(模型 refno, 取回前是否可见)。只记第一次——
+    /// 清场之后场景一直是空的，重试轮次再拍只会拍到空白；重载成功落地才消费，
+    /// 失败后的欠账补载仍按这份最初的快照回放。
+    model_reload_restore: Option<Vec<(RefU64, bool)>>,
     /// 增量整场查询已经完成，正等 View3d 报 mesh/AABB 全部落地。
     refresh_generation_pending: bool,
     /// 还没回包的那一次房间视图请求（`Cmd::FocusRoom` -> `Req::RoomDetail`）。
@@ -950,6 +952,48 @@ fn begin_get_work(pending: bool, reload_models: bool, deferred: &mut Option<bool
     } else {
         true
     }
+}
+
+/// 取回工作清场前的快照：场景里每个模型 refno 配上「取回前是否可见」。
+///
+/// 方向的优先序：用户最后一次指令（`pending_direction`，模型行直接命中）>
+/// 三维实际回执（`visibility`）> 可见。最后一档兜的是「刚被显示指令带进场景、
+/// 回执还没上来」的模型。容器行上还没落地的在途指令拍不进来——反解要走范围表，
+/// 清场重装拿到的就是那条指令发出前的样子，边缘窄且诚实。
+fn reload_snapshot(
+    loaded: &HashSet<RefU64>,
+    pending_direction: &HashMap<RefU64, bool>,
+    visibility: &HashMap<RefU64, ModelVisibility>,
+) -> Vec<(RefU64, bool)> {
+    let mut snapshot: Vec<(RefU64, bool)> = loaded
+        .iter()
+        .map(|refno| {
+            let visible = pending_direction
+                .get(refno)
+                .copied()
+                .or_else(|| visibility.get(refno).map(|actual| actual.visible))
+                .unwrap_or(true);
+            (*refno, visible)
+        })
+        .collect();
+    // HashSet 迭代序不稳定，而重查请求与日志都吃这份序：排一下，可复现。
+    snapshot.sort_by_key(|(refno, _)| refno.0);
+    snapshot
+}
+
+/// 重载落地这一刻要回放的隐藏集：快照里方向为隐藏、且这次真的查了回来的那批。
+/// 快照就此消费——回放只认清场那一刻的样子，成功之后它的使命就结束了。
+fn take_hidden_for_replay(
+    restore: &mut Option<Vec<(RefU64, bool)>>,
+    loaded: &HashSet<RefU64>,
+) -> Vec<RefU64> {
+    restore
+        .take()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(refno, visible)| !visible && loaded.contains(refno))
+        .map(|(refno, _)| refno)
+        .collect()
 }
 
 fn task_matches_project(task_project: &str, project: &str) -> bool {
@@ -1225,9 +1269,9 @@ impl App {
             get_work_again: None,
             get_work_task_ids: HashSet::new(),
             get_work_again_task_ids: HashSet::new(),
-            model_reload_ready: false,
             model_reload_owed: false,
             model_reload_in_flight: false,
+            model_reload_restore: None,
             refresh_generation_pending: false,
             focus_room_pending: None,
             xray_room_pending: None,
@@ -1547,18 +1591,10 @@ impl App {
                         }
                     };
                 }
-                data::Evt::Models(true, _)
-                    if self.model_reload_in_flight && !self.model_reload_ready =>
-                {
-                    self.model_reload_in_flight = false;
-                    self.model_reload_owed = true;
-                    self.set_get_work_busy(false);
-                    self.run_deferred_get_work();
-                    self.logs.info(
-                        &mut self.vm.logs,
-                        "后台又出现更新任务，保留当前三维并等待下一次空闲",
-                    );
-                }
+                // 场景在点击取回工作那一刻已经清空，查回来的批次一律上屏：它比
+                // 空场景新，也比旧几何新。上屏时若又有新保存落库，后续自动刷新
+                // 照旧只换树并在日志里提示再点取回工作——不再整包丢弃结果，否则
+                // 空场景要一直挂到整条队列跑完（决定 4）。
                 data::Evt::Models(debt_reload, result) => {
                     if debt_reload {
                         self.model_reload_in_flight = false;
@@ -1582,28 +1618,49 @@ impl App {
                                 self.loaded_models.insert(refno);
                                 cache_model_scope(&mut self.model_scopes, refno, refno);
                             }
-                            // 整场重载：旧的实际状态全作废，新的等 View3d 装完
+                            // 清场重装：旧的实际状态全作废，新的等 View3d 装完
                             // 网格再回执上来。这中间 eye 停在未加载而不是抢先
                             // 说「已显示」。
                             self.tree.visibility.clear();
                             self.tree.pending_direction.clear();
+                            // 清场快照到此消费：取回前隐藏着、这次又查回来的那批
+                            // 稍后按原方向回放。
+                            let replay_hidden = take_hidden_for_replay(
+                                &mut self.model_reload_restore,
+                                &self.loaded_models,
+                            );
+                            let replay = if replay_hidden.is_empty() {
+                                String::new()
+                            } else {
+                                format!("；回放隐藏 {} 个", replay_hidden.len())
+                            };
                             self.logs.info(
                                 &mut self.vm.logs,
                                 format!(
-                                    "三维模型已就绪：{} 个元素，{} 个网格实例",
+                                    "三维模型已就绪：{} 个元素，{} 个网格实例{replay}",
                                     models.len(),
                                     mesh_count
                                 ),
                             );
+                            // 帧循环里 load 先行、隐藏方向后至但先于批次在 Bevy
+                            // 里落地：被回放的模型直接以 Hidden 出生，不会先亮
+                            // 一下再暗。
                             self.pending_models = Some(models);
+                            if !replay_hidden.is_empty() {
+                                self.set_model_visible(replay_hidden, false);
+                            }
                             dirty = true;
                         }
                         Err(error) => {
                             restore_model_reload(&mut self.model_reload_owed, debt_reload);
                             self.set_get_work_busy(false);
                             self.run_deferred_get_work();
-                            self.logs
-                                .error(&mut self.vm.logs, "三维模型查询失败", &error, None);
+                            self.logs.error(
+                                &mut self.vm.logs,
+                                "三维模型查询失败：场景已清空，队列空闲时自动重试，也可再点「取回工作」",
+                                &error,
+                                None,
+                            );
                         }
                     }
                 }
@@ -1911,13 +1968,25 @@ impl App {
                             let before = self.tree.element_count();
                             self.tree.roots = fresh.sites;
                             if fresh.reload_models {
-                                let roots = self
-                                    .tree
-                                    .roots
+                                // 重查范围 = 清场快照里的那批模型（显示 + 已隐藏），
+                                // 不再是全部 SITE 根：取回工作刷的是「已加载的三维
+                                // 模型」（CONTEXT.md），叶子 refno 当根走的是同一条
+                                // anc 索引查询（决定 6）。
+                                let roots: Vec<RefU64> = self
+                                    .model_reload_restore
+                                    .as_deref()
+                                    .unwrap_or_default()
                                     .iter()
-                                    .map(|site| site.refno.refno())
+                                    .map(|(refno, _)| *refno)
                                     .collect();
-                                if self
+                                if roots.is_empty() {
+                                    // 清场前一个模型都没有：无可重查，忙碌态与在途
+                                    // 标记就地收尾，别让人等一个不存在的回包。
+                                    self.model_reload_restore = None;
+                                    self.model_reload_in_flight = false;
+                                    self.set_get_work_busy(false);
+                                    self.run_deferred_get_work();
+                                } else if self
                                     .bridge
                                     .req
                                     .send(data::Req::Models(roots, true))
@@ -2012,7 +2081,6 @@ impl App {
                             self.queue.mdb = self.mdb.clone();
                             self.queue.namespace = self.namespace.clone();
                             self.queue.adopt(poll);
-                            self.model_reload_ready = models_settled;
                             if reload_due {
                                 self.get_work_with_models_for_tasks(true, task_ids);
                             } else if data_applied {
@@ -2023,7 +2091,6 @@ impl App {
                         }
                         // 上一份快照留在界面上，横幅把「这份是旧的」说出来。
                         Err(error) => {
-                            self.model_reload_ready = false;
                             self.queue.error = Some(logs::error_chain(&error));
                         }
                     }
@@ -2096,7 +2163,6 @@ impl App {
                 data::Evt::CommandQuery { .. } => {}
                 data::Evt::QueueProgress(task_id, event) => self.queue.apply(&task_id, event),
                 data::Evt::QueueTaskChanged => {
-                    self.model_reload_ready = false;
                     self.poll_queue_now();
                 }
                 data::Evt::QueueFeedLive => self.queue.feed = ModelUpdateFeed::Live,
@@ -2352,7 +2418,6 @@ impl App {
                     let ModelUpdateVm::Ready(preview) = &self.model_update else {
                         continue;
                     };
-                    self.model_reload_ready = false;
                     self.model_update = ModelUpdateVm::Starting(preview.clone());
                     let _ = self.bridge.req.send(data::Req::ModelUpdateExecute {
                         base: self.model_api_url.clone(),
@@ -2369,7 +2434,6 @@ impl App {
                     if !self.model_service_writable() {
                         continue;
                     }
-                    self.model_reload_ready = false;
                     // 队列面板的即时扫描没有勾选语境，走全范围（ADR-020 缺省）。
                     let _ = self.bridge.req.send(data::Req::ModelUpdateExecute {
                         base: self.model_api_url.clone(),
@@ -3019,9 +3083,10 @@ impl App {
 
     /// 取回工作：把库里此刻的样子取到界面上来。
     ///
-    /// 刷新范围只到「当前看得见的那些」——已展开、且子层已经在手里的分支，加上
-    /// 根层。没展开的分支不预取：那是把一次刷新做成一次全量拉库，而它们下次展开
-    /// 时本来就会现查。
+    /// 刷新范围只到「当前看得见的那些」——树是已展开、且子层已经在手里的分支加上
+    /// 根层；三维是清场那一刻场景里存在的那批模型（显示 + 已隐藏，见
+    /// [`Self::clear_scene_for_reload`]）。没展开的分支、没加载过的模型都不预取：
+    /// 那是把一次刷新做成一次全量拉库，它们下次展开 / 点眼睛时本来就会现查。
     ///
     /// 与 `reconnect` 的分别在这里：重连从空缓存重来，展开状态、选中、属性一起
     /// 清掉；取回工作要的恰恰是这些都留着，只换里面的内容。
@@ -3093,6 +3158,55 @@ impl App {
         } else if reload_models {
             self.model_reload_owed = false;
             self.model_reload_in_flight = true;
+            self.clear_scene_for_reload();
+        }
+    }
+
+    /// 取回工作的清场半步：拍快照、despawn 整个场景、台账复位（决定 2/5/6）。
+    ///
+    /// 这批复位原先挂在 `Evt::Models` 的成功分支里，提前到点击这一刻：eye 立刻
+    /// 回「未加载」，加载期间不抢说「已显示」（ADR-0016）；旧几何也不再在冷查询
+    /// 期间冒充新数据。`Replace(空)` 会 despawn 全部场景根，不必新造一个清空动作。
+    ///
+    /// 快照只记第一次：清场之后场景一直是空的，欠账补载那一轮再拍只会拍到空白，
+    /// 把用户真正的显示 / 隐藏冲掉。
+    fn clear_scene_for_reload(&mut self) {
+        if self.model_reload_restore.is_none() {
+            self.model_reload_restore = Some(reload_snapshot(
+                &self.loaded_models,
+                &self.tree.pending_direction,
+                &self.tree.visibility,
+            ));
+        }
+        let snapshot = self.model_reload_restore.as_deref().unwrap_or_default();
+        let total = snapshot.len();
+        let hidden = snapshot.iter().filter(|(_, visible)| !visible).count();
+        self.pending_models = Some(Vec::new());
+        self.pending_incremental_models.clear();
+        self.model_show_waiting.clear();
+        self.latest_mesh_progress = None;
+        self.model_scope_failures = 0;
+        self.model_scopes.clear();
+        self.model_scope_pending.clear();
+        // 在途的范围查询说的是清场前那个世界，回包一律作废。
+        self.model_scope_epoch = self.model_scope_epoch.wrapping_add(1);
+        self.loaded_models.clear();
+        self.tree.visibility.clear();
+        self.tree.pending_direction.clear();
+        self.tree.pending_visibility.clear();
+        self.tree.visibility_unavailable.clear();
+        self.model_progress_until = None;
+        if total == 0 {
+            self.vm.model_load = None;
+            self.logs
+                .info(&mut self.vm.logs, "三维本来就空着，这次只刷新树");
+        } else {
+            self.vm.model_load =
+                Some(ModelLoadVm::Resolving("已清空三维，正在重查模型…".into()));
+            self.logs.info(
+                &mut self.vm.logs,
+                format!("已清空三维场景：将重查 {total} 个模型（其中 {hidden} 个保持隐藏）"),
+            );
         }
     }
 
@@ -3253,9 +3367,9 @@ impl App {
         self.get_work_again = None;
         self.get_work_task_ids.clear();
         self.get_work_again_task_ids.clear();
-        self.model_reload_ready = false;
         self.model_reload_owed = false;
         self.model_reload_in_flight = false;
+        self.model_reload_restore = None;
         self.refresh_generation_pending = false;
         self.vm.refresh_generation = 0;
         self.vm.project_code.clear();
@@ -3439,9 +3553,10 @@ mod tests {
         cache_model_scope, claim_unloaded_model_refnos, command_reply_is_current,
         complete_refresh_generation, expand_room_model_targets, finished_after, in_mdb_path,
         mark_model_scope_unavailable, model_drains_idle, model_progress_terminal, model_reload_due,
-        model_visibility_plan, needs_children_query, refresh_anchor, resolve_panel_room_reply,
-        restore_model_reload, settle_pending_directions, settle_refresh_generation,
-        settled_pending_roots, sync_ime_window, task_matches_project,
+        model_visibility_plan, needs_children_query, refresh_anchor, reload_snapshot,
+        resolve_panel_room_reply, restore_model_reload, settle_pending_directions,
+        settle_refresh_generation, settled_pending_roots, sync_ime_window, take_hidden_for_replay,
+        task_matches_project,
     };
     use chrono::{TimeZone, Utc};
     use plant_ui::model_update::PendingModelUnit;
@@ -4169,6 +4284,47 @@ mod tests {
         let mut owed = false;
         restore_model_reload(&mut owed, true);
         assert!(model_reload_due(&mut owed, false, true));
+    }
+
+    #[test]
+    fn reload_snapshot_prefers_the_users_last_direction() {
+        let shown = RefU64(1);
+        let hidden = RefU64(2);
+        let toggling = RefU64(3);
+        let fresh = RefU64(4);
+        let loaded = HashSet::from([shown, hidden, toggling, fresh]);
+        let actual = |visible| ModelVisibility {
+            visible,
+            mesh_loaded: 1,
+            mesh_failed: 0,
+        };
+        let visibility = HashMap::from([
+            (shown, actual(true)),
+            (hidden, actual(false)),
+            // 用户刚点了隐藏、回执还没上来：快照信指令，不信旧回执。
+            (toggling, actual(true)),
+        ]);
+        let pending = HashMap::from([(toggling, false)]);
+
+        assert_eq!(
+            reload_snapshot(&loaded, &pending, &visibility),
+            vec![(shown, true), (hidden, false), (toggling, false), (fresh, true)],
+            "刚进场没回执的按可见记，其余按指令 > 回执"
+        );
+    }
+
+    #[test]
+    fn replay_hides_only_survivors_and_consumes_the_snapshot() {
+        let kept = RefU64(1);
+        let gone = RefU64(2);
+        let shown = RefU64(3);
+        let mut restore = Some(vec![(kept, false), (gone, false), (shown, true)]);
+        // 库里删掉的 gone 这次没查回来：不回放，免得对着空气记一笔隐藏账。
+        let loaded = HashSet::from([kept, shown]);
+
+        assert_eq!(take_hidden_for_replay(&mut restore, &loaded), vec![kept]);
+        assert!(restore.is_none(), "快照回放即消费，下一次取回重新拍");
+        assert!(take_hidden_for_replay(&mut restore, &loaded).is_empty());
     }
 
     #[test]

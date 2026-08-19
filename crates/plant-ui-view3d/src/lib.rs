@@ -506,8 +506,11 @@ fn record_applied_visibility(view: &mut View3d, applied: Vec<RefU64>, visible: b
     }
 }
 
-fn should_frame_batch(replace: bool, scene_empty: bool) -> bool {
-    replace || scene_empty
+/// 只有落进空场景的那一批需要自动取景：首个模型进场时相机多半还停在出厂
+/// 位置，不取景就是一屏空白。整场替换不再取景——取回工作的约定是回到取回
+/// 前的样子，相机也算在内（docs/plans/get-work-clear-and-reload.md 决定 5）。
+fn should_frame_batch(scene_empty: bool) -> bool {
+    scene_empty
 }
 
 fn srgb(c: egui::Color32) -> Color {
@@ -1046,7 +1049,7 @@ fn load_models(
         return;
     };
     let replace = batch.clears_scene();
-    let frame = should_frame_batch(replace, roots.is_empty());
+    let frame = should_frame_batch(roots.is_empty());
     let models = batch.into_models();
     if replace {
         view.bounds.clear();
@@ -2183,9 +2186,10 @@ mod tests {
     }
 
     #[test]
-    fn first_incremental_batch_frames_an_empty_scene() {
-        assert!(should_frame_batch(false, true));
-        assert!(!should_frame_batch(false, false));
+    fn only_a_batch_into_an_empty_scene_frames_the_camera() {
+        assert!(should_frame_batch(true));
+        // 整场替换不取景：取回工作清场重装要回到取回前的样子，相机也算在内。
+        assert!(!should_frame_batch(false));
     }
 
     #[test]
