@@ -124,6 +124,28 @@ pub struct GeomInstQuery {
     pub date: Option<surrealdb::sql::Datetime>,
 }
 
+/// 布尔成品网格已经把各正/负原语的局部变换烘进顶点；显示时只能再乘构件的
+/// `world_trans`，不能回退到正体列表后把原语缩放重复施加一次。
+fn display_insts(
+    booled_id: Option<String>,
+    positive_insts: Vec<ModelHashInst>,
+) -> (Vec<ModelHashInst>, bool) {
+    let booled_id = booled_id.filter(|id| {
+        let id = id.trim();
+        !id.is_empty() && !id.eq_ignore_ascii_case("none")
+    });
+    match booled_id {
+        Some(geo_hash) => (
+            vec![ModelHashInst {
+                geo_hash,
+                ..Default::default()
+            }],
+            true,
+        ),
+        None => (positive_insts, false),
+    }
+}
+
 /// 几何点集查询结构体
 #[derive(Serialize, Deserialize, Debug)]
 pub struct GeomPtsQuery {
@@ -213,6 +235,7 @@ pub async fn query_insts_slim(
         generic: Option<String>,
         world_aabb: Aabb,
         world_trans: Transform,
+        booled_id: Option<String>,
         insts: Vec<ModelHashInst>,
     }
     let refnos = refnos.into_iter().cloned().collect::<Vec<_>>();
@@ -221,6 +244,7 @@ pub async fn query_insts_slim(
         r#"
         select
             in as refno, anc, generic, aabb.d as world_aabb, world_trans.d as world_trans,
+            booled_id,
             (select trans.d as transform, record::id(out) as geo_hash from out->geo_relate where visible && out.meshed && trans.d != none && geo_type='Pos') as insts
         from {inst_keys} where aabb.d != none "#
     );
@@ -229,6 +253,7 @@ pub async fn query_insts_slim(
     Ok(rows
         .into_iter()
         .map(|row| {
+            let (insts, has_neg) = display_insts(row.booled_id, row.insts);
             let owner = row
                 .anc
                 .as_ref()
@@ -241,14 +266,49 @@ pub async fn query_insts_slim(
                 owner,
                 world_aabb: row.world_aabb,
                 world_trans: row.world_trans,
-                insts: row.insts,
-                has_neg: false,
+                insts,
+                has_neg,
                 generic: row.generic.unwrap_or_default(),
                 pts: None,
                 date: None,
             }
         })
         .collect())
+}
+
+#[cfg(test)]
+mod display_insts_tests {
+    use super::{ModelHashInst, Transform, display_insts};
+
+    #[test]
+    fn booled_mesh_replaces_positive_instances_with_identity_transform() {
+        let positive = ModelHashInst {
+            geo_hash: "positive".into(),
+            transform: Transform {
+                scale: glam::Vec3::new(1.0, 1.0, 234.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let (insts, has_neg) = display_insts(Some("24381_36945_63".into()), vec![positive]);
+
+        assert!(has_neg);
+        assert_eq!(insts.len(), 1);
+        assert_eq!(insts[0].geo_hash, "24381_36945_63");
+        assert_eq!(insts[0].transform.scale, glam::Vec3::ONE);
+    }
+
+    #[test]
+    fn positive_instances_remain_when_there_is_no_booled_mesh() {
+        let positive = ModelHashInst {
+            geo_hash: "positive".into(),
+            ..Default::default()
+        };
+        let (insts, has_neg) = display_insts(None, vec![positive]);
+        assert!(!has_neg);
+        assert_eq!(insts[0].geo_hash, "positive");
+    }
 }
 
 /// P4 平表读连接池：全场景重载的响应载荷在**单条 WS 连接的响应流上串行**——
