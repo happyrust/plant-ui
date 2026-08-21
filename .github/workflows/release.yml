@@ -1,59 +1,104 @@
-name: Release
+name: Build and Release
 
 on:
   push:
+    branches:
+      - publish-version
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
 
-jobs:
-  release:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
+env:
+  CARGO_TERM_COLOR: always
 
-      - uses: dtolnay/rust-toolchain@stable
+jobs:
+  build:
+    name: Windows and Web release artifacts
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
 
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: plant-ui-release
+
+      # The checked-in Cargo config points at the developer machine's complete
+      # vendored registry. GitHub-hosted runners resolve the locked graph online.
       - name: Use network dependency sources
         shell: pwsh
         run: Rename-Item .cargo/config.toml config.local.toml
 
-      - name: Verify tag and build
+      - name: Validate release version
         shell: pwsh
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"$').Matches[0].Groups[1].Value
-          if ($env:GITHUB_REF_NAME -ne "v$version") { throw "tag $env:GITHUB_REF_NAME does not match Cargo.toml $version" }
-          cargo build -p plant-ui-app --release --locked
+          "PLANT_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+          if ($env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME -ne "v$version") {
+            throw "tag $env:GITHUB_REF_NAME does not match Cargo.toml version $version"
+          }
 
-      - name: Build WASM
+      - name: Check workspace
+        shell: pwsh
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Build Windows application
+        shell: pwsh
+        run: cargo build -p rs-plant --release --locked
+
+      - name: Build Web application
         shell: pwsh
         run: ./scripts/build-wasm.ps1
 
-      - name: Package
+      - name: Package release artifacts
         shell: pwsh
         run: |
-          $name = "plant-ui-$env:GITHUB_REF_NAME-windows-x64"
-          New-Item -ItemType Directory -Path $name | Out-Null
-          Copy-Item target/release/plant-ui-app.exe "$name/"
-          Copy-Item DbOption.toml "$name/"
-          Copy-Item resource "$name/resource" -Recurse
-          Compress-Archive -Path "$name/*" -DestinationPath "$name.zip"
+          $suffix = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME } else { "v$env:PLANT_VERSION-$env:GITHUB_REF_NAME" }
 
-          $wasmName = "plant-ui-$env:GITHUB_REF_NAME-wasm"
-          New-Item -ItemType Directory -Path $wasmName | Out-Null
-          Copy-Item web/public/* "$wasmName/" -Recurse
-          Compress-Archive -Path "$wasmName/*" -DestinationPath "$wasmName.zip"
+          $windowsName = "plant-ui-$suffix-windows-x64"
+          New-Item -ItemType Directory -Path $windowsName | Out-Null
+          Copy-Item target/release/rs-plant.exe "$windowsName/"
+          Copy-Item DbOption.toml "$windowsName/"
+          Copy-Item resource "$windowsName/resource" -Recurse
+          Compress-Archive -Path "$windowsName/*" -DestinationPath "$windowsName.zip"
+
+          $webName = "plant-ui-$suffix-web"
+          New-Item -ItemType Directory -Path $webName | Out-Null
+          Copy-Item web/public/* "$webName/" -Recurse
+          Compress-Archive -Path "$webName/*" -DestinationPath "$webName.zip"
+
+          Get-FileHash "$windowsName.zip", "$webName.zip" -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  $([IO.Path]::GetFileName($_.Path))" } |
+            Set-Content -Encoding ascii SHA256SUMS
+
+      - name: Upload publishable artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: plant-ui-v${{ env.PLANT_VERSION }}-${{ github.ref_name }}
+          path: |
+            plant-ui-*.zip
+            SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Publish GitHub release
+        if: github.ref_type == 'tag'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$env:GITHUB_REF_NAME" `
-            "plant-ui-$env:GITHUB_REF_NAME-windows-x64.zip" `
-            "plant-ui-$env:GITHUB_REF_NAME-wasm.zip" `
+            plant-ui-*.zip `
+            SHA256SUMS `
             --verify-tag --generate-notes --title "Plant UI $env:GITHUB_REF_NAME"

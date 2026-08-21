@@ -26,7 +26,7 @@ if (-not $clang) {
   $env:AR_wasm32_unknown_unknown = Join-Path (Split-Path $clang) "llvm-ar.exe"
 }
 
-cargo build -p rs-plant --target wasm32-unknown-unknown --release
+cargo build -p rs-plant --target wasm32-unknown-unknown --release --locked
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $targetDir = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).target_directory
 $wasm = Join-Path $targetDir "wasm32-unknown-unknown/release/rs-plant.wasm"
