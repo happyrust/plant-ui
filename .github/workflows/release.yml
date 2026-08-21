@@ -143,7 +143,7 @@ jobs:
                   "password": os.environ["PLANT_DB_PASSWORD"],
               },
               "model_api_url": f"http://{host}",
-              "data_api_url": "",
+              "data_api_url": f"http://{host}",
           }
           Path("deploy/config.json").write_text(
               json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
