@@ -46,7 +46,14 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
     }
 }
 
-fn ready(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, data: &RoomsDataVm, cmds: &mut Vec<Cmd>) {
+fn ready(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    vm: &WorkbenchVm,
+    data: &RoomsDataVm,
+    cmds: &mut Vec<Cmd>,
+) {
     if data.relations.is_empty() {
         note(
             ui,

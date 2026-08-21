@@ -157,7 +157,17 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                                 cmds.push(Cmd::SelectElement(row.refno));
                             }
                             out.response.context_menu(|ui| {
-                                row_menu(ui, t, d, row, &vm.selection, &vm.rooms, live, cmds)
+                                row_menu(
+                                    ui,
+                                    t,
+                                    d,
+                                    row,
+                                    &vm.selection,
+                                    &vm.rooms,
+                                    live,
+                                    vm.regen_busy,
+                                    cmds,
+                                )
                             });
                         }
                     });
@@ -167,7 +177,8 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
 }
 
 fn tree_item_accessible_label(refno: aios_core::RefU64, name: &str) -> String {
-    format!("refno={}; name={name}", refno.to_slash_string())
+    // E3D 形式自带等号，前缀里就不再补一个，否则读屏念出来是「refno 等于 等于」。
+    format!("refno {}; name={name}", refno.to_e3d_id())
 }
 
 /// Vm 的四态可见性翻成组件层的画法。两个枚举是同一件事在两层的说法——
@@ -223,6 +234,7 @@ fn row_menu(
     selection: &Selection,
     rooms: &RoomVm,
     live: bool,
+    regen_busy: bool,
     cmds: &mut Vec<Cmd>,
 ) {
     // 右键落在集内 = 对整批操作；落在集外 = 只对这一行。
@@ -245,7 +257,9 @@ fn row_menu(
         }
         grouped = true;
     }
-    element_menu(ui, t, d, row.refno, &targets, rooms, live, cmds, grouped);
+    element_menu(
+        ui, t, d, row.refno, &targets, rooms, live, regen_busy, cmds, grouped,
+    );
 }
 
 /// 元素菜单的公共部分：模型动作 + 房间归属 + 复制 REFNO。模型树的行菜单与
@@ -262,6 +276,7 @@ pub(super) fn element_menu(
     targets: &[aios_core::RefU64],
     rooms: &RoomVm,
     live: bool,
+    regen_busy: bool,
     cmds: &mut Vec<Cmd>,
     mut grouped: bool,
 ) {
@@ -310,6 +325,25 @@ pub(super) fn element_menu(
         ui.separator();
     }
     room_menu_section(ui, t, d, refno, rooms, live, cmds);
+    // 自成一组。上面那几项改的是「我看不看得见」，这一项改的是模型库里的产物
+    // ——删掉的几何只能重新算回来。挤进同一组里，手滑的代价差得太远。
+    //
+    // 吃 `live` 门禁：跑完要把结果显示出来，没有渲染器的壳里点了只能改库、
+    // 看不见结果，而现有约定是「不接线就不显示」，不摆灰色占位。
+    if live {
+        ui.separator();
+        let label = format!("{}  重新生成模型{suffix}", ph::ARROWS_CLOCKWISE);
+        if ui
+            .add_enabled(!regen_busy, egui::Button::new(label))
+            .on_disabled_hover_text("已经有一趟重新生成在跑了")
+            .clicked()
+        {
+            cmds.push(Cmd::RegenerateModels {
+                targets: targets.to_vec(),
+            });
+            ui.close();
+        }
+    }
     ui.separator();
     if ui
         .button(format!("{}  复制 REFNO{suffix}", ph::COPY_SIMPLE))
@@ -447,7 +481,11 @@ fn room_menu_items(
     if live && let Some(primary) = data.relations.first() {
         let resp = ui.add_enabled(
             primary.room.is_some(),
-            egui::Button::new(format!("{}  显示房间模型（{}）", ph::CUBE, primary.room_num)),
+            egui::Button::new(format!(
+                "{}  显示房间模型（{}）",
+                ph::CUBE,
+                primary.room_num
+            )),
         );
         if resp.clicked()
             && let Some(room) = primary.room
@@ -515,9 +553,9 @@ mod tests {
         let refno = RefU64(0x1234);
         let before = tree_item_accessible_label(refno, "OLD-EQUI");
         let after = tree_item_accessible_label(refno, "NEW-EQUI");
-        assert!(before.contains("refno=0/4660"));
-        assert!(after.contains("refno=0/4660"));
-        assert!(!after.contains("refno=0_4660"));
+        assert!(before.contains("refno =0/4660"));
+        assert!(after.contains("refno =0/4660"));
+        assert!(!after.contains("0_4660"));
         assert!(!after.contains("OLD-EQUI"));
         assert!(after.contains("name=NEW-EQUI"));
     }

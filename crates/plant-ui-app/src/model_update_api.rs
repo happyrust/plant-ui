@@ -216,9 +216,151 @@ pub async fn retry_pending_unit(
     Ok(())
 }
 
+/// 删掉一个 refno **精确子树**下已经生成的模型数据。
+///
+/// `confirm` 服务端强制要求等于 `refno`，不等就是 400——这个接口不接受随手一点。
+/// 它删的是产物不是本体：`pe` 一行不动，删完那片元素在三维里就是「未加载」。
+///
+/// 容器也删得动（`WORL / SITE / ZONE` 在这里不受限，那道门只挡生成根），
+/// 所以「整片删一次」只需要对右键那一行调一次。
+pub async fn delete_model_subtree(
+    base: &str,
+    refno: &str,
+    project: &str,
+    mdb: &str,
+    namespace: &str,
+) -> anyhow::Result<()> {
+    let query = format!(
+        "refno={}&confirm={}&project={}&mdb={}&namespace={}",
+        urlencode(refno),
+        urlencode(refno),
+        urlencode(project),
+        urlencode(mdb),
+        urlencode(namespace),
+    );
+    let _: serde_json::Value = delete(
+        base,
+        &format!("/api/v1/model/subtree?{query}"),
+        Duration::from_secs(300),
+    )
+    .await?;
+    Ok(())
+}
+
+/// `POST /api/v1/model/ensure` 的回执状态。
+///
+/// 四档对界面是四件不同的事，别压成一个布尔：`Generated` 是真做了一趟，
+/// `AlreadyAvailable` 是同根的活刚被别的元素触发过（这正是删除之后靠
+/// `force:false` 拿到的免费去重），`NoRenderableGeometry` 是这一片本来就没有
+/// 可画的东西——它不是失败，重试一百遍还是同一个结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnsureStatus {
+    Generated,
+    AlreadyAvailable,
+    NoRenderableGeometry,
+    /// 服务端换了新状态名。当成「做过了」计数，但要在日志里点名。
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnsureReply {
+    pub status: EnsureStatus,
+    /// 服务端解出来的生成根。客户端归根算错时，这一份是唯一的对照物。
+    pub generation_root: String,
+    pub model_available: bool,
+}
+
+#[derive(Deserialize)]
+struct EnsureBody {
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    generation_root: String,
+    #[serde(default)]
+    model_available: bool,
+}
+
+/// 让一个 refno 有可渲染模型。`force` 只在人明确要求「无论如何重跑一遍」时为真。
+///
+/// **重新生成走的是 `force = false`**：删除已经把这一片清空了，第一个元素触发
+/// 真生成，同根后面的元素读到 `renderable > 0` 直接回 `AlreadyAvailable`——
+/// 去重是服务端免费给的，客户端不必自己裁剪嵌套单元。
+///
+/// 超时给到 125 秒，比服务端那道 120 秒稍长：让服务端的超时语义先生效
+/// （它回 504 并说明后台继续跑），而不是客户端先把连接掐掉、什么都不知道。
+pub async fn ensure_model(
+    base: &str,
+    refno: &str,
+    force: bool,
+    project: &str,
+    mdb: &str,
+    namespace: &str,
+) -> anyhow::Result<EnsureReply> {
+    let body = serde_json::json!({
+        "refno": refno,
+        "force": force,
+        "project": project,
+        "mdb": mdb,
+        "namespace": namespace,
+    });
+    let reply: EnsureBody = post(
+        base,
+        "/api/v1/model/ensure",
+        body.to_string(),
+        Duration::from_secs(125),
+    )
+    .await?;
+    Ok(EnsureReply {
+        status: ensure_status(&reply.status),
+        generation_root: reply.generation_root,
+        model_available: reply.model_available,
+    })
+}
+
+fn ensure_status(raw: &str) -> EnsureStatus {
+    match raw {
+        "generated" | "Generated" => EnsureStatus::Generated,
+        "already_available" | "AlreadyAvailable" => EnsureStatus::AlreadyAvailable,
+        "no_renderable_geometry" | "NoRenderableGeometry" => EnsureStatus::NoRenderableGeometry,
+        _ => EnsureStatus::Unknown,
+    }
+}
+
+/// query 串里的 refno 带 `/`，项目名与 MDB 带 `/` 也带空格。
+/// 只做百分号转义，不引第三方依赖——这几个字段的字符集很窄。
+fn urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
 async fn get<T: DeserializeOwned>(base: &str, path: &str) -> anyhow::Result<T> {
     let mut req = ehttp::Request::get(format!("{base}{path}"));
     req.timeout = Some(Duration::from_secs(15));
+    let response = ehttp::fetch_async(req)
+        .await
+        .map_err(transport)
+        .context("请求模型服务失败")?;
+    request(response)
+}
+
+/// `ehttp` 只给了 get / post / head 三个构造器，DELETE 自己改 `method`。
+/// 服务端那条路由把参数全放在 query 串里，所以不带请求体。
+async fn delete<T: DeserializeOwned>(
+    base: &str,
+    path: &str,
+    timeout: Duration,
+) -> anyhow::Result<T> {
+    let mut req = ehttp::Request::get(format!("{base}{path}"));
+    req.method = ehttp::Method::DELETE;
+    req.timeout = Some(timeout);
     let response = ehttp::fetch_async(req)
         .await
         .map_err(transport)
@@ -342,6 +484,36 @@ mod tests {
             "{}",
             bare.message
         );
+    }
+
+    /// `DELETE /model/subtree` 的 `confirm` 必须与 `refno` 逐字相同，且 `/`
+    /// 要转义——服务端拿它当「你确实想删这一个」的凭据，不等就是 400。
+    #[test]
+    fn the_delete_confirm_matches_the_refno_after_escaping() {
+        assert_eq!(urlencode("24381/100677"), "24381%2F100677");
+        assert_eq!(urlencode("/ALL"), "%2FALL");
+        assert_eq!(urlencode("ProjAMS"), "ProjAMS");
+
+        let refno = "24381/100677";
+        let query = format!("refno={}&confirm={}", urlencode(refno), urlencode(refno));
+        assert_eq!(query, "refno=24381%2F100677&confirm=24381%2F100677");
+    }
+
+    /// ensure 的四档状态对界面是四件不同的事，压成布尔就分不出「重做过了」与
+    /// 「同根刚被别人做过」——后者正是删除之后 `force:false` 拿到的免费去重。
+    #[test]
+    fn ensure_status_keeps_the_four_outcomes_apart() {
+        assert_eq!(ensure_status("generated"), EnsureStatus::Generated);
+        assert_eq!(
+            ensure_status("already_available"),
+            EnsureStatus::AlreadyAvailable
+        );
+        assert_eq!(
+            ensure_status("no_renderable_geometry"),
+            EnsureStatus::NoRenderableGeometry
+        );
+        // 服务端换名字不许静默当成成功的那一档：它要能在日志里被点名。
+        assert_eq!(ensure_status("brand_new_state"), EnsureStatus::Unknown);
     }
 
     /// 连不上、超时、握手不成对用的人是同一件事：服务够不着，没有任何数据被改动，

@@ -93,7 +93,11 @@ pub fn command_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: 
                     ui.separator();
                     // 没连上库时取回工作无从谈起：没有树可重查，也没有
                     // 模型可重载。禁用而不是隐藏——菜单项换位置比灰着更难找。
+                    //
+                    // 重新生成跑着的时候也灰。那一趟正在逐个删掉并重做库里的产物，
+                    // 中间插一次清场重装，重装的是一份删了一半的模型。
                     let busy = vm.get_work_busy;
+                    let regen = vm.regen_busy;
                     let label = if busy {
                         "正在取回工作…"
                     } else {
@@ -101,16 +105,18 @@ pub fn command_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: 
                     };
                     let get_work = ui
                         .add_enabled(
-                            vm.data_source_ok && !busy,
+                            vm.data_source_ok && !busy && !regen,
                             command_menu_action(
                                 d,
                                 ph::ARROW_CLOCKWISE,
                                 label,
-                                if busy { "请稍候" } else { "GET WORK" },
+                                if busy || regen { "请稍候" } else { "GET WORK" },
                             ),
                         )
                         .on_disabled_hover_text(if busy {
                             "取回工作正在进行"
+                        } else if regen {
+                            "重新生成模型正在进行"
                         } else {
                             "连接数据源后可用"
                         });
@@ -224,9 +230,9 @@ pub fn status_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
                     Some(refno) => {
                         let rest = vm.selection.len() - 1;
                         let text = if rest > 0 {
-                            format!("{refno} +{rest}")
+                            format!("{} +{rest}", refno.to_e3d_id())
                         } else {
-                            refno.to_string()
+                            refno.to_e3d_id()
                         };
                         ui.label(
                             RichText::new(text)

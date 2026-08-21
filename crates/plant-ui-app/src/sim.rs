@@ -111,6 +111,12 @@ struct SimDb {
     /// 「距剧本纪元几小时前」。`None` = 从未应用或读不到会话页，界面文案「从未应用」。
     applied_at_ago_h: Option<i64>,
     latest_at_ago_h: Option<i64>,
+    /// **第一条待应用保存**（窗口左端）的写入时刻，同样记成「几小时前」。
+    ///
+    /// 与 `applied_at_ago_h` 不是一回事（ADR-0019 Q3）：那个是「上次应用的是哪一条」，
+    /// 这个是「这批要应用的第一条」，两者之间的空档正是上次应用之后隔了多久才又存盘。
+    /// 没有待应用窗口（已追平 / 阻断 / 需初始化 / 够不着）时为 `None`。
+    first_pending_at_ago_h: Option<i64>,
     /// 待应用窗口内的会话（sesno > applied 的那部分）。
     sessions: Vec<SessionPreview>,
     zone_refno: &'static str,
@@ -219,8 +225,18 @@ struct SimBatch {
     dbnum: u32,
     start_sesno: i32,
     end_sesno: i32,
+    /// 窗口两端那两条保存的写入时刻（「几小时前」），**入队时就冻在行上**。
+    ///
+    /// 不在渲染时回查那个库：批次跑完之后水位会前移，回查出来的是推进后的状态，
+    /// 而任务行说的应该是它自己应用过的那个窗口。右端在并入推高时跟着刷新，
+    /// 与服务端「序号与时刻同生共死」的口径一致（ADR-0019）。
+    start_at_ago_h: Option<i64>,
+    end_at_ago_h: Option<i64>,
     units: Vec<SimUnit>,
     merged_sesnos: Vec<u32>,
+    /// 与 `merged_sesnos` 严格等长的写入时刻（「几小时前」）。契约要求逐条对应，
+    /// 界面按下标配对，所以这里也只能一起 push。
+    merged_at_ago_h: Vec<Option<i64>>,
     changed_elements: u64,
     stage: Stage,
     state: &'static str, // 终态串："succeeded" | "partial"
@@ -615,8 +631,11 @@ impl Engine {
                 dbnum: db.dbnum,
                 start_sesno,
                 end_sesno: db.latest,
+                start_at_ago_h: db.first_pending_at_ago_h,
+                end_at_ago_h: db.latest_at_ago_h,
                 units: db.units.clone(),
                 merged_sesnos: Vec::new(),
+                merged_at_ago_h: Vec::new(),
                 changed_elements: db.changed_elements,
                 stage: Stage::Queued,
                 state: "succeeded",
@@ -710,6 +729,9 @@ impl Engine {
                 queue_paused: self.paused,
                 worker_alive: Some(true),
                 worker_idle_secs: Some((now - self.last_activity).num_seconds().max(0) as u64),
+                delivery_unit_types: ["BRAN", "HANG", "SUPPO", "EQUI"]
+                    .map(str::to_owned)
+                    .to_vec(),
             }),
             pending: self.pending.clone(),
             pending_known: true,
@@ -755,9 +777,16 @@ impl Engine {
                     .unwrap_or_default(),
                 start_sesno: batch.start_sesno,
                 end_sesno: batch.end_sesno,
+                start_sesno_time: self.e3d_stamp(batch.start_at_ago_h),
+                end_sesno_time: self.e3d_stamp(batch.end_at_ago_h),
                 status: BatchStatus::Applied,
                 message: None,
                 merged_sesnos: batch.merged_sesnos.clone(),
+                merged_sesno_times: batch
+                    .merged_at_ago_h
+                    .iter()
+                    .map(|ago| self.e3d_stamp(*ago))
+                    .collect(),
                 changed_elements: batch.changed_elements,
             }),
             units: batch
@@ -792,6 +821,8 @@ impl Engine {
             db_type: Some("DESI".into()),
             start_sesno: Some(batch.start_sesno),
             end_sesno: Some(batch.end_sesno),
+            start_sesno_time: self.e3d_stamp(batch.start_at_ago_h),
+            end_sesno_time: self.e3d_stamp(batch.end_at_ago_h),
             units_done: generating.then_some(batch.units_done),
             total_units: generating.then_some(batch.units.len() as u32),
             events_seen: batch.events_seen,
@@ -818,6 +849,8 @@ impl Engine {
             db_type: None,
             start_sesno: None,
             end_sesno: None,
+            start_sesno_time: None,
+            end_sesno_time: None,
             units_done: Some(room.done),
             total_units: Some(room.total),
             events_seen: 0,
@@ -1042,6 +1075,10 @@ impl Engine {
         };
         batch.end_sesno += 1;
         batch.merged_sesnos.push(batch.end_sesno as u32);
+        // 并入推高了右端，右端时刻必须跟着走——不刷的话队列上那一格会停在入队
+        // 观察到的那一刻，并入越多越骗人（ADR-0019）。刚存进去的保存就是此刻。
+        batch.merged_at_ago_h.push(Some(0));
+        batch.end_at_ago_h = Some(0);
         if let Some(db) = self.dbs.iter_mut().find(|db| db.dbnum == 7002) {
             db.latest = batch.end_sesno;
             // 刚刚才写进文件的会话：时间戳就是此刻。
@@ -1108,6 +1145,8 @@ fn script() -> Vec<SimDb> {
             latest: 43,
             applied_at_ago_h: Some(72),
             latest_at_ago_h: Some(4),
+            // 41 之后隔了两天才又存盘，42 就是这批的第一条。
+            first_pending_at_ago_h: Some(30),
             sessions: vec![session(42, 3, 2, 0), session(43, 0, 1, 1)],
             zone_refno: "9101/1",
             zone_name: "/SIM-Z1",
@@ -1154,6 +1193,8 @@ fn script() -> Vec<SimDb> {
             latest: 56,
             applied_at_ago_h: Some(192),
             latest_at_ago_h: Some(26),
+            // 只有 56 一条待应用，窗口两端是同一条保存。
+            first_pending_at_ago_h: Some(26),
             sessions: vec![session(56, 0, 4, 0)],
             zone_refno: "9102/1",
             zone_name: "/SIM-Z2",
@@ -1200,6 +1241,8 @@ fn script() -> Vec<SimDb> {
             latest: 88,
             applied_at_ago_h: Some(48),
             latest_at_ago_h: Some(48),
+            // 已追平，没有待应用窗口。
+            first_pending_at_ago_h: None,
             sessions: Vec::new(),
             zone_refno: "",
             zone_name: "",
@@ -1222,6 +1265,8 @@ fn script() -> Vec<SimDb> {
             // 回退的库两个时间也是倒着的：文件最新那个会话比已应用的还老。
             applied_at_ago_h: Some(120),
             latest_at_ago_h: Some(288),
+            // 阻断的库不解窗口。
+            first_pending_at_ago_h: None,
             sessions: Vec::new(),
             zone_refno: "",
             zone_name: "",
@@ -1248,6 +1293,7 @@ fn script() -> Vec<SimDb> {
             // 够不着的库连文件都没有，读不到任何会话页。
             applied_at_ago_h: None,
             latest_at_ago_h: None,
+            first_pending_at_ago_h: None,
             sessions: Vec::new(),
             zone_refno: "",
             zone_name: "",
@@ -1273,6 +1319,8 @@ fn script() -> Vec<SimDb> {
             // 从未应用：界面文案「从未应用 → 文件最新 …」。
             applied_at_ago_h: None,
             latest_at_ago_h: Some(6),
+            // 需初始化：契约不为它解窗口。
+            first_pending_at_ago_h: None,
             sessions: Vec::new(),
             zone_refno: "",
             zone_name: "",
@@ -1311,6 +1359,7 @@ fn script() -> Vec<SimDb> {
             latest: 30,
             applied_at_ago_h: Some(720),
             latest_at_ago_h: Some(720),
+            first_pending_at_ago_h: None,
             sessions: Vec::new(),
             zone_refno: "",
             zone_name: "",

@@ -9,6 +9,7 @@ mod gallery;
 mod logs;
 mod model_update_api;
 mod model_update_ws;
+mod regenerate;
 mod settings_store;
 mod sim;
 mod startup;
@@ -782,7 +783,15 @@ impl TreeModel {
     /// 而它底下那些子层、`parent` 指向、展开标记还留在表里。不摘掉的话
     /// `ancestors` 会顺着 `parent` 走进一串已经不存在的祖先，状态栏的元素计数
     /// 也会一直虚高。
-    fn prune_unreachable(&mut self) {
+    fn prune_unreachable(&mut self) -> Vec<RefU64> {
+        let mut known: HashSet<RefU64> = self
+            .roots
+            .iter()
+            .chain(self.children.values().flatten())
+            .map(|node| node.refno.refno())
+            .collect();
+        known.extend(self.children.keys().copied());
+        known.extend(self.parent.keys().copied());
         let mut alive: HashSet<RefU64> = HashSet::new();
         let mut stack: Vec<RefU64> = self.roots.iter().map(|n| n.refno.refno()).collect();
         while let Some(refno) = stack.pop() {
@@ -798,8 +807,16 @@ impl TreeModel {
         self.parent.retain(|refno, _| alive.contains(refno));
         self.expanded.retain(|refno| alive.contains(refno));
         self.loading.retain(|refno| alive.contains(refno));
+        self.visibility.retain(|refno, _| alive.contains(refno));
+        self.pending_direction
+            .retain(|refno, _| alive.contains(refno));
+        self.pending_visibility
+            .retain(|refno, _| alive.contains(refno));
         self.visibility_unavailable
             .retain(|refno| alive.contains(refno));
+        let mut removed: Vec<_> = known.difference(&alive).copied().collect();
+        removed.sort_by_key(|refno| refno.0);
+        removed
     }
 
     /// 从最近的父到 SITE 根的祖先链；不在已加载的树里就是 None。
@@ -1076,9 +1093,34 @@ fn settle_refresh_generation(pending: &mut bool, generation: &mut u64, mesh_ok: 
     }
 }
 
-fn model_reload_due(owed: &mut bool, refresh_observed: bool, models_settled: bool) -> bool {
-    *owed |= refresh_observed;
-    models_settled && *owed
+/// 一次队列轮询发现变化之后，界面该刷什么。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoRefresh {
+    /// 整场重载：树与三维一起换。只用来补人已经要过、却没给成的那一次。
+    FullReload,
+    /// 整棵树重查，三维保持原样。
+    TreeOnly,
+    /// 按交付单元精确重查那几个分支，三维同样保持原样。
+    Units,
+}
+
+/// 自动刷新只换模型树，清场重装留给人主动点的那条菜单。
+///
+/// 重装的模型查询调用前刚 `invalidate_all` 过、必定是冷的，而批次收官这一刻
+/// 人未必在看三维。数据应用因此不再排它——`owed` 只剩一个来源：模型查询本身
+/// 失败（[`restore_model_reload`]），那时场景已经清空，队列空下来必须补上，
+/// 不然点了没反应、屏幕还一直空着。
+///
+/// 代价是三维会停在旧几何上，这件事不许闷着：收尾那句日志要说出来。按单元
+/// 局部重画是下一步的事，那之前菜单那条清场重装是唯一的出路。
+fn auto_refresh(owed: bool, models_settled: bool, data_applied: bool) -> AutoRefresh {
+    if owed && models_settled {
+        AutoRefresh::FullReload
+    } else if data_applied {
+        AutoRefresh::TreeOnly
+    } else {
+        AutoRefresh::Units
+    }
 }
 
 fn restore_model_reload(owed: &mut bool, failed_debt_reload: bool) {
@@ -1409,17 +1451,9 @@ impl App {
                         Ok(relations) => RoomVm::Ready(build_rooms(refno, relations)),
                         Err(e) => {
                             let el = self.tree.element(refno);
-                            self.logs.error_of(
-                                &mut self.vm.logs,
-                                el,
-                                "房间归属查询失败",
-                                &e,
-                                None,
-                            );
-                            RoomVm::Failed(format!(
-                                "房间归属查询失败：{}",
-                                logs::error_chain(&e)
-                            ))
+                            self.logs
+                                .error_of(&mut self.vm.logs, el, "房间归属查询失败", &e, None);
+                            RoomVm::Failed(format!("房间归属查询失败：{}", logs::error_chain(&e)))
                         }
                     };
                 }
@@ -1455,12 +1489,8 @@ impl App {
                         }
                         Err(e) => {
                             self.xray_room_pending = None;
-                            self.logs.error(
-                                &mut self.vm.logs,
-                                "房间 PANEL 查询失败",
-                                &e,
-                                None,
-                            );
+                            self.logs
+                                .error(&mut self.vm.logs, "房间 PANEL 查询失败", &e, None);
                         }
                     }
                 }
@@ -1566,21 +1596,17 @@ impl App {
                                     logs::error_chain(&e)
                                 ));
                             }
-                            self.logs.error(
-                                &mut self.vm.logs,
-                                "房间详情查询失败",
-                                &e,
-                                None,
-                            );
+                            self.logs
+                                .error(&mut self.vm.logs, "房间详情查询失败", &e, None);
                         }
                     }
                 }
                 data::Evt::RoomDetail(..) => {}
                 data::Evt::RoomsOverview(result) => {
                     self.rooms_overview = match result {
-                        Ok(rows) => RoomBrowserVm::Ready(
-                            rows.into_iter().map(build_overview_row).collect(),
-                        ),
+                        Ok(rows) => {
+                            RoomBrowserVm::Ready(rows.into_iter().map(build_overview_row).collect())
+                        }
                         Err(e) => {
                             self.logs
                                 .error(&mut self.vm.logs, "房间总览查询失败", &e, None);
@@ -2016,14 +2042,32 @@ impl App {
                                     format!("子层重查失败，这一层保持原样：{reason}"),
                                 );
                             }
-                            self.tree.prune_unreachable();
+                            let removed = self.tree.prune_unreachable();
+                            if !removed.is_empty() {
+                                self.view3d_commands.push(Cmd::Model(
+                                    plant_ui::ModelAction::Unload {
+                                        refnos: removed.clone(),
+                                    },
+                                ));
+                                self.logs.info(
+                                    &mut self.vm.logs,
+                                    format!("已卸载 {} 个从资料树消失的模型节点", removed.len()),
+                                );
+                            }
                             // 清扫可以把待滚动路径上的某一节摘掉（元素被删或挪了
                             // OWNER）。那条路径已经通不到目标，待滚动跟着结束。
                             self.drop_locate_off_the_tree();
                             let after = self.tree.element_count();
+                            // 只换了树的那次必须自己说出来：三维还是旧几何，
+                            // 而画面上没有任何东西会替它认这件事。
+                            let scene = if fresh.reload_models {
+                                ""
+                            } else {
+                                "；三维保持原样，要换新点菜单「取回工作」"
+                            };
                             self.logs.info(
                                 &mut self.vm.logs,
-                                format!("取回工作完成：已加载元素 {before} → {after}"),
+                                format!("取回工作完成：已加载元素 {before} → {after}{scene}"),
                             );
                             // 数据缓存刚换代，属性、归属与房间面板集都不能继续沿用。
                             self.clear_room_xray();
@@ -2069,11 +2113,8 @@ impl App {
                                 poll.tasks_error.is_none(),
                                 model_drains_idle(&poll.tasks, &self.vm.project),
                             );
-                            let reload_due = model_reload_due(
-                                &mut self.model_reload_owed,
-                                data_applied || !fresh.is_empty(),
-                                models_settled,
-                            );
+                            let plan =
+                                auto_refresh(self.model_reload_owed, models_settled, data_applied);
                             if !models_settled {
                                 fresh.clear();
                             }
@@ -2081,12 +2122,14 @@ impl App {
                             self.queue.mdb = self.mdb.clone();
                             self.queue.namespace = self.namespace.clone();
                             self.queue.adopt(poll);
-                            if reload_due {
-                                self.get_work_with_models_for_tasks(true, task_ids);
-                            } else if data_applied {
-                                self.get_work_with_models_for_tasks(false, task_ids);
-                            } else {
-                                self.refresh_for_units(fresh, task_ids);
+                            match plan {
+                                AutoRefresh::FullReload => {
+                                    self.get_work_with_models_for_tasks(true, task_ids)
+                                }
+                                AutoRefresh::TreeOnly => {
+                                    self.get_work_with_models_for_tasks(false, task_ids)
+                                }
+                                AutoRefresh::Units => self.refresh_for_units(fresh, task_ids),
                             }
                         }
                         // 上一份快照留在界面上，横幅把「这份是旧的」说出来。
@@ -2640,7 +2683,7 @@ impl App {
         };
         let attr = attr.trim();
         let value = if attr.eq_ignore_ascii_case("REF") || attr.eq_ignore_ascii_case("REFNO") {
-            data.refno.to_string()
+            data.refno.to_e3d_id()
         } else {
             data.common
                 .iter()
@@ -3259,13 +3302,13 @@ impl App {
     /// 与菜单点进来的那次不同：这里手上有确切线索，所以只重查真正会变的
     /// 分支——单元自己、它的原 OWNER、新 OWNER，外加树里记着的当前父节点
     /// （元素被移走时后端的 `old_owner` 未必解得出来，本端的缓存却还留着移动前
-    /// 那一头）。模型刷新只会在后台欠账全部清零后走到这里。
+    /// 那一头）。自动路径一律只换树，三维保持原样（见 [`auto_refresh`]）。
     fn refresh_for_units(&mut self, units: Vec<model_update::RefreshUnit>, task_ids: Vec<String>) {
         if units.is_empty() {
             return;
         }
         if !task_ids.is_empty() {
-            self.get_work_with_models_for_tasks(true, task_ids);
+            self.get_work_with_models_for_tasks(false, task_ids);
             return;
         }
         let mut branches: HashSet<RefU64> = HashSet::new();
@@ -3291,7 +3334,7 @@ impl App {
         for refno in unresolved {
             self.resolve_refresh_anchor(refno);
         }
-        self.start_get_work_for_tasks(branches.into_iter().collect(), true, task_ids);
+        self.start_get_work_for_tasks(branches.into_iter().collect(), false, task_ids);
     }
 
     /// 这个元素不在缓存里，现查一条祖先链，找出**第一个已经展开过的祖先**来刷新。
@@ -3318,7 +3361,7 @@ impl App {
         else {
             return false;
         };
-        self.start_get_work(vec![anchor], true);
+        self.start_get_work(vec![anchor], false);
         true
     }
 
@@ -3548,15 +3591,15 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{
-        EleTreeNode, ModelVisibility, ModelVisibilityPlan, PanelRoomResolution, RefU64,
-        RowVisibility, TreeModel, TreeRowVm, Window, background_models_settled, begin_get_work,
-        cache_model_scope, claim_unloaded_model_refnos, command_reply_is_current,
-        complete_refresh_generation, expand_room_model_targets, finished_after, in_mdb_path,
-        mark_model_scope_unavailable, model_drains_idle, model_progress_terminal, model_reload_due,
-        model_visibility_plan, needs_children_query, refresh_anchor, reload_snapshot,
-        resolve_panel_room_reply, restore_model_reload, settle_pending_directions,
-        settle_refresh_generation, settled_pending_roots, sync_ime_window, take_hidden_for_replay,
-        task_matches_project,
+        AutoRefresh, EleTreeNode, ModelVisibility, ModelVisibilityPlan, PanelRoomResolution,
+        RefU64, RowVisibility, TreeModel, TreeRowVm, Window, auto_refresh,
+        background_models_settled, begin_get_work, cache_model_scope, claim_unloaded_model_refnos,
+        command_reply_is_current, complete_refresh_generation, expand_room_model_targets,
+        finished_after, in_mdb_path, mark_model_scope_unavailable, model_drains_idle,
+        model_progress_terminal, model_visibility_plan, needs_children_query, refresh_anchor,
+        reload_snapshot, resolve_panel_room_reply, restore_model_reload,
+        settle_pending_directions, settle_refresh_generation, settled_pending_roots,
+        sync_ime_window, take_hidden_for_replay, task_matches_project,
     };
     use chrono::{TimeZone, Utc};
     use plant_ui::model_update::PendingModelUnit;
@@ -3660,10 +3703,7 @@ mod tests {
         let member = RefU64(10);
         let branch = RefU64(11);
         let unrelated = RefU64(12);
-        let scopes = HashMap::from([
-            (branch, vec![member, branch]),
-            (unrelated, vec![unrelated]),
-        ]);
+        let scopes = HashMap::from([(branch, vec![member, branch]), (unrelated, vec![unrelated])]);
 
         assert_eq!(
             expand_room_model_targets(vec![member], &scopes),
@@ -3679,6 +3719,52 @@ mod tests {
             children_count: children,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn get_work_reports_removed_subtree_and_clears_its_ui_state() {
+        let site = RefU64(1);
+        let zone = RefU64(2);
+        let equipment = RefU64(3);
+        let primitive = RefU64(4);
+        let mut tree = TreeModel {
+            roots: vec![node(site, "SITE", 1)],
+            ..Default::default()
+        };
+        tree.children.insert(site, vec![node(zone, "ZONE", 1)]);
+        tree.children.insert(zone, vec![node(equipment, "EQUI", 1)]);
+        tree.children
+            .insert(equipment, vec![node(primitive, "BOX", 0)]);
+        tree.parent
+            .extend([(zone, site), (equipment, zone), (primitive, equipment)]);
+        tree.expanded.extend([site, zone, equipment]);
+        tree.visibility.insert(
+            primitive,
+            ModelVisibility {
+                visible: true,
+                mesh_loaded: 1,
+                mesh_failed: 0,
+            },
+        );
+        tree.pending_direction.insert(equipment, true);
+        tree.pending_visibility
+            .insert(equipment, RowVisibility::Shown);
+        tree.visibility_unavailable.insert(primitive);
+
+        // GET WORK says the equipment is no longer a child of the zone; its cached BOX layer is
+        // still present until prune_unreachable walks reachability from SITE.
+        tree.children.insert(zone, Vec::new());
+        let removed = tree.prune_unreachable();
+
+        assert_eq!(removed, vec![equipment, primitive]);
+        assert!(!tree.children.contains_key(&equipment));
+        assert!(!tree.parent.contains_key(&equipment));
+        assert!(!tree.parent.contains_key(&primitive));
+        assert!(!tree.expanded.contains(&equipment));
+        assert!(!tree.visibility.contains_key(&primitive));
+        assert!(!tree.pending_direction.contains_key(&equipment));
+        assert!(!tree.pending_visibility.contains_key(&equipment));
+        assert!(!tree.visibility_unavailable.contains(&primitive));
     }
 
     /// eye 那条链路的最小复现：点击 -> 查询 -> View3d 回执。
@@ -4220,16 +4306,24 @@ mod tests {
     }
 
     #[test]
-    fn pending_failure_then_empty_still_reloads_after_the_queue_drains() {
-        let mut owed = false;
-        assert!(!model_reload_due(&mut owed, true, false));
-        assert!(owed);
+    fn applied_data_refreshes_the_tree_and_leaves_the_scene_alone() {
+        // 数据应用只换树。回到旧写法（把它记进整场重载的欠账）这两条会红。
+        assert_eq!(auto_refresh(false, true, true), AutoRefresh::TreeOnly);
+        assert_eq!(auto_refresh(false, false, true), AutoRefresh::TreeOnly);
+        // 没有数据应用就只剩交付单元那条精确线索。
+        assert_eq!(auto_refresh(false, true, false), AutoRefresh::Units);
+    }
+
+    #[test]
+    fn an_owed_reload_waits_for_the_queue_to_drain() {
         assert!(!background_models_settled(false, true, true, true, true));
         assert!(!background_models_settled(true, true, false, true, true));
         assert!(!background_models_settled(true, true, true, false, true));
         assert!(!background_models_settled(true, true, true, true, false));
         assert!(background_models_settled(true, true, true, true, true));
-        assert!(model_reload_due(&mut owed, false, true));
+        // 欠着账但后台还没静下来：这一拍照旧只换树，不去抢那次冷查询。
+        assert_eq!(auto_refresh(true, false, true), AutoRefresh::TreeOnly);
+        assert_eq!(auto_refresh(true, true, false), AutoRefresh::FullReload);
     }
 
     #[test]
@@ -4283,7 +4377,7 @@ mod tests {
     fn failed_model_load_restores_the_reload_debt() {
         let mut owed = false;
         restore_model_reload(&mut owed, true);
-        assert!(model_reload_due(&mut owed, false, true));
+        assert_eq!(auto_refresh(owed, true, false), AutoRefresh::FullReload);
     }
 
     #[test]

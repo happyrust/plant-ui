@@ -341,8 +341,11 @@ fn merge_edges(
     }
     let mut merged: Vec<MergedEdge> = best.into_values().collect();
     merged.sort_by(|a, b| {
-        strength_cmp((a.inside_count, a.center_dist), (b.inside_count, b.center_dist))
-            .then_with(|| a.room_num.cmp(&b.room_num))
+        strength_cmp(
+            (a.inside_count, a.center_dist),
+            (b.inside_count, b.center_dist),
+        )
+        .then_with(|| a.room_num.cmp(&b.room_num))
     });
     merged
 }

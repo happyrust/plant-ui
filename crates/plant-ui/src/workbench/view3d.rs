@@ -194,6 +194,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                 &vm.selection.to_vec(),
                 &vm.rooms,
                 true,
+                vm.regen_busy,
                 cmds,
                 false,
             );

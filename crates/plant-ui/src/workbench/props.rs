@@ -119,7 +119,7 @@ fn current_element(
                 );
             });
             ui.horizontal(|ui| {
-                refno_chip(ui, t, d, &data.refno.to_string());
+                refno_chip(ui, t, d, &data.refno.to_e3d_id());
                 room_chip(ui, t, d, data, rooms, cmds);
             });
         });
@@ -183,6 +183,9 @@ fn room_chip(
 /// 字走真控件而不是 `painter().galley`：refno 是这一屏最常被抄去别处（命令行、
 /// 日志、工单）的一串字符，画上去的字形选不中，也就复制不走。芯片按文字宽度
 /// 撑开，因此不截断——截断的 refno 抄出去是废的。
+///
+/// 显示用 E3D 的 `=24381/36931` 而不是 `Display` 的 `24381_36931`：后者是库键
+/// 的写法，抄进 E3D 命令行不认。抄出去就能用，是这枚芯片存在的全部理由。
 fn refno_chip(ui: &mut Ui, t: &Tokens, d: Density, refno: &str) {
     let pad = d.px(8.0);
     let text = RichText::new(refno)

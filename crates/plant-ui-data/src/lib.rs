@@ -74,50 +74,28 @@ pub async fn model_instances(roots: &[RefU64]) -> Result<Vec<aios_core::GeomInst
     model_instances_with_progress(roots, |_, _| {}).await
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BranchQuery {
-    Root,
-    Descendants,
-}
-
-fn branch_query(noun: &str) -> BranchQuery {
-    match noun {
-        "BRAN" | "HANG" => BranchQuery::Root,
-        _ => BranchQuery::Descendants,
-    }
-}
-
-/// 强制走旧深遍历路径的运维开关（现场回退用，一个版本后随旧路径一起退役）。
-fn legacy_model_query_forced() -> bool {
-    std::env::var("PLANT_UI_LEGACY_MODEL_QUERY").is_ok_and(|v| v == "1")
-}
-
 /// 查询已经生成好的模型，并按查询分块报告进度。
 ///
-/// 自动选路：`inst_relate.anc` 已回填 → [`model_instances_anc`]（每根一条
-/// `anc CONTAINS` 索引查询，根间并发）；未回填（gen-model 新版启动会自愈回填）
-/// 或探测失败 → [`model_instances_legacy`]。`PLANT_UI_LEGACY_MODEL_QUERY=1`
-/// 强制旧路径。这里仍然只读 SurrealDB；mesh 文件由 View3d 的 AssetLoader 消费，
-/// 不会触发模型生成。
+/// 唯一路径是 [`model_instances_anc`]（每根一条 `anc CONTAINS` 索引查询，
+/// 根间并发）。旧深遍历路径（`model_instances_legacy`）与
+/// `PLANT_UI_LEGACY_MODEL_QUERY` 回退开关已随层级查询优化 P3 退役——它经
+/// `query_inst_refnos_by_zone` 消费 `inst_relate.zone_refno`，而 gen-model
+/// 已不再写该列，旧路径对新行只会静默漏，不配再当回退保险丝。
+///
+/// `anc` 未回填的库不再静默降级，而是响亮失败：升级 gen-model 并对该库启动
+/// 一次（启动序列的幂等自愈回填）即恢复。这里仍然只读 SurrealDB；mesh 文件
+/// 由 View3d 的 AssetLoader 消费，不会触发模型生成。
 pub async fn model_instances_with_progress(
     roots: &[RefU64],
     progress: impl FnMut(usize, usize),
 ) -> Result<Vec<aios_core::GeomInstQuery>> {
-    if legacy_model_query_forced() {
-        return model_instances_legacy(roots, progress).await;
-    }
     match aios_core::inst_relate_anc_ready().await {
         Ok(true) => model_instances_anc(roots, progress).await,
-        Ok(false) => {
-            eprintln!(
-                "inst_relate.anc 未回填（升级 gen-model 并启动一次即自愈），本次走旧深遍历路径"
-            );
-            model_instances_legacy(roots, progress).await
-        }
-        Err(error) => {
-            eprintln!("anc 覆盖探测失败（{error}），本次走旧深遍历路径");
-            model_instances_legacy(roots, progress).await
-        }
+        Ok(false) => anyhow::bail!(
+            "inst_relate.anc 未回填，模型查询无法进行：用新版 gen-model 对该库启动一次\
+             （启动序列自愈回填）后重试"
+        ),
+        Err(error) => Err(error.context("anc 覆盖探测失败")),
     }
 }
 
@@ -128,8 +106,9 @@ pub async fn model_instances_with_progress(
 /// 并发（`buffered` 保输入序，结果顺序确定）。根类型无关——SITE/ZONE/PIPE/
 /// BRAN/叶子一律同一条查询，不再需要辨名词、SITE→ZONE 中转与深遍历。
 ///
-/// 进度口径：每根完成算 1 步（旧路径按 500 行分块计步，粒度不同但语义同为
-/// 「已完成/总数」）。pub 供对拍验收（`tests/anc_model_query_parity.rs`）
+/// 进度口径：每根完成算 1 步（退役前的旧路径按 500 行分块计步，粒度不同但
+/// 语义同为「已完成/总数」）。pub 供计时探针（`tests/anc_model_query_parity.rs`
+/// 的 timing 用例；对拍基线已随旧路径退役，验收记录见 gen-model 方案文档 P2 节）
 /// 与排障直接调用。
 pub async fn model_instances_anc(
     roots: &[RefU64],
@@ -195,8 +174,7 @@ pub async fn model_instances_anc(
         spawn_query(async move {
             match job {
                 Job::Inst(idx, chunk) => {
-                    let (mut models, missing) =
-                        aios_core::query_insts_flat(chunk.iter()).await?;
+                    let (mut models, missing) = aios_core::query_insts_flat(chunk.iter()).await?;
                     if !missing.is_empty() {
                         models.extend(aios_core::query_insts_slim(missing.iter()).await?);
                     }
@@ -246,67 +224,9 @@ fn spawn_query<F: std::future::Future>(fut: F) -> F {
     fut
 }
 
-/// 旧路径：深遍历解可见实例集 + 分批 `query_insts`。保留一个版本作现场回退
-/// 与对拍基线（anc 回填完成、AMS 对拍通过后随开关一起退役）。
-pub async fn model_instances_legacy(
-    roots: &[RefU64],
-    mut progress: impl FnMut(usize, usize),
-) -> Result<Vec<aios_core::GeomInstQuery>> {
-    let mut refnos = Vec::new();
-    let mut branch_refnos = Vec::new();
-    let mut zone_refnos = Vec::new();
-    let roots = roots
-        .iter()
-        .copied()
-        .map(Into::into)
-        .collect::<Vec<aios_core::RefnoEnum>>();
-    let nouns = aios_core::get_type_names(roots.iter()).await?;
-    for (root, noun) in roots.into_iter().zip(nouns) {
-        match noun.as_str() {
-            "ZONE" => zone_refnos.push(root),
-            "SITE" => {
-                zone_refnos.extend(aios_core::query_filter_deep_children(root, &["ZONE"]).await?);
-            }
-            _ => refnos.extend(aios_core::query_deep_visible_inst_refnos(root).await?),
-        }
-        match branch_query(&noun) {
-            BranchQuery::Root => branch_refnos.push(root),
-            BranchQuery::Descendants => {
-                branch_refnos
-                    .extend(aios_core::query_filter_deep_children(root, &["BRAN", "HANG"]).await?);
-            }
-        }
-    }
-    for chunk in zone_refnos.chunks(500) {
-        refnos.extend(aios_core::query_inst_refnos_by_zone(chunk.iter()).await?);
-    }
-    let mut models = Vec::new();
-    let total = refnos.len().div_ceil(500) + branch_refnos.len().div_ceil(500);
-    let mut done = 0;
-    progress(done, total);
-    for chunk in refnos.chunks(500) {
-        models.extend(aios_core::query_insts(chunk.iter(), false).await?);
-        done += 1;
-        progress(done, total);
-    }
-    for chunk in branch_refnos.chunks(500) {
-        models.extend(
-            aios_core::query_tubi_insts_by_brans(chunk)
-                .await?
-                .into_iter()
-                .map(tubi_to_geom),
-        );
-        done += 1;
-        progress(done, total);
-    }
-    Ok(models)
-}
-
-/// 直管段实例 → 几何实例的统一换装（新旧路径共用；`owner` 取自身、单实例
-/// `is_tubi`、generic 缺省 PIPE 都是旧路径的既有口径）。
-fn tubi_to_geom(
-    tubi: aios_core::rs_surreal::inst::TubiInstQuery,
-) -> aios_core::GeomInstQuery {
+/// 直管段实例 → 几何实例的统一换装（`owner` 取自身、单实例 `is_tubi`、
+/// generic 缺省 PIPE 都是退役前旧路径的既有口径，anc 路径原样继承）。
+fn tubi_to_geom(tubi: aios_core::rs_surreal::inst::TubiInstQuery) -> aios_core::GeomInstQuery {
     let refno = tubi.refno;
     aios_core::GeomInstQuery {
         refno,
@@ -318,6 +238,7 @@ fn tubi_to_geom(
             geo_hash: tubi.geo_hash,
             transform: Default::default(),
             is_tubi: true,
+            is_invalid_tubi: tubi.invalid,
         }],
         has_neg: false,
         generic: tubi.generic.unwrap_or_else(|| "PIPE".into()),
@@ -326,15 +247,78 @@ fn tubi_to_geom(
     }
 }
 
-#[cfg(test)]
-mod model_scope_tests {
-    use super::{BranchQuery, branch_query};
-
-    #[test]
-    fn site_and_zone_scopes_include_descendant_straight_tubes() {
-        assert_eq!(branch_query("ZONE"), BranchQuery::Descendants);
-        assert_eq!(branch_query("SITE"), BranchQuery::Descendants);
+/// 一个范围里**已经生成过模型**的元素，连同各自的祖先链（refno 的 u64 原值）。
+///
+/// 「重新生成模型」的取材查询。走的是模型查询同一条 `inst_relate.anc` 索引，
+/// 任意根类型通吃（SITE / ZONE / PIPE / BRAN / 叶子一律同一条），所以右键
+/// 落在容器行上也不必先展开子层。
+///
+/// 两条纪律：
+///
+/// - **必须在任何删除之前调**。它认的是 `inst_relate` 行，删完就查不到了；
+///   删完再查回的是空集，而空集在调用方那里长得像「这里本来就没模型」。
+/// - `anc` 未回填的库响亮失败，与 [`model_instances_with_progress`] 同一句话。
+///   这条路没有深遍历回退——那条旧路径已随层级查询优化 P3 退役。
+/// **直管段单独算一份。** 隐含直管走 `tubi_relate` 而不是 `inst_relate`，
+/// 只有直管没有管件的 BRAN 在上一条查询里一行都没有。漏掉它们的话，一整根
+/// 光管的支管会被当成「没生成过」，重新生成时直接跳过。
+pub async fn generated_scope(root: RefU64) -> Result<GeneratedScope> {
+    match aios_core::inst_relate_anc_ready().await {
+        Ok(true) => {}
+        Ok(false) => anyhow::bail!(
+            "inst_relate.anc 未回填，取不到已生成元素：用新版 gen-model 对该库启动一次\
+             （启动序列自愈回填）后重试"
+        ),
+        Err(error) => return Err(error.context("anc 覆盖探测失败")),
     }
+    let root: RefnoEnum = root.into();
+    let (elements, tubing) = futures::future::try_join(
+        aios_core::query_generated_subtree_with_anc(root),
+        aios_core::query_bran_refnos_by_root_anc(root),
+    )
+    .await?;
+    Ok(GeneratedScope {
+        elements,
+        tubing_branches: tubing.into_iter().map(|refno| refno.refno()).collect(),
+    })
+}
+
+/// 一个范围里已经生产出来的模型，按两张边表分开装。
+#[derive(Debug, Clone, Default)]
+pub struct GeneratedScope {
+    /// `inst_relate` 上的几何元素，各自带祖先链。
+    pub elements: Vec<aios_core::rs_surreal::inst::GeneratedElement>,
+    /// `tubi_relate` 上带直管的 BRAN / HANG。它们本身就是交付单元粒度。
+    pub tubing_branches: Vec<RefU64>,
+}
+
+impl GeneratedScope {
+    /// 确认框上报的「已生成元素」数。两张表各数各的，不去重——
+    /// 一根 BRAN 既有管件又有直管时，那是两类产物，都要重做。
+    pub fn element_count(&self) -> usize {
+        self.elements.len() + self.tubing_branches.len()
+    }
+}
+
+/// 一批 refno 的 noun。缺行的不进表——**按对返回而不是按位置**，
+/// 中间少一行不会把后面所有 noun 都错位一格。
+pub async fn nouns_of(refnos: &[RefU64]) -> Result<std::collections::HashMap<RefU64, String>> {
+    // 与模型查询同一个分批口径：id 列表载荷太大时单条 WS 消息会撑爆。
+    const CHUNK: usize = 1500;
+    let mut out = std::collections::HashMap::with_capacity(refnos.len());
+    for chunk in refnos.chunks(CHUNK) {
+        let keys = chunk
+            .iter()
+            .map(|refno| RefnoEnum::from(*refno).to_pe_key())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut response = SUL_DB
+            .query(format!("select value [id, noun] from [{keys}]"))
+            .await?;
+        let rows: Vec<(RefnoEnum, String)> = response.take(0)?;
+        out.extend(rows.into_iter().map(|(refno, noun)| (refno.refno(), noun)));
+    }
+    Ok(out)
 }
 
 /// 设计库里还没被应用到模型的会话数。

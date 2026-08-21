@@ -3,6 +3,7 @@
 
 pub mod data_publish;
 pub mod fonts;
+pub mod model_regenerate;
 pub mod model_update;
 pub mod project_picker;
 pub mod room_browser;
@@ -27,6 +28,11 @@ pub enum ModelAction {
         refnos: Vec<aios_core::RefU64>,
         visible: bool,
     },
+    /// 从三维场景中卸载这些模型及其网格。
+    ///
+    /// 与 `SetVisible(false)` 不同，卸载会同时释放场景实体与渲染状态；用于 GET WORK
+    /// 已确认元素从资料树消失、而整场模型重查仍在后台进行的窗口期。
+    Unload { refnos: Vec<aios_core::RefU64> },
     /// 原子替换当前 X-Ray 目标集。空集恢复全部模型的常态 / 选中材质。
     /// 只改变材质，不改变可见性、隔离快照或相机。
     SetXRay { refnos: Vec<aios_core::RefU64> },
@@ -180,7 +186,9 @@ pub enum Cmd {
     /// （gen-model ADR-020）：`None` = 全范围（队列面板的即时扫描走它）；
     /// `Some` 时未勾选的库不入队、水位不动。向导确认总是显式给名单——
     /// 预览之后新冒出来的库不在那份确认里，不该被顺手执行。
-    ExecuteModelUpdate { dbnums: Option<Vec<u32>> },
+    ExecuteModelUpdate {
+        dbnums: Option<Vec<u32>>,
+    },
     /// 任务队列上的「立刻扫一遍」。它**不插队**，作用只是别等服务端下一个 30 秒轮询。
     ScanNow,
     /// 暂停 / 恢复队列出队。暂停**只挡出队**，正在跑的那一批会跑完为止——
@@ -241,4 +249,41 @@ pub enum Cmd {
     /// 只碰失败的那些：网格文件名是内容哈希，已经加载成功的换个目录取到的还是
     /// 同一份内容。由宿主在设置保存之后发出，界面上没有对应的按钮。
     RetryFailedMeshes,
+    /// 模型树右键「重新生成模型」：删掉这几行范围内**已经生成**的模型，再重做一遍。
+    ///
+    /// **不进 [`ModelAction`]。** 那个枚举里的每一项改的都是「三维此刻画成什么样」，
+    /// 撤销它只要再下一条相反的命令；这一条改的是模型库里的产物，删掉的几何只能
+    /// 重新算回来。两者混在一个枚举里，宿主那边就只剩注释在提醒这件事。
+    ///
+    /// 这一条只发起**清点**：宿主先跑 deep query 数出「多少个已生成元素、归成多少个
+    /// 生成单元」，把数字摆进确认框，等 [`Self::RegenerateConfirm`] 才动手。
+    RegenerateModels { targets: Vec<aios_core::RefU64> },
+    /// 确认框的回执。`false`（取消 / 关窗）时一个请求都不发。
+    RegenerateConfirm { accepted: bool },
+    /// 「停在这里」。**只停派发**：已经发出去的那一个停不了——服务端那边是
+    /// `await_background_without_cancelling`，连超时都不杀后台任务。所以按钮文案
+    /// 里不许出现「取消」，见 `model_regenerate::STOP_LABEL`。
+    RegenerateStop,
+}
+
+#[cfg(test)]
+mod tests {
+    /// 重新生成是对**模型库**的动作，不是对三维场景的动作。混进 `ModelAction`
+    /// 之后，宿主那边处理可见性的那一路会顺手把它也接了，而那条路上没有确认框、
+    /// 没有互斥、没有账本——删除会变成一次没人拦得住的点击。
+    #[test]
+    fn regeneration_is_not_a_scene_action() {
+        let source = include_str!("lib.rs");
+        let model_action = source
+            .split_once("pub enum ModelAction {")
+            .expect("ModelAction exists")
+            .1
+            .split_once("\n}")
+            .expect("ModelAction ends")
+            .0;
+        assert!(
+            !model_action.contains("Regenerate"),
+            "重新生成不该是三维动作: {model_action}"
+        );
+    }
 }

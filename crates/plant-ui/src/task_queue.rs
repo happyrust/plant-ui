@@ -94,6 +94,16 @@ pub struct TaskEntry {
     pub start_sesno: Option<i32>,
     #[serde(default)]
     pub end_sesno: Option<i32>,
+    /// 保存窗口两端那两条保存在 E3D 里的**写入时刻**（RFC3339）。
+    ///
+    /// 「保存窗口」列显示的是这一对，序号只留作执行边界（ADR-0019）。服务端保证
+    /// 它与 `end_sesno` 同生共死——并入推高右端时一起刷新、冻结点重扫时一起改写，
+    /// 端点对不上时干脆不贴。所以拿到 `None` 是**正常态**：整格留空，
+    /// **不许回落成 sesno**。
+    #[serde(default)]
+    pub start_sesno_time: Option<String>,
+    #[serde(default)]
+    pub end_sesno_time: Option<String>,
     #[serde(default)]
     pub units_done: Option<u32>,
     #[serde(default)]
@@ -174,6 +184,13 @@ pub struct Health {
     pub worker_alive: Option<bool>,
     #[serde(default)]
     pub worker_idle_secs: Option<u64>,
+    /// 本项目此刻生效的最小交付单元名词表（默认 `[BRAN, HANG, SUPPO, EQUI]`，
+    /// 项目配置可整体替换或扩充）。「重新生成模型」按元素归并生成根时只认这一份。
+    ///
+    /// 老服务端不给这个键，解出来是空表——调用方必须把空表当「不知道」而不是
+    /// 「没有交付单元」，见 `model_regenerate::DeliveryUnits`。
+    #[serde(default)]
+    pub delivery_unit_types: Vec<String>,
 }
 
 /// `GET /api/v1/update/pending-units`。走持久表，**不依赖任务历史**——一个库
@@ -709,7 +726,13 @@ pub fn rows(vm: &Vm) -> Vec<RowVm> {
             dbnum: row.dbnum,
             db_type: row.db_type.clone(),
             phase,
-            window: window(row.start_sesno, row.end_sesno),
+            // 队列快照只给序号，时刻在任务行上（服务端把它挂在 `TaskEntry` 上，
+            // 与 `end_sesno` 同生共死）。配不到任务行的活动行就整格留空——那种行
+            // 是被 `/tasks` 那 200 条窗口挤出去的，宁可少一格也不摆回 sesno。
+            window: save_window(
+                entry.and_then(|e| e.start_sesno_time.as_deref()),
+                entry.and_then(|e| e.end_sesno_time.as_deref()),
+            ),
             position: queued.then_some(position),
             units_done: entry.and_then(|e| e.units_done),
             total_units,
@@ -788,12 +811,12 @@ pub fn rows(vm: &Vm) -> Vec<RowVm> {
             dbnum,
             db_type: entry.db_type.clone().unwrap_or_default(),
             phase,
-            // 契约把这两个字段给成 `Option` 就是因为它们可能缺席。补 0 的话这一格会
-            // 摆出「sesno 0 → 0」——一个指不到任何契约字段的数。宁可空着。
-            window: match (entry.start_sesno, entry.end_sesno) {
-                (Some(start), Some(end)) => window(start, end),
-                _ => String::new(),
-            },
+            // 契约把这两个字段给成 `Option` 就是因为它们可能缺席，缺了就整格空着
+            // ——摆一个指不到任何契约字段的数（旧写法的「sesno 0 → 0」）更糟。
+            window: save_window(
+                entry.start_sesno_time.as_deref(),
+                entry.end_sesno_time.as_deref(),
+            ),
             position: None,
             units_done: entry.units_done,
             total_units: entry.total_units,
@@ -1741,7 +1764,7 @@ fn header(ui: &mut Ui, t: &Tokens, d: Density) {
     for (x, name) in [
         (c.db, "设计库"),
         (c.ty, "类型"),
-        (c.window, "会话区间"),
+        (c.window, "保存窗口"),
         (c.state, "状态"),
         (c.note, "进度 / 说明"),
     ] {
@@ -1771,7 +1794,7 @@ struct Cols {
 
 /// 七个列位。
 ///
-/// 左边四列按内容定宽（库号、类型、会话区间都是定长的），「状态」与
+/// 左边四列按内容定宽（库号、类型、保存窗口都是定长的），「状态」与
 /// 「进度 / 说明」分掉剩下的宽度。**不能照画板那 1024 写死列位**：dock 里这块面板
 /// 可宽可窄，默认布局下它只有六百点上下，写死的话说明列会整个被挤掉——而
 /// 「上一批已冻结」那句恰恰是「同一个 dbnum 两行不是重复项」的全部依据。
@@ -1782,7 +1805,9 @@ fn cols(rect: Rect, d: Density) -> Cols {
     let pad = d.px(14.0);
     let right = rect.right() - pad;
     let window = rect.left() + d.px(168.0);
-    let after_window = window + d.px(146.0);
+    // 时间对比会话号长（`08-01 09:12 → 08-07 14:33` vs `sesno 1 024 → 1 038`），
+    // 这一列随 ADR-0019 从 150 加宽到 180。
+    let after_window = window + d.px(180.0);
     let note_end = right - d.px(80.0);
     let room = (note_end - after_window).max(0.0);
     let state_w = d.px(168.0).min(room);
@@ -1812,7 +1837,7 @@ fn row_id(task_id: &str) -> egui::Id {
     egui::Id::new(("task-queue-row", task_id))
 }
 
-/// 组件 `C/QueueRow`：状态点 / 设计库 / 类型 / 会话区间 / 状态 / 进度与说明 / 计时。
+/// 组件 `C/QueueRow`：状态点 / 设计库 / 类型 / 保存窗口 / 状态 / 进度与说明 / 计时。
 /// 返回行的响应，以及「进度 / 说明」那一格有没有装下——装不下的由调用点
 /// 在行下面补一行，不许截没。
 fn queue_row(
@@ -1985,18 +2010,15 @@ fn row_detail(
             }
 
             if let Some(entry) = vm.task(&row.task_id)
-                && let Some(merged) = entry
-                    .result
-                    .as_ref()
-                    .and_then(|o| o.batch.as_ref())
-                    .map(|b| b.merged_sesnos.as_slice())
-                && !merged.is_empty()
+                && let Some(batch) = entry.result.as_ref().and_then(|o| o.batch.as_ref())
+                && !batch.merged_sesnos.is_empty()
             {
-                let listed = merged
-                    .iter()
-                    .map(|s| group(*s as i64))
-                    .collect::<Vec<_>>()
-                    .join(" – ");
+                // 时刻读不到就只说条数：这一行的用处是「本批不止预览时看到的那些」，
+                // 说得出几条就已经成立，没必要为此把会话号摆回来。
+                let label = match batch.merged_save_times().as_deref().and_then(save_list) {
+                    Some(listed) => format!("{listed} 已并入"),
+                    None => format!("{} 次保存已并入", batch.merged_sesnos.len()),
+                };
                 detail_line(
                     ui,
                     t,
@@ -2004,8 +2026,8 @@ fn row_detail(
                     DetailLine {
                         icon: ph::GIT_MERGE,
                         icon_color: t.accent,
-                        label: &format!("{listed} 已并入"),
-                        note: "预览之后新存的会话",
+                        label: &label,
+                        note: "预览之后新存的保存",
                         note_color: t.text_muted,
                     },
                 );
@@ -2108,29 +2130,32 @@ fn terminal_detail(
     }
 
     if let Some(batch) = batch {
+        // 窗口与水位都说时刻（ADR-0019 Q3 / Q8）。水位那一段与右端重复是**刻意的**：
+        // partial 行里只有它在说「数据侧已全部写入、水位已推进、不会重扫」。
+        // 时刻缺席就把对应的段整段去掉，剩下的话照说——绝不回落成 sesno。
+        let saved = save_window(
+            batch.start_sesno_time.as_deref(),
+            batch.end_sesno_time.as_deref(),
+        );
+        let advanced = batch
+            .end_sesno_time
+            .as_deref()
+            .and_then(|at| Some(parse(at)?.format("%m-%d %H:%M").to_string()));
         let (icon, color, label) = match batch.status {
             BatchStatus::Applied => (
                 ph::CHECK_CIRCLE,
                 t.success,
-                format!(
-                    "{} · 已应用 · 水位推进至 {}",
-                    window(batch.start_sesno, batch.end_sesno),
-                    group(batch.end_sesno.into())
-                ),
+                match advanced {
+                    Some(at) => segments(&[&saved, "已应用", &format!("水位推进至 {at}")]),
+                    None => segments(&[&saved, "已应用"]),
+                },
             ),
             BatchStatus::Failed => (
                 ph::X_CIRCLE,
                 t.danger,
-                format!(
-                    "{} · 批次失败 · 水位不变",
-                    window(batch.start_sesno, batch.end_sesno)
-                ),
+                segments(&[&saved, "批次失败", "水位不变"]),
             ),
-            BatchStatus::Skipped => (
-                ph::PROHIBIT,
-                t.text_muted,
-                format!("{} · 已跳过", window(batch.start_sesno, batch.end_sesno)),
-            ),
+            BatchStatus::Skipped => (ph::PROHIBIT, t.text_muted, segments(&[&saved, "已跳过"])),
         };
         detail_line(
             ui,
@@ -2146,12 +2171,6 @@ fn terminal_detail(
         );
 
         if !batch.merged_sesnos.is_empty() {
-            let listed = batch
-                .merged_sesnos
-                .iter()
-                .map(|sesno| group((*sesno).into()))
-                .collect::<Vec<_>>()
-                .join(" / ");
             detail_line(
                 ui,
                 t,
@@ -2159,12 +2178,16 @@ fn terminal_detail(
                 DetailLine {
                     icon: ph::GIT_MERGE,
                     icon_color: t.accent,
-                    label: &format!("预览后并入 {} 个会话", batch.merged_sesnos.len()),
+                    label: &format!("预览后并入 {} 次保存", batch.merged_sesnos.len()),
                     note: "",
                     note_color: t.text_muted,
                 },
             );
-            sub_line(ui, t, d, &listed, false);
+            // 逐条列出的是时刻（ADR-0019 Q5）。有一条读不到就只报条数——列一半却
+            // 顶着「并入 3 次」的标题，会让人以为列出来的就是全部。
+            if let Some(listed) = batch.merged_save_times().as_deref().and_then(save_list) {
+                sub_line(ui, t, d, &listed, false);
+            }
         }
 
         let changed = match vm.preview_changes.get(&row.task_id) {
@@ -2484,10 +2507,66 @@ fn text_at(ui: &Ui, at: egui::Pos2, text: &str, font: FontId, color: Color32) {
 
 // ---------------------------------------------------------------- 数与时间
 
-/// 会话区间。画板上千位是分开写的（`sesno 1 024 → 1 038`），四位数的会话号连着写
-/// 一眼数不清。
-fn window(start: i32, end: i32) -> String {
-    format!("sesno {} → {}", group(start as i64), group(end as i64))
+/// 保存窗口：两端那两条保存的**写入时刻**（`08-01 09:12 → 08-07 14:33`，ADR-0019）。
+///
+/// 两端缺任何一端都整格不画。**不许回落成 sesno，也不许只摆一端**——半个窗口比
+/// 空着更容易被读成「从这一刻起全都应用了」。跨天靠日期本身说清，不另加标注。
+fn save_window(start: Option<&str>, end: Option<&str>) -> String {
+    let stamp = |at: Option<&str>| Some(parse(at?)?.format("%m-%d %H:%M").to_string());
+    match (stamp(start), stamp(end)) {
+        (Some(start), Some(end)) => format!("{start} → {end}"),
+        _ => String::new(),
+    }
+}
+
+/// 并入的那几条保存，列成 `08-07 14:21 / 14:27 / 14:33`（ADR-0019 Q5）。
+///
+/// 同一天的只在第一条带日期，跨天每条各带自己的；同一分钟内出现重复时**整列补到秒**
+/// ——只给撞上的那两条补秒，一列里就出现两种精度，比统一补秒更难读。
+///
+/// 有一条解不出来就整列不给（`None`），由调用点只报条数：列一半却顶着「并入 N 次」
+/// 的标题，会让人以为列出来的就是全部。
+fn save_list(times: &[&str]) -> Option<String> {
+    let parsed = times
+        .iter()
+        .map(|at| parse(at))
+        .collect::<Option<Vec<_>>>()?;
+    if parsed.is_empty() {
+        return None;
+    }
+    let mut minutes = HashSet::new();
+    let to_seconds = !parsed
+        .iter()
+        .all(|at| minutes.insert(at.format("%m-%d %H:%M").to_string()));
+    let clock = if to_seconds { "%H:%M:%S" } else { "%H:%M" };
+    let same_day = parsed
+        .windows(2)
+        .all(|pair| pair[0].date_naive() == pair[1].date_naive());
+    let listed = parsed
+        .iter()
+        .enumerate()
+        .map(|(i, at)| {
+            if same_day && i > 0 {
+                at.format(clock).to_string()
+            } else {
+                at.format(&format!("%m-%d {clock}")).to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" / ");
+    Some(listed)
+}
+
+/// 用 ` · ` 串起一行里的几段，**空段整段丢掉**。
+///
+/// 时刻缺席时那一段本来就不该出现，直接拼会留下一个孤零零的前导分隔符。
+fn segments(parts: &[&str]) -> String {
+    parts
+        .iter()
+        .filter(|part| !part.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 fn clock(elapsed: Duration) -> String {
@@ -3216,27 +3295,145 @@ mod tests {
     fn an_unparseable_timestamp_yields_no_stopwatch() {
         assert!(since("").is_none());
         assert!(hhmm("not-a-time").is_none());
-        assert_eq!(window(1024, 1038), "sesno 1 024 → 1 038");
         assert_eq!(clock(Duration::from_secs(3725)), "1:02:05");
     }
 
-    /// 会话区间同理：契约给 `Option` 就是因为它可能缺席，补 0 会摆出「sesno 0 → 0」。
-    /// 队列快照那一侧的 `start_sesno` 是必填，所以只有终态历史行会走到这一档。
+    /// 保存窗口只认时刻（ADR-0019）：两端缺任何一端就整格不画。
+    ///
+    /// **序号还在也照样不画**——那正是这条规则的要害：回落成 `sesno 1 024 → 1 038`
+    /// 等于把「时刻拿不到」说成「这批从 1 024 到 1 038」，两句话不是一回事。
     #[test]
-    fn a_history_row_without_sesnos_shows_no_window() {
+    fn a_row_without_both_save_times_shows_no_window() {
         let mut bare = entry("db-7997-9", 7997, "succeeded");
         bare.finished_at = Some("2026-07-27T10:04:00+08:00".into());
-        bare.start_sesno = None;
-        bare.end_sesno = None;
+        bare.start_sesno = Some(1024);
+        bare.end_sesno = Some(1038);
+
+        let mut half = entry("db-7998-9", 7998, "succeeded");
+        half.finished_at = Some("2026-07-27T10:04:30+08:00".into());
+        half.start_sesno_time = Some("2026-08-01T09:12:00+08:00".into());
 
         let mut full = entry("db-8000-9", 8000, "succeeded");
         full.finished_at = Some("2026-07-27T10:05:00+08:00".into());
-        full.start_sesno = Some(1024);
-        full.end_sesno = Some(1038);
+        full.start_sesno_time = Some("2026-08-01T09:12:00+08:00".into());
+        full.end_sesno_time = Some("2026-08-07T14:33:00+08:00".into());
 
-        let all = rows(&vm(Vec::new(), vec![bare, full]));
-        assert_eq!(all[0].window, "", "缺一个就整格不画，不许摆 sesno 0 → 0");
-        assert_eq!(all[1].window, "sesno 1 024 → 1 038");
+        let all = rows(&vm(Vec::new(), vec![bare, half, full]));
+        assert_eq!(all[0].window, "", "只有序号没有时刻时不许回落成 sesno");
+        assert_eq!(all[1].window, "", "半个窗口比空着更容易被误读");
+        assert_eq!(all[2].window, "08-01 09:12 → 08-07 14:33");
+    }
+
+    /// 活动行的序号来自 `/queue`，时刻来自配对的任务行——配不上就留空。
+    ///
+    /// 被 `/tasks` 那 200 条窗口挤出去的排队行会走到这一档：它照旧显示、照旧计位，
+    /// 只是那一格空着。
+    #[test]
+    fn an_active_row_takes_its_save_window_from_the_paired_task_row() {
+        let mut timed = entry("db-7997-1", 7997, "running");
+        timed.start_sesno_time = Some("2026-08-01T09:12:00+08:00".into());
+        timed.end_sesno_time = Some("2026-08-07T14:33:00+08:00".into());
+
+        let all = rows(&vm(
+            vec![
+                queued("db-7997-1", 7997, 1024, 1038),
+                queued("db-8000-1", 8000, 1024, 1031),
+            ],
+            vec![timed],
+        ));
+        assert_eq!(all[0].window, "08-01 09:12 → 08-07 14:33");
+        assert_eq!(
+            all[1].window, "",
+            "配不到任务行就空着，队列快照那两个序号不是退路"
+        );
+    }
+
+    /// 并入逐条：同一天只在第一条带日期，跨天每条各带（ADR-0019 Q5）。
+    #[test]
+    fn a_merged_save_list_carries_the_date_where_it_is_needed() {
+        assert_eq!(
+            save_list(&[
+                "2026-08-07T14:21:00+08:00",
+                "2026-08-07T14:27:00+08:00",
+                "2026-08-07T14:33:00+08:00",
+            ])
+            .unwrap(),
+            "08-07 14:21 / 14:27 / 14:33"
+        );
+        assert_eq!(
+            save_list(&["2026-08-06T23:58:00+08:00", "2026-08-07T00:04:00+08:00"]).unwrap(),
+            "08-06 23:58 / 08-07 00:04",
+            "跨天每条都得带自己的日期"
+        );
+    }
+
+    /// 同一分钟内重复的那条补到秒——**整列一起补**，一列两种精度更难读。
+    #[test]
+    fn saves_within_the_same_minute_are_listed_to_the_second() {
+        assert_eq!(
+            save_list(&[
+                "2026-08-07T14:21:05+08:00",
+                "2026-08-07T14:21:47+08:00",
+                "2026-08-07T14:33:00+08:00",
+            ])
+            .unwrap(),
+            "08-07 14:21:05 / 14:21:47 / 14:33:00"
+        );
+    }
+
+    /// 有一条读不到就整列不给，由调用点只报条数：列一半却顶着「并入 3 次」的标题，
+    /// 会让人以为列出来的就是全部。
+    #[test]
+    fn one_unreadable_save_time_drops_the_whole_list() {
+        assert!(save_list(&["2026-08-07T14:21:00+08:00", "not-a-time"]).is_none());
+        assert!(save_list(&[]).is_none());
+
+        // 契约层的守卫：老服务端不给这个字段，两个数组长度对不上就不许配对。
+        let mut batch = crate::model_update::BatchResult {
+            merged_sesnos: vec![1032, 1033],
+            ..Default::default()
+        };
+        assert!(batch.merged_save_times().is_none(), "长度对不上不许配对");
+        batch.merged_sesno_times = vec![Some("2026-08-07T14:21:00+08:00".into()), None];
+        assert!(batch.merged_save_times().is_none(), "缺一条就整列不给");
+        batch.merged_sesno_times = vec![
+            Some("2026-08-07T14:21:00+08:00".into()),
+            Some("2026-08-07T14:33:00+08:00".into()),
+        ];
+        assert_eq!(batch.merged_save_times().unwrap().len(), 2);
+    }
+
+    /// 时刻缺席时那一段整段丢掉，不留孤零零的前导分隔符。
+    #[test]
+    fn an_absent_segment_takes_its_separator_with_it() {
+        assert_eq!(
+            segments(&[
+                "08-01 09:12 → 08-07 14:33",
+                "已应用",
+                "水位推进至 08-07 14:33"
+            ]),
+            "08-01 09:12 → 08-07 14:33 · 已应用 · 水位推进至 08-07 14:33"
+        );
+        assert_eq!(segments(&["", "已应用"]), "已应用");
+        assert_eq!(
+            segments(&["", "批次失败", "水位不变"]),
+            "批次失败 · 水位不变"
+        );
+    }
+
+    /// 跨天靠日期本身说清，同一天也照样带日期——两端各自完整，不做「省略同一天」
+    /// 那种聪明省略：省了之后 `09:12 → 14:33` 读不出这是哪一天的事。
+    #[test]
+    fn a_save_window_always_carries_both_dates() {
+        assert_eq!(
+            save_window(
+                Some("2026-08-07T09:26:00+08:00"),
+                Some("2026-08-07T14:10:00+08:00")
+            ),
+            "08-07 09:26 → 08-07 14:10"
+        );
+        assert_eq!(save_window(None, Some("2026-08-07T14:10:00+08:00")), "");
+        assert_eq!(save_window(Some("not-a-time"), Some("also-not")), "");
     }
 
     /// 明细的存活判据以 `/queue` 为准：一个还排着、却被挤到 `/tasks` 那 200 条

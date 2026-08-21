@@ -831,6 +831,13 @@ pub struct BatchResult {
     pub file_path: String,
     pub start_sesno: i32,
     pub end_sesno: i32,
+    /// 窗口两端那两条保存的**写入时刻**（RFC3339）。终态行内明细摆的是这一对，
+    /// 序号只留作执行边界（ADR-0019 Q3）。任一端缺席就整格不画，不回落成 sesno。
+    #[serde(default)]
+    pub start_sesno_time: Option<String>,
+    /// 右端时刻。「水位推进至」那一段说的也是它（Q8），与右端重复是刻意的。
+    #[serde(default)]
+    pub end_sesno_time: Option<String>,
     #[serde(default)]
     pub status: BatchStatus,
     #[serde(default)]
@@ -838,8 +845,30 @@ pub struct BatchResult {
     /// 预览扫描之后才并入本批次的会话。契约明写结果摘要必须逐条列出。
     #[serde(default)]
     pub merged_sesnos: Vec<u32>,
+    /// 与 `merged_sesnos` **一一对应**的写入时刻（ADR-0019 Q5）。
+    ///
+    /// 服务端保证等长，按下标配对；读不到的那条是 `None`。**别按长度对齐**——
+    /// 老服务端根本不给这个字段，那时它是空数组而 `merged_sesnos` 有内容。
+    #[serde(default)]
+    pub merged_sesno_times: Vec<Option<String>>,
     #[serde(default)]
     pub changed_elements: u64,
+}
+
+impl BatchResult {
+    /// 并入的那几条保存，逐条配上时刻（ADR-0019 Q5）。
+    ///
+    /// **只有每一条都拿得到时刻才给**：漏掉几条却仍标着「并入 3 次」会让人以为
+    /// 列出来的就是全部。缺任何一条就返回 `None`，由调用点只报条数。
+    pub fn merged_save_times(&self) -> Option<Vec<&str>> {
+        if self.merged_sesno_times.len() != self.merged_sesnos.len() {
+            return None;
+        }
+        self.merged_sesno_times
+            .iter()
+            .map(|time| time.as_deref())
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]

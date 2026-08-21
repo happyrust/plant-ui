@@ -19,6 +19,10 @@ pub struct TubiInstQuery {
     pub world_aabb: Aabb,
     pub world_trans: Transform,
     pub geo_hash: String,
+    /// 该段在 E3D 中不是一根实体管，应按诊断线型显示：生成侧判定为不可成管（方向不共线、
+    /// 口径未知），或任一实际端点已经删除。缺字段的历史行按可成管处理。
+    #[serde(default)]
+    pub invalid: bool,
     pub date: Option<surrealdb::sql::Datetime>,
 }
 
@@ -37,6 +41,7 @@ pub async fn query_tubi_insts_by_brans(
                 in.old_pe as old_refno,
                 in.owner.noun as generic, aabb.d as world_aabb, world_trans.d as world_trans,
                 record::id(out) as geo_hash,
+                (invalid = true or leave.deleted = true or arrive.deleted = true) as invalid,
                 fn::ses_date(in.id) as date
              from  array::flatten([{}]->tubi_relate) where leave.id != none and aabb.d != none
              "#,
@@ -60,6 +65,7 @@ pub async fn query_tubi_insts_by_flow(refnos: &[RefnoEnum]) -> anyhow::Result<Ve
         r#"
         array::group(array::complement(select value
         (select in.id as refno, in.owner.noun as generic, aabb.d as world_aabb, world_trans.d as world_trans, record::id(out) as geo_hash,
+            (invalid = true or leave.deleted = true or arrive.deleted = true) as invalid,
             fn::ses_date(in.id) as date
             from tubi_relate where leave=$parent.id or arrive=$parent.id)
                 from [{}] where in.id != none and  owner.noun in ['BRAN', 'HANG'], [none]))
@@ -81,6 +87,9 @@ pub struct ModelHashInst {
     pub transform: Transform,
     #[serde(default)]
     pub is_tubi: bool,
+    /// 这一段在 E3D 里画不出实体管（方向拐死、口径未知或端点已删除），三维视口画虚线中心线。
+    #[serde(default)]
+    pub is_invalid_tubi: bool,
 }
 
 #[derive(Debug)]
@@ -311,6 +320,58 @@ mod display_insts_tests {
     }
 }
 
+/// Spec 019 FR-004：平表读的显示集裁决与 slim 同口径——booled 优先、
+/// 脏值当缺失、没有成品且平表缺失才交回 slim 兜底。
+#[cfg(test)]
+mod flat_display_tests {
+    use super::{ModelHashInst, Transform, flat_display};
+
+    fn stale_positive() -> ModelHashInst {
+        ModelHashInst {
+            geo_hash: "positive".into(),
+            transform: Transform {
+                scale: glam::Vec3::new(1.0, 1.0, 234.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn booled_mesh_wins_over_stale_flat_copy() {
+        let (insts, has_neg) =
+            flat_display(Some("24381_36945_63".into()), Some(vec![stale_positive()]))
+                .expect("row is displayable");
+        assert!(has_neg);
+        assert_eq!(insts.len(), 1);
+        assert_eq!(insts[0].geo_hash, "24381_36945_63");
+        assert_eq!(insts[0].transform.scale, glam::Vec3::ONE);
+    }
+
+    #[test]
+    fn booled_mesh_displays_even_when_flat_copy_is_missing() {
+        let (insts, has_neg) =
+            flat_display(Some("b9".into()), None).expect("booled row needs no flat copy");
+        assert!(has_neg);
+        assert_eq!(insts[0].geo_hash, "b9");
+    }
+
+    #[test]
+    fn positive_flat_copy_stays_without_booled_mesh() {
+        let (insts, has_neg) =
+            flat_display(None, Some(vec![stale_positive()])).expect("row is displayable");
+        assert!(!has_neg);
+        assert_eq!(insts[0].geo_hash, "positive");
+    }
+
+    #[test]
+    fn missing_everything_falls_back_to_slim() {
+        assert!(flat_display(None, None).is_none());
+        assert!(flat_display(Some("".into()), None).is_none());
+        assert!(flat_display(Some("NONE".into()), None).is_none());
+    }
+}
+
 /// P4 平表读连接池：全场景重载的响应载荷在**单条 WS 连接的响应流上串行**——
 /// AMS 实测根间 8 路并发下平表阶段的 wall time 几乎等于各批串行之和，管道本身
 /// 是瓶颈。4 条只读连接让服务端多核参与序列化，解析与平表投影轮转分摊。
@@ -320,12 +381,11 @@ static FLAT_READ_POOL: tokio::sync::OnceCell<Vec<surrealdb::Surreal<surrealdb::e
 static FLAT_READ_CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 async fn flat_read_db() -> &'static surrealdb::Surreal<surrealdb::engine::any::Any> {
-    async fn build_one()
-    -> anyhow::Result<surrealdb::Surreal<surrealdb::engine::any::Any>> {
+    async fn build_one() -> anyhow::Result<surrealdb::Surreal<surrealdb::engine::any::Any>> {
         let db_option = crate::try_get_db_option()?;
         let config = surrealdb::opt::Config::default().ast_payload();
-        let db = surrealdb::engine::any::connect((db_option.get_version_db_conn_str(), config))
-            .await?;
+        let db =
+            surrealdb::engine::any::connect((db_option.get_version_db_conn_str(), config)).await?;
         db.use_ns(&db_option.surreal_ns)
             .use_db(&db_option.project_name)
             .await?;
@@ -368,6 +428,26 @@ pub async fn prewarm_flat_read_pool() {
     let _ = flat_read_db().await;
 }
 
+/// 平表行的显示集裁决（[`display_insts`] 的平表包装，Spec 019 FR-004）：
+/// `booled_id` 有值时成品即完整显示集——平表副本是不是正体残留、甚至在不在，
+/// 都不重要；没有成品时平表缺失返回 `None`，交回调用方走 slim 兜底。
+///
+/// 这层包装的存在理由：存量库里有一批「先回填正体、后写 booled_id」的历史行
+/// （RM13 事故形态），gen-model 的修复清扫收敛它们需要一次部署——读侧不等，
+/// 拿到行就按 booled 优先裁决，对着旧服务的库也不显示错误正体。
+fn flat_display(
+    booled_id: Option<String>,
+    insts_flat: Option<Vec<ModelHashInst>>,
+) -> Option<(Vec<ModelHashInst>, bool)> {
+    match insts_flat {
+        Some(flat) => Some(display_insts(booled_id, flat)),
+        None => {
+            let (insts, has_neg) = display_insts(booled_id, Vec::new());
+            has_neg.then_some((insts, has_neg))
+        }
+    }
+}
+
 /// [`query_insts_slim`] 的平表版（层级查询优化 P4 写时物化，读侧两段式第一段）：
 /// gen-model 写入侧把 `aabb.d` / `world_trans.d` 的行内副本（`aabb_d` /
 /// `world_trans_d`）与 insts 子查询的派生缓存（`insts_flat`）物化在
@@ -375,6 +455,10 @@ pub async fn prewarm_flat_read_pool() {
 /// 按 id 取行。缺任一副本的行（清扫未及的新行、pre-P4 存量）把 refno 交回
 /// 调用方，聚拢后走 [`query_insts_slim`] 现值兜底：**正确性不依赖物化覆盖率，
 /// 覆盖率只买速度**。
+///
+/// 布尔成品行（Spec 019）：`booled_id` 顺行捎带（行内字段，零解引用），显示集
+/// 由 [`flat_display`] 按 booled 优先裁决——`insts_flat` 过期或缺失都不影响
+/// 正确性，`has_neg` 与 slim / insts 两路同口径。
 ///
 /// AMS 实库成本画像（53,582 行）：slim 投影 ~11.1s 里 insts 子查询占 ~8.7s、
 /// aabb/trans 解引用占 ~2.0s——平表版把这两档都归零，只剩 ~0.7s 的平表读。
@@ -391,6 +475,7 @@ pub async fn query_insts_flat(
         aabb_d: Option<Aabb>,
         world_trans_d: Option<Transform>,
         insts_flat: Option<Vec<ModelHashInst>>,
+        booled_id: Option<String>,
     }
     let refnos = refnos.into_iter().cloned().collect::<Vec<_>>();
     let inst_keys = get_inst_relate_keys(&refnos);
@@ -400,16 +485,16 @@ pub async fn query_insts_flat(
     // owner 只需要 `anc[1]` 一个值，不搬整条链（载荷 -25%，51k 行省近 1s）。
     let sql = format!(
         "select in as refno, anc[1] as owner_packed, generic, aabb != NONE as has_aabb, \
-         aabb_d, world_trans_d, insts_flat from {inst_keys}"
+         aabb_d, world_trans_d, insts_flat, booled_id from {inst_keys}"
     );
     let mut response = flat_read_db().await.query(sql).await?;
     let rows: Vec<FlatInstRow> = response.take(0)?;
     let mut ready = Vec::with_capacity(rows.len());
     let mut missing = Vec::new();
     for row in rows {
-        let (Some(world_aabb), Some(world_trans), Some(insts)) =
-            (row.aabb_d, row.world_trans_d, row.insts_flat)
-        else {
+        let copies = row.aabb_d.zip(row.world_trans_d);
+        let display = flat_display(row.booled_id, row.insts_flat);
+        let (Some((world_aabb, world_trans)), Some((insts, has_neg))) = (copies, display) else {
             if row.has_aabb {
                 missing.push(row.refno);
             }
@@ -426,7 +511,7 @@ pub async fn query_insts_flat(
             world_aabb,
             world_trans,
             insts,
-            has_neg: false,
+            has_neg,
             generic: row.generic.unwrap_or_default(),
             pts: None,
             date: None,
@@ -449,7 +534,8 @@ pub async fn query_insts_flat(
 /// 打死），id 列表则再大的根也只有百 KB 级。
 ///
 /// 回填完成前的旧行 `anc = NONE`，CONTAINS 天然不命中——调用方先用
-/// [`inst_relate_anc_ready`] 探测覆盖，再决定走本函数还是旧路径。
+/// [`inst_relate_anc_ready`] 探测覆盖；未就绪按响亮失败处理（旧深遍历回退
+/// 路径已随 P3 退役，升级 gen-model 并启动一次即自愈回填）。
 pub async fn query_inst_refnos_by_root_anc(root: RefnoEnum) -> anyhow::Result<Vec<RefnoEnum>> {
     let root_u64 = root.refno().0;
     // 纯索引扫描，零解引用（P4）：可见性（aabb 在不在）不在这里判——原先的
@@ -465,6 +551,47 @@ pub async fn query_inst_refnos_by_root_anc(root: RefnoEnum) -> anyhow::Result<Ve
         ))
         .await?;
     Ok(response.take(0)?)
+}
+
+/// 任意根子树里**已经生成过模型**的元素，连同它们各自的祖先链。
+///
+/// 与 [`query_inst_refnos_by_root_anc`] 是同一条索引、同一个谓词，只多取 `anc`
+/// 那一列。多出来的这一列是「按元素归并生成根」的全部依据：客户端拿到
+/// 每个几何元素的整条祖先 refno，再回 `pe` 读一次 noun 就能挑出交付单元，
+/// 不必逐个元素爬 owner 链。
+///
+/// **只找得到已经生成过的**——没有 `inst_relate` 行的元素不在结果里。
+/// 「重新生成」正需要这个口径（删的就是已生产的产物），但也因此必须在
+/// **任何删除动作之前**查完：删完之后这条查询回的是空集。
+///
+/// `anc` 的顺序不作承诺，调用方不得依赖它——归根按「链上哪些 noun 是交付单元」
+/// 判定，与远近无关（嵌套交付单元由服务端 ensure 的幂等去重收拾）。
+/// **根自己那一行单独取。** `anc CONTAINS $root` 找的是后代，根自身的
+/// `inst_relate` 行不在其中——右键一个自带几何的叶子（单独一个 ELBO）时，
+/// 少了这一条整趟就成了「这里没有已生成的模型」。它是一次 id 直取，不花钱。
+pub async fn query_generated_subtree_with_anc(
+    root: RefnoEnum,
+) -> anyhow::Result<Vec<GeneratedElement>> {
+    let root_u64 = root.refno().0;
+    let mut response = flat_read_db()
+        .await
+        .query(format!(
+            "select in as refno, anc from inst_relate where anc contains {root_u64};\
+             select in as refno, anc from {} limit 1;",
+            root.to_inst_relate_key()
+        ))
+        .await?;
+    let mut rows: Vec<GeneratedElement> = response.take(0)?;
+    rows.extend(response.take::<Vec<GeneratedElement>>(1)?);
+    Ok(rows)
+}
+
+/// 一个已生成模型的元素，以及它到库顶那条祖先链上的 refno。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct GeneratedElement {
+    pub refno: RefnoEnum,
+    #[serde(default)]
+    pub anc: Vec<u64>,
 }
 
 /// 任意根子树里**带直管段**的 BRAN/HANG refno：`tubi_relate` 上同款
@@ -486,9 +613,9 @@ pub async fn query_bran_refnos_by_root_anc(root: RefnoEnum) -> anyhow::Result<Ve
 /// `anc` 回填覆盖探测：库里是否已有带祖先链的 `inst_relate` 行。
 ///
 /// gen-model 的启动序列会对存量行做幂等回填（`backfill_inst_relate_anc`）；
-/// 在那之前 anc 全为 NONE，`anc CONTAINS` 查什么都是空集。读侧在选路前
+/// 在那之前 anc 全为 NONE，`anc CONTAINS` 查什么都是空集。读侧在查询前
 /// 探一次（`LIMIT 1`，最坏整表扫一遍 id，3.8 万行毫秒级），空库（0 行）视作
-/// 就绪——两条路径都只能回空，走新路径省掉深遍历。
+/// 就绪；未就绪由调用方响亮失败（旧深遍历回退路径已随 P3 退役）。
 pub async fn inst_relate_anc_ready() -> anyhow::Result<bool> {
     let sql = "return array::len((select value id from inst_relate limit 1)) == 0 \
                || array::len((select value id from inst_relate where anc != none limit 1)) > 0;";
@@ -553,79 +680,9 @@ pub async fn inst_relate_anc_ready() -> anyhow::Result<bool> {
 //     Ok(geom_insts)
 // }
 
-/// 根据区域编号查询几何实例信息
-///
-/// # 参数
-///
-/// * `refnos` - 区域编号迭代器
-/// * `enable_holes` - 是否启用孔洞查询
-///
-/// # 返回值
-///
-/// 返回几何实例查询结果的向量
-pub async fn query_insts_by_zone(
-    refnos: impl IntoIterator<Item = &RefnoEnum>,
-    enable_holes: bool,
-) -> anyhow::Result<Vec<GeomInstQuery>> {
-    let zone_refnos = refnos
-        .into_iter()
-        .map(RefnoEnum::to_pe_key)
-        .collect::<Vec<_>>()
-        .join(",");
-
-    let sql = if enable_holes {
-        format!(
-            r#"
-            select
-                in.id as refno,
-                in.old_pe as old_refno,
-                in.owner as owner, generic, aabb.d as world_aabb, world_trans.d as world_trans, out.ptset.d.pt as pts,
-                if booled_id != none {{ [{{ "geo_hash": booled_id }}] }} else {{ (select trans.d as transform, record::id(out) as geo_hash from out->geo_relate where visible && out.meshed && trans.d != none && geo_type='Pos')  }} as insts,
-                booled_id != none as has_neg,
-                fn::ses_date(in.id) as date
-            from inst_relate where zone_refno in [{}] and aabb.d != none
-            "#,
-            zone_refnos
-        )
-    } else {
-        format!(
-            r#"
-            select
-                in.id as refno,
-                in.old_pe as old_refno,
-                in.owner as owner, generic, aabb.d as world_aabb, world_trans.d as world_trans, out.ptset.d.pt as pts,
-                (select trans.d as transform, record::id(out) as geo_hash from out->geo_relate where visible && out.meshed && trans.d != none && geo_type='Pos') as insts,
-                booled_id != none as has_neg,
-                fn::ses_date(in.id) as date
-            from inst_relate where zone_refno in [{}] and aabb.d != none
-            "#,
-            zone_refnos
-        )
-    };
-
-    println!("Query insts by zone sql: {}", &sql);
-
-    let mut response = SUL_DB.query(sql).await?;
-    let geom_insts: Vec<GeomInstQuery> = response.take(0)?;
-
-    Ok(geom_insts)
-}
-
-pub async fn query_inst_refnos_by_zone(
-    refnos: impl IntoIterator<Item = &RefnoEnum>,
-) -> anyhow::Result<Vec<RefnoEnum>> {
-    let zone_refnos = refnos
-        .into_iter()
-        .map(RefnoEnum::to_pe_key)
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut response = SUL_DB
-        .query(format!(
-            "select value in.id from inst_relate where zone_refno in [{zone_refnos}] and aabb.d != none"
-        ))
-        .await?;
-    Ok(response.take(0)?)
-}
+// `query_insts_by_zone` / `query_inst_refnos_by_zone`（按 `inst_relate.zone_refno`
+// 过滤的旧读法）已随层级查询优化 P3 退役：gen-model 不再写该列，任意根的子树
+// 实例一律走 [`query_inst_refnos_by_root_anc`]。
 
 #[cfg(test)]
 mod tests {
@@ -673,29 +730,6 @@ mod tests {
         //     result.is_empty(),
         //     "Should return empty for non-existent refno"
         // );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_query_insts_by_zone() -> anyhow::Result<()> {
-        init_test_surreal().await;
-
-        // Test case: Query instances by zone
-        let zone_refnos = vec!["24383_66457".into()];
-        let result = query_insts_by_zone(&zone_refnos, false).await?;
-
-        // Verify the results
-        assert!(!result.is_empty(), "Should return instances for the zone");
-
-        // Check the first instance has all required fields
-        if let Some(first_inst) = result.first() {
-            assert!(
-                first_inst.refno.to_string().len() > 0,
-                "Should have valid refno"
-            );
-            assert!(first_inst.insts.len() > 0, "Should have geometry instances");
-        }
 
         Ok(())
     }
