@@ -20,14 +20,20 @@
           fetch("/assets/config/e3d.project.ron", { cache: "no-store" }),
           fetch("./config.json", { cache: "no-store" }),
         ]);
-        if (legacyResponse.ok) {
+        const legacyText = legacyResponse.ok ? await legacyResponse.text() : "";
+        const legacyContentType = legacyResponse.headers.get("content-type") || "";
+        const hasLegacyConfig =
+          legacyResponse.ok &&
+          !legacyContentType.includes("text/html") &&
+          !legacyText.trimStart().startsWith("<");
+        if (hasLegacyConfig) {
           if (!currentResponse.ok && currentResponse.status !== 404) {
             throw new Error(`config.json: HTTP ${currentResponse.status}`);
           }
           const current = currentResponse.ok ? await currentResponse.json() : {};
           const configuredModelUrl = current.model_api_url?.trim();
           return {
-            legacy_project_ron: await legacyResponse.text(),
+            legacy_project_ron: legacyText,
             model_api_url:
               configuredModelUrl && configuredModelUrl !== "http://127.0.0.1:8022"
                 ? configuredModelUrl
@@ -37,7 +43,7 @@
             password: current.db?.password || "",
           };
         }
-        if (legacyResponse.status !== 404) {
+        if (!legacyResponse.ok && legacyResponse.status !== 404) {
           throw new Error(`e3d.project.ron: HTTP ${legacyResponse.status}`);
         }
         if (!currentResponse.ok) {
