@@ -9,6 +9,10 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::f32::consts::FRAC_PI_2;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use web_time::{Duration, Instant};
 
 use std::str::FromStr;
@@ -17,23 +21,41 @@ use aios_core::pdms_types::PdmsGenericType;
 use aios_core::shape::pdms_shape::PlantMesh;
 use aios_core::{GeomInstQuery, RefU64};
 use bevy::asset::io::Reader;
-use bevy::asset::{AssetLoader, AssetServer, Assets, LoadContext, LoadState};
+use bevy::asset::{
+    AssetLoader, AssetServer, Assets, LoadContext, LoadState, load_internal_asset, weak_handle,
+};
 use bevy::core_pipeline::tonemapping::Tonemapping;
+use bevy::pbr::{MaterialPipeline, MaterialPipelineKey, NotShadowCaster, NotShadowReceiver};
 use bevy::prelude::*;
+use bevy::reflect::TypePath;
 use bevy::render::camera::{ClearColorConfig, RenderTarget, ScalingMode};
-use bevy::render::mesh::{Indices, PrimitiveTopology};
+use bevy::render::extract_resource::{ExtractResource, ExtractResourcePlugin};
+use bevy::render::mesh::{
+    Indices, MeshVertexAttribute, MeshVertexBufferLayoutRef, PrimitiveTopology,
+};
 use bevy::render::render_asset::RenderAssetUsages;
 use bevy::render::render_resource::{
-    Extent3d, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
+    AsBindGroup, Extent3d, RenderPipelineDescriptor, Shader, ShaderRef,
+    SpecializedMeshPipelineError, TextureDescriptor, TextureDimension, TextureFormat,
+    TextureUsages, VertexFormat,
 };
 use bevy::render::view::RenderLayers;
+use bevy::render::{Render, RenderApp, RenderSystems, renderer::render_system};
 use bevy::transform::TransformSystems;
 use bevy_egui35::{EguiUserTextures, egui};
 use plant_ui::{CameraGesture, CameraMotion, ModelAction};
 
+pub mod mesh_source;
+
 const INITIAL_SIZE: UVec2 = UVec2::new(1200, 700);
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(120);
+/// 模型单位（PDMS 毫米）到世界单位：1 mm = 0.01 世界单位，也就是
+/// **1 世界单位 = 100 mm**。它只挂在 `SceneRoot` 上，所以场景里任何表示
+/// 「多长」的数都要过这一层才有物理意义。
 const MODEL_SCALE: f32 = 0.01;
+/// 上一行的倒数。网格与三轴按真实长度反推世界尺寸走它，两个方向同源，
+/// 改比例只动 `MODEL_SCALE` 一处。
+const MM_PER_WORLD: f32 = 1.0 / MODEL_SCALE;
 const HEADLIGHT_LIFT: f32 = 0.6;
 const HEADLIGHT_SIDE: f32 = 0.35;
 
@@ -46,8 +68,23 @@ const GRID_MAJOR_EVERY: i32 = 5;
 /// 主 / 次网格线的线心不透明度；顶点色让线端渐隐到 0，充当「随距离淡出」。
 const GRID_MAJOR_ALPHA: f32 = 0.5;
 const GRID_MINOR_ALPHA: f32 = 0.22;
-/// 原点三轴长（单位：格）。轴比网格短，尖端落在格子里而不是伸出场外。
-const AXIS_CELLS: f32 = 6.0;
+/// 视野里横着大致铺多少格；格距按它从相机距离反推。
+const GRID_CELLS_ACROSS: f32 = 12.0;
+/// 格距的上下限，用**真实长度**（毫米）表述：下界是模型自身的精度量级，
+/// 上界够装下整个厂区。两端都取在档位上（1×10⁰ / 1×10⁶），所以夹过之后
+/// 再落档不会又被推出界。
+const GRID_MIN_MM: f32 = 1.0;
+const GRID_MAX_MM: f32 = 1_000_000.0;
+/// 开机档位：一格 1 世界单位。首帧 `update_grid` 就按相机距离改写它，这个值
+/// 只决定「相机第一帧就位之前」那一瞬间的网格。
+const INITIAL_GRID_LEVEL: f32 = 1.0;
+/// 原点三轴长（单位：格）。整根轴挂在网格档位上等比缩放，取一格意味着它在
+/// 屏幕上恒定占 `1 / GRID_CELLS_ACROSS` 的宽度，不随远近变大；单臂长度也正好
+/// 等于 HUD 报的那句「一格 N m」，三轴顺带当比例尺。
+const AXIS_CELLS: f32 = 1.0;
+/// 轴端箭头高（同为格数）。箭头底面要严丝合缝接在杆末端、轴标签又要落在箭尖
+/// 之外，两处位置都从它推，别再各写各的常数。
+const AXIS_TIP_HEIGHT: f32 = 0.18;
 /// X / Y / Z 轴的世界方向：PDMS 的 X、Y、Z 过了装载旋转就是这三条。
 const AXIS_DIRS: [Vec3; 3] = [Vec3::X, Vec3::NEG_Z, Vec3::Y];
 /// X 红 / Y 绿 / Z 蓝（S1-B 稿取值）。egui 侧轴标签用同一组色，两处要一致。
@@ -66,6 +103,17 @@ const MODEL_ROUGHNESS: f32 = 0.7;
 /// 选中高亮色：橙红描不上边框（无 outline 依赖），直接换 base_color 最稳。
 /// 与 rs-plant3-d outline 的 ORANGE_RED 同源。
 const SELECT_COLOR: Color = Color::srgb(1.0, 0.27, 0.0);
+/// 房间面板 X-Ray：淡蓝、约 25% 不透明度。
+const XRAY_COLOR: Color = Color::srgba_u8(89, 169, 255, 64);
+/// 无效 TUBI 诊断带的屏幕参数。宽度与节距全部使用物理像素，不随模型或镜头缩放。
+const INVALID_TUBI_LINE_WIDTH_PX: f32 = 1.5;
+const INVALID_TUBI_SELECTED_WIDTH_PX: f32 = 2.0;
+const INVALID_TUBI_DASH_PX: f32 = 5.0;
+const INVALID_TUBI_GAP_PX: f32 = 4.0;
+const INVALID_TUBI_AA_PX: f32 = 0.75;
+/// GPU 屏幕带在离屏视口上不可用时采用的真实长度虚线节距（模型数据单位为毫米）。
+const INVALID_TUBI_DASH_MM: f32 = 100.0;
+const INVALID_TUBI_GAP_MM: f32 = 80.0;
 /// 开机默认配色（深色主题的 viewport tokens：#232F3A / #0E1318 / #46586A）。
 /// 首帧 App 就会按当前主题发 `SetViewportBackground` 盖掉，这里只求
 /// 「主题命令到达前别闪白」。
@@ -75,15 +123,36 @@ const DEFAULT_GRID: Color = Color::srgb(0.275, 0.345, 0.416);
 
 pub struct View3dPlugin;
 
+const INVALID_TUBI_LINE_SHADER: Handle<Shader> =
+    weak_handle!("fd65ad9b-1e39-4c83-8f44-d03b65fb443d");
+
+/// 高编号避免与 Bevy 内置顶点属性碰撞；值为屏幕法线方向上的 `-1/+1`。
+const INVALID_TUBI_LINE_SIDE: MeshVertexAttribute =
+    MeshVertexAttribute::new("InvalidTubiLineSide", 1_734_510_291, VertexFormat::Float32);
+
 impl Plugin for View3dPlugin {
     fn build(&self, app: &mut bevy::prelude::App) {
-        app.init_asset_loader::<MeshLoader>()
+        load_internal_asset!(
+            app,
+            INVALID_TUBI_LINE_SHADER,
+            "invalid_tubi_line.wgsl",
+            Shader::from_wgsl
+        );
+        app.init_resource::<ViewportResizeSync>()
+            .add_plugins(MaterialPlugin::<InvalidTubiLineMaterial> {
+                prepass_enabled: false,
+                shadows_enabled: false,
+                ..default()
+            })
+            .add_plugins(ExtractResourcePlugin::<ViewportResizeSync>::default())
+            .init_asset_loader::<MeshLoader>()
             .add_systems(Startup, setup)
             .add_systems(
                 Update,
                 (
                     load_models,
                     update_mesh_progress,
+                    retry_meshes,
                     apply_resize,
                     apply_commands,
                     apply_selection,
@@ -100,7 +169,109 @@ impl Plugin for View3dPlugin {
                     publish_camera.after(TransformSystems::Propagate),
                 ),
             );
+        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+            render_app.add_systems(
+                Render,
+                acknowledge_viewport_render
+                    .after(render_system)
+                    .in_set(RenderSystems::Render),
+            );
+        }
     }
+}
+
+/// 屏幕空间无效 TUBI 虚线材质。`params = (line_width, dash, gap, aa)`，均为物理像素。
+#[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
+struct InvalidTubiLineMaterial {
+    #[uniform(0)]
+    color: LinearRgba,
+    #[uniform(1)]
+    params: Vec4,
+}
+
+impl InvalidTubiLineMaterial {
+    fn new(color: Color, line_width_px: f32) -> Self {
+        Self {
+            color: color.to_linear(),
+            params: Vec4::new(
+                line_width_px,
+                INVALID_TUBI_DASH_PX,
+                INVALID_TUBI_GAP_PX,
+                INVALID_TUBI_AA_PX,
+            ),
+        }
+    }
+}
+
+impl Material for InvalidTubiLineMaterial {
+    fn vertex_shader() -> ShaderRef {
+        INVALID_TUBI_LINE_SHADER.into()
+    }
+
+    fn fragment_shader() -> ShaderRef {
+        INVALID_TUBI_LINE_SHADER.into()
+    }
+
+    fn alpha_mode(&self) -> AlphaMode {
+        // 抗锯齿覆盖率与 X-Ray 透明度都由片元 alpha 表达；仍沿用 Bevy 透明管线的
+        // 深度比较，所以实体几何会照常遮挡虚线。
+        AlphaMode::Blend
+    }
+
+    fn specialize(
+        _pipeline: &MaterialPipeline<Self>,
+        descriptor: &mut RenderPipelineDescriptor,
+        layout: &MeshVertexBufferLayoutRef,
+        _key: MaterialPipelineKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        descriptor.vertex.buffers = vec![layout.0.get_layout(&[
+            Mesh::ATTRIBUTE_POSITION.at_shader_location(0),
+            INVALID_TUBI_LINE_SIDE.at_shader_location(1),
+        ])?];
+        // 屏幕法线扩张后的绕序会随投影方向翻转，不能剔除任一面。
+        descriptor.primitive.cull_mode = None;
+        Ok(())
+    }
+}
+
+/// 主世界把待切换代次提取到 Render world；Render world 只有在整张 render graph
+/// 跑完之后才确认该代次。两个原子量由两边共享，不把“过了一次 Update”误当成
+/// “离屏相机真的画完了一帧”。
+#[derive(Resource, Clone, ExtractResource)]
+struct ViewportResizeSync {
+    requested_generation: u64,
+    rendered_generation: Arc<AtomicU64>,
+    rendered_frames: Arc<AtomicU64>,
+}
+
+impl Default for ViewportResizeSync {
+    fn default() -> Self {
+        Self {
+            requested_generation: 0,
+            rendered_generation: Arc::new(AtomicU64::new(0)),
+            rendered_frames: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+impl ViewportResizeSync {
+    fn acknowledge_rendered(&self) {
+        self.rendered_generation
+            .store(self.requested_generation, Ordering::Release);
+        self.rendered_frames.fetch_add(1, Ordering::Release);
+    }
+
+    fn generation_is_rendered(&self, generation: u64) -> bool {
+        self.rendered_generation.load(Ordering::Acquire) >= generation
+    }
+
+    fn rendered_frames(&self) -> u64 {
+        self.rendered_frames.load(Ordering::Acquire)
+    }
+}
+
+fn acknowledge_viewport_render(sync: Res<ViewportResizeSync>) {
+    sync.acknowledge_rendered();
 }
 
 #[derive(Resource)]
@@ -111,10 +282,21 @@ pub struct View3d {
     pub camera_rot: [[f32; 3]; 3],
     /// X / Y / Z 轴端标签在渲染纹理上的归一化 UV；出画或在相机身后为 None。
     pub axis_labels: [Option<[f32; 2]>; 3],
+    /// 当前地面网格的格距，**真实长度（毫米）**。HUD 的比例读数用它。
+    /// 读数与网格必须是同一个数：另算一遍迟早与眼睛看见的格子对不上。
+    pub grid_cell_mm: f32,
     image: Handle<Image>,
     commands: VecDeque<ViewCommand>,
     pending_models: VecDeque<ModelBatch>,
     loading_meshes: Vec<LoadingMesh>,
+    /// 加载失败的网格，**一直留到重试成功为止**。
+    ///
+    /// 与 `loading_meshes` 那份「装完即清」的账不同：换过网格目录之后要重来的正是
+    /// 这些，清掉就无从下手了。
+    failed_meshes: Vec<LoadingMesh>,
+    /// 已经重新发出、还没有结果的那些。
+    retrying_meshes: Vec<RetryingMesh>,
+    retry_requested: bool,
     mesh_progress: Option<MeshLoadProgress>,
     desired_visibility: HashMap<RefU64, bool>,
     /// 每个模型在场景里的**实际**渲染结果。与 `desired_visibility` 分开记：
@@ -123,10 +305,22 @@ pub struct View3d {
     /// 实际状态变过、还没被宿主取走的模型。
     render_dirty: HashSet<RefU64>,
     pending_resize: Option<(UVec2, Instant)>,
+    /// 已经改给离屏相机、但还没交给 egui 的新目标。至少让相机完整画过一帧再切，
+    /// 否则窗口相机会采到刚创建、内容尚空的 GPU 纹理。
+    prepared_resize: Option<PreparedResize>,
+    /// 已不再展示/写入、但上一帧的 egui paint job 或 render world 仍可能引用的目标。
+    /// 再等一个确认完成的渲染帧才同时注销 TextureId 与 Image asset。
+    retired_resize: VecDeque<RetiredResize>,
     picked: Option<RefU64>,
     selected: HashSet<RefU64>,
     selection_dirty: bool,
+    /// 当前完整的 X-Ray 目标集；同时匹配模型 refno 与 owner。
+    xray: HashSet<RefU64>,
+    material_dirty: bool,
     bounds: HashMap<RefU64, (Vec3, Vec3)>,
+    /// 隔离前的可见性快照（refno -> 是否可见）。`Some` = 正处于隔离中。
+    /// 只记第一次：连续隔离退出时回到隔离前的世界，而不是上一间房。
+    isolate_restore: Option<HashMap<RefU64, bool>>,
 }
 
 impl View3d {
@@ -150,7 +344,8 @@ impl View3d {
 
     pub fn resize(&mut self, size: [u32; 2]) {
         let wanted = UVec2::new(size[0].max(16), size[1].max(16));
-        if wanted == self.size {
+        let prepared = self.prepared_resize.as_ref().map(|resize| resize.size);
+        if (wanted == self.size && prepared.is_none()) || prepared == Some(wanted) {
             self.pending_resize = None;
         } else if self.pending_resize.map(|(size, _)| size) != Some(wanted) {
             self.pending_resize = Some((wanted, Instant::now()));
@@ -162,6 +357,15 @@ impl View3d {
     }
 
     pub fn model(&mut self, action: ModelAction) {
+        if let ModelAction::Unload { refnos } = &action {
+            let removed: HashSet<_> = refnos.iter().copied().collect();
+            for batch in &mut self.pending_models {
+                batch.retain(|model| {
+                    !removed.contains(&model.refno.refno())
+                        && !removed.contains(&model.owner.refno())
+                });
+            }
+        }
         record_model_visibility(&action, &mut self.desired_visibility);
         self.commands.push_back(ViewCommand::Model(action));
     }
@@ -209,6 +413,23 @@ impl View3d {
         self.picked.take()
     }
 
+    /// 加载失败、还没重试成功的网格数。
+    pub fn failed_mesh_count(&self) -> usize {
+        self.failed_meshes.len()
+    }
+
+    /// 重来一遍那些失败的网格。换过网格目录之后由宿主发起。
+    ///
+    /// 只碰失败的那些：网格文件名是内容哈希，已经加载成功的换个目录取到的还是同一份
+    /// 内容，重来一遍只是白花时间。返回这一轮重发了几个。
+    pub fn retry_failed_meshes(&mut self) -> usize {
+        if self.failed_meshes.is_empty() {
+            return 0;
+        }
+        self.retry_requested = true;
+        self.failed_meshes.len()
+    }
+
     /// 取一拍 mesh 文件加载进度；终态只交付一次。
     pub fn take_mesh_progress(&mut self) -> Option<MeshLoadProgress> {
         let progress = self.mesh_progress.clone();
@@ -247,6 +468,18 @@ impl View3d {
     }
 }
 
+struct PreparedResize {
+    size: UVec2,
+    image: Handle<Image>,
+    texture: egui::TextureId,
+    generation: u64,
+}
+
+struct RetiredResize {
+    image: Handle<Image>,
+    remove_after_rendered_frame: u64,
+}
+
 /// 一个模型此刻在三维场景里的**实际**渲染结果。
 ///
 /// 与「下过的指令」相对：`visible` 是实体真的可见，两个 mesh 计数是网格文件
@@ -265,6 +498,10 @@ pub struct ModelRenderState {
 struct RenderState {
     visible: bool,
     mesh_total: usize,
+    /// 当场绑定共享内存网格的数量（无效 TUBI 的屏幕空间虚线带）。它们不走 `AssetServer`，
+    /// 没有加载事件可等，所以要单独记一笔：`update_mesh_progress` 每帧从
+    /// `loading_meshes` 重算的只是外部文件那一半，得把这一笔加回去才是全部。
+    mesh_immediate: usize,
     mesh_loaded: usize,
     mesh_failed: usize,
 }
@@ -306,6 +543,27 @@ struct LoadingMesh {
     handle: Handle<Mesh>,
 }
 
+/// 重发之后等结果的一个网格。
+struct RetryingMesh {
+    mesh: LoadingMesh,
+    asked_at: Instant,
+    /// 有没有亲眼见过它离开失败态。
+    started: bool,
+}
+
+/// 重发之后多久，还没见它动过就认账。
+///
+/// `AssetServer::reload` 不给回执，只能等状态自己翻。没有这道兜底的话，一个压根
+/// 没被重发的网格会永远挂在重试队列里，界面上那个红点也就永远不落地。
+const RETRY_GRACE: Duration = Duration::from_secs(3);
+
+impl RetryingMesh {
+    /// 这一刻的失败态算不算数。
+    fn settling(&self) -> bool {
+        self.started || self.asked_at.elapsed() >= RETRY_GRACE
+    }
+}
+
 enum ModelBatch {
     Replace(Vec<GeomInstQuery>),
     Append(Vec<GeomInstQuery>),
@@ -321,12 +579,23 @@ impl ModelBatch {
             Self::Replace(models) | Self::Append(models) => models,
         }
     }
+
+    fn retain(&mut self, keep: impl FnMut(&GeomInstQuery) -> bool) {
+        match self {
+            Self::Replace(models) | Self::Append(models) => models.retain(keep),
+        }
+    }
 }
 
 fn record_model_visibility(action: &ModelAction, desired: &mut HashMap<RefU64, bool>) {
     match action {
         ModelAction::SetVisible { refnos, visible } => {
             desired.extend(refnos.iter().copied().map(|refno| (refno, *visible)));
+        }
+        ModelAction::Unload { refnos } => {
+            for refno in refnos {
+                desired.remove(refno);
+            }
         }
         ModelAction::HideAll => desired.values_mut().for_each(|visible| *visible = false),
         ModelAction::ShowAll => desired.values_mut().for_each(|visible| *visible = true),
@@ -350,8 +619,11 @@ fn record_applied_visibility(view: &mut View3d, applied: Vec<RefU64>, visible: b
     }
 }
 
-fn should_frame_batch(replace: bool, scene_empty: bool) -> bool {
-    replace || scene_empty
+/// 只有落进空场景的那一批需要自动取景：首个模型进场时相机多半还停在出厂
+/// 位置，不取景就是一屏空白。整场替换不再取景——取回工作的约定是回到取回
+/// 前的样子，相机也算在内（docs/plans/get-work-clear-and-reload.md 决定 5）。
+fn should_frame_batch(scene_empty: bool) -> bool {
+    scene_empty
 }
 
 fn srgb(c: egui::Color32) -> Color {
@@ -401,14 +673,56 @@ struct ModelRoot {
 struct ModelMesh {
     refno: RefU64,
     owner: RefU64,
-    /// 该网格按类型算出的常态材质。选中高亮换成 [`HighlightMaterial`]，
+    /// 该网格按类型算出的常态材质。选中高亮换成 [`ModelMesh::highlight`]，
     /// 取消选中时靠它还原——不存的话就得重算颜色，还得重新走一遍类型解析。
     base: Handle<StandardMaterial>,
+    /// 该网格选中时该换成哪枚材质。
+    highlight: Handle<StandardMaterial>,
+}
+
+/// 拾取只依赖模型身份，不依赖它使用 StandardMaterial 还是专用虚线材质。
+#[derive(Component, Clone, Copy)]
+struct ModelPickTarget {
+    refno: RefU64,
+}
+
+/// 无效 TUBI 使用专用屏幕空间材质；身份与常态/选中句柄独立于实体网格保存。
+#[derive(Component, Clone)]
+struct InvalidTubiLine {
+    refno: RefU64,
+    owner: RefU64,
+    base: Handle<InvalidTubiLineMaterial>,
+    highlight: Handle<InvalidTubiLineMaterial>,
 }
 
 /// 选中高亮共用的一枚材质句柄；换选择集只改各网格指向哪枚材质，不新建材质。
 #[derive(Resource)]
 struct HighlightMaterial(Handle<StandardMaterial>);
+
+/// 无效 TUBI 的 `LineList` 高亮不参与光照，避免随视角变暗消失。
+#[derive(Resource)]
+struct LineHighlightMaterial(Handle<StandardMaterial>);
+
+/// 全部无效 TUBI 共用的一枚四顶点单位带；长度完全来自实例的局部 Z 缩放。
+#[derive(Resource)]
+struct InvalidTubiLineMesh(Handle<Mesh>);
+
+impl InvalidTubiLineMesh {
+    fn handle(&self) -> Handle<Mesh> {
+        self.0.clone()
+    }
+}
+
+/// 无效 TUBI 的全局状态材质。Base 继续按类型色缓存，只有 Selected / X-Ray 共用。
+#[derive(Resource)]
+struct InvalidTubiLineStateMaterials {
+    highlight: Handle<InvalidTubiLineMaterial>,
+    xray: Handle<InvalidTubiLineMaterial>,
+}
+
+/// 房间面板共用的一枚半透明材质；换房间只替换目标集合。
+#[derive(Resource)]
+struct XRayMaterial(Handle<StandardMaterial>);
 
 /// 原点三轴的挂点；网格换级时改它的 scale，轴跟着格距伸缩。
 #[derive(Component)]
@@ -495,12 +809,17 @@ fn viewport_image(size: UVec2) -> Image {
     image
 }
 
+/// 所有写入三维离屏目标的相机。换目标必须一起换，否则背景与模型会分写到两张图。
+#[derive(Component)]
+struct ViewportRenderCamera;
+
 fn setup(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
     mut egui_textures: ResMut<EguiUserTextures>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut line_materials: ResMut<Assets<InvalidTubiLineMaterial>>,
 ) {
     let image = images.add(viewport_image(INITIAL_SIZE));
     let texture = egui_textures.add_image(image.clone());
@@ -509,19 +828,28 @@ fn setup(
         size: INITIAL_SIZE,
         camera_rot: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
         axis_labels: [None; 3],
+        grid_cell_mm: INITIAL_GRID_LEVEL * MM_PER_WORLD,
         image: image.clone(),
         commands: VecDeque::new(),
         pending_models: VecDeque::new(),
         loading_meshes: Vec::new(),
+        failed_meshes: Vec::new(),
+        retrying_meshes: Vec::new(),
+        retry_requested: false,
         mesh_progress: None,
         desired_visibility: HashMap::new(),
         render_states: HashMap::new(),
         render_dirty: HashSet::new(),
         pending_resize: None,
+        prepared_resize: None,
+        retired_resize: VecDeque::new(),
         picked: None,
         selected: HashSet::new(),
         selection_dirty: false,
+        xray: HashSet::new(),
+        material_dirty: false,
         bounds: HashMap::new(),
+        isolate_restore: None,
     });
     commands.insert_resource(OrbitCamera::default());
 
@@ -563,6 +891,7 @@ fn setup(
         Transform::from_xyz(0.0, 0.0, 1.0).looking_at(Vec3::ZERO, Vec3::Y),
         Tonemapping::None,
         RenderLayers::layer(BACKGROUND_LAYER),
+        ViewportRenderCamera,
     ));
 
     commands.spawn((
@@ -575,6 +904,7 @@ fn setup(
         Transform::from_xyz(8.0, 6.0, 10.0).looking_at(Vec3::ZERO, Vec3::Y),
         Tonemapping::None,
         ViewCamera,
+        ViewportRenderCamera,
     ));
     commands.spawn((
         DirectionalLight {
@@ -595,12 +925,27 @@ fn setup(
     commands.insert_resource(HighlightMaterial(
         materials.add(model_material(SELECT_COLOR)),
     ));
+    commands.insert_resource(LineHighlightMaterial(
+        materials.add(fallback_line_material(SELECT_COLOR)),
+    ));
+    commands.insert_resource(XRayMaterial(materials.add(xray_material())));
+    commands.insert_resource(InvalidTubiLineStateMaterials {
+        highlight: line_materials.add(InvalidTubiLineMaterial::new(
+            SELECT_COLOR,
+            INVALID_TUBI_SELECTED_WIDTH_PX,
+        )),
+        xray: line_materials.add(InvalidTubiLineMaterial::new(
+            XRAY_COLOR,
+            INVALID_TUBI_LINE_WIDTH_PX,
+        )),
+    });
+    commands.insert_resource(InvalidTubiLineMesh(meshes.add(invalid_tubi_line_mesh())));
 
     // 地面网格（PDMS Z=0，过装载旋转即世界 y=0 面）与原点三色轴。
-    let grid_mesh = meshes.add(build_grid_mesh(1.0, DEFAULT_GRID));
+    let grid_mesh = meshes.add(build_grid_mesh(INITIAL_GRID_LEVEL, DEFAULT_GRID));
     commands.insert_resource(GridMesh(grid_mesh.clone()));
     commands.insert_resource(GridState {
-        level: 1.0,
+        level: INITIAL_GRID_LEVEL,
         color: DEFAULT_GRID,
         rebuild: false,
     });
@@ -614,10 +959,12 @@ fn setup(
         })),
         Transform::IDENTITY,
     ));
-    let rod_mesh = meshes.add(Cylinder::new(0.032, AXIS_CELLS));
+    // 杆径不跟着臂长等比走：臂长收到一格后按比例算出来的杆会细进亚像素，
+    // 这里单独定在屏幕上约 3px 的粗细上。
+    let rod_mesh = meshes.add(Cylinder::new(0.015, AXIS_CELLS));
     let tip_mesh = meshes.add(Cone {
-        radius: 0.11,
-        height: 0.45,
+        radius: 0.05,
+        height: AXIS_TIP_HEIGHT,
     });
     // 把「+Y 朝向」的圆柱掰到各轴的世界方向上：X 红、Y(PDMS) 绿即 -Z、Z(PDMS) 蓝即 +Y。
     let axis_rotations = [
@@ -644,7 +991,7 @@ fn setup(
                         arm.spawn((
                             Mesh3d(tip_mesh.clone()),
                             MeshMaterial3d(material),
-                            Transform::from_xyz(0.0, AXIS_CELLS + 0.22, 0.0),
+                            Transform::from_xyz(0.0, AXIS_CELLS + AXIS_TIP_HEIGHT / 2.0, 0.0),
                         ));
                     });
             }
@@ -721,11 +1068,39 @@ fn build_grid_mesh(cell: f32, color: Color) -> Mesh {
     mesh
 }
 
-/// 相机离焦点多远，格距取几：10 的整幂，视野里保持十来格的密度。
-/// 上下限把「相机贴脸」与「拉到平流层」两头都夹住。
+/// 相机离焦点多远，格距取多少**真实长度**（毫米）。
+///
+/// 换档判断全在毫米上做。在世界单位上取 10 的整幂得出的是「一格 100 mm」
+/// 这种没人报得出口的数，而界面上又没有地方说明一格多长；落到
+/// 1/2/5×10ⁿ 这套工程与地图通用的档位上，每一档都是能直接念出来的长度，
+/// 相邻档之间也只差 2～2.5 倍，不像纯 10 次幂那样一跳就是十倍。
+fn grid_cell_mm(dist: f32) -> f32 {
+    // 先夹再落档：夹的是真实长度，且两端本身就在档位上，落档不会再推出界。
+    // 夹在前面还顺带挡掉 `dist = 0` 时的退化对数。
+    let wanted =
+        ((dist.max(0.0) / GRID_CELLS_ACROSS) * MM_PER_WORLD).clamp(GRID_MIN_MM, GRID_MAX_MM);
+    snap_grid_step(wanted)
+}
+
+/// 同上，换算成网格与三轴直接使用的世界单位。
 fn grid_level(dist: f32) -> f32 {
-    let raw = (dist.max(0.001) / 12.0).log10().round() as i32;
-    10f32.powi(raw).clamp(0.001, 1_000_000.0)
+    grid_cell_mm(dist) * MODEL_SCALE
+}
+
+/// 把一个真实长度落到最近的 1/2/5×10ⁿ 档。
+///
+/// 档位边界取相邻两档的**几何**中点：拉远与拉近的换档时机因此对称。用算术
+/// 中点的话同一个格距在放大时和缩小时会在不同的距离上跳档，来回滚一次滚轮
+/// 就能看出网格在同一位置上闪。
+fn snap_grid_step(mm: f32) -> f32 {
+    let decade = 10f32.powi(mm.max(f32::MIN_POSITIVE).log10().floor() as i32);
+    match mm / decade {
+        mantissa if mantissa < std::f32::consts::SQRT_2 => decade,
+        // √10 与 √50：1↔2、2↔5、5↔10 三处交界。
+        mantissa if mantissa < 3.162_277_7 => decade * 2.0,
+        mantissa if mantissa < 7.071_068 => decade * 5.0,
+        _ => decade * 10.0,
+    }
 }
 
 fn headlight_aim(camera: &Transform) -> Option<Vec3> {
@@ -764,7 +1139,9 @@ fn publish_camera(
         m.y_axis.to_array(),
         m.z_axis.to_array(),
     ];
-    let tip = (AXIS_CELLS + 0.9) * grid.level;
+    view.grid_cell_mm = grid.level * MM_PER_WORLD;
+    // 标签落在箭尖再往外一个箭头高的位置，跟轴端留出一点空隙。
+    let tip = (AXIS_CELLS + AXIS_TIP_HEIGHT * 2.0) * grid.level;
     for (axis, dir) in AXIS_DIRS.into_iter().enumerate() {
         view.axis_labels[axis] = camera
             .world_to_ndc(transform, dir * tip)
@@ -811,6 +1188,136 @@ fn model_material(color: Color) -> StandardMaterial {
     }
 }
 
+fn fallback_line_material(color: Color) -> StandardMaterial {
+    StandardMaterial {
+        unlit: true,
+        ..model_material(color)
+    }
+}
+
+/// 在局部 `+Z` 的 `[0, 1]` 范围内生成真实长度虚线。两端都落在线段端点，实例原点
+/// 仍是连接起点；短于一个节距的错误管段退化为一条完整诊断线，不会彻底消失。
+fn invalid_tubi_fallback_line_mesh(axis_length_mm: f32) -> Mesh {
+    let length_mm = axis_length_mm.abs();
+    let mut positions = Vec::new();
+    if !length_mm.is_finite() || length_mm <= INVALID_TUBI_DASH_MM + INVALID_TUBI_GAP_MM {
+        positions.extend([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]]);
+    } else {
+        let dash_count = ((length_mm + INVALID_TUBI_GAP_MM)
+            / (INVALID_TUBI_DASH_MM + INVALID_TUBI_GAP_MM))
+            .ceil()
+            .max(2.0) as usize;
+        let dash_mm =
+            (length_mm - INVALID_TUBI_GAP_MM * (dash_count - 1) as f32) / dash_count as f32;
+        for index in 0..dash_count {
+            let start_mm = index as f32 * (dash_mm + INVALID_TUBI_GAP_MM);
+            let end_mm = start_mm + dash_mm;
+            positions.extend([
+                [0.0, 0.0, start_mm / length_mm],
+                [0.0, 0.0, end_mm / length_mm],
+            ]);
+        }
+    }
+    let normals = vec![[0.0, 1.0, 0.0]; positions.len()];
+    let mut mesh = Mesh::new(PrimitiveTopology::LineList, RenderAssetUsages::default());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh
+}
+
+/// 为全部无效 TUBI 创建共享的局部 +Z 单位带。局部端点严格为 `[0, 1]`：实例原点
+/// 就是起始连接点，既不以中心对称，也不会向 `Z < 0` 反向延长。
+fn invalid_tubi_line_mesh() -> Mesh {
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    );
+    mesh.insert_attribute(
+        Mesh::ATTRIBUTE_POSITION,
+        vec![
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0],
+        ],
+    );
+    mesh.insert_attribute(INVALID_TUBI_LINE_SIDE, vec![-1.0, 1.0, -1.0, 1.0]);
+    mesh.insert_indices(Indices::U32(vec![0, 1, 2, 2, 1, 3]));
+    mesh
+}
+
+fn xray_material() -> StandardMaterial {
+    StandardMaterial {
+        base_color: XRAY_COLOR,
+        alpha_mode: AlphaMode::Blend,
+        unlit: true,
+        double_sided: true,
+        cull_mode: None,
+        ..default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaterialState {
+    Base,
+    Selected,
+    XRay,
+}
+
+impl MaterialState {
+    fn choose<M: Asset>(
+        self,
+        base: &Handle<M>,
+        highlight: &Handle<M>,
+        xray: &Handle<M>,
+    ) -> Handle<M> {
+        match self {
+            Self::Base => base.clone(),
+            Self::Selected => highlight.clone(),
+            Self::XRay => xray.clone(),
+        }
+    }
+}
+
+/// 普通实体与无效 TUBI 共用的唯一状态裁决：X-Ray > Selected > Base，且 refno / owner
+/// 任一命中都生效。
+fn material_state(
+    selected: &HashSet<RefU64>,
+    xray: &HashSet<RefU64>,
+    refno: RefU64,
+    owner: RefU64,
+) -> MaterialState {
+    if xray.contains(&refno) || xray.contains(&owner) {
+        MaterialState::XRay
+    } else if selected.contains(&refno) || selected.contains(&owner) {
+        MaterialState::Selected
+    } else {
+        MaterialState::Base
+    }
+}
+
+fn forget_model_state(view: &mut View3d, removed: &HashSet<RefU64>) {
+    view.desired_visibility
+        .retain(|refno, _| !removed.contains(refno));
+    view.render_states
+        .retain(|refno, _| !removed.contains(refno));
+    view.render_dirty.retain(|refno| !removed.contains(refno));
+    view.bounds.retain(|refno, _| !removed.contains(refno));
+    view.loading_meshes
+        .retain(|mesh| !removed.contains(&mesh.refno));
+    view.failed_meshes
+        .retain(|mesh| !removed.contains(&mesh.refno));
+    view.retrying_meshes
+        .retain(|mesh| !removed.contains(&mesh.mesh.refno));
+    view.selected.retain(|refno| !removed.contains(refno));
+    view.xray.retain(|refno| !removed.contains(refno));
+    if let Some(snapshot) = &mut view.isolate_restore {
+        snapshot.retain(|refno, _| !removed.contains(refno));
+    }
+    view.selection_dirty = true;
+    view.material_dirty = true;
+}
+
 #[allow(clippy::too_many_arguments)]
 fn load_models(
     mut commands: Commands,
@@ -819,18 +1326,27 @@ fn load_models(
     mut camera: Query<(&mut Transform, &mut Projection), With<ViewCamera>>,
     roots: Query<Entity, With<SceneRoot>>,
     assets: Res<AssetServer>,
+    mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut line_materials: ResMut<Assets<InvalidTubiLineMaterial>>,
     highlight: Res<HighlightMaterial>,
+    line_highlight: Res<LineHighlightMaterial>,
+    xray_material: Res<XRayMaterial>,
+    invalid_line_mesh: Res<InvalidTubiLineMesh>,
+    invalid_line_state: Res<InvalidTubiLineStateMaterials>,
 ) {
     let Some(batch) = view.pending_models.pop_front() else {
         return;
     };
     let replace = batch.clears_scene();
-    let frame = should_frame_batch(replace, roots.is_empty());
+    let frame = should_frame_batch(roots.is_empty());
     let models = batch.into_models();
     if replace {
         view.bounds.clear();
         view.loading_meshes.clear();
+        // 整场换掉，上一场的失败连同它指向的实体一起作废。
+        view.failed_meshes.clear();
+        view.retrying_meshes.clear();
         view.mesh_progress = None;
         view.render_states.clear();
         view.render_dirty.clear();
@@ -890,10 +1406,16 @@ fn load_models(
     // 一类一枚材质：同类构件成千上万，逐网格建材质既费显存也断批。按基色缓存，
     // 同色（含 UNKOWN 兜底）只落一枚。
     let mut material_cache: HashMap<[u8; 4], Handle<StandardMaterial>> = HashMap::new();
+    let mut fallback_line_material_cache: HashMap<[u8; 4], Handle<StandardMaterial>> =
+        HashMap::new();
+    let mut fallback_line_mesh_cache: HashMap<u32, Handle<Mesh>> = HashMap::new();
+    // 无效 TUBI 的屏幕空间材质同样按类型色缓存；Mesh 则全场只用资源里的那一枚。
+    let mut line_material_cache: HashMap<[u8; 4], Handle<InvalidTubiLineMaterial>> = HashMap::new();
     let selected = view.selected.clone();
+    let xray = view.xray.clone();
     let desired_visibility = view.desired_visibility.clone();
     let mut loading_meshes = Vec::new();
-    let mut spawned: Vec<(RefU64, bool, usize)> = Vec::new();
+    let mut spawned: Vec<(RefU64, bool, usize, usize)> = Vec::new();
     commands.entity(scene).with_children(|scene| {
         for model in models {
             let refno = model.refno.refno();
@@ -904,11 +1426,7 @@ fn load_models(
                 .entry(key)
                 .or_insert_with(|| materials.add(model_material(color)))
                 .clone();
-            let shown_material = if selected.contains(&refno) || selected.contains(&owner) {
-                highlight.0.clone()
-            } else {
-                material.clone()
-            };
+            let state = material_state(&selected, &xray, refno, owner);
             let visible = desired_visibility
                 .get(&refno)
                 .or_else(|| desired_visibility.get(&owner))
@@ -919,52 +1437,114 @@ fn load_models(
             } else {
                 Visibility::Hidden
             };
-            spawned.push((refno, visible, model.insts.len()));
+            let mesh_total = model.insts.len();
+            let mesh_immediate = model
+                .insts
+                .iter()
+                .filter(|inst| inst.is_invalid_tubi)
+                .count();
+            spawned.push((refno, visible, mesh_total, mesh_immediate));
+            // 只有真挂着无效 TUBI 的模型才建线材质。
+            let line_material = (mesh_immediate > 0).then(|| {
+                line_material_cache
+                    .entry(key)
+                    .or_insert_with(|| {
+                        line_materials.add(InvalidTubiLineMaterial::new(
+                            color,
+                            INVALID_TUBI_LINE_WIDTH_PX,
+                        ))
+                    })
+                    .clone()
+            });
             scene
                 .spawn((model.world_trans, visibility, ModelRoot { refno, owner }))
                 .with_children(|element| {
                     for inst in model.insts {
-                        let path = format!("meshes/{}.mesh", inst.geo_hash);
-                        let handle = assets.load(path.clone());
-                        loading_meshes.push(LoadingMesh {
-                            refno,
-                            path,
-                            handle: handle.clone(),
-                        });
-                        element.spawn((
-                            Mesh3d(handle),
-                            MeshMaterial3d(shown_material.clone()),
-                            inst.transform,
-                            ModelMesh {
+                        if inst.is_invalid_tubi {
+                            // 这里使用 Bevy 原生 LineList，而不是自定义屏幕带。后者的材质
+                            // bind group / 离屏管线一旦失配会整段不画；LineList 已在同一实库
+                            // 场景验证过，且仍保留正确的起点、方向、深度遮挡和选择状态。
+                            let base = fallback_line_material_cache
+                                .entry(key)
+                                .or_insert_with(|| materials.add(fallback_line_material(color)))
+                                .clone();
+                            let shown = state.choose(&base, &line_highlight.0, &xray_material.0);
+                            let axis_length_mm =
+                                (model.world_trans.scale.z * inst.transform.scale.z).abs();
+                            let mesh = fallback_line_mesh_cache
+                                .entry(axis_length_mm.to_bits())
+                                .or_insert_with(|| {
+                                    meshes.add(invalid_tubi_fallback_line_mesh(axis_length_mm))
+                                })
+                                .clone();
+                            element.spawn((
+                                Mesh3d(mesh),
+                                MeshMaterial3d(shown),
+                                inst.transform,
+                                ModelMesh {
+                                    refno,
+                                    owner,
+                                    base,
+                                    highlight: line_highlight.0.clone(),
+                                },
+                                ModelPickTarget { refno },
+                                NotShadowCaster,
+                                NotShadowReceiver,
+                            ));
+                        } else {
+                            let path = mesh_source::asset_path(&inst.geo_hash);
+                            let handle = assets.load(path.clone());
+                            loading_meshes.push(LoadingMesh {
                                 refno,
-                                owner,
-                                base: material.clone(),
-                            },
-                        ));
+                                path,
+                                handle: handle.clone(),
+                            });
+                            let shown = state.choose(&material, &highlight.0, &xray_material.0);
+                            element.spawn((
+                                Mesh3d(handle),
+                                MeshMaterial3d(shown),
+                                inst.transform,
+                                ModelMesh {
+                                    refno,
+                                    owner,
+                                    base: material.clone(),
+                                    highlight: highlight.0.clone(),
+                                },
+                                ModelPickTarget { refno },
+                            ));
+                        }
                     }
                 });
         }
     });
     // 新模型先记账再等 mesh：`settled()` 在这一刻还是 false，所以宿主取不到它，
     // eye 停在原来的样子直到网格真的有了结果。零网格的那些当场就是终态。
-    for (refno, visible, mesh_total) in spawned {
+    for (refno, visible, mesh_total, mesh_immediate) in spawned {
         let state = view.render_states.entry(refno).or_insert(RenderState {
             visible,
             mesh_total: 0,
+            mesh_immediate: 0,
             mesh_loaded: 0,
             mesh_failed: 0,
         });
         state.visible = visible;
         state.mesh_total += mesh_total;
+        state.mesh_immediate += mesh_immediate;
+        state.mesh_loaded += mesh_immediate;
         view.render_dirty.insert(refno);
     }
     view.loading_meshes.extend(loading_meshes);
-    if !view.loading_meshes.is_empty() {
-        view.mesh_progress = Some(MeshLoadProgress {
-            done: 0,
-            total: view.loading_meshes.len(),
-            errors: Vec::new(),
-        });
+    // Even an empty replacement is observable only after this system has cleared the old
+    // scene. Reporting a terminal 0/0 batch here lets the host publish its refresh generation
+    // on the following frame instead of doing so before `View3d::load` is consumed.
+    view.mesh_progress = Some(begin_mesh_progress(view.loading_meshes.len()));
+}
+
+fn begin_mesh_progress(total: usize) -> MeshLoadProgress {
+    MeshLoadProgress {
+        done: 0,
+        total,
+        errors: Vec::new(),
     }
 }
 
@@ -1000,7 +1580,9 @@ fn update_mesh_progress(mut view: ResMut<View3d>, assets: Res<AssetServer>) {
             continue;
         };
         let was_settled = state.settled();
-        state.mesh_loaded = loaded;
+        // 重算的只是外部文件那一半；内存里的共享虚线带没有加载事件，
+        // 直接赋值会把它们抹掉，那个模型就再也等不到终态。
+        state.mesh_loaded = state.mesh_immediate + loaded;
         state.mesh_failed = failed;
         if !was_settled && state.settled() {
             settled_now.push(refno);
@@ -1014,11 +1596,130 @@ fn update_mesh_progress(mut view: ResMut<View3d>, assets: Res<AssetServer>) {
         errors,
     });
     if done == total {
-        view.loading_meshes.clear();
+        // 整批有了结果：失败的那些挑出来留着。换过网格目录之后要重来的就是它们，
+        // 跟着 `loading_meshes` 一起清掉就无从下手了。
+        let failed: Vec<LoadingMesh> = view
+            .loading_meshes
+            .drain(..)
+            .filter(|mesh| {
+                matches!(
+                    assets.get_load_state(&mesh.handle),
+                    Some(LoadState::Failed(_))
+                )
+            })
+            .collect();
+        view.failed_meshes.extend(failed);
     }
 }
 
-fn apply_resize(mut view: ResMut<View3d>, mut images: ResMut<Assets<Image>>) {
+/// 重发上一轮失败的网格，并推进正在重试的那些。
+///
+/// 与 [`update_mesh_progress`] 分开走：那一份每帧从 `loading_meshes` 从头重算整批
+/// 计数，而重试只补个别网格——混进同一份账里会把同一个模型早先成功的那些数抹掉。
+fn retry_meshes(mut view: ResMut<View3d>, assets: Res<AssetServer>) {
+    if view.retry_requested {
+        view.retry_requested = false;
+        let asked_at = Instant::now();
+        let retrying: Vec<_> = view
+            .failed_meshes
+            .drain(..)
+            .map(|mesh| RetryingMesh {
+                mesh,
+                asked_at,
+                started: false,
+            })
+            .collect();
+        let mut reloaded = HashSet::new();
+        for entry in &retrying {
+            // 一个网格文件可以被许多实例共用，重发一次就够。
+            if reloaded.insert(entry.mesh.path.clone()) {
+                assets.reload(entry.mesh.path.as_str());
+            }
+        }
+        view.retrying_meshes.extend(retrying);
+    }
+    if view.retrying_meshes.is_empty() {
+        return;
+    }
+    let mut settled_now = Vec::new();
+    let mut still_failed = Vec::new();
+    let mut in_flight = Vec::new();
+    for mut entry in std::mem::take(&mut view.retrying_meshes) {
+        match assets.get_load_state(&entry.mesh.handle) {
+            Some(LoadState::Loaded) => {
+                if let Some(state) = view.render_states.get_mut(&entry.mesh.refno) {
+                    state.mesh_loaded += 1;
+                    state.mesh_failed = state.mesh_failed.saturating_sub(1);
+                }
+                settled_now.push(entry.mesh.refno);
+            }
+            // 还是失败态，但重发是丢进 IO 任务池的，状态要过几帧才翻——在亲眼见到
+            // 它离开失败态之前，这个 `Failed` 说的还是上一轮的事，不是这次的结论。
+            Some(LoadState::Failed(_)) if entry.settling() => still_failed.push(entry.mesh),
+            Some(LoadState::Failed(_)) => in_flight.push(entry),
+            _ => {
+                entry.started = true;
+                in_flight.push(entry);
+            }
+        }
+    }
+    view.retrying_meshes = in_flight;
+    view.failed_meshes.extend(still_failed);
+    view.render_dirty.extend(settled_now);
+}
+
+fn apply_resize(
+    mut view: ResMut<View3d>,
+    mut sync: ResMut<ViewportResizeSync>,
+    mut images: ResMut<Assets<Image>>,
+    mut egui_textures: ResMut<EguiUserTextures>,
+    mut cameras: Query<&mut Camera, With<ViewportRenderCamera>>,
+) {
+    let rendered_frame = sync.rendered_frames();
+    while view
+        .retired_resize
+        .front()
+        .is_some_and(|retired| retired.remove_after_rendered_frame <= rendered_frame)
+    {
+        let retired = view.retired_resize.pop_front().expect("刚检查过队首");
+        egui_textures.remove_image(&retired.image);
+        images.remove(&retired.image);
+    }
+
+    if let Some(prepared) = view.prepared_resize.take() {
+        // 在新目标预热这一帧里，dock 可能又被拖回当前尺寸。此时丢掉预热目标，
+        // 相机重新指回仍完整保留的展示纹理，避免下一帧无意义地来回切换。
+        if view.pending_resize.map(|(size, _)| size) == Some(view.size) {
+            for mut camera in &mut cameras {
+                camera.target = RenderTarget::Image(view.image.clone().into());
+            }
+            view.retired_resize.push_back(RetiredResize {
+                image: prepared.image,
+                remove_after_rendered_frame: rendered_frame + 1,
+            });
+            view.pending_resize = None;
+            return;
+        }
+
+        if !sync.generation_is_rendered(prepared.generation) {
+            view.prepared_resize = Some(prepared);
+            return;
+        }
+
+        // Render world 已在完整 render graph 之后确认过这个代次。现在发布它不会露出
+        // 未初始化/透明的一帧；旧目标再留一个渲染帧，等上一份 egui paint job 排空。
+        let old_image = std::mem::replace(&mut view.image, prepared.image);
+        view.texture = prepared.texture;
+        view.size = prepared.size;
+        view.retired_resize.push_back(RetiredResize {
+            image: old_image,
+            remove_after_rendered_frame: rendered_frame + 1,
+        });
+        if view.pending_resize.map(|(size, _)| size) == Some(view.size) {
+            view.pending_resize = None;
+        }
+    }
+
     let Some((wanted, asked_at)) = view.pending_resize else {
         return;
     };
@@ -1026,27 +1727,31 @@ fn apply_resize(mut view: ResMut<View3d>, mut images: ResMut<Assets<Image>>) {
         return;
     }
     view.pending_resize = None;
-    let Some(image) = images.get_mut(&view.image) else {
-        return;
-    };
-    image.resize(Extent3d {
-        width: wanted.x,
-        height: wanted.y,
-        ..default()
+    let image = images.add(viewport_image(wanted));
+    let texture = egui_textures.add_image(image.clone());
+    sync.requested_generation += 1;
+    for mut camera in &mut cameras {
+        camera.target = RenderTarget::Image(image.clone().into());
+    }
+    view.prepared_resize = Some(PreparedResize {
+        size: wanted,
+        image,
+        texture,
+        generation: sync.requested_generation,
     });
-    view.size = wanted;
 }
 
 #[allow(clippy::too_many_arguments)]
 fn apply_commands(
+    mut commands: Commands,
     mut view: ResMut<View3d>,
     mut orbit: ResMut<OrbitCamera>,
     mut camera: Query<
         (&Camera, &GlobalTransform, &mut Transform, &mut Projection),
         With<ViewCamera>,
     >,
-    mut roots: Query<(&ModelRoot, &mut Visibility)>,
-    meshes: Query<&ModelMesh>,
+    mut roots: Query<(Entity, &ModelRoot, &mut Visibility)>,
+    meshes: Query<&ModelPickTarget>,
     mut mesh_params: ParamSet<(MeshRayCast, ResMut<Assets<Mesh>>)>,
     background: Res<BackgroundMesh>,
     mut grid: ResMut<GridState>,
@@ -1093,7 +1798,7 @@ fn apply_commands(
                     // Home 键的「拉回全景」：与 FitAll 同一套可见包围盒。
                     let mut min = Vec3::splat(f32::INFINITY);
                     let mut max = Vec3::splat(f32::NEG_INFINITY);
-                    for (root, visibility) in &roots {
+                    for (_, root, visibility) in &roots {
                         if *visibility == Visibility::Hidden {
                             continue;
                         }
@@ -1111,9 +1816,32 @@ fn apply_commands(
                 orbit.anim = Some(snap_anim(&camera_transform, focus, forward, up, dist));
             }
             ViewCommand::Model(action) => match action {
+                ModelAction::SetXRay { refnos } => {
+                    let xray: HashSet<_> = refnos.into_iter().collect();
+                    if view.xray != xray {
+                        view.xray = xray;
+                        view.material_dirty = true;
+                    }
+                }
+                ModelAction::Unload { refnos } => {
+                    let targets: HashSet<_> = refnos.into_iter().collect();
+                    let mut removed = HashSet::new();
+                    let mut entities = Vec::new();
+                    for (entity, root, _) in &mut roots {
+                        if targets.contains(&root.refno) || targets.contains(&root.owner) {
+                            removed.insert(root.refno);
+                            entities.push(entity);
+                        }
+                    }
+                    for entity in entities {
+                        commands.entity(entity).despawn();
+                    }
+                    removed.extend(targets);
+                    forget_model_state(&mut view, &removed);
+                }
                 ModelAction::SetVisible { refnos, visible } => {
                     let mut applied = Vec::new();
-                    for (root, mut visibility) in &mut roots {
+                    for (_, root, mut visibility) in &mut roots {
                         if refnos.contains(&root.refno) || refnos.contains(&root.owner) {
                             *visibility = if visible {
                                 Visibility::Visible
@@ -1127,7 +1855,7 @@ fn apply_commands(
                 }
                 ModelAction::HideAll => {
                     let mut applied = Vec::new();
-                    for (root, mut visibility) in &mut roots {
+                    for (_, root, mut visibility) in &mut roots {
                         *visibility = Visibility::Hidden;
                         applied.push(root.refno);
                     }
@@ -1135,7 +1863,7 @@ fn apply_commands(
                 }
                 ModelAction::ShowAll => {
                     let mut applied = Vec::new();
-                    for (root, mut visibility) in &mut roots {
+                    for (_, root, mut visibility) in &mut roots {
                         *visibility = Visibility::Visible;
                         applied.push(root.refno);
                     }
@@ -1147,10 +1875,76 @@ fn apply_commands(
                         frame_bounds(min, max, &mut orbit, &mut camera_transform, &mut projection);
                     }
                 }
+                ModelAction::FocusGroup { refnos } => {
+                    let mut min = Vec3::splat(f32::INFINITY);
+                    let mut max = Vec3::splat(f32::NEG_INFINITY);
+                    for refno in &refnos {
+                        if let Some(&(group_min, group_max)) = view.bounds.get(refno) {
+                            min = min.min(group_min);
+                            max = max.max(group_max);
+                        }
+                    }
+                    // 一个都没加载就不动相机：飞到原点比不动更糟。
+                    if min.is_finite() && max.is_finite() {
+                        orbit.anim = None;
+                        frame_bounds(min, max, &mut orbit, &mut camera_transform, &mut projection);
+                    }
+                }
+                ModelAction::Isolate { refnos } => {
+                    if view.isolate_restore.is_none() {
+                        view.isolate_restore = Some(
+                            roots
+                                .iter()
+                                .map(|(_, root, visibility)| {
+                                    (root.refno, *visibility != Visibility::Hidden)
+                                })
+                                .collect(),
+                        );
+                    }
+                    let mut shown = Vec::new();
+                    let mut hidden = Vec::new();
+                    for (_, root, mut visibility) in &mut roots {
+                        let keep = refnos.contains(&root.refno) || refnos.contains(&root.owner);
+                        *visibility = if keep {
+                            Visibility::Visible
+                        } else {
+                            Visibility::Hidden
+                        };
+                        if keep {
+                            shown.push(root.refno);
+                        } else {
+                            hidden.push(root.refno);
+                        }
+                    }
+                    record_applied_visibility(&mut view, shown, true);
+                    record_applied_visibility(&mut view, hidden, false);
+                }
+                ModelAction::ExitIsolate => {
+                    if let Some(snapshot) = view.isolate_restore.take() {
+                        let mut shown = Vec::new();
+                        let mut hidden = Vec::new();
+                        for (_, root, mut visibility) in &mut roots {
+                            // 快照之后才加载进来的模型不在账上，按可见处理。
+                            let visible = snapshot.get(&root.refno).copied().unwrap_or(true);
+                            *visibility = if visible {
+                                Visibility::Visible
+                            } else {
+                                Visibility::Hidden
+                            };
+                            if visible {
+                                shown.push(root.refno);
+                            } else {
+                                hidden.push(root.refno);
+                            }
+                        }
+                        record_applied_visibility(&mut view, shown, true);
+                        record_applied_visibility(&mut view, hidden, false);
+                    }
+                }
                 ModelAction::FitAll => {
                     let mut min = Vec3::splat(f32::INFINITY);
                     let mut max = Vec3::splat(f32::NEG_INFINITY);
-                    for (root, visibility) in &roots {
+                    for (_, root, visibility) in &roots {
                         if *visibility == Visibility::Hidden {
                             continue;
                         }
@@ -1224,7 +2018,8 @@ fn zoom_camera(camera: &mut Transform, focus: Vec3, amount: f32) {
 }
 
 fn orbit_camera(camera: &mut Transform, focus: Vec3, x: f32, y: f32) {
-    let yaw = Quat::from_rotation_y(-x * 0.005);
+    // 右键向右拖时相机应沿 +X 绕焦点运动；负号会让左右手感完全反转。
+    let yaw = Quat::from_rotation_y(x * 0.005);
     let right = camera.rotation * Vec3::X;
     let pitch = Quat::from_axis_angle(right, -y * 0.005);
     camera.rotate_around(focus, yaw * pitch);
@@ -1232,19 +2027,32 @@ fn orbit_camera(camera: &mut Transform, focus: Vec3, x: f32, y: f32) {
 
 fn apply_selection(
     mut view: ResMut<View3d>,
-    highlight: Res<HighlightMaterial>,
+    xray: Res<XRayMaterial>,
+    invalid_line_state: Res<InvalidTubiLineStateMaterials>,
     mut meshes: Query<(&ModelMesh, &mut MeshMaterial3d<StandardMaterial>)>,
+    mut invalid_lines: Query<(
+        &InvalidTubiLine,
+        &mut MeshMaterial3d<InvalidTubiLineMaterial>,
+    )>,
 ) {
-    if !view.selection_dirty {
+    if !view.selection_dirty && !view.material_dirty {
         return;
     }
     view.selection_dirty = false;
+    view.material_dirty = false;
     for (mesh, mut material) in &mut meshes {
-        material.0 = if view.selected.contains(&mesh.refno) || view.selected.contains(&mesh.owner) {
-            highlight.0.clone()
-        } else {
-            mesh.base.clone()
-        };
+        material.0 = material_state(&view.selected, &view.xray, mesh.refno, mesh.owner).choose(
+            &mesh.base,
+            &mesh.highlight,
+            &xray.0,
+        );
+    }
+    for (line, mut material) in &mut invalid_lines {
+        material.0 = material_state(&view.selected, &view.xray, line.refno, line.owner).choose(
+            &line.base,
+            &line.highlight,
+            &invalid_line_state.xray,
+        );
     }
 }
 
@@ -1342,7 +2150,7 @@ fn surface_hit(
     uv: [f32; 2],
     camera: &Camera,
     camera_transform: &GlobalTransform,
-    meshes: &Query<&ModelMesh>,
+    meshes: &Query<&ModelPickTarget>,
     ray_cast: &mut MeshRayCast,
 ) -> Option<(RefU64, Vec3)> {
     // TODO(诊断): 拾取排查完把日志删掉、恢复 `?` 链。
@@ -1383,25 +2191,405 @@ mod tests {
     use bevy::asset::AssetPlugin;
     use bevy::render::mesh::VertexAttributeValues;
 
+    #[test]
+    fn invalid_tubi_line_starts_at_the_connection_origin() {
+        let mesh = invalid_tubi_line_mesh();
+
+        assert_eq!(mesh.primitive_topology(), PrimitiveTopology::TriangleList);
+        let Some(VertexAttributeValues::Float32x3(positions)) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+        else {
+            panic!("invalid TUBI line mesh must contain Float32x3 positions");
+        };
+        assert_eq!(positions.len(), 4);
+        assert_eq!(positions[0][2], 0.0);
+        assert_eq!(positions[1][2], 0.0);
+        assert_eq!(positions[2][2], 1.0);
+        assert_eq!(positions[3][2], 1.0);
+        assert!(
+            positions
+                .iter()
+                .all(|position| position[0] == 0.0 && position[1] == 0.0)
+        );
+        let Some(VertexAttributeValues::Float32(sides)) = mesh.attribute(INVALID_TUBI_LINE_SIDE)
+        else {
+            panic!("invalid TUBI line mesh must contain Float32 side values");
+        };
+        assert_eq!(sides, &vec![-1.0, 1.0, -1.0, 1.0]);
+        match mesh.indices().expect("unit ribbon must be indexed") {
+            Indices::U32(indices) => assert_eq!(indices, &vec![0, 1, 2, 2, 1, 3]),
+            Indices::U16(_) => panic!("unit ribbon indices must stay U32"),
+        }
+    }
+
+    #[test]
+    fn invalid_tubi_shader_uses_bevys_material_bind_group() {
+        let shader = include_str!("invalid_tubi_line.wgsl");
+        assert_eq!(shader.matches("@group(#{MATERIAL_BIND_GROUP})").count(), 2);
+        assert!(
+            !shader.contains("@group(2)"),
+            "group 2 belongs to Bevy's mesh bindings; material uniforms must use the injected group"
+        );
+    }
+
+    #[test]
+    fn invalid_tubi_fallback_line_is_dashed_from_connection_to_endpoint() {
+        let mesh = invalid_tubi_fallback_line_mesh(1_000.0);
+        assert_eq!(mesh.primitive_topology(), PrimitiveTopology::LineList);
+        let Some(VertexAttributeValues::Float32x3(positions)) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+        else {
+            panic!("fallback line must contain Float32x3 positions");
+        };
+        assert!(positions.len() > 2);
+        assert_eq!(positions.first().unwrap(), &[0.0, 0.0, 0.0]);
+        assert!((positions.last().unwrap()[2] - 1.0).abs() < 1.0e-6);
+        for pair in positions.chunks_exact(2).collect::<Vec<_>>().windows(2) {
+            assert!(pair[1][0][2] > pair[0][1][2], "dashes need a visible gap");
+        }
+    }
+
+    #[test]
+    fn long_and_short_invalid_tubi_share_the_same_unit_ribbon() {
+        let mut meshes = Assets::<Mesh>::default();
+        let shared = InvalidTubiLineMesh(meshes.add(invalid_tubi_line_mesh()));
+        let long_segment = shared.handle();
+        let short_segment = shared.handle();
+
+        assert_eq!(long_segment, short_segment);
+        assert_eq!(
+            meshes.len(),
+            1,
+            "segment length must not create another mesh"
+        );
+    }
+
+    #[test]
+    fn invalid_tubi_material_state_is_xray_then_selected_then_base_for_refno_or_owner() {
+        let refno = RefU64::from(42);
+        let owner = RefU64::from(7);
+        let mut view = test_view();
+
+        assert_eq!(
+            material_state(&view.selected, &view.xray, refno, owner),
+            MaterialState::Base
+        );
+        view.selected.insert(owner);
+        assert_eq!(
+            material_state(&view.selected, &view.xray, refno, owner),
+            MaterialState::Selected
+        );
+        view.xray.insert(refno);
+        assert_eq!(
+            material_state(&view.selected, &view.xray, refno, owner),
+            MaterialState::XRay
+        );
+        view.xray.clear();
+        view.selected.clear();
+        view.selected.insert(refno);
+        assert_eq!(
+            material_state(&view.selected, &view.xray, refno, owner),
+            MaterialState::Selected
+        );
+        view.xray.insert(owner);
+        assert_eq!(
+            material_state(&view.selected, &view.xray, refno, owner),
+            MaterialState::XRay
+        );
+    }
+
+    #[test]
+    fn horizontal_orbit_follows_right_button_drag_direction() {
+        let focus = Vec3::ZERO;
+        let mut camera = Transform::from_xyz(0.0, 0.0, 10.0);
+
+        orbit_camera(&mut camera, focus, 20.0, 0.0);
+
+        assert!(
+            camera.translation.x > 0.0,
+            "dragging right should orbit the camera toward +X, got {:?}",
+            camera.translation
+        );
+    }
+
     fn test_view() -> View3d {
         View3d {
             texture: egui::TextureId::Managed(0),
             size: UVec2::new(16, 16),
             camera_rot: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             axis_labels: [None; 3],
+            grid_cell_mm: INITIAL_GRID_LEVEL * MM_PER_WORLD,
             image: Handle::default(),
             commands: VecDeque::new(),
             pending_models: VecDeque::new(),
             loading_meshes: Vec::new(),
+            failed_meshes: Vec::new(),
+            retrying_meshes: Vec::new(),
+            retry_requested: false,
             mesh_progress: None,
             desired_visibility: HashMap::new(),
             render_states: HashMap::new(),
             render_dirty: HashSet::new(),
             pending_resize: None,
+            prepared_resize: None,
+            retired_resize: VecDeque::new(),
             picked: None,
             selected: HashSet::new(),
             selection_dirty: false,
+            xray: HashSet::new(),
+            material_dirty: false,
             bounds: HashMap::new(),
+            isolate_restore: None,
+        }
+    }
+
+    /// egui 正在采样的离屏纹理不能原地改尺寸：`Image::resize` 会让 wgpu 重建 GPU
+    /// 纹理并丢掉旧内容，而窗口相机与离屏相机没有显式的渲染图依赖，窗口可能先把
+    /// 这张尚未重画的空纹理采样出来，表现就是 dock 拖动时闪一下底色。
+    #[test]
+    fn resize_keeps_the_displayed_texture_alive_until_replacement_is_rendered() {
+        let old_size = UVec2::new(320, 180);
+        let wanted = UVec2::new(640, 360);
+        let mut app = App::new();
+        app.init_resource::<Assets<Image>>()
+            .init_resource::<EguiUserTextures>()
+            .init_resource::<ViewportResizeSync>();
+
+        let old_image = app
+            .world_mut()
+            .resource_mut::<Assets<Image>>()
+            .add(viewport_image(old_size));
+        let old_texture = app
+            .world_mut()
+            .resource_mut::<EguiUserTextures>()
+            .add_image(old_image.clone());
+        let mut view = test_view();
+        view.image = old_image.clone();
+        view.texture = old_texture;
+        view.size = old_size;
+        view.pending_resize = Some((wanted, Instant::now() - RESIZE_DEBOUNCE));
+        app.insert_resource(view).add_systems(Update, apply_resize);
+        for _ in 0..2 {
+            app.world_mut().spawn((
+                Camera {
+                    target: RenderTarget::Image(old_image.clone().into()),
+                    ..default()
+                },
+                ViewportRenderCamera,
+            ));
+        }
+
+        app.update();
+
+        let view = app.world().resource::<View3d>();
+        assert_eq!(view.image, old_image, "展示中的纹理句柄被提前换掉了");
+        assert_eq!(view.texture, old_texture, "egui 提前采样了新纹理");
+        assert_eq!(view.size, old_size, "展示尺寸在替代纹理就绪前就发布了");
+        assert_eq!(
+            app.world()
+                .resource::<Assets<Image>>()
+                .get(&old_image)
+                .expect("展示纹理仍应存在")
+                .size(),
+            old_size,
+            "展示中的纹理被原地 resize，旧画面已经丢失"
+        );
+        let (prepared_image, prepared_texture) = {
+            let prepared = view
+                .prepared_resize
+                .as_ref()
+                .expect("新目标应该已经开始预热");
+            assert_eq!(prepared.size, wanted);
+            (prepared.image.clone(), prepared.texture)
+        };
+        let camera_targets = {
+            let world = app.world_mut();
+            let mut cameras = world.query_filtered::<&Camera, With<ViewportRenderCamera>>();
+            cameras
+                .iter(world)
+                .map(|camera| match &camera.target {
+                    RenderTarget::Image(target) => target.handle.clone(),
+                    other => panic!("离屏相机被改到了非 Image 目标：{other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(camera_targets, vec![prepared_image.clone(); 2]);
+
+        // 只过 Update 没有任何资格冒充“已经渲染”：显式回执到达前一直展示旧目标。
+        app.update();
+        assert_eq!(app.world().resource::<View3d>().image, old_image);
+        app.world()
+            .resource::<ViewportResizeSync>()
+            .acknowledge_rendered();
+
+        // 收到 render_system 后的代次回执才切换；旧目标仍多活一个渲染帧，避免上一份
+        // egui paint job 或 render world 还引用它时 TextureId 被复用。
+        app.update();
+        let view = app.world().resource::<View3d>();
+        assert_eq!(view.image, prepared_image);
+        assert_eq!(view.texture, prepared_texture);
+        assert_eq!(view.size, wanted);
+        assert!(
+            app.world()
+                .resource::<Assets<Image>>()
+                .get(&old_image)
+                .is_some(),
+            "刚发布新目标就回收了旧目标"
+        );
+
+        app.world()
+            .resource::<ViewportResizeSync>()
+            .acknowledge_rendered();
+        app.update();
+        assert!(
+            app.world()
+                .resource::<Assets<Image>>()
+                .get(&old_image)
+                .is_none(),
+            "下一帧已经排空，旧目标仍未回收"
+        );
+    }
+
+    #[test]
+    fn resize_reversal_retargets_cameras_before_retiring_the_prepared_image() {
+        let old_size = UVec2::new(320, 180);
+        let mut app = App::new();
+        app.init_resource::<Assets<Image>>()
+            .init_resource::<EguiUserTextures>()
+            .init_resource::<ViewportResizeSync>();
+        let old_image = app
+            .world_mut()
+            .resource_mut::<Assets<Image>>()
+            .add(viewport_image(old_size));
+        let old_texture = app
+            .world_mut()
+            .resource_mut::<EguiUserTextures>()
+            .add_image(old_image.clone());
+        let mut view = test_view();
+        view.image = old_image.clone();
+        view.texture = old_texture;
+        view.size = old_size;
+        view.pending_resize = Some((UVec2::new(640, 360), Instant::now() - RESIZE_DEBOUNCE));
+        app.insert_resource(view).add_systems(Update, apply_resize);
+        let camera = app
+            .world_mut()
+            .spawn((
+                Camera {
+                    target: RenderTarget::Image(old_image.clone().into()),
+                    ..default()
+                },
+                ViewportRenderCamera,
+            ))
+            .id();
+
+        app.update();
+        let prepared_image = app
+            .world()
+            .resource::<View3d>()
+            .prepared_resize
+            .as_ref()
+            .expect("应该已经开始预热")
+            .image
+            .clone();
+        app.world_mut()
+            .resource_mut::<View3d>()
+            .resize(old_size.to_array());
+        app.update();
+
+        let view = app.world().resource::<View3d>();
+        assert_eq!(view.image, old_image);
+        assert!(view.prepared_resize.is_none());
+        let camera = app.world().entity(camera).get::<Camera>().expect("相机");
+        assert!(
+            matches!(&camera.target, RenderTarget::Image(target) if target.handle == old_image),
+            "取消预热后相机没有回到当前展示目标"
+        );
+        assert!(
+            app.world()
+                .resource::<Assets<Image>>()
+                .get(&prepared_image)
+                .is_some(),
+            "取消当帧就删除了 render world 仍可能引用的预热目标"
+        );
+
+        app.world()
+            .resource::<ViewportResizeSync>()
+            .acknowledge_rendered();
+        app.update();
+        assert!(
+            app.world()
+                .resource::<Assets<Image>>()
+                .get(&prepared_image)
+                .is_none(),
+            "相机回切并完成一帧后，取消的预热目标仍未回收"
+        );
+    }
+
+    /// 档位表：1/2/5×10ⁿ 毫米，夹在格距上下限之内。
+    fn ladder_mm() -> Vec<f32> {
+        (0..=6)
+            .flat_map(|exp| {
+                let decade = 10f32.powi(exp);
+                [1.0, 2.0, 5.0].map(move |step| step * decade)
+            })
+            .filter(|mm| (GRID_MIN_MM..=GRID_MAX_MM).contains(mm))
+            .collect()
+    }
+
+    #[test]
+    fn every_grid_cell_is_a_round_real_length() {
+        let ladder = ladder_mm();
+        for step in 0..=400 {
+            let dist = 10f32.powf(-2.0 + step as f32 * 0.03);
+            let mm = grid_cell_mm(dist);
+            assert!(
+                ladder.iter().any(|rung| (rung - mm).abs() <= rung * 1e-4),
+                "相机距离 {dist} 处格距 {mm} mm 不在 1/2/5×10ⁿ 档上"
+            );
+        }
+    }
+
+    #[test]
+    fn the_grid_stays_between_a_millimetre_and_a_kilometre() {
+        // 相机贴到构件表面，以及 `dist` 退化成 0：都落到下界，不会算出 0 或负数
+        // 格距——那会让 `build_grid_mesh` 画出一堆重合线，也会把三轴缩成一点。
+        assert_eq!(grid_cell_mm(0.0), GRID_MIN_MM);
+        assert_eq!(grid_cell_mm(1e-6), GRID_MIN_MM);
+        assert_eq!(grid_cell_mm(f32::MAX), GRID_MAX_MM);
+    }
+
+    #[test]
+    fn pulling_the_camera_back_never_shrinks_the_grid() {
+        let mut previous = 0.0;
+        for step in 0..=300 {
+            let dist = 10f32.powf(-1.0 + step as f32 * 0.04);
+            let mm = grid_cell_mm(dist);
+            assert!(mm >= previous, "距离 {dist} 处格距回缩：{previous} -> {mm}");
+            previous = mm;
+        }
+    }
+
+    /// 世界单位与毫米之间只有 `MODEL_SCALE` 一处换算。谁把网格或三轴那一边
+    /// 改成另写的常数，这条就红——两个尺度各自漂移是本次要根治的病。
+    #[test]
+    fn world_units_and_millimetres_meet_at_one_conversion() {
+        assert_eq!(MM_PER_WORLD * MODEL_SCALE, 1.0);
+        for dist in [0.5f32, 5.0, 50.0, 500.0, 5_000.0] {
+            assert_eq!(grid_level(dist), grid_cell_mm(dist) * MODEL_SCALE);
+        }
+    }
+
+    /// 换到 1/2/5 阶梯不能把密度带跑偏。落档最多偏到相邻两档的几何中点，
+    /// 视野里的格数因此稳定在十来格——这是「格距跟着相机走」的全部意义。
+    #[test]
+    fn the_cell_keeps_about_a_dozen_cells_across_the_view() {
+        for step in 0..=285 {
+            let dist = 10f32.powf(-0.7 + step as f32 * 0.02);
+            let cells = dist / grid_level(dist);
+            assert!(
+                (GRID_CELLS_ACROSS / 2.0..=GRID_CELLS_ACROSS * 2.0).contains(&cells),
+                "距离 {dist} 处视野里 {cells} 格，离 {GRID_CELLS_ACROSS} 太远"
+            );
         }
     }
 
@@ -1479,9 +2667,61 @@ mod tests {
     }
 
     #[test]
-    fn first_incremental_batch_frames_an_empty_scene() {
-        assert!(should_frame_batch(false, true));
-        assert!(!should_frame_batch(false, false));
+    fn unloading_a_model_forgets_its_render_and_interaction_state() {
+        let removed = RefU64::from(42);
+        let kept = RefU64::from(43);
+        let mut view = test_view();
+        for refno in [removed, kept] {
+            view.desired_visibility.insert(refno, true);
+            view.render_states.insert(
+                refno,
+                RenderState {
+                    visible: true,
+                    mesh_total: 1,
+                    mesh_immediate: 0,
+                    mesh_loaded: 1,
+                    mesh_failed: 0,
+                },
+            );
+            view.render_dirty.insert(refno);
+            view.bounds.insert(refno, (Vec3::ZERO, Vec3::ONE));
+            view.selected.insert(refno);
+            view.xray.insert(refno);
+        }
+        view.isolate_restore = Some(HashMap::from([(removed, true), (kept, false)]));
+
+        record_model_visibility(
+            &ModelAction::Unload {
+                refnos: vec![removed],
+            },
+            &mut view.desired_visibility,
+        );
+        forget_model_state(&mut view, &HashSet::from([removed]));
+
+        assert!(!view.desired_visibility.contains_key(&removed));
+        assert!(!view.render_states.contains_key(&removed));
+        assert!(!view.render_dirty.contains(&removed));
+        assert!(!view.bounds.contains_key(&removed));
+        assert!(!view.selected.contains(&removed));
+        assert!(!view.xray.contains(&removed));
+        assert!(
+            !view
+                .isolate_restore
+                .as_ref()
+                .unwrap()
+                .contains_key(&removed)
+        );
+        assert!(view.render_states.contains_key(&kept));
+        assert!(view.selected.contains(&kept));
+        assert!(view.selection_dirty);
+        assert!(view.material_dirty);
+    }
+
+    #[test]
+    fn only_a_batch_into_an_empty_scene_frames_the_camera() {
+        assert!(should_frame_batch(true));
+        // 整场替换不取景：取回工作清场重装要回到取回前的样子，相机也算在内。
+        assert!(!should_frame_batch(false));
     }
 
     #[test]
@@ -1491,10 +2731,16 @@ mod tests {
             .push_back(ModelBatch::Append(Vec::new()));
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_asset::<Mesh>()
             .insert_resource(view)
             .insert_resource(OrbitCamera::default())
             .insert_resource(HighlightMaterial(Handle::default()))
+            .insert_resource(LineHighlightMaterial(Handle::default()))
+            .insert_resource(XRayMaterial(Handle::default()))
+            .insert_resource(InvalidTubiLineMesh(Handle::default()))
+            .insert_resource(test_invalid_line_state())
             .insert_resource(Assets::<StandardMaterial>::default())
+            .insert_resource(Assets::<InvalidTubiLineMaterial>::default())
             .add_systems(Update, load_models);
         app.world_mut().spawn((
             Transform::default(),
@@ -1522,6 +2768,13 @@ mod tests {
 
         assert_eq!(view.take_mesh_progress().unwrap().errors.len(), 1);
         assert!(view.take_mesh_progress().is_none());
+    }
+
+    #[test]
+    fn an_empty_replacement_reports_terminal_progress_after_scene_consumption() {
+        let progress = begin_mesh_progress(0);
+        assert!(progress.finished());
+        assert!(progress.errors.is_empty());
     }
 
     #[test]
@@ -1557,15 +2810,109 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        let progress = app
-            .world()
-            .resource::<View3d>()
-            .mesh_progress
-            .as_ref()
-            .unwrap();
+        let view = app.world().resource::<View3d>();
+        let progress = view.mesh_progress.as_ref().unwrap();
         assert_eq!((progress.done, progress.total), (1, 1));
         assert_eq!(progress.errors.len(), 1);
         assert!(progress.errors[0].contains(path));
+        // 装完的那一批清掉了，但失败的这个要留着——换过网格目录之后要重来的就是它。
+        assert!(view.loading_meshes.is_empty());
+        assert_eq!(view.failed_mesh_count(), 1);
+    }
+
+    /// 同一个模型同时挂着内存虚线带和外部网格文件。外部那一半是每帧从头重算的，
+    /// 重算时要把当场绑定的虚线带加回去——否则这个模型的账永远凑不齐，终态不来。
+    #[test]
+    fn an_invalid_tubi_line_mesh_survives_the_external_mesh_recount() {
+        let refno = RefU64::from(11);
+        let path = "meshes/__plant_ui_missing_mixed_test__.mesh";
+        let mut view = test_view();
+        view.render_states.insert(
+            refno,
+            RenderState {
+                visible: true,
+                mesh_total: 2,
+                mesh_immediate: 1,
+                mesh_loaded: 1,
+                mesh_failed: 0,
+            },
+        );
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_asset::<Mesh>()
+            .init_asset_loader::<MeshLoader>()
+            .insert_resource(view)
+            .add_systems(Update, update_mesh_progress);
+        let handle = app.world().resource::<AssetServer>().load(path);
+        app.world_mut()
+            .resource_mut::<View3d>()
+            .loading_meshes
+            .push(LoadingMesh {
+                refno,
+                path: path.into(),
+                handle,
+            });
+
+        for _ in 0..100 {
+            app.update();
+            if app
+                .world()
+                .resource::<View3d>()
+                .mesh_progress
+                .as_ref()
+                .is_some_and(MeshLoadProgress::finished)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut view = app.world_mut().resource_mut::<View3d>();
+        let reported = view.take_render_states();
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].refno, refno);
+        assert_eq!((reported[0].mesh_loaded, reported[0].mesh_failed), (1, 1));
+    }
+
+    /// 重发是丢进 IO 任务池的，状态要过几帧才翻。在亲眼见到它离开失败态之前，
+    /// 那一刻的 `Failed` 说的还是上一轮的事——照单全收的话重试会当场自我否定。
+    #[test]
+    fn a_stale_failure_does_not_settle_a_fresh_retry() {
+        let mut entry = RetryingMesh {
+            mesh: LoadingMesh {
+                refno: RefU64::from(1),
+                path: "meshes://a.mesh".into(),
+                handle: Handle::default(),
+            },
+            asked_at: Instant::now(),
+            started: false,
+        };
+        assert!(!entry.settling());
+        entry.started = true;
+        assert!(entry.settling());
+
+        // 兜底：压根没被重发的那些不能永远挂着，宽限期一过就认账。
+        let stale = RetryingMesh {
+            asked_at: Instant::now() - RETRY_GRACE - Duration::from_millis(1),
+            started: false,
+            ..entry
+        };
+        assert!(stale.settling());
+    }
+
+    #[test]
+    fn retrying_needs_something_to_retry() {
+        let mut view = test_view();
+        assert_eq!(view.retry_failed_meshes(), 0);
+        assert!(!view.retry_requested);
+
+        view.failed_meshes.push(LoadingMesh {
+            refno: RefU64::from(1),
+            path: "meshes://a.mesh".into(),
+            handle: Handle::default(),
+        });
+        assert_eq!(view.retry_failed_meshes(), 1);
+        assert!(view.retry_requested);
     }
 
     /// 网格还在装的模型不回执：eye 不许抢在画面前面变成「已显示」。
@@ -1578,6 +2925,7 @@ mod tests {
             RenderState {
                 visible: true,
                 mesh_total: 2,
+                mesh_immediate: 0,
                 mesh_loaded: 0,
                 mesh_failed: 0,
             },
@@ -1608,6 +2956,7 @@ mod tests {
             RenderState {
                 visible: true,
                 mesh_total: 0,
+                mesh_immediate: 0,
                 mesh_loaded: 0,
                 mesh_failed: 0,
             },
@@ -1629,6 +2978,7 @@ mod tests {
             RenderState {
                 visible: true,
                 mesh_total: 1,
+                mesh_immediate: 0,
                 mesh_loaded: 1,
                 mesh_failed: 0,
             },
@@ -1638,6 +2988,7 @@ mod tests {
             RenderState {
                 visible: true,
                 mesh_total: 1,
+                mesh_immediate: 0,
                 mesh_loaded: 0,
                 mesh_failed: 0,
             },
@@ -1669,6 +3020,7 @@ mod tests {
             RenderState {
                 visible: true,
                 mesh_total: 1,
+                mesh_immediate: 0,
                 mesh_loaded: 0,
                 mesh_failed: 0,
             },
@@ -1701,6 +3053,13 @@ mod tests {
         );
     }
 
+    fn test_invalid_line_state() -> InvalidTubiLineStateMaterials {
+        InvalidTubiLineStateMaterials {
+            highlight: Handle::default(),
+            xray: Handle::default(),
+        }
+    }
+
     #[test]
     fn selection_highlight_replaces_and_restores_the_type_material() {
         let refno = RefU64::from(42);
@@ -1714,7 +3073,8 @@ mod tests {
         view.selected.insert(owner);
         view.selection_dirty = true;
         app.add_plugins(MinimalPlugins)
-            .insert_resource(HighlightMaterial(highlight.clone()))
+            .insert_resource(XRayMaterial(Handle::default()))
+            .insert_resource(test_invalid_line_state())
             .insert_resource(view)
             .add_systems(Update, apply_selection);
         let entity = app
@@ -1724,11 +3084,163 @@ mod tests {
                     refno,
                     owner,
                     base: base.clone(),
+                    highlight: highlight.clone(),
                 },
                 MeshMaterial3d(base.clone()),
             ))
             .id();
 
+        app.update();
+        assert_eq!(
+            app.world()
+                .entity(entity)
+                .get::<MeshMaterial3d<StandardMaterial>>()
+                .unwrap()
+                .0,
+            highlight
+        );
+
+        {
+            let mut view = app.world_mut().resource_mut::<View3d>();
+            view.selected.clear();
+            view.selection_dirty = true;
+        }
+        app.update();
+        assert_eq!(
+            app.world()
+                .entity(entity)
+                .get::<MeshMaterial3d<StandardMaterial>>()
+                .unwrap()
+                .0,
+            base
+        );
+    }
+
+    /// 无效 TUBI 的屏幕带选中再取消，必须回到自己的类型色与 1.5px 常态宽度。
+    #[test]
+    fn an_invalid_tubi_line_keeps_its_own_material_across_selection() {
+        let refno = RefU64::from(42);
+        let owner = RefU64::from(7);
+        let color = type_color("TUBI");
+        let base_value = InvalidTubiLineMaterial::new(color, INVALID_TUBI_LINE_WIDTH_PX);
+        let highlight_value =
+            InvalidTubiLineMaterial::new(SELECT_COLOR, INVALID_TUBI_SELECTED_WIDTH_PX);
+        assert_eq!(base_value.params, Vec4::new(1.5, 5.0, 4.0, 0.75));
+        assert_eq!(highlight_value.params.x, 2.0);
+
+        let mut materials = Assets::<InvalidTubiLineMaterial>::default();
+        let line_base = materials.add(base_value);
+        let line_highlight = materials.add(highlight_value);
+        let line_xray = materials.add(InvalidTubiLineMaterial::new(
+            XRAY_COLOR,
+            INVALID_TUBI_LINE_WIDTH_PX,
+        ));
+        let mut app = App::new();
+        let mut view = test_view();
+        view.selected.insert(owner);
+        view.selection_dirty = true;
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(XRayMaterial(Handle::default()))
+            .insert_resource(InvalidTubiLineStateMaterials {
+                highlight: line_highlight.clone(),
+                xray: line_xray,
+            })
+            .insert_resource(view)
+            .add_systems(Update, apply_selection);
+        let entity = app
+            .world_mut()
+            .spawn((
+                InvalidTubiLine {
+                    refno,
+                    owner,
+                    base: line_base.clone(),
+                    highlight: line_highlight.clone(),
+                },
+                MeshMaterial3d(line_base.clone()),
+            ))
+            .id();
+
+        app.update();
+        let shown = app
+            .world()
+            .entity(entity)
+            .get::<MeshMaterial3d<InvalidTubiLineMaterial>>()
+            .unwrap()
+            .0
+            .clone();
+        assert_eq!(shown, line_highlight);
+
+        {
+            let mut view = app.world_mut().resource_mut::<View3d>();
+            view.selected.clear();
+            view.selection_dirty = true;
+        }
+        app.update();
+        assert_eq!(
+            app.world()
+                .entity(entity)
+                .get::<MeshMaterial3d<InvalidTubiLineMaterial>>()
+                .unwrap()
+                .0,
+            line_base
+        );
+    }
+
+    #[test]
+    fn room_xray_overrides_selection_and_restores_the_highlight() {
+        let refno = RefU64::from(42);
+        let owner = RefU64::from(7);
+        let mut materials = Assets::<StandardMaterial>::default();
+        let base = materials.add(model_material(type_color("PIPE")));
+        let highlight = materials.add(model_material(SELECT_COLOR));
+        let xray_material_value = xray_material();
+        assert_eq!(
+            xray_material_value.base_color.to_srgba().to_u8_array(),
+            [89, 169, 255, 64]
+        );
+        assert_eq!(xray_material_value.alpha_mode, AlphaMode::Blend);
+        assert!(xray_material_value.unlit);
+        assert!(xray_material_value.double_sided);
+        assert_eq!(xray_material_value.cull_mode, None);
+        let xray = materials.add(xray_material_value);
+        let mut app = App::new();
+        let mut view = test_view();
+        view.selected.insert(owner);
+        view.xray.insert(refno);
+        view.material_dirty = true;
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(XRayMaterial(xray.clone()))
+            .insert_resource(test_invalid_line_state())
+            .insert_resource(view)
+            .add_systems(Update, apply_selection);
+        let entity = app
+            .world_mut()
+            .spawn((
+                ModelMesh {
+                    refno,
+                    owner,
+                    base: base.clone(),
+                    highlight: highlight.clone(),
+                },
+                MeshMaterial3d(base.clone()),
+            ))
+            .id();
+
+        app.update();
+        assert_eq!(
+            app.world()
+                .entity(entity)
+                .get::<MeshMaterial3d<StandardMaterial>>()
+                .unwrap()
+                .0,
+            xray
+        );
+
+        {
+            let mut view = app.world_mut().resource_mut::<View3d>();
+            view.xray.clear();
+            view.material_dirty = true;
+        }
         app.update();
         assert_eq!(
             app.world()
@@ -1846,13 +3358,20 @@ mod tests {
         );
     }
 
-    /// 格距永远是 10 的整幂，距离归零也有下限——网格换档表是显示稳定性的根。
+    /// 换档表逐档钉死。它既是显示稳定性的根，也是 HUD 那句「一格 x」的唯一
+    /// 出处——档位一改，用户读到的尺寸就跟着改，所以拿具体距离对具体读数。
     #[test]
-    fn grid_level_snaps_to_powers_of_ten() {
+    fn grid_cells_snap_to_the_one_two_five_ladder() {
+        assert_eq!(grid_cell_mm(12.0), 100.0);
+        assert_eq!(grid_cell_mm(30.0), 200.0);
+        assert_eq!(grid_cell_mm(50.0), 500.0);
+        assert_eq!(grid_cell_mm(100.0), 1_000.0);
+        assert_eq!(grid_cell_mm(1_200.0), 10_000.0);
+        // 相机贴到构件表面：停在 1 mm，模型自身的精度量级。
+        assert_eq!(grid_cell_mm(0.0), GRID_MIN_MM);
+        // 网格与三轴收到的是同一档过一次 `MODEL_SCALE` 的世界单位。
         assert_eq!(grid_level(12.0), 1.0);
-        assert_eq!(grid_level(1.0), 0.1);
         assert_eq!(grid_level(1_200.0), 100.0);
-        assert_eq!(grid_level(0.0), 0.001);
     }
 
     /// 渐变面片的顶点色：下两枚是 bottom、上两枚是 top。铺反了渐变就头脚倒置，

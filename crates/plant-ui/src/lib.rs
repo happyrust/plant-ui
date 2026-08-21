@@ -4,8 +4,10 @@
 pub mod data_publish;
 pub mod fonts;
 pub mod manual_data_publish;
+pub mod model_regenerate;
 pub mod model_update;
 pub mod project_picker;
+pub mod room_browser;
 pub mod settings;
 pub mod style;
 pub mod task_queue;
@@ -27,6 +29,14 @@ pub enum ModelAction {
         refnos: Vec<aios_core::RefU64>,
         visible: bool,
     },
+    /// 从三维场景中卸载这些模型及其网格。
+    ///
+    /// 与 `SetVisible(false)` 不同，卸载会同时释放场景实体与渲染状态；用于 GET WORK
+    /// 已确认元素从资料树消失、而整场模型重查仍在后台进行的窗口期。
+    Unload { refnos: Vec<aios_core::RefU64> },
+    /// 原子替换当前 X-Ray 目标集。空集恢复全部模型的常态 / 选中材质。
+    /// 只改变材质，不改变可见性、隔离快照或相机。
+    SetXRay { refnos: Vec<aios_core::RefU64> },
     /// 隐藏当前已显示的全部模型。全局动作，只在工具栏出现。
     HideAll,
     /// 把已加载的模型全部显示回来，`HideAll` 的对偶。
@@ -44,6 +54,16 @@ pub enum ModelAction {
     /// refno。塞一组进去的结果是定位到其中某一个、还说不清是哪一个。定位本来
     /// 就是「带我到它跟前」，作用于主选中是说得清的语义。
     Focus(aios_core::RefU64),
+    /// 相机覆盖一组元素的合并包围盒（房间取景用）。与 `Focus` 分开：房间 FRMW
+    /// 自身没有几何实体，能取景的只有它的面板与成员；合并**已加载**那部分的
+    /// 包围盒，没加载的不参与，一个都没加载时不动相机。
+    FocusGroup { refnos: Vec<aios_core::RefU64> },
+    /// 隔离显示：目标可见、其余全部隐藏。首次隔离时视口记下隔离前的可见性
+    /// 快照，供 [`Self::ExitIsolate`] 恢复；连续隔离（房间 A -> 房间 B）不覆盖
+    /// 快照——退出回到隔离前的世界，而不是上一间房。
+    Isolate { refnos: Vec<aios_core::RefU64> },
+    /// 退出隔离，恢复隔离前的可见性快照；没有快照时是无操作。
+    ExitIsolate,
     /// 相机拉远到覆盖当前所有可见模型。
     FitAll,
     /// 进入 / 退出距离测量。
@@ -110,6 +130,28 @@ pub enum Cmd {
     /// 所以直接说重做哪件事——一块面板的失败只有一种来源，说得出来。
     Reconnect,
     RetryProps(aios_core::RefU64),
+    RetryRooms(aios_core::RefU64),
+    /// 房间视图：隔离该房间（面板 + 成员）并取景到它，同时把这间房的详情
+    /// 填进「房间」页签。宿主先经数据层解析成员集（一拍往返），再展开为
+    /// `Model(Isolate)` + `Model(FocusGroup)`；没有实时渲染器时视口那一半
+    /// 自然缺席，详情照常。
+    FocusRoom(aios_core::RefU64),
+    /// 把这间房自己的模型（墙面板那些几何）取回来显示，再取景到它。
+    ///
+    /// 与 [`Self::FocusRoom`] 分成两条：那条是「只看这间房」——隔离既有场景再
+    /// 取景，而隔离与取景都只对**已经加载进场景**的模型生效。房间的墙面板多半
+    /// 从没被加载过，于是那条路走完往往是别的模型全隐藏了、房间本身仍然看不见。
+    /// 这条走的是显示模型那条既有链路：范围没缓存过就先去查、把几何取回来。
+    ShowRoomModel(aios_core::RefU64),
+    /// 打开「房间」页签并对准该元素：元素不是当前主选中时先把选中切过去
+    /// （归属数据跟着选中预取，页签一亮出来就有内容）。
+    ShowRooms(aios_core::RefU64),
+    /// 打开房间浏览器浮窗并（重新）拉取全表。全表是全库扫描级的重查询，
+    /// 所以由这条命令按需触发，不进启动路径；查询在途时再按只开窗不重发。
+    OpenRoomBrowser,
+    /// 把某个常驻视图切到前台（如待重算横幅 -> 任务队列）。找不到该页签时
+    /// 宿主是无操作——用户可以把页签拖走，那是他的布局。
+    FocusPane(workbench::Pane),
     /// 清空日志缓冲。
     ClearLogs,
     /// 提交一条命令；解析与执行由宿主负责。
@@ -143,13 +185,27 @@ pub enum Cmd {
     /// 放弃等待预览结果。**只放弃客户端这一侧**——服务端没有 cancel 接口，
     /// 扫描照跑，界面上也不许暗示它会停。
     CancelModelUpdatePreview,
-    /// 执行当前项目的全部待更新库；范围由服务端的 Committed Watermark 决定。
-    ExecuteModelUpdate,
+    /// 执行当前项目的待更新库。`dbnums` 是勾选集折算的**范围内子集**
+    /// （gen-model ADR-020）：`None` = 全范围（队列面板的即时扫描走它）；
+    /// `Some` 时未勾选的库不入队、水位不动。向导确认总是显式给名单——
+    /// 预览之后新冒出来的库不在那份确认里，不该被顺手执行。
+    ExecuteModelUpdate {
+        dbnums: Option<Vec<u32>>,
+    },
     /// 任务队列上的「立刻扫一遍」。它**不插队**，作用只是别等服务端下一个 30 秒轮询。
     ScanNow,
     /// 暂停 / 恢复队列出队。暂停**只挡出队**，正在跑的那一批会跑完为止——
     /// 服务端没有中止接口，所以这条命令也不该被当成「停下来」。
     SetQueuePaused(bool),
+    /// 复活一行死信。自动路径到了重试上限就永不再碰它，人按这一下是**唯一**的出路。
+    ///
+    /// 它不排新的数据批次：服务端只把这一行的 `attempts` 清零、`revision` 加一，
+    /// 再叫醒调度器，下一轮空闲积压消化会把它重新取到。所以按完之后队列面板上
+    /// 不会立刻多出一行，变化要等下一拍轮询。
+    RetryPendingUnit {
+        dbnum: u32,
+        root_refno: String,
+    },
     /// 重开队列视图的明细长连接。断线降级的是明细区，队列行走轮询不受影响。
     ReconnectQueueFeed,
     /// 点击三维视口；坐标是离屏渲染纹理的归一化 UV。
@@ -191,4 +247,50 @@ pub enum Cmd {
         up: [f32; 3],
         fit: bool,
     },
+    /// 换过网格目录之后，把上一轮加载失败的网格重来一遍。
+    ///
+    /// 只碰失败的那些：网格文件名是内容哈希，已经加载成功的换个目录取到的还是
+    /// 同一份内容。由宿主在设置保存之后发出，界面上没有对应的按钮。
+    RetryFailedMeshes,
+    /// 模型树右键「重新生成模型」：删掉这几行范围内**已经生成**的模型，再重做一遍。
+    ///
+    /// **不进 [`ModelAction`]。** 那个枚举里的每一项改的都是「三维此刻画成什么样」，
+    /// 撤销它只要再下一条相反的命令；这一条改的是模型库里的产物，删掉的几何只能
+    /// 重新算回来。两者混在一个枚举里，宿主那边就只剩注释在提醒这件事。
+    ///
+    /// 这一条只发起**清点**：宿主先跑 deep query 数出「多少个已生成元素、归成多少个
+    /// 生成单元」，把数字摆进确认框，等 [`Self::RegenerateConfirm`] 才动手。
+    RegenerateModels {
+        targets: Vec<aios_core::RefU64>,
+    },
+    /// 确认框的回执。`false`（取消 / 关窗）时一个请求都不发。
+    RegenerateConfirm {
+        accepted: bool,
+    },
+    /// 「停在这里」。**只停派发**：已经发出去的那一个停不了——服务端那边是
+    /// `await_background_without_cancelling`，连超时都不杀后台任务。所以按钮文案
+    /// 里不许出现「取消」，见 `model_regenerate::STOP_LABEL`。
+    RegenerateStop,
+}
+
+#[cfg(test)]
+mod tests {
+    /// 重新生成是对**模型库**的动作，不是对三维场景的动作。混进 `ModelAction`
+    /// 之后，宿主那边处理可见性的那一路会顺手把它也接了，而那条路上没有确认框、
+    /// 没有互斥、没有账本——删除会变成一次没人拦得住的点击。
+    #[test]
+    fn regeneration_is_not_a_scene_action() {
+        let source = include_str!("lib.rs");
+        let model_action = source
+            .split_once("pub enum ModelAction {")
+            .expect("ModelAction exists")
+            .1
+            .split_once("\n}")
+            .expect("ModelAction ends")
+            .0;
+        assert!(
+            !model_action.contains("Regenerate"),
+            "重新生成不该是三维动作: {model_action}"
+        );
+    }
 }

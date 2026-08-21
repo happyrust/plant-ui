@@ -5,9 +5,10 @@
 //! 跟着 dock 分隔条走，拉伸的话管子会随手一拖就变成椭圆。
 //!
 //! 视口里的浮层：左上角 HUD、实时渲染时的左侧工具栏、右上角视图立方体
-//! （[`super::viewcube`]，S1-B 稿），以及三根世界轴的轴端标签。坐标读数与
-//! 比例尺仍留白——它们是另一类 HUD 信息件，拷问定案第 1 题把范围钉在
-//! 背景 / 坐标系 / ViewCube 三件，其余另轮。
+//! （[`super::viewcube`]，S1-B 稿），以及三根世界轴的轴端标签。HUD 末尾带一段
+//! 格距读数——网格与三轴是视口里唯一的长度参照，不把一格多长说出来，它们就
+//! 只是一组看得见疏密、读不出尺寸的线。光标处的坐标读数仍留白，那是另一类
+//! 信息件（要逐帧的射线命中），另轮再说。
 //!
 //! 鼠标：左键点击拾取、左键 / 中键拖拽平移、右键拖拽旋转、滚轮缩放。
 
@@ -21,7 +22,7 @@ use super::viewcube;
 use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Tokens, radius};
 use crate::style::widgets;
-use crate::vm::{Selection, View3dVm, WorkbenchVm};
+use crate::vm::{RoomViewVm, Selection, View3dVm, WorkbenchVm};
 use crate::{CameraGesture, CameraMotion, Cmd, ModelAction, RefU64};
 
 /// 占位纹理的不透明度，取自 S1 的「模型场景」矩形。压这么一点让渐变底透上来，
@@ -143,7 +144,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
             Color32::from_white_alpha(PLACEHOLDER_ALPHA)
         },
     );
-    hud(ui, t, d, rect, view.live);
+    let hud = hud(ui, t, d, rect, &view, vm.room_view.as_ref(), cmds);
     if !view.live {
         return;
     }
@@ -155,7 +156,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
     }
 
     axis_labels(ui, t, d, rect, &view);
-    // 浮层先画完再判拾取：工具栏与立方体盖住的那两片是控件，不是模型。
+    // 浮层先画完再判拾取：工具栏、立方体、HUD 盖住的这几片是控件，不是模型。
     let bar = toolbar(ui, t, d, rect, vm, response.id, cmds);
     let cube = viewcube::show(ui, t, d, &view, rect, response.id, cmds);
     if response.clicked_by(egui::PointerButton::Primary)
@@ -170,7 +171,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
         );
         // 点过视口，键盘就归视口。快捷键的开关是焦点，不是「鼠标在不在上面」。
         ui.memory_mut(|m| m.request_focus(response.id));
-        if !bar.contains(pointer) && !cube.contains(pointer) {
+        if !bar.contains(pointer) && !cube.contains(pointer) && !hud.contains(pointer) {
             cmds.push(Cmd::PickViewport(pointer_texture_uv(
                 rect.size(),
                 view.size,
@@ -178,7 +179,27 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
             )));
         }
     }
-    camera(ui, rect, view.size, [bar, cube], &response, cmds);
+    camera(ui, rect, view.size, [bar, cube, hud], &response, cmds);
+    // 视口右键菜单：与模型树行菜单同一段构造器，内容一致（S13 稿）。作用对象
+    // 是**当前选中**——视口的拾取是一次异步往返，右键当帧拿不到指针底下是谁，
+    // 「先左键选中、再右键操作」与树上的习惯一致。没有选中就不摆空菜单，
+    // 右键拖拽旋转不受影响（拖过门槛就不算点击）。
+    if let Some(primary) = vm.selection.primary() {
+        response.context_menu(|ui| {
+            super::tree::element_menu(
+                ui,
+                t,
+                d,
+                primary,
+                &vm.selection.to_vec(),
+                &vm.rooms,
+                true,
+                vm.regen_busy,
+                cmds,
+                false,
+            );
+        });
+    }
     // 焦点在命令行或属性输入框里时，敲 s / h / f 是在打字，不是在发命令。
     if response.has_focus() {
         for tool in Tool::BAR {
@@ -208,7 +229,7 @@ fn camera(
     ui: &Ui,
     view: Rect,
     texture: Vec2,
-    blocked: [Rect; 2],
+    blocked: [Rect; 3],
     response: &egui::Response,
     cmds: &mut Vec<Cmd>,
 ) {
@@ -481,8 +502,40 @@ fn hud_h(d: Density) -> f32 {
     d.px(26.0)
 }
 
+/// 格距读数：真实长度换成人念得出的单位。
+///
+/// 宿主的档位是 1/2/5×10ⁿ 毫米，永远落在整数上，所以不留小数位——「1 m」比
+/// 「1.0 m」更像一句话。独立壳没有网格（`live` 为假、读数为 0），返回 None
+/// 让这一段连同它的分隔线一起消失，而不是显示一个「一格 0 mm」。
+fn grid_cell(vm3d: &View3dVm) -> Option<String> {
+    let mm = vm3d.grid_cell_mm;
+    if !vm3d.live || !mm.is_finite() || mm <= 0.0 {
+        return None;
+    }
+    Some(if mm >= 1_000_000.0 {
+        format!("{} km", (mm / 1_000_000.0).round() as i64)
+    } else if mm >= 1_000.0 {
+        format!("{} m", (mm / 1_000.0).round() as i64)
+    } else {
+        format!("{} mm", mm.round() as i64)
+    })
+}
+
 /// 左上角的 HUD（S1 的「HUD状态」位置与规格：距边 14、高 26、bg-elevated + 1px 边）。
-fn hud(ui: &mut Ui, t: &Tokens, d: Density, view: Rect, live: bool) {
+///
+/// 房间视图进行中时多出一段徽章（S13-B 稿的「房间视图 · R301」）和「退出」
+/// 按钮。返回占住的矩形：HUD 从此有了交互，从它上面起手的点击 / 拖拽不该
+/// 穿到拾取与相机上——与工具栏、立方体同一条规矩。
+fn hud(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    view: Rect,
+    vm3d: &View3dVm,
+    room: Option<&RoomViewVm>,
+    cmds: &mut Vec<Cmd>,
+) -> Rect {
+    let live = vm3d.live;
     let inset = d.px(HUD_INSET);
     let mut child = ui.new_child(
         egui::UiBuilder::new()
@@ -492,7 +545,7 @@ fn hud(ui: &mut Ui, t: &Tokens, d: Density, view: Rect, live: bool) {
             ))
             .layout(egui::Layout::left_to_right(egui::Align::Min)),
     );
-    egui::Frame::new()
+    let frame = egui::Frame::new()
         .fill(t.bg_elevated)
         .stroke(Stroke::new(1.0, t.border))
         .corner_radius(radius::MD)
@@ -527,8 +580,42 @@ fn hud(ui: &mut Ui, t: &Tokens, d: Density, view: Rect, live: bool) {
                     .font(Font::mono_meta(d))
                     .color(t.text_muted),
                 );
+                // 比例读数：地面网格一格多长。没有它，网格与三轴只是一组好看的
+                // 线——看得见疏密，读不出尺寸，而它们恰恰是视口里唯一的长度参照。
+                if let Some(cell) = grid_cell(vm3d) {
+                    let (div, _) = ui.allocate_exact_size(vec2(1.0, d.px(12.0)), Sense::hover());
+                    ui.painter().rect_filled(div, 0, t.border);
+                    ui.label(
+                        RichText::new(format!("一格 {cell}"))
+                            .font(Font::mono_meta(d))
+                            .color(t.text_muted),
+                    )
+                    .on_hover_text("地面网格的格距，随相机远近换档");
+                }
+                if let Some(room) = room {
+                    let (div, _) = ui.allocate_exact_size(vec2(1.0, d.px(12.0)), Sense::hover());
+                    ui.painter().rect_filled(div, 0, t.border);
+                    ui.label(
+                        RichText::new(format!(
+                            "{} 房间视图 · {} · 成员 {}",
+                            ph::DOOR_OPEN,
+                            room.room_num,
+                            room.member_count
+                        ))
+                        .font(Font::mono_meta(d))
+                        .color(t.accent_strong),
+                    );
+                    if ui
+                        .add(widgets::chip(t, d, "退出", false))
+                        .on_hover_text("退出房间视图，恢复隔离前的可见性")
+                        .clicked()
+                    {
+                        cmds.push(Cmd::Model(ModelAction::ExitIsolate));
+                    }
+                }
             });
         });
+    frame.response.rect
 }
 
 /// 没有纹理时的错误态。
@@ -574,8 +661,13 @@ mod tests {
 
     /// 同上，纹理尺寸可选——「渲染目标跟着视口走」那条要拿它和视口尺寸对照。
     fn viewport_cmds_with(texture: Vec2, frames: Vec<Vec<egui::Event>>) -> Vec<Cmd> {
-        let ctx = egui::Context::default();
-        let vm = WorkbenchVm {
+        viewport_cmds_on(live_vm(texture), frames)
+    }
+
+    /// 一个接着实时渲染器的工作台 Vm，测试要改别的字段（如 `room_view`）就在
+    /// 返回值上继续摆。
+    fn live_vm(texture: Vec2) -> WorkbenchVm {
+        WorkbenchVm {
             view3d: Some(View3dVm {
                 texture: egui::TextureId::User(0),
                 size: texture,
@@ -583,9 +675,39 @@ mod tests {
                 measurement_active: false,
                 camera_rot: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
                 axis_labels: [None; 3],
+                grid_cell_mm: 1_000.0,
             }),
             ..Default::default()
-        };
+        }
+    }
+
+    #[test]
+    fn the_hud_reads_the_cell_out_in_human_units() {
+        let mut vm3d = live_vm(vec2(1600.0, 900.0)).view3d.expect("实时视口");
+        // 宿主的档位是 1/2/5×10ⁿ 毫米，所以这几个就是读数会遇到的全部形状。
+        for (mm, text) in [
+            (1.0, "1 mm"),
+            (20.0, "20 mm"),
+            (500.0, "500 mm"),
+            (1_000.0, "1 m"),
+            (2_000.0, "2 m"),
+            (200_000.0, "200 m"),
+            (1_000_000.0, "1 km"),
+        ] {
+            vm3d.grid_cell_mm = mm;
+            assert_eq!(grid_cell(&vm3d).as_deref(), Some(text), "{mm} mm 的读数");
+        }
+        // 独立壳没有网格，这一段连同它的分隔线一起消失，而不是显示「一格 0 mm」。
+        vm3d.live = false;
+        assert_eq!(grid_cell(&vm3d), None);
+        vm3d.live = true;
+        vm3d.grid_cell_mm = 0.0;
+        assert_eq!(grid_cell(&vm3d), None);
+    }
+
+    /// 同上，工作台 Vm 由调用方给。
+    fn viewport_cmds_on(vm: WorkbenchVm, frames: Vec<Vec<egui::Event>>) -> Vec<Cmd> {
+        let ctx = egui::Context::default();
         let t = crate::style::theme_tokens::current();
         let d = Density::Standard;
         let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 700.0));
@@ -704,6 +826,24 @@ mod tests {
         assert!(
             !cmds.iter().any(|cmd| matches!(cmd, Cmd::PickViewport(_))),
             "点在工具栏上却穿成了拾取：{cmds:?}"
+        );
+    }
+
+    /// 房间视图徽章带着「退出」按钮，HUD 从此是控件不是模型——点在它上面
+    /// 不该穿成拾取（与工具栏、立方体同一条规矩）。
+    #[test]
+    fn clicking_the_hud_does_not_pick_through_it() {
+        let mut vm = live_vm(vec2(1600.0, 900.0));
+        vm.room_view = Some(RoomViewVm {
+            room: RefU64(7),
+            room_num: "R301".into(),
+            member_count: 128,
+        });
+        // HUD 距边 14、高 26，(20, 27) 落在它的框里。
+        let cmds = viewport_cmds_on(vm, click_at(pos2(20.0, 27.0)));
+        assert!(
+            !cmds.iter().any(|cmd| matches!(cmd, Cmd::PickViewport(_))),
+            "点在 HUD 上却穿成了拾取：{cmds:?}"
         );
     }
 

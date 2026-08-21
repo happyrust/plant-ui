@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 aios_core.workspace = true
 anyhow.workspace = true
+# 模型查询新路径的根间并发（buffered 流，wasm 友好）。
+futures = "0.3"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio.workspace = true

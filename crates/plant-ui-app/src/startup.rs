@@ -7,6 +7,22 @@ use url::{Host, Url};
 
 pub const LEGACY_PROJECT_CONFIG: &str = "config/e3d.project.ron";
 
+/// 这次启动的库配置是从哪儿来的，原样说给状态栏的接入点面板听。
+///
+/// 非记不可：`aios_core::get_db_option()` 在没人注入配置时会**静默回落**去读工作目录的
+/// `DbOption.toml`，那次启动与正常启动在界面上一模一样，连到了别处也没人知道。
+///
+/// 一个进程一份——切项目走的是重启（ADR-0018），不存在中途换配置来源这回事。
+static CONFIG_SOURCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn record_config_source(source: impl Into<String>) {
+    let _ = CONFIG_SOURCE.set(source.into());
+}
+
+pub fn config_source() -> Option<&'static str> {
+    CONFIG_SOURCE.get().map(String::as_str)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct LegacyProjectConfig {
     pub api_host: String,

@@ -10,7 +10,7 @@
 //! 本模块放在顶层而不是 `workbench/` 下，与 `model_update` 同源：那一层按模块注释
 //! 是「输入 &WorkbenchVm、输出 Vec<Cmd>」的纯绘制，而这里要连契约类型一起管。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use chrono::{DateTime, Local};
@@ -23,14 +23,18 @@ use serde::Deserialize;
 
 use crate::Cmd;
 use crate::model_update::{
-    Feed, FileAnomaly, PendingModelUnit, ProgressEvent, RowState, UnitStatus,
+    BatchStatus, Enqueued, Feed, FileAnomaly, PendingModelUnit, Preview, ProgressEvent, RowState,
+    UnitResult, UnitStatus,
 };
+use crate::style::group_number as group;
 use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Status, Tokens, radius};
 use crate::style::widgets;
 
 /// 数据批次任务。`manual_update` 那个 kind 随心脏改造退役，不再产生新行。
 pub const KIND_DATA_BATCH: &str = "data_batch";
+/// 数据阶段之后的持久模型工作消费者。它会因新数据让位，`yielded` 是终态而不是失败。
+pub const KIND_MODEL_DRAIN: &str = "model_drain";
 /// 房间归属重算轮。它与 dbnum 列表平级，不挂在任何 dbnum 行下（ADR-0011）。
 pub const KIND_ROOM_RECALC: &str = "room_recalc";
 
@@ -90,6 +94,16 @@ pub struct TaskEntry {
     pub start_sesno: Option<i32>,
     #[serde(default)]
     pub end_sesno: Option<i32>,
+    /// 保存窗口两端那两条保存在 E3D 里的**写入时刻**（RFC3339）。
+    ///
+    /// 「保存窗口」列显示的是这一对，序号只留作执行边界（ADR-0019）。服务端保证
+    /// 它与 `end_sesno` 同生共死——并入推高右端时一起刷新、冻结点重扫时一起改写，
+    /// 端点对不上时干脆不贴。所以拿到 `None` 是**正常态**：整格留空，
+    /// **不许回落成 sesno**。
+    #[serde(default)]
+    pub start_sesno_time: Option<String>,
+    #[serde(default)]
+    pub end_sesno_time: Option<String>,
     #[serde(default)]
     pub units_done: Option<u32>,
     #[serde(default)]
@@ -97,16 +111,31 @@ pub struct TaskEntry {
     #[serde(default)]
     pub events_seen: u64,
     /// 房间轮的 `{panels, elements, dead_letters}`；数据批次没有这一格。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub detail: Option<RoomCounts>,
     /// 终态结果；queued / running 时缺席。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub result: Option<crate::model_update::Outcome>,
+}
+
+/// `result` / `detail` 按 kind 承载不同形状（数据批次的终态摘要、房间轮的
+/// `{done,total}`、absorbed 收口……），这两格解不动只丢**这一格**，不许把整条
+/// `/tasks` 响应连坐掉——一条毒行冻住整个队列面板，比少一格明细贵得多。
+fn lenient<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 impl TaskEntry {
     pub fn terminal(&self) -> bool {
-        matches!(self.state.as_str(), "succeeded" | "partial" | "failed")
+        matches!(
+            self.state.as_str(),
+            "succeeded" | "partial" | "failed" | "yielded"
+        )
     }
 
     /// 本批次里没能生成出来的交付单元。终态摘要给得出，不必等持久表。
@@ -155,6 +184,13 @@ pub struct Health {
     pub worker_alive: Option<bool>,
     #[serde(default)]
     pub worker_idle_secs: Option<u64>,
+    /// 本项目此刻生效的最小交付单元名词表（默认 `[BRAN, HANG, SUPPO, EQUI]`，
+    /// 项目配置可整体替换或扩充）。「重新生成模型」按元素归并生成根时只认这一份。
+    ///
+    /// 老服务端不给这个键，解出来是空表——调用方必须把空表当「不知道」而不是
+    /// 「没有交付单元」，见 `model_regenerate::DeliveryUnits`。
+    #[serde(default)]
+    pub delivery_unit_types: Vec<String>,
 }
 
 /// `GET /api/v1/update/pending-units`。走持久表，**不依赖任务历史**——一个库
@@ -185,6 +221,13 @@ pub struct DbnumStatus {
     /// 与阻断**不是一回事**，界面上不许合成一行：混起来会把「出事了」讲成「本来就不跑」。
     #[serde(default)]
     pub excluded: bool,
+    /// 当前 MDB **声明了**这个库，但当前项目目录里没有它的文件。
+    ///
+    /// 与 `excluded` 恰好相反的意思，所以第三档必须单独有。缺省 false 是有意的：
+    /// 老服务端只给两档，那时候这些库压根不出现在 `/dbnums` 里——少一行比顶着
+    /// 一句反话出现好。
+    #[serde(default)]
+    pub not_in_project: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -199,6 +242,9 @@ pub struct DbnumReport {
 pub struct Poll {
     pub queue: QueueSnapshot,
     pub tasks: Vec<TaskEntry>,
+    /// `/tasks` 没取到（或没解动）时的原因。它失败不作废整次轮询：队列行、health、
+    /// 欠账、dbnums 照常换代，计时与终态历史沿用上一份快照，界面要把这句说出来。
+    pub tasks_error: Option<String>,
     pub health: Option<Health>,
     pub pending: Vec<PendingModelUnit>,
     /// pending 接口是否成功。失败不能冒充“欠账清零”，否则会过早替换旧三维。
@@ -249,8 +295,15 @@ pub struct Vm {
     pub feed: Feed,
     /// 轮询失败的原因。进度与行都停在上一份快照上，界面要说出来。
     pub error: Option<String>,
+    /// 任务表单独失败的原因（队列行照常换代）。计时、进度分母与终态历史
+    /// 停在上一份快照上，横幅要把降级范围说清楚。
+    pub tasks_error: Option<String>,
     /// 有没有成功取到过一次快照。没有的话画「还没连上」而不是画一个空队列。
     pub loaded: bool,
+    /// 只有手动向导能给出的比较基线；按 execute 回执里的 task_id 精确关联。
+    preview_changes: HashMap<String, u64>,
+    /// 本会话已经消费过刷新线索的终态任务。
+    refreshed: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,9 +314,31 @@ pub enum IdentityStatus {
 }
 
 impl Vm {
+    pub fn remember_manual_preview(&mut self, preview: &Preview, receipt: &Enqueued) {
+        let changes: HashMap<u32, u64> = preview
+            .dbnums
+            .iter()
+            .map(|db| (db.dbnum, u64::from(db.changes())))
+            .collect();
+        for batch in receipt.enqueued.iter().chain(&receipt.merged) {
+            if let Some(changed) = changes.get(&batch.dbnum) {
+                self.preview_changes.insert(batch.task_id.clone(), *changed);
+            }
+        }
+    }
+
+    pub fn mark_refreshed(&mut self, task_id: &str) {
+        self.refreshed.insert(task_id.to_owned());
+    }
+
     pub fn adopt(&mut self, poll: Poll) {
         self.queue = poll.queue;
-        self.tasks = poll.tasks;
+        // 任务表取不到时保留上一份：一条 result 解不动不许把计时与终态历史
+        // 整个清空——排队与运行中的行以 `/queue` 为准，本来就不靠它。
+        if poll.tasks_error.is_none() {
+            self.tasks = poll.tasks;
+        }
+        self.tasks_error = poll.tasks_error;
         self.health = poll.health;
         if poll.pending_known {
             self.pending = poll.pending;
@@ -282,6 +357,14 @@ impl Vm {
         // 为准：那一份不封顶，而 `/tasks` 钳到 200——一个排了几百行的批次还没轮到
         // 进任务窗口，它的明细不该被当成垃圾收掉。
         self.details.retain(|task_id, _| {
+            self.queue.rows.iter().any(|r| &r.task_id == task_id)
+                || self.tasks.iter().any(|t| &t.task_id == task_id)
+        });
+        self.preview_changes.retain(|task_id, _| {
+            self.queue.rows.iter().any(|r| &r.task_id == task_id)
+                || self.tasks.iter().any(|t| &t.task_id == task_id)
+        });
+        self.refreshed.retain(|task_id| {
             self.queue.rows.iter().any(|r| &r.task_id == task_id)
                 || self.tasks.iter().any(|t| &t.task_id == task_id)
         });
@@ -455,6 +538,10 @@ impl Phase {
 
     fn running(self) -> bool {
         matches!(self, Self::Applying | Self::Generating)
+    }
+
+    fn terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Partial | Self::Failed)
     }
 }
 
@@ -639,7 +726,13 @@ pub fn rows(vm: &Vm) -> Vec<RowVm> {
             dbnum: row.dbnum,
             db_type: row.db_type.clone(),
             phase,
-            window: window(row.start_sesno, row.end_sesno),
+            // 队列快照只给序号，时刻在任务行上（服务端把它挂在 `TaskEntry` 上，
+            // 与 `end_sesno` 同生共死）。配不到任务行的活动行就整格留空——那种行
+            // 是被 `/tasks` 那 200 条窗口挤出去的，宁可少一格也不摆回 sesno。
+            window: save_window(
+                entry.and_then(|e| e.start_sesno_time.as_deref()),
+                entry.and_then(|e| e.end_sesno_time.as_deref()),
+            ),
             position: queued.then_some(position),
             units_done: entry.and_then(|e| e.units_done),
             total_units,
@@ -684,30 +777,46 @@ pub fn rows(vm: &Vm) -> Vec<RowVm> {
             _ => Phase::Unknown,
         };
         let failed = entry.failed_units();
-        let note = match failed.first() {
-            Some(unit) if unit.attempts > 0 => format!(
-                "{} {} 第 {} 次尝试失败",
-                unit.noun, unit.root_refno, unit.attempts
-            ),
-            Some(unit) => format!("{} {} 未能生成", unit.noun, unit.root_refno),
-            None => entry
-                .result
-                .as_ref()
-                .and_then(|o| o.batch.as_ref())
-                .and_then(|b| b.message.clone())
-                .unwrap_or_default(),
+        let absorbed = entry.result.as_ref().is_some_and(|o| o.is_absorbed());
+        let note = if phase == Phase::Succeeded {
+            if absorbed {
+                // ADR-011 §5 的 absorbed 收口：这一行没跑，工作在运行中那一批里。
+                // 不说这句的话，一条「已完成」却没有任何单元计数的行解释不了自己。
+                "入队后被运行中批次覆盖，未单独执行".to_owned()
+            } else {
+                match (entry.units_done, entry.total_units) {
+                    (Some(done), Some(total)) if done == total => {
+                        format!("{total} 个交付单元全部生成")
+                    }
+                    _ => String::new(),
+                }
+            }
+        } else {
+            match failed.first() {
+                Some(unit) if unit.attempts > 0 => format!(
+                    "{} {} 第 {} 次尝试失败",
+                    unit.noun, unit.root_refno, unit.attempts
+                ),
+                Some(unit) => format!("{} {} 未能生成", unit.noun, unit.root_refno),
+                None => entry
+                    .result
+                    .as_ref()
+                    .and_then(|o| o.batch.as_ref())
+                    .and_then(|b| b.message.clone())
+                    .unwrap_or_default(),
+            }
         };
         out.push(RowVm {
             task_id: entry.task_id.clone(),
             dbnum,
             db_type: entry.db_type.clone().unwrap_or_default(),
             phase,
-            // 契约把这两个字段给成 `Option` 就是因为它们可能缺席。补 0 的话这一格会
-            // 摆出「sesno 0 → 0」——一个指不到任何契约字段的数。宁可空着。
-            window: match (entry.start_sesno, entry.end_sesno) {
-                (Some(start), Some(end)) => window(start, end),
-                _ => String::new(),
-            },
+            // 契约把这两个字段给成 `Option` 就是因为它们可能缺席，缺了就整格空着
+            // ——摆一个指不到任何契约字段的数（旧写法的「sesno 0 → 0」）更糟。
+            window: save_window(
+                entry.start_sesno_time.as_deref(),
+                entry.end_sesno_time.as_deref(),
+            ),
             position: None,
             units_done: entry.units_done,
             total_units: entry.total_units,
@@ -766,6 +875,15 @@ pub fn filtered_out(vm: &Vm) -> usize {
     active + history
 }
 
+/// 已达重试上限、自动路径永不再碰的交付单元数。
+///
+/// 它与「欠着」是两回事，摆在一起会把「等着自愈」和「不会自愈」讲成一件事。
+/// 房间轮早就有同名的分项计数（`RoomCounts.dead_letters`），regen_root 这一侧
+/// 一直没有——于是一个根永久停在旧几何这件事，界面上一个数都指不出来。
+pub fn dead_letters(vm: &Vm) -> usize {
+    vm.pending.iter().filter(|unit| unit.dead).count()
+}
+
 /// 状态栏那一格要的几个数。与面板共用同一份行推导——同一组数字两处各数各的，
 /// 迟早会对不上。
 pub fn status(vm: &Vm) -> crate::vm::QueueStatusVm {
@@ -775,6 +893,7 @@ pub fn status(vm: &Vm) -> crate::vm::QueueStatusVm {
         paused: vm.paused(),
         filtered_out: filtered_out(vm),
         malformed: malformed(vm),
+        dead_letters: dead_letters(vm),
         known: vm.loaded,
     }
 }
@@ -862,10 +981,33 @@ pub fn not_running(vm: &Vm) -> Vec<&DbnumStatus> {
     let mut rows: Vec<&DbnumStatus> = vm
         .dbnums
         .iter()
-        .filter(|db| db.blocked || db.excluded)
+        .filter(|db| db.blocked || db.excluded || db.not_in_project)
         .collect();
     rows.sort_by_key(|db| (!db.blocked, db.dbnum));
     rows
+}
+
+/// 「本期不执行」按三个理由分开数。**不许合成一个总数**——三档的出路完全不同：
+/// 阻断要人去处理文件、够不着多半在别的项目目录里、排除本来就不在范围内。
+/// 一个 84px 的框里滚着两百多行而标题只说「本期不执行」，等于没说（施工单 Q3）。
+pub fn not_running_tally(rows: &[&DbnumStatus]) -> String {
+    let blocked = rows.iter().filter(|db| db.blocked).count();
+    let unreachable = rows
+        .iter()
+        .filter(|db| !db.blocked && db.not_in_project)
+        .count();
+    let excluded = rows.len() - blocked - unreachable;
+    let mut parts = Vec::new();
+    if blocked > 0 {
+        parts.push(format!("{blocked} 个阻断"));
+    }
+    if unreachable > 0 {
+        parts.push(format!("{unreachable} 个够不着"));
+    }
+    if excluded > 0 {
+        parts.push(format!("{excluded} 个不在范围内"));
+    }
+    parts.join(" · ")
 }
 
 /// 筛选与搜索。**搜索时不受筛选芯片限制**——搜一个已完成的库却搜不到，
@@ -897,6 +1039,28 @@ pub struct State {
     pub search: String,
     /// 显式点过的展开箭头。默认展开与否按行的形态定，这里只记「与默认相反」的那些。
     toggled: std::collections::HashSet<String>,
+    /// 已经按下重试、还没在快照里看到结果的单元（root_refno → 提交前 attempts）。
+    ///
+    /// 复活是一次写请求，回执 202 只表示「行改好了」，不表示生成跑完了——真值要等
+    /// 下一拍轮询。中间这一拍按钮必须置灰：不灰的话人会连按，每按一次都是一次
+    /// `revision + 1`，而界面上一点变化都没有。
+    in_flight: HashMap<String, u32>,
+}
+
+impl State {
+    /// 复活请求压根没发出去。成功那一半由快照自己收口（见 [`show`]），只有失败
+    /// 需要宿主说一声——不然那枚按钮会一直灰着等一个永远不会来的变化。
+    pub fn retry_failed(&mut self, root_refno: &str) {
+        self.in_flight.remove(root_refno);
+    }
+
+    fn settle_retries(&mut self, pending: &[PendingModelUnit]) {
+        self.in_flight.retain(|root, attempts| {
+            pending
+                .iter()
+                .any(|unit| &unit.root_refno == root && unit.attempts == *attempts)
+        });
+    }
 }
 
 impl State {
@@ -924,6 +1088,9 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, state: &mut State, cmd
             return not_connected(ui, t, d, vm);
         }
 
+        // 成功会清零 attempts；活跃欠账与死信都靠下一份快照的这个变化收口。
+        state.settle_retries(&vm.pending);
+
         service_status_banners(ui, t, d, vm);
         if vm.paused() {
             paused_banner(ui, t, d, vm, cmds);
@@ -939,6 +1106,18 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, state: &mut State, cmd
                 Status::Warn,
                 ph::WARNING,
                 &format!("队列状态查询暂时失败：{error}。下面这份是上一次取到的快照。"),
+            );
+        }
+        if let Some(error) = vm.tasks_error.as_deref() {
+            hint_banner(
+                ui,
+                t,
+                d,
+                Status::Warn,
+                ph::WARNING,
+                &format!(
+                    "任务表暂时读不到：{error}。队列行是新的；计时、进度分母与终态历史沿用上一份快照。"
+                ),
             );
         }
 
@@ -971,10 +1150,11 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, state: &mut State, cmd
                     if open {
                         // 明细里的控件也按 task_id 定号，理由同 `row_id`：那枚「重试」
                         // 按错行不是显示问题，服务端会真的去重跑一遍生成。
+                        let in_flight = &mut state.in_flight;
                         ui.scope_builder(
                             egui::UiBuilder::new()
                                 .id(egui::Id::new(("task-queue-detail", row.task_id.as_str()))),
-                            |ui| row_detail(ui, t, d, vm, row),
+                            |ui| row_detail(ui, t, d, vm, row, in_flight, cmds),
                         );
                     }
                 }
@@ -1190,6 +1370,12 @@ fn summary_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, all: &[RowVm], cmds
         ui.add_space(d.px(8.0));
         count_dot(&mut ui, t, d, t.warn, &format!("房间待收敛 {rooms}"));
     }
+    // 死信不与「排队」并列：那一格是「等着轮到」，这一格是「不会再轮到了」。
+    let dead = dead_letters(vm);
+    if dead > 0 {
+        ui.add_space(d.px(8.0));
+        count_dot(&mut ui, t, d, t.danger, &format!("已放弃 {dead}"));
+    }
 
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         if vm.paused() {
@@ -1224,20 +1410,32 @@ fn summary_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, all: &[RowVm], cmds
             cmds.push(Cmd::ScanNow);
         }
         // 断线降级的是明细区，不是进度：计数走轮询，连接断了照样准（ADR-0007）。
-        if let Feed::Down(reason) = &vm.feed {
-            let behind: u64 = all.iter().map(|r| r.behind_events).sum();
-            if ui
-                .add(widgets::button(t, d, "重连明细").icon(ph::PLUGS))
-                .on_hover_text(reason.as_str())
-                .clicked()
-            {
-                cmds.push(Cmd::ReconnectQueueFeed);
+        match &vm.feed {
+            Feed::Down(reason) => {
+                let behind: u64 = all.iter().map(|r| r.behind_events).sum();
+                if ui
+                    .add(widgets::button(t, d, "重连明细").icon(ph::PLUGS))
+                    .on_hover_text(reason.as_str())
+                    .clicked()
+                {
+                    cmds.push(Cmd::ReconnectQueueFeed);
+                }
+                ui.label(
+                    RichText::new(format!("实时通道断开 · 本端落后 {behind} 条明细"))
+                        .font(Font::meta(d))
+                        .color(t.warn),
+                );
             }
-            ui.label(
-                RichText::new(format!("实时通道断开 · 本端落后 {behind} 条明细"))
-                    .font(Font::meta(d))
-                    .color(t.warn),
-            );
+            // 从来没订过就没有「重连」这回事，也没有「落后多少条」——那个数会等于
+            // 服务端发过的全部，摆出来是把「本来就不收」讲成「丢了」。
+            Feed::NotSubscribed(reason) => {
+                ui.label(
+                    RichText::new(format!("不订阅逐单元明细 · {reason}"))
+                        .font(Font::meta(d))
+                        .color(t.text_muted),
+                );
+            }
+            Feed::Connecting | Feed::Live => {}
         }
     });
 }
@@ -1430,10 +1628,17 @@ fn excluded_block(ui: &mut Ui, t: &Tokens, d: Density, rows: &[&DbnumStatus]) {
             .color(t.text_primary),
     );
     row.label(
-        RichText::new("这些库不入队，水位不动")
+        RichText::new(not_running_tally(rows))
             .font(Font::micro(d))
             .color(t.text_muted),
     );
+    row.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        ui.label(
+            RichText::new("这些库不入队，水位不动")
+                .font(Font::micro(d))
+                .color(t.text_muted),
+        );
+    });
 
     ScrollArea::vertical()
         .id_salt("task-queue-excluded")
@@ -1468,16 +1673,7 @@ fn excluded_row(ui: &mut Ui, t: &Tokens, d: Density, db: &DbnumStatus) {
         Font::mono(d),
         t.text_primary,
     );
-    // 排除有两种来源：类型不对，或者是 DESI 但当前 MDB 没声明它（ADR-0013）。一律写
-    // 「非 DESI」的话，后一种就是假话——那个库明明是 DESI，只是这一期的 MDB 没要它。
-    let reason = match (&db.anomaly, blocked) {
-        (Some(anomaly), _) => anomaly_brief(anomaly),
-        (None, true) => "阻断，原因未随契约给出".to_owned(),
-        (None, false) if db.db_type != "DESI" => {
-            format!("非 DESI（{}），不在本期范围", db.db_type)
-        }
-        (None, false) => "DESI，但不在当前 MDB 声明的名单里".to_owned(),
-    };
+    let reason = not_running_reason(db);
     text_at(
         ui,
         pos2(rect.left() + d.px(108.0), mid),
@@ -1485,8 +1681,15 @@ fn excluded_row(ui: &mut Ui, t: &Tokens, d: Density, db: &DbnumStatus) {
         Font::meta(d),
         if blocked { t.danger } else { t.text_muted },
     );
-    // 「阻断」与「排除」两个词分开摆：一个是出事了，一个是本来就不跑。
-    let tag = if blocked { "阻断" } else { "排除" };
+    // 三个词分开摆：阻断是出事了、排除是本来就不在范围里、够不着是范围里但这次
+    // 碰不到它。合成两档的时候「够不着」只能借「排除」那个词，而它俩意思相反。
+    let tag = if blocked {
+        "阻断"
+    } else if db.not_in_project {
+        "够不着"
+    } else {
+        "排除"
+    };
     let g = layout(ui, tag, Font::mono_micro(d));
     let pad = d.px(6.0);
     let box_rect = Rect::from_min_size(
@@ -1509,6 +1712,23 @@ fn excluded_row(ui: &mut Ui, t: &Tokens, d: Density, db: &DbnumStatus) {
     // 与预览那边 S2-E 用的是同一段文案，两处不许各说各话。
     if let Some(anomaly) = &db.anomaly {
         resp.on_hover_text(anomaly.to_string());
+    }
+}
+
+/// 「本期不执行」那一行的理由。**三档，不是两档。**
+///
+/// 「排除」与「够不着」的意思恰好相反：前者是当前 MDB 没声明它，后者是声明了、
+/// 当前项目目录里没有它的文件。契约只有 `excluded` 的那阵子，够不着的库只能借
+/// 「不在当前 MDB 声明的名单里」那句话出现，读起来正好是反的（施工单 Q5）。
+fn not_running_reason(db: &DbnumStatus) -> String {
+    match (&db.anomaly, db.blocked) {
+        (Some(anomaly), _) => anomaly_brief(anomaly),
+        (None, true) => "阻断，原因未随契约给出".to_owned(),
+        (None, false) if db.not_in_project => "MDB 声明了它，当前项目目录里没有这个文件".to_owned(),
+        (None, false) if db.db_type != "DESI" => {
+            format!("非 DESI（{}），不在本期范围", db.db_type)
+        }
+        (None, false) => "DESI，但不在当前 MDB 声明的名单里".to_owned(),
     }
 }
 
@@ -1544,7 +1764,7 @@ fn header(ui: &mut Ui, t: &Tokens, d: Density) {
     for (x, name) in [
         (c.db, "设计库"),
         (c.ty, "类型"),
-        (c.window, "会话区间"),
+        (c.window, "保存窗口"),
         (c.state, "状态"),
         (c.note, "进度 / 说明"),
     ] {
@@ -1574,7 +1794,7 @@ struct Cols {
 
 /// 七个列位。
 ///
-/// 左边四列按内容定宽（库号、类型、会话区间都是定长的），「状态」与
+/// 左边四列按内容定宽（库号、类型、保存窗口都是定长的），「状态」与
 /// 「进度 / 说明」分掉剩下的宽度。**不能照画板那 1024 写死列位**：dock 里这块面板
 /// 可宽可窄，默认布局下它只有六百点上下，写死的话说明列会整个被挤掉——而
 /// 「上一批已冻结」那句恰恰是「同一个 dbnum 两行不是重复项」的全部依据。
@@ -1585,7 +1805,9 @@ fn cols(rect: Rect, d: Density) -> Cols {
     let pad = d.px(14.0);
     let right = rect.right() - pad;
     let window = rect.left() + d.px(168.0);
-    let after_window = window + d.px(146.0);
+    // 时间对比会话号长（`08-01 09:12 → 08-07 14:33` vs `sesno 1 024 → 1 038`），
+    // 这一列随 ADR-0019 从 150 加宽到 180。
+    let after_window = window + d.px(180.0);
     let note_end = right - d.px(80.0);
     let room = (note_end - after_window).max(0.0);
     let state_w = d.px(168.0).min(room);
@@ -1615,7 +1837,7 @@ fn row_id(task_id: &str) -> egui::Id {
     egui::Id::new(("task-queue-row", task_id))
 }
 
-/// 组件 `C/QueueRow`：状态点 / 设计库 / 类型 / 会话区间 / 状态 / 进度与说明 / 计时。
+/// 组件 `C/QueueRow`：状态点 / 设计库 / 类型 / 保存窗口 / 状态 / 进度与说明 / 计时。
 /// 返回行的响应，以及「进度 / 说明」那一格有没有装下——装不下的由调用点
 /// 在行下面补一行，不许截没。
 fn queue_row(
@@ -1754,7 +1976,15 @@ fn queue_row(
 }
 
 /// 行内明细：逐单元事件、并入会话、欠着的单元、断线时缺了多少条。
-fn row_detail(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, row: &RowVm) {
+fn row_detail(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    vm: &Vm,
+    row: &RowVm,
+    in_flight: &mut HashMap<String, u32>,
+    cmds: &mut Vec<Cmd>,
+) {
     let indent = d.px(28.0);
     egui::Frame::new()
         .inner_margin(Margin {
@@ -1767,19 +1997,28 @@ fn row_detail(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, row: &RowVm) {
             ui.set_min_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = d.px(2.0);
 
+            if row.phase.terminal() {
+                egui::Frame::new()
+                    .fill(t.bg_header)
+                    .corner_radius(CornerRadius::same(radius::MD))
+                    .inner_margin(Margin::same(d.px(10.0) as i8))
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        terminal_detail(ui, t, d, vm, row, in_flight, cmds);
+                    });
+                return;
+            }
+
             if let Some(entry) = vm.task(&row.task_id)
-                && let Some(merged) = entry
-                    .result
-                    .as_ref()
-                    .and_then(|o| o.batch.as_ref())
-                    .map(|b| b.merged_sesnos.as_slice())
-                && !merged.is_empty()
+                && let Some(batch) = entry.result.as_ref().and_then(|o| o.batch.as_ref())
+                && !batch.merged_sesnos.is_empty()
             {
-                let listed = merged
-                    .iter()
-                    .map(|s| group(*s as i64))
-                    .collect::<Vec<_>>()
-                    .join(" – ");
+                // 时刻读不到就只说条数：这一行的用处是「本批不止预览时看到的那些」，
+                // 说得出几条就已经成立，没必要为此把会话号摆回来。
+                let label = match batch.merged_save_times().as_deref().and_then(save_list) {
+                    Some(listed) => format!("{listed} 已并入"),
+                    None => format!("{} 次保存已并入", batch.merged_sesnos.len()),
+                };
                 detail_line(
                     ui,
                     t,
@@ -1787,27 +2026,26 @@ fn row_detail(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, row: &RowVm) {
                     DetailLine {
                         icon: ph::GIT_MERGE,
                         icon_color: t.accent,
-                        label: &format!("{listed} 已并入"),
-                        note: "预览之后新存的会话",
+                        label: &label,
+                        note: "预览之后新存的保存",
                         note_color: t.text_muted,
                     },
                 );
             }
 
             let detail = vm.details.get(&row.task_id);
-            if let Feed::Down(_) = vm.feed
-                && row.phase.running()
-            {
+            if let Some(notice) = feed_notice(&vm.feed, row.phase.running(), row.behind_events) {
+                let color = if notice.warn { t.warn } else { t.text_muted };
                 detail_line(
                     ui,
                     t,
                     d,
                     DetailLine {
-                        icon: ph::PLUGS,
-                        icon_color: t.warn,
-                        label: "断线期间没收到事件，不知道它开没开始",
-                        note: &format!("明细缺 {} 条", row.behind_events),
-                        note_color: t.warn,
+                        icon: notice.icon,
+                        icon_color: color,
+                        label: notice.label,
+                        note: &notice.note,
+                        note_color: color,
                     },
                 );
             }
@@ -1839,7 +2077,7 @@ fn row_detail(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, row: &RowVm) {
             let owed: Vec<&PendingModelUnit> =
                 vm.pending.iter().filter(|u| u.dbnum == row.dbnum).collect();
             for unit in &owed {
-                pending_line(ui, t, d, unit);
+                pending_line(ui, t, d, vm, unit, in_flight, cmds);
             }
 
             if detail.is_none_or(|x| x.units.is_empty()) && owed.is_empty() {
@@ -1851,6 +2089,247 @@ fn row_detail(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, row: &RowVm) {
                 ui.label(RichText::new(text).font(Font::micro(d)).color(t.text_muted));
             }
         });
+}
+
+/// 终态只读 `/tasks` 与持久欠账；WS 明细跨重连不可靠，也会与结果重复。
+fn terminal_detail(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    vm: &Vm,
+    row: &RowVm,
+    in_flight: &mut HashMap<String, u32>,
+    cmds: &mut Vec<Cmd>,
+) {
+    let Some(entry) = vm.task(&row.task_id) else {
+        return;
+    };
+    let outcome = entry.result.as_ref();
+    let batch = outcome.and_then(|result| result.batch.as_ref());
+
+    if outcome.is_some_and(|result| result.is_absorbed()) {
+        detail_line(
+            ui,
+            t,
+            d,
+            DetailLine {
+                icon: ph::GIT_MERGE,
+                icon_color: t.accent,
+                label: "已被运行中批次吸收",
+                note: "",
+                note_color: t.text_muted,
+            },
+        );
+        sub_line(
+            ui,
+            t,
+            d,
+            "冻结重扫把这一窗口并进了运行中的批次，这一行无需单独执行",
+            false,
+        );
+    }
+
+    if let Some(batch) = batch {
+        // 窗口与水位都说时刻（ADR-0019 Q3 / Q8）。水位那一段与右端重复是**刻意的**：
+        // partial 行里只有它在说「数据侧已全部写入、水位已推进、不会重扫」。
+        // 时刻缺席就把对应的段整段去掉，剩下的话照说——绝不回落成 sesno。
+        let saved = save_window(
+            batch.start_sesno_time.as_deref(),
+            batch.end_sesno_time.as_deref(),
+        );
+        let advanced = batch
+            .end_sesno_time
+            .as_deref()
+            .and_then(|at| Some(parse(at)?.format("%m-%d %H:%M").to_string()));
+        let (icon, color, label) = match batch.status {
+            BatchStatus::Applied => (
+                ph::CHECK_CIRCLE,
+                t.success,
+                match advanced {
+                    Some(at) => segments(&[&saved, "已应用", &format!("水位推进至 {at}")]),
+                    None => segments(&[&saved, "已应用"]),
+                },
+            ),
+            BatchStatus::Failed => (
+                ph::X_CIRCLE,
+                t.danger,
+                segments(&[&saved, "批次失败", "水位不变"]),
+            ),
+            BatchStatus::Skipped => (ph::PROHIBIT, t.text_muted, segments(&[&saved, "已跳过"])),
+        };
+        detail_line(
+            ui,
+            t,
+            d,
+            DetailLine {
+                icon,
+                icon_color: color,
+                label: &label,
+                note: "",
+                note_color: color,
+            },
+        );
+
+        if !batch.merged_sesnos.is_empty() {
+            detail_line(
+                ui,
+                t,
+                d,
+                DetailLine {
+                    icon: ph::GIT_MERGE,
+                    icon_color: t.accent,
+                    label: &format!("预览后并入 {} 次保存", batch.merged_sesnos.len()),
+                    note: "",
+                    note_color: t.text_muted,
+                },
+            );
+            // 逐条列出的是时刻（ADR-0019 Q5）。有一条读不到就只报条数——列一半却
+            // 顶着「并入 3 次」的标题，会让人以为列出来的就是全部。
+            if let Some(listed) = batch.merged_save_times().as_deref().and_then(save_list) {
+                sub_line(ui, t, d, &listed, false);
+            }
+        }
+
+        let changed = match vm.preview_changes.get(&row.task_id) {
+            Some(previewed) => format!(
+                "{} 项变化（预览时 {}）",
+                group(batch.changed_elements as i64),
+                group(*previewed as i64)
+            ),
+            None => format!("{} 项变化", group(batch.changed_elements as i64)),
+        };
+        if batch.changed_elements > 0 {
+            sub_line(ui, t, d, &changed, false);
+        }
+
+        if batch.status == BatchStatus::Failed {
+            if let Some(message) = batch.message.as_deref() {
+                sub_line(ui, t, d, message, true);
+            }
+            sub_line(
+                ui,
+                t,
+                d,
+                "模型生成未开始——数据未落库，不产生待重试单元",
+                false,
+            );
+            sub_line(
+                ui,
+                t,
+                d,
+                "不用手动重排：下一轮扫描会按原水位区间重新入队",
+                false,
+            );
+        }
+    }
+
+    if batch.is_none_or(|batch| batch.status != BatchStatus::Failed) {
+        let units = outcome
+            .map(|result| result.units.as_slice())
+            .unwrap_or_default();
+        let generated = entry
+            .units_done
+            .map(|done| done as usize)
+            .unwrap_or_else(|| {
+                units
+                    .iter()
+                    .filter(|unit| unit.status == UnitStatus::Generated)
+                    .count()
+            });
+        let failed: Vec<_> = units
+            .iter()
+            .filter(|unit| unit.status == UnitStatus::Failed)
+            .collect();
+        if let Some(total) = entry.total_units {
+            let label = if failed.is_empty() {
+                format!("{generated} / {total} 个交付单元已生成")
+            } else {
+                format!("{generated} 成功 · {} 失败 · 共 {total}", failed.len())
+            };
+            sub_line(ui, t, d, &label, false);
+        }
+
+        for unit in failed {
+            if let Some(pending) = batch
+                .and_then(|batch| pending_for_task(&vm.pending, row.dbnum, batch.end_sesno, unit))
+            {
+                pending_line(ui, t, d, vm, pending, in_flight, cmds);
+            } else {
+                detail_line(
+                    ui,
+                    t,
+                    d,
+                    DetailLine {
+                        icon: ph::X_CIRCLE,
+                        icon_color: t.danger,
+                        label: &format!("{} {}", unit.noun, unit.root_refno),
+                        note: "生成失败",
+                        note_color: t.danger,
+                    },
+                );
+                if let Some(message) = unit.message.as_deref() {
+                    sub_line(ui, t, d, message, true);
+                }
+            }
+        }
+
+        if vm.refreshed.contains(&row.task_id) {
+            sub_line(ui, t, d, "模型树已就地刷新", false);
+        }
+    }
+
+    if let Some(times) = terminal_times(entry) {
+        sub_line(ui, t, d, &times, false);
+    }
+}
+
+fn pending_for_task<'a>(
+    pending: &'a [PendingModelUnit],
+    dbnum: u32,
+    end_sesno: i32,
+    unit: &UnitResult,
+) -> Option<&'a PendingModelUnit> {
+    pending.iter().find(|pending| {
+        pending.dbnum == dbnum
+            && pending.root_refno == unit.root_refno
+            && pending.source_end_sesno == end_sesno
+    })
+}
+
+/// 运行中的行在明细区上方那句降级提示。`None` = 不画。
+struct FeedNotice {
+    icon: &'static str,
+    label: &'static str,
+    note: String,
+    warn: bool,
+}
+
+/// 明细通道的状态怎么说给人听。**断线与从未订阅必须分开**，这个函数存在的
+/// 唯一理由就是钉住这件事。
+///
+/// 断线是「连过、掉了、中间那段确实漏了」，所以报得出缺多少条，也值得警示色；
+/// 从未订阅（wasm 构建）是「本来就不收」——说断线是在指控一次不存在的故障，
+/// 而它的 `behind_events` 恰好等于服务端发过的**全部**，摆成「明细缺 N 条」
+/// 会让人以为丢了一大批东西。
+fn feed_notice(feed: &Feed, running: bool, behind: u64) -> Option<FeedNotice> {
+    if !running {
+        return None;
+    }
+    match feed {
+        Feed::Down(_) => Some(FeedNotice {
+            icon: ph::PLUGS,
+            label: "断线期间没收到事件，不知道它开没开始",
+            note: format!("明细缺 {behind} 条"),
+            warn: true,
+        }),
+        Feed::NotSubscribed(_) => Some(FeedNotice {
+            icon: ph::PULSE,
+            label: "这个构建不收逐单元明细，进度按轮询走",
+            note: String::new(),
+            warn: false,
+        }),
+        Feed::Connecting | Feed::Live => None,
+    }
 }
 
 /// 明细区的一条行。图标色与行尾说明色分开取：同一条行上「这是什么」与
@@ -1885,46 +2364,100 @@ fn detail_line(ui: &mut Ui, t: &Tokens, d: Density, line: DetailLine<'_>) {
     }
 }
 
-/// 欠着的交付单元由后台 worker 自动重试；界面只展示状态，不另起生成链。
-fn pending_line(ui: &mut Ui, t: &Tokens, d: Density, unit: &PendingModelUnit) {
+/// 欠着的交付单元。**两种形态必须分开说**：还在自动重试的那些等着就行，已经
+/// 到重试上限的那些自动路径永不再碰——对它们说「后台自动重试」是字面错误，
+/// 模型会一直停在旧几何而没人知道。
+///
+/// 死信那一行是本视图唯一的出路，所以按钮就摆在这里；它走的是复活端点，不排新批次。
+fn pending_line(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    vm: &Vm,
+    unit: &PendingModelUnit,
+    in_flight: &mut HashMap<String, u32>,
+    cmds: &mut Vec<Cmd>,
+) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), d.px(30.0)), Sense::hover());
-    let mut ui = child(ui, rect, Align::Center);
-    ui.spacing_mut().item_spacing.x = d.px(8.0);
-    let (mark, _) = ui.allocate_exact_size(vec2(d.px(13.0), d.px(13.0)), Sense::hover());
-    glyph(
-        &ui,
-        mark.center(),
-        ph::ARROW_COUNTER_CLOCKWISE,
-        d.px(12.0),
-        t.warn,
-    );
-    ui.label(
+    let tone = if unit.dead { t.danger } else { t.warn };
+    let mut line = child(ui, rect, Align::Center);
+    line.spacing_mut().item_spacing.x = d.px(8.0);
+    let (mark, _) = line.allocate_exact_size(vec2(d.px(13.0), d.px(13.0)), Sense::hover());
+    let icon = if unit.dead {
+        ph::X_CIRCLE
+    } else {
+        ph::ARROW_COUNTER_CLOCKWISE
+    };
+    glyph(&line, mark.center(), icon, d.px(12.0), tone);
+    line.label(
         RichText::new(format!("{} {}", unit.noun, unit.root_refno))
             .font(Font::mono_meta(d))
             .color(t.text_secondary),
     );
-    ui.label(
-        RichText::new(format!("欠着 · 已尝试 {} 次", unit.attempts))
-            .font(Font::micro(d))
-            .color(t.warn),
-    );
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        ui.label(
-            RichText::new("后台自动重试")
-                .font(Font::micro(d))
-                .color(t.text_muted),
-        );
+    let state = if unit.dead {
+        format!("已尝试 {} 次 · 已放弃重试", unit.attempts)
+    } else {
+        format!("第 {} 次尝试失败", unit.attempts)
+    };
+    line.label(RichText::new(state).font(Font::micro(d)).color(tone));
+
+    let submitted = in_flight.contains_key(&unit.root_refno);
+    line.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        if submitted {
+            ui.label(
+                RichText::new("已提交 · 等下一拍")
+                    .font(Font::micro(d))
+                    .color(t.text_muted),
+            );
+            return;
+        }
+        if ui
+            .add_enabled(
+                vm.can_mutate(),
+                widgets::button(t, d, "立刻重试").icon(ph::ARROW_COUNTER_CLOCKWISE),
+            )
+            .on_hover_text("清零重试次数并叫醒调度器；不排新的数据批次，结果等下一拍轮询")
+            .on_disabled_hover_text("当前数据源身份未就绪，或与模型服务固定范围不一致")
+            .clicked()
+        {
+            in_flight.insert(unit.root_refno.clone(), unit.attempts);
+            cmds.push(Cmd::RetryPendingUnit {
+                dbnum: unit.dbnum,
+                root_refno: unit.root_refno.clone(),
+            });
+        }
+        if !unit.dead {
+            ui.label(
+                RichText::new("后台仍会自动重试")
+                    .font(Font::micro(d))
+                    .color(t.text_muted),
+            );
+        }
     });
+
+    if unit.dead {
+        sub_line(ui, t, d, "不再自动重试，也不并入手动更新", true);
+    }
+
+    // 「为什么失败」只在这里说得出口：WS 明细活在进程内存里，重连即失；
+    // 持久表这一份跨重启仍在，不画就等于没有。
+    if let Some(error) = unit.last_error.as_deref() {
+        sub_line(ui, t, d, error, unit.dead);
+    }
 }
 
 fn sub_line(ui: &mut Ui, t: &Tokens, d: Density, text: &str, danger: bool) {
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), d.px(18.0)), Sense::hover());
-    let mut ui = child(ui, rect.shrink2(vec2(d.px(21.0), 0.0)), Align::Center);
-    ui.label(RichText::new(text).font(Font::micro(d)).color(if danger {
-        t.danger
-    } else {
-        t.text_muted
-    }));
+    ui.horizontal(|ui| {
+        ui.add_space(d.px(21.0));
+        ui.add(
+            egui::Label::new(RichText::new(text).font(Font::micro(d)).color(if danger {
+                t.danger
+            } else {
+                t.text_muted
+            }))
+            .wrap(),
+        );
+    });
 }
 
 // ---------------------------------------------------------------- 绘制小工具
@@ -1974,23 +2507,66 @@ fn text_at(ui: &Ui, at: egui::Pos2, text: &str, font: FontId, color: Color32) {
 
 // ---------------------------------------------------------------- 数与时间
 
-/// 会话区间。画板上千位是分开写的（`sesno 1 024 → 1 038`），四位数的会话号连着写
-/// 一眼数不清。
-fn window(start: i32, end: i32) -> String {
-    format!("sesno {} → {}", group(start as i64), group(end as i64))
+/// 保存窗口：两端那两条保存的**写入时刻**（`08-01 09:12 → 08-07 14:33`，ADR-0019）。
+///
+/// 两端缺任何一端都整格不画。**不许回落成 sesno，也不许只摆一端**——半个窗口比
+/// 空着更容易被读成「从这一刻起全都应用了」。跨天靠日期本身说清，不另加标注。
+fn save_window(start: Option<&str>, end: Option<&str>) -> String {
+    let stamp = |at: Option<&str>| Some(parse(at?)?.format("%m-%d %H:%M").to_string());
+    match (stamp(start), stamp(end)) {
+        (Some(start), Some(end)) => format!("{start} → {end}"),
+        _ => String::new(),
+    }
 }
 
-fn group(value: i64) -> String {
-    let negative = value < 0;
-    let digits = value.abs().to_string();
-    let mut out = String::new();
-    for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(' ');
-        }
-        out.push(ch);
+/// 并入的那几条保存，列成 `08-07 14:21 / 14:27 / 14:33`（ADR-0019 Q5）。
+///
+/// 同一天的只在第一条带日期，跨天每条各带自己的；同一分钟内出现重复时**整列补到秒**
+/// ——只给撞上的那两条补秒，一列里就出现两种精度，比统一补秒更难读。
+///
+/// 有一条解不出来就整列不给（`None`），由调用点只报条数：列一半却顶着「并入 N 次」
+/// 的标题，会让人以为列出来的就是全部。
+fn save_list(times: &[&str]) -> Option<String> {
+    let parsed = times
+        .iter()
+        .map(|at| parse(at))
+        .collect::<Option<Vec<_>>>()?;
+    if parsed.is_empty() {
+        return None;
     }
-    if negative { format!("-{out}") } else { out }
+    let mut minutes = HashSet::new();
+    let to_seconds = !parsed
+        .iter()
+        .all(|at| minutes.insert(at.format("%m-%d %H:%M").to_string()));
+    let clock = if to_seconds { "%H:%M:%S" } else { "%H:%M" };
+    let same_day = parsed
+        .windows(2)
+        .all(|pair| pair[0].date_naive() == pair[1].date_naive());
+    let listed = parsed
+        .iter()
+        .enumerate()
+        .map(|(i, at)| {
+            if same_day && i > 0 {
+                at.format(clock).to_string()
+            } else {
+                at.format(&format!("%m-%d {clock}")).to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" / ");
+    Some(listed)
+}
+
+/// 用 ` · ` 串起一行里的几段，**空段整段丢掉**。
+///
+/// 时刻缺席时那一段本来就不该出现，直接拼会留下一个孤零零的前导分隔符。
+fn segments(parts: &[&str]) -> String {
+    parts
+        .iter()
+        .filter(|part| !part.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 fn clock(elapsed: Duration) -> String {
@@ -2019,6 +2595,21 @@ fn since(stamp: &str) -> Option<Duration> {
 
 fn hhmm(stamp: &str) -> Option<String> {
     Some(parse(stamp)?.format("%H:%M").to_string())
+}
+
+fn terminal_times(entry: &TaskEntry) -> Option<String> {
+    let started = entry.started_at.as_deref()?;
+    let finished = entry.finished_at.as_deref()?;
+    let elapsed = parse(finished)?
+        .signed_duration_since(parse(started)?)
+        .to_std()
+        .ok()?;
+    Some(format!(
+        "开跑 {} · 结束 {} · 用时 {}",
+        hhmm(started)?,
+        hhmm(finished)?,
+        clock(elapsed)
+    ))
 }
 
 /// 房间泳道的「已等待」按分钟报。秒级精度在这里没有意义——它衡量的是
@@ -2140,6 +2731,94 @@ mod tests {
         let batch = task.result.as_ref().unwrap().batch.as_ref().unwrap();
         assert_eq!(batch.merged_sesnos, vec![1032, 1034]);
         assert_eq!(task.failed_units()[0].attempts, 3);
+    }
+
+    #[test]
+    fn a_manual_preview_is_attached_only_to_the_tasks_named_by_the_receipt() {
+        let preview = Preview {
+            dbnums: vec![crate::model_update::DbPreview {
+                dbnum: 8000,
+                net_added: 10,
+                net_modified: 20,
+                net_deleted: 3,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let batch = |task_id: &str| crate::model_update::EnqueuedBatch {
+            task_id: task_id.into(),
+            dbnum: 8000,
+            ..Default::default()
+        };
+        let receipt = Enqueued {
+            enqueued: vec![batch("new")],
+            merged: vec![batch("merged")],
+            already_covered: vec![8000],
+            ..Default::default()
+        };
+        let mut model = Vm::default();
+
+        model.remember_manual_preview(&preview, &receipt);
+
+        assert_eq!(model.preview_changes.get("new"), Some(&33));
+        assert_eq!(model.preview_changes.get("merged"), Some(&33));
+        assert_eq!(
+            model.preview_changes.len(),
+            2,
+            "没有 task_id 的覆盖项不许猜"
+        );
+    }
+
+    #[test]
+    fn an_active_retry_stays_disabled_until_the_snapshot_changes() {
+        let mut state = State::default();
+        state.in_flight.insert("1/2".into(), 3);
+        let mut unit = PendingModelUnit {
+            root_refno: "1/2".into(),
+            attempts: 3,
+            ..Default::default()
+        };
+
+        state.settle_retries(std::slice::from_ref(&unit));
+        assert!(state.in_flight.contains_key("1/2"));
+        unit.attempts = 0;
+        state.settle_retries(&[unit]);
+        assert!(!state.in_flight.contains_key("1/2"));
+    }
+
+    #[test]
+    fn an_old_task_does_not_borrow_a_newer_failure_of_the_same_unit() {
+        let unit = UnitResult {
+            root_refno: "1/2".into(),
+            status: UnitStatus::Failed,
+            ..Default::default()
+        };
+        let pending = vec![PendingModelUnit {
+            dbnum: 8000,
+            root_refno: "1/2".into(),
+            source_end_sesno: 20,
+            attempts: 4,
+            ..Default::default()
+        }];
+
+        assert!(pending_for_task(&pending, 8000, 10, &unit).is_none());
+        assert_eq!(
+            pending_for_task(&pending, 8000, 20, &unit).map(|unit| unit.attempts),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn terminal_timing_needs_both_valid_timestamps() {
+        let mut task = entry("db-8000-1", 8000, "succeeded");
+        task.started_at = Some("2026-07-27T10:07:22+08:00".into());
+        task.finished_at = Some("2026-07-27T10:12:00+08:00".into());
+        assert_eq!(
+            terminal_times(&task).as_deref(),
+            Some("开跑 10:07 · 结束 10:12 · 用时 04:38")
+        );
+        task.finished_at = Some("bad".into());
+        assert!(terminal_times(&task).is_none());
     }
 
     /// 房间轮的 `detail` 与数据批次的 `result` 是两种形状，不能互相踩。
@@ -2269,6 +2948,131 @@ mod tests {
         let all = rows(&model);
         let order = visible(&all, Filter::All, "");
         assert_eq!(all[order[0]].dbnum, 9);
+    }
+
+    /// 「够不着」与「排除」意思相反，不许共用一句话。
+    ///
+    /// 契约只有 `excluded` 的那阵子，MDB 声明了、项目目录里却没文件的库只能借
+    /// 「不在当前 MDB 声明的名单里」那句话出现——读起来正好是反的（施工单 Q5）。
+    /// 标题那格也得按三个理由分开数：一个 84px 的框里滚两百多行而只说「本期不执行」
+    /// 等于没说（Q3）。
+    #[test]
+    fn unreachable_and_excluded_never_share_a_sentence() {
+        let unreachable = DbnumStatus {
+            dbnum: 7015,
+            db_type: "DESI".into(),
+            not_in_project: true,
+            ..Default::default()
+        };
+        let excluded = DbnumStatus {
+            dbnum: 8191,
+            db_type: "CATA".into(),
+            excluded: true,
+            ..Default::default()
+        };
+        let out_of_mdb = DbnumStatus {
+            dbnum: 8200,
+            db_type: "DESI".into(),
+            excluded: true,
+            ..Default::default()
+        };
+        let blocked = DbnumStatus {
+            dbnum: 8003,
+            db_type: "DESI".into(),
+            blocked: true,
+            anomaly: Some(FileAnomaly::Missing { path: "a".into() }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            not_running_reason(&unreachable),
+            "MDB 声明了它，当前项目目录里没有这个文件"
+        );
+        assert_eq!(
+            not_running_reason(&out_of_mdb),
+            "DESI，但不在当前 MDB 声明的名单里"
+        );
+        assert!(not_running_reason(&excluded).contains("非 DESI"));
+        assert!(not_running_reason(&blocked).contains("文件缺失"));
+
+        let mut model = vm(Vec::new(), Vec::new());
+        model.dbnums = vec![
+            unreachable,
+            excluded,
+            out_of_mdb,
+            blocked,
+            // 正常待更新的库不进这一格。
+            DbnumStatus {
+                dbnum: 7997,
+                db_type: "DESI".into(),
+                ..Default::default()
+            },
+        ];
+        let rows = not_running(&model);
+        assert_eq!(rows.len(), 4, "正常库不该混进「本期不执行」");
+        assert!(rows[0].blocked, "阻断排在前面");
+        assert_eq!(
+            not_running_tally(&rows),
+            "1 个阻断 · 1 个够不着 · 2 个不在范围内"
+        );
+    }
+
+    /// 「从来没订过」不许被讲成「断线」。
+    ///
+    /// wasm 构建的 Feed 是个桩，开局就报一次状态。它若混进 `Down`，每一条运行中的
+    /// 行都会挂上「断线期间没收到事件」——从来没连过，何来断线；而那句「明细缺 N 条」
+    /// 里的 N 恰好等于服务端发过的全部，把「本来就不收」讲成了「丢了一大批」。
+    #[test]
+    fn a_build_that_never_subscribes_is_not_reported_as_a_dropped_connection() {
+        let down = feed_notice(&Feed::Down("socket closed".into()), true, 47)
+            .expect("断线且在跑，要说出来");
+        assert!(down.warn);
+        assert!(down.label.contains("断线"));
+        assert_eq!(down.note, "明细缺 47 条");
+
+        let never = feed_notice(&Feed::NotSubscribed("走轮询".into()), true, 47)
+            .expect("没订阅也要说一句，不能默不作声");
+        assert!(!never.warn, "本来就不收，不是故障");
+        assert!(!never.label.contains("断线"), "{}", never.label);
+        assert!(
+            never.note.is_empty(),
+            "没订过就没有「缺了多少条」：{}",
+            never.note
+        );
+
+        // 没在跑的行与通道好着的时候都不画。
+        assert!(feed_notice(&Feed::NotSubscribed("走轮询".into()), false, 47).is_none());
+        assert!(feed_notice(&Feed::Live, true, 0).is_none());
+        assert!(feed_notice(&Feed::Connecting, true, 0).is_none());
+    }
+
+    /// 死信自己一格，不并进「还有活没干完」。
+    ///
+    /// `active` 数的是「还会被干掉的活」，而死信恰恰是「不会再有人干它了」。混起来
+    /// 的后果是队列跑空、状态栏显示「队列 0」，而几个根永远停在旧几何——最容易
+    /// 以为都干完了的那一刻，恰恰是最需要这个数在的时候。
+    #[test]
+    fn dead_letters_are_counted_apart_from_the_work_that_still_moves() {
+        let mut model = vm(Vec::new(), Vec::new());
+        model.loaded = true;
+        model.pending.push(PendingModelUnit {
+            dbnum: 7997,
+            root_refno: "24381/1".into(),
+            attempts: 2,
+            ..Default::default()
+        });
+        model.pending.push(PendingModelUnit {
+            dbnum: 7997,
+            root_refno: "24381/2".into(),
+            attempts: 5,
+            dead: true,
+            ..Default::default()
+        });
+
+        assert_eq!(dead_letters(&model), 1);
+        let bar = status(&model);
+        assert_eq!(bar.dead_letters, 1);
+        assert_eq!(bar.active, 0, "死信不是「还有活没干完」");
     }
 
     /// 只画当前项目，且**过滤要出声**：别的项目那几条不显示，但计数说得出来。
@@ -2491,27 +3295,145 @@ mod tests {
     fn an_unparseable_timestamp_yields_no_stopwatch() {
         assert!(since("").is_none());
         assert!(hhmm("not-a-time").is_none());
-        assert_eq!(window(1024, 1038), "sesno 1 024 → 1 038");
         assert_eq!(clock(Duration::from_secs(3725)), "1:02:05");
     }
 
-    /// 会话区间同理：契约给 `Option` 就是因为它可能缺席，补 0 会摆出「sesno 0 → 0」。
-    /// 队列快照那一侧的 `start_sesno` 是必填，所以只有终态历史行会走到这一档。
+    /// 保存窗口只认时刻（ADR-0019）：两端缺任何一端就整格不画。
+    ///
+    /// **序号还在也照样不画**——那正是这条规则的要害：回落成 `sesno 1 024 → 1 038`
+    /// 等于把「时刻拿不到」说成「这批从 1 024 到 1 038」，两句话不是一回事。
     #[test]
-    fn a_history_row_without_sesnos_shows_no_window() {
+    fn a_row_without_both_save_times_shows_no_window() {
         let mut bare = entry("db-7997-9", 7997, "succeeded");
         bare.finished_at = Some("2026-07-27T10:04:00+08:00".into());
-        bare.start_sesno = None;
-        bare.end_sesno = None;
+        bare.start_sesno = Some(1024);
+        bare.end_sesno = Some(1038);
+
+        let mut half = entry("db-7998-9", 7998, "succeeded");
+        half.finished_at = Some("2026-07-27T10:04:30+08:00".into());
+        half.start_sesno_time = Some("2026-08-01T09:12:00+08:00".into());
 
         let mut full = entry("db-8000-9", 8000, "succeeded");
         full.finished_at = Some("2026-07-27T10:05:00+08:00".into());
-        full.start_sesno = Some(1024);
-        full.end_sesno = Some(1038);
+        full.start_sesno_time = Some("2026-08-01T09:12:00+08:00".into());
+        full.end_sesno_time = Some("2026-08-07T14:33:00+08:00".into());
 
-        let all = rows(&vm(Vec::new(), vec![bare, full]));
-        assert_eq!(all[0].window, "", "缺一个就整格不画，不许摆 sesno 0 → 0");
-        assert_eq!(all[1].window, "sesno 1 024 → 1 038");
+        let all = rows(&vm(Vec::new(), vec![bare, half, full]));
+        assert_eq!(all[0].window, "", "只有序号没有时刻时不许回落成 sesno");
+        assert_eq!(all[1].window, "", "半个窗口比空着更容易被误读");
+        assert_eq!(all[2].window, "08-01 09:12 → 08-07 14:33");
+    }
+
+    /// 活动行的序号来自 `/queue`，时刻来自配对的任务行——配不上就留空。
+    ///
+    /// 被 `/tasks` 那 200 条窗口挤出去的排队行会走到这一档：它照旧显示、照旧计位，
+    /// 只是那一格空着。
+    #[test]
+    fn an_active_row_takes_its_save_window_from_the_paired_task_row() {
+        let mut timed = entry("db-7997-1", 7997, "running");
+        timed.start_sesno_time = Some("2026-08-01T09:12:00+08:00".into());
+        timed.end_sesno_time = Some("2026-08-07T14:33:00+08:00".into());
+
+        let all = rows(&vm(
+            vec![
+                queued("db-7997-1", 7997, 1024, 1038),
+                queued("db-8000-1", 8000, 1024, 1031),
+            ],
+            vec![timed],
+        ));
+        assert_eq!(all[0].window, "08-01 09:12 → 08-07 14:33");
+        assert_eq!(
+            all[1].window, "",
+            "配不到任务行就空着，队列快照那两个序号不是退路"
+        );
+    }
+
+    /// 并入逐条：同一天只在第一条带日期，跨天每条各带（ADR-0019 Q5）。
+    #[test]
+    fn a_merged_save_list_carries_the_date_where_it_is_needed() {
+        assert_eq!(
+            save_list(&[
+                "2026-08-07T14:21:00+08:00",
+                "2026-08-07T14:27:00+08:00",
+                "2026-08-07T14:33:00+08:00",
+            ])
+            .unwrap(),
+            "08-07 14:21 / 14:27 / 14:33"
+        );
+        assert_eq!(
+            save_list(&["2026-08-06T23:58:00+08:00", "2026-08-07T00:04:00+08:00"]).unwrap(),
+            "08-06 23:58 / 08-07 00:04",
+            "跨天每条都得带自己的日期"
+        );
+    }
+
+    /// 同一分钟内重复的那条补到秒——**整列一起补**，一列两种精度更难读。
+    #[test]
+    fn saves_within_the_same_minute_are_listed_to_the_second() {
+        assert_eq!(
+            save_list(&[
+                "2026-08-07T14:21:05+08:00",
+                "2026-08-07T14:21:47+08:00",
+                "2026-08-07T14:33:00+08:00",
+            ])
+            .unwrap(),
+            "08-07 14:21:05 / 14:21:47 / 14:33:00"
+        );
+    }
+
+    /// 有一条读不到就整列不给，由调用点只报条数：列一半却顶着「并入 3 次」的标题，
+    /// 会让人以为列出来的就是全部。
+    #[test]
+    fn one_unreadable_save_time_drops_the_whole_list() {
+        assert!(save_list(&["2026-08-07T14:21:00+08:00", "not-a-time"]).is_none());
+        assert!(save_list(&[]).is_none());
+
+        // 契约层的守卫：老服务端不给这个字段，两个数组长度对不上就不许配对。
+        let mut batch = crate::model_update::BatchResult {
+            merged_sesnos: vec![1032, 1033],
+            ..Default::default()
+        };
+        assert!(batch.merged_save_times().is_none(), "长度对不上不许配对");
+        batch.merged_sesno_times = vec![Some("2026-08-07T14:21:00+08:00".into()), None];
+        assert!(batch.merged_save_times().is_none(), "缺一条就整列不给");
+        batch.merged_sesno_times = vec![
+            Some("2026-08-07T14:21:00+08:00".into()),
+            Some("2026-08-07T14:33:00+08:00".into()),
+        ];
+        assert_eq!(batch.merged_save_times().unwrap().len(), 2);
+    }
+
+    /// 时刻缺席时那一段整段丢掉，不留孤零零的前导分隔符。
+    #[test]
+    fn an_absent_segment_takes_its_separator_with_it() {
+        assert_eq!(
+            segments(&[
+                "08-01 09:12 → 08-07 14:33",
+                "已应用",
+                "水位推进至 08-07 14:33"
+            ]),
+            "08-01 09:12 → 08-07 14:33 · 已应用 · 水位推进至 08-07 14:33"
+        );
+        assert_eq!(segments(&["", "已应用"]), "已应用");
+        assert_eq!(
+            segments(&["", "批次失败", "水位不变"]),
+            "批次失败 · 水位不变"
+        );
+    }
+
+    /// 跨天靠日期本身说清，同一天也照样带日期——两端各自完整，不做「省略同一天」
+    /// 那种聪明省略：省了之后 `09:12 → 14:33` 读不出这是哪一天的事。
+    #[test]
+    fn a_save_window_always_carries_both_dates() {
+        assert_eq!(
+            save_window(
+                Some("2026-08-07T09:26:00+08:00"),
+                Some("2026-08-07T14:10:00+08:00")
+            ),
+            "08-07 09:26 → 08-07 14:10"
+        );
+        assert_eq!(save_window(None, Some("2026-08-07T14:10:00+08:00")), "");
+        assert_eq!(save_window(Some("not-a-time"), Some("also-not")), "");
     }
 
     /// 明细的存活判据以 `/queue` 为准：一个还排着、却被挤到 `/tasks` 那 200 条

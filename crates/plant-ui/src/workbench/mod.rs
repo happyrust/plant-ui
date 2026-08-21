@@ -8,6 +8,7 @@ pub mod command_line;
 pub mod logs;
 pub mod panes;
 pub mod props;
+pub mod room;
 pub mod tree;
 pub mod view3d;
 pub mod viewcube;
@@ -55,7 +56,9 @@ impl Default for WorkbenchState {
             let surface = dock.main_surface_mut();
             let [center, _left] =
                 surface.split_left(NodeIndex::root(), 0.19, vec![Pane::ModelTree]);
-            let [center, _right] = surface.split_right(center, 0.76, vec![Pane::Properties]);
+            // 房间与属性同一格页签（S13-B 的右侧面板分组）。
+            let [center, _right] =
+                surface.split_right(center, 0.76, vec![Pane::Properties, Pane::Room]);
             let [_center, bottom] = surface.split_below(center, 0.7, vec![Pane::CommandLine]);
             let [_command, _logs] =
                 surface.split_right(bottom, 0.4, vec![Pane::Logs, Pane::TaskQueue]);
@@ -78,6 +81,12 @@ impl WorkbenchState {
         if let Some(path) = self.dock.find_tab(&pane) {
             let _ = self.dock.set_active_tab(path);
         }
+    }
+
+    /// 复活死信的请求没发出去。成功那一半队列面板自己按快照收口，只有失败要宿主
+    /// 说一声——否则那枚按钮会一直灰着等一个永远不会来的变化。
+    pub fn queue_retry_failed(&mut self, root_refno: &str) {
+        self.queue.retry_failed(root_refno);
     }
 }
 

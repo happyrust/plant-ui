@@ -10,7 +10,7 @@ members = [
 exclude = ["vendor"]
 
 [workspace.package]
-version = "0.1.4"
+version = "0.1.7"
 edition = "2024"
 
 [workspace.dependencies]
@@ -36,6 +36,11 @@ bevy_egui35 = { path = "vendor/bevy_egui35", default-features = false, features 
 # 双端 spawn：原生走 tokio、浏览器走 spawn_local（view3d-migration.md 决定 5）
 bevy-wasm-tasks = { git = "https://gitee.com/happydpc/bevy-wasm-tasks", rev = "51aabcb8124ad80be902fa120c84a2e91d28c9ed" }
 
+# 设置窗里那个「浏览…」的系统目录对话框。`default-features = false` 关掉 Linux 的
+# xdg-portal 与 tokio 集成：前者会拖进 ashpd / zbus 一整串没 vendored 的包，后者这里
+# 用不上——对话框跑在自己的线程上，不进异步运行时。Linux 上要构建得自己开一个后端 feature。
+rfd = { version = "0.15", default-features = false }
+
 egui = "0.35.0"
 eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts", "accesskit", "inspection"] }
 egui_extras = "0.35"
@@ -45,6 +50,9 @@ egui-phosphor = "0.13.0"
 egui_inspection = "0.35"
 
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
+# 数据桥的并发通道：FuturesUnordered 在一个任务里并发驱动全部交互读查询。
+# 0.3.33 本来就在 lock 里（surrealdb / bevy 链带进来的），不新增下载。
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -23,6 +23,7 @@ use egui::{
 use egui_phosphor::regular as ph;
 use serde::Deserialize;
 
+use crate::style::group_number;
 use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Status, Tokens, radius};
 use crate::style::widgets;
@@ -55,6 +56,15 @@ pub struct DbPreview {
     pub file_path: String,
     pub applied_sesno: i32,
     pub file_latest_sesno: i32,
+    /// `applied_sesno` 那个会话在 **E3D 里被写入的时刻**（RFC3339，ADR-020）。
+    /// 从未应用或会话页读不到 → `None`，界面文案「从未应用」。老服务端没有
+    /// 这个字段——缺席时详情行不摆时间对，不摆假数据。
+    #[serde(default)]
+    pub applied_sesno_time: Option<String>,
+    /// `file_latest_sesno` 那个会话的 E3D 写入时刻。与 `applied_sesno_time`
+    /// 同一把尺子，相减 = 文件里还有多大时间跨度的设计改动没被吸收。
+    #[serde(default)]
+    pub file_latest_sesno_time: Option<String>,
     pub sessions: Vec<SessionPreview>,
     pub net_added: u32,
     pub net_modified: u32,
@@ -63,6 +73,14 @@ pub struct DbPreview {
     pub units: Vec<UnitPreview>,
     #[serde(default)]
     pub zones: Vec<ZonePreview>,
+    /// 净变化按最近 SITE 祖先分桶（ADR-020 `SiteSummary`）。S2-G 预览树的顶层
+    /// 语言；执行边界仍是（dbnum, 会话号区间），SITE 只是选取入口与报告口径。
+    /// 老服务端没有这个字段——缺席时该库退回文件身份行（优雅降级，不装死）。
+    #[serde(default)]
+    pub sites: Vec<SitePreview>,
+    /// 纯位姿变更目标（与 `units` 互斥的另一类工作：变换刷新，不重建网格）。
+    #[serde(default)]
+    pub transform_targets: Vec<TransformTargetPreview>,
     pub no_generation: u32,
     pub blocked: bool,
     pub anomaly: Option<FileAnomaly>,
@@ -112,6 +130,45 @@ impl ZonePreview {
     }
 }
 
+/// ADR-020 `SiteSummary`：一个库的净变化按最近 SITE 祖先分出的一桶。
+/// 挪动的交付单元可以出现在两个桶里（pre/post 两侧各解一次）。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SitePreview {
+    /// 空串 = 「SITE 归属未知」桶（解析不出 SITE 祖先的变化）。
+    pub site_refno: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub added: u32,
+    #[serde(default)]
+    pub modified: u32,
+    #[serde(default)]
+    pub deleted: u32,
+    #[serde(default)]
+    pub moved_in: u32,
+    #[serde(default)]
+    pub moved_out: u32,
+    #[serde(default)]
+    pub model_affecting: u32,
+    #[serde(default)]
+    pub units: Vec<UnitPreview>,
+}
+
+impl SitePreview {
+    /// 归属未知桶：行形态同 SITE 行、无勾选框、排在同库 SITE 行之后（§2-G）。
+    pub fn unknown(&self) -> bool {
+        self.site_refno.is_empty()
+    }
+
+    pub fn display_name(&self) -> &str {
+        if self.name.is_empty() {
+            &self.site_refno
+        } else {
+            &self.name
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct UnitPreview {
     pub root_refno: String,
@@ -140,6 +197,22 @@ fn yes() -> bool {
     true
 }
 
+/// 一个纯位姿（`POS`/`ORI`）变更目标：执行阶段走 `transform` 便宜工作项——
+/// 只刷新世界变换、包围盒、空间树与房间归属，不重建网格、不整单重生成，
+/// 所以它不出现在交付单元列表里。老服务端的 payload 没有这个字段，缺省为空。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TransformTargetPreview {
+    /// PDMS `a/b` 引用串。
+    pub refno: String,
+    #[serde(default)]
+    pub noun: String,
+    #[serde(default)]
+    pub name: String,
+    /// 粗层级容器（WORL/SITE/ZONE）：执行时会刷新其**整棵子树**的模型实例。
+    #[serde(default)]
+    pub container: bool,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct PendingModelUnit {
     pub dbnum: u32,
@@ -151,6 +224,13 @@ pub struct PendingModelUnit {
     pub attempts: u32,
     #[serde(default)]
     pub last_error: Option<String>,
+    /// 已达服务端的重试上限：自动路径**永不再碰**它，只有人按一下才会动。
+    ///
+    /// 判定必须由服务端给——上限是它那边的常量，本端拿着 `attempts` 判不出来。
+    /// 缺省 false 是有意的：老服务端不带这个字段，那时候少标一行「已放弃」，
+    /// 比凭空标一行安全。
+    #[serde(default)]
+    pub dead: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -199,9 +279,9 @@ impl std::fmt::Display for FileAnomaly {
             ),
             Self::Duplicate { paths } => write!(
                 f,
-                "项目内发现 {} 个同号文件，界面不替人挑：{}。",
+                "项目内发现 {} 个同号文件，不自动挑选；出路：人工挑一个。\n· {}",
                 paths.len(),
-                paths.join("、")
+                paths.join("\n· ")
             ),
             Self::Missing { path } => write!(
                 f,
@@ -351,6 +431,70 @@ impl DbPreview {
             self.file_latest_sesno
         )
     }
+
+    /// 有名有姓的 SITE 桶（归属未知桶不算）。空 = 老服务端没给 `sites[]`，或
+    /// 变化全解不出 SITE 祖先——两种情形都退回文件身份行（§2-G 优雅降级）。
+    pub fn named_sites(&self) -> impl Iterator<Item = &SitePreview> {
+        self.sites.iter().filter(|site| !site.unknown())
+    }
+
+    /// 确认页批次行标题（S2-H）：同库 SITE 名单，`SITE /A + /B`。
+    /// 没有可说的 SITE 时退回文件身份（首次导入 / 老服务端）。
+    pub fn batch_title(&self) -> String {
+        let names: Vec<&str> = self.named_sites().map(SitePreview::display_name).collect();
+        if names.is_empty() {
+            return format!("db{} · {}", self.dbnum, self.db_type);
+        }
+        format!("SITE {}", names.join(" + "))
+    }
+
+    /// SITE 详情行（§2-G 展开首行）。库级事实按 SITE 重复画——这是 SITE 平铺
+    /// 明确接受的代价。`exclude` 是当前行自己的 refno，联动名单里不列自己；
+    /// 同库只有 1 个 SITE 时整句不画。
+    pub fn site_detail_line(&self, exclude: &str) -> String {
+        let mut parts = Vec::new();
+        if let Some(latest) = self.file_latest_sesno_time.as_deref() {
+            let applied = self
+                .applied_sesno_time
+                .as_deref()
+                .map(e3d_time)
+                .unwrap_or_else(|| "从未应用".into());
+            parts.push(format!(
+                "上次应用 {applied} → 文件最新 {}",
+                e3d_time(latest)
+            ));
+        }
+        parts.push(format!(
+            "待应用 sesno {} → {}（{} 个会话）",
+            group_number((self.applied_sesno + 1).into()),
+            group_number(self.file_latest_sesno.into()),
+            self.sessions.len()
+        ));
+        let linked: Vec<&str> = self
+            .named_sites()
+            .map(SitePreview::display_name)
+            .filter(|name| *name != exclude)
+            .collect();
+        if !linked.is_empty() {
+            parts.push(format!("与 {} 同库联动", linked.join("、")));
+        }
+        if matches!(self.anomaly, Some(FileAnomaly::PathMigrated { .. })) {
+            parts.push("文件已迁移 · 登记路径自动跟新".into());
+        }
+        parts.join(" · ")
+    }
+}
+
+/// RFC3339 → 「MM-DD HH:MM」（本地时区）。语义是 **E3D 会话写入时刻**（ADR-020），
+/// 解不动就原样返回——一串错格式比一格假时间诚实。
+fn e3d_time(rfc3339: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(rfc3339)
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|_| rfc3339.to_owned())
 }
 
 /// 一次预览能算出来的全部汇总量。分子分母都在这一处算，免得几张画板各算各的。
@@ -363,6 +507,12 @@ pub struct Totals {
     pub no_generation: u32,
     /// 受影响交付单元：`DeliveryUnitSummary` 已按 refno 去重，直接相加。
     pub units: usize,
+    /// 其中执行阶段真正会重新生成的单元（`will_generate`）。E3D 的 SAVEWORK
+    /// 常会顺带触碰整库元素，产生大量「不生成」单元行——确认页说「将重新生成」
+    /// 时必须用这个数，不能用 `units` 总数。
+    pub generating: usize,
+    /// 纯位姿刷新目标（`transform` 便宜路径，不重建网格）。
+    pub transform_targets: usize,
     /// 会产生数据批次的 dbnum 数。
     pub batches: usize,
     /// 在本期执行范围之内的 DESI 库数（当前 MDB 声明、且当前项目目录里有文件）。
@@ -385,6 +535,8 @@ impl Preview {
             t.model_affecting += db.model_affecting;
             t.no_generation += db.no_generation;
             t.units += db.units.len();
+            t.generating += db.units.iter().filter(|u| u.will_generate).count();
+            t.transform_targets += db.transform_targets.len();
             t.batches += usize::from(db.will_run());
             if !db.is_desi() {
                 t.excluded += 1;
@@ -398,10 +550,25 @@ impl Preview {
         t
     }
 
+    /// 本次运行会一并处理的待重试单元。**死信不在其中**——执行侧按服务端的
+    /// 重试上限封顶，到顶的行只出现在检查视图里，一次都不会跑。
+    pub fn retries_to_run(&self) -> impl Iterator<Item = &PendingModelUnit> {
+        self.pending_model_retries.iter().filter(|u| !u.dead)
+    }
+
+    /// 已放弃的那些。它们同样在列表里，但要分开数、分开说：混进「将合并」等于
+    /// 承诺一件本次不会发生的事。
+    pub fn dead_retries(&self) -> impl Iterator<Item = &PendingModelUnit> {
+        self.pending_model_retries.iter().filter(|u| u.dead)
+    }
+
     /// 有没有值得按下「开始更新」的东西。待重试单元自己就够成一次运行——
     /// 契约明写没有新 sesno 也要显示并允许重试。
+    ///
+    /// 但只有**还会跑的**那些算数：一个项目攒下几个死信之后，这里若照旧算进去，
+    /// 「开始更新」会永远亮着，按下去扫一圈什么也不做，而死信一个都没动。
     pub fn executable(&self) -> bool {
-        self.dbnums.iter().any(DbPreview::will_run) || !self.pending_model_retries.is_empty()
+        self.dbnums.iter().any(DbPreview::will_run) || self.retries_to_run().next().is_some()
     }
 }
 
@@ -434,6 +601,10 @@ pub struct Enqueued {
     pub blocked: Vec<BlockedDbnum>,
     #[serde(default)]
     pub up_to_date: usize,
+    /// 请求带了 `dbnums` 勾选子集（ADR-020）而未勾选的库：不扫描、不入队、
+    /// 水位不动，等下一次执行。全范围请求时恒为空。
+    #[serde(default)]
+    pub unselected: Vec<u32>,
     #[serde(default)]
     pub warnings: Vec<String>,
 }
@@ -461,8 +632,15 @@ pub struct BlockedDbnum {
 }
 
 impl Enqueued {
-    /// 一句能写进日志的回执。入队、并入、阻断三件事分开说——它们的出路不一样：
-    /// 排上的等着跑，并入的已经在别人那一行里，阻断的要人去处理文件。
+    /// 一句能写进日志的回执。五个去向分开说——它们的出路各不相同：排上的等着跑、
+    /// 并入的已经在别人那一行里、被覆盖的无需动作、已是最新的本来就没事、
+    /// 阻断的要人去处理文件。
+    ///
+    /// **五个数要与 `scanned` 算得平。** 早先的写法只在「一行都没排」那条兜底
+    /// 分支里报 `up_to_date` 与 `already_covered`，于是只要有任意一条入队，
+    /// 那两个数就整个消失：人按下确认看到「扫描 29 个库；已入队 2 个数据批次」，
+    /// 剩下 27 个去哪了说不出来。那与本仓自己坚持的「排除有两个理由，界面上必须
+    /// 分开数」「过滤不许无声」正好相反。
     pub fn summary(&self) -> String {
         let mut parts = Vec::new();
         if !self.enqueued.is_empty() {
@@ -489,6 +667,33 @@ impl Enqueued {
                 self.merged.len()
             ));
         }
+        if !self.already_covered.is_empty() {
+            let list = self
+                .already_covered
+                .iter()
+                .map(|dbnum| format!("db{dbnum}"))
+                .collect::<Vec<_>>()
+                .join("、");
+            parts.push(format!(
+                "{} 个已被排队中的批次覆盖（{list}）",
+                self.already_covered.len()
+            ));
+        }
+        if self.up_to_date > 0 {
+            parts.push(format!("{} 个已是最新", self.up_to_date));
+        }
+        if !self.unselected.is_empty() {
+            let list = self
+                .unselected
+                .iter()
+                .map(|dbnum| format!("db{dbnum}"))
+                .collect::<Vec<_>>()
+                .join("、");
+            parts.push(format!(
+                "{} 个未勾选跳过（{list}，水位不变）",
+                self.unselected.len()
+            ));
+        }
         if !self.blocked.is_empty() {
             let list = self
                 .blocked
@@ -500,13 +705,28 @@ impl Enqueued {
         }
         if parts.is_empty() {
             return format!(
-                "扫描 {} 个库，没有需要入队的批次：{} 个已是最新，{} 个已被排队中的批次覆盖",
-                self.scanned,
-                self.up_to_date,
-                self.already_covered.len()
+                "扫描 {} 个库，没有需要入队的批次，回执也没说这些库各自是什么去向",
+                self.scanned
             );
         }
+        // 加不到 `scanned` 就把差额摆出来。契约上这五桶应当是它的一个划分，
+        // 但那是服务端的性质，不是本端能保证的事——差额说不出来的时候，
+        // 宁可承认「有 N 个库没交代」也不让那个数无声消失。
+        let unaccounted = self.scanned.saturating_sub(self.accounted());
+        if unaccounted > 0 {
+            parts.push(format!("另有 {unaccounted} 个库回执没交代去向"));
+        }
         format!("扫描 {} 个库；{}", self.scanned, parts.join("；"))
+    }
+
+    /// 回执把去向说清楚了的库数。与 `scanned` 的差就是说不清的那部分。
+    fn accounted(&self) -> usize {
+        self.enqueued.len()
+            + self.merged.len()
+            + self.already_covered.len()
+            + self.up_to_date
+            + self.unselected.len()
+            + self.blocked.len()
     }
 }
 
@@ -521,6 +741,11 @@ pub struct Outcome {
     pub project: String,
     #[serde(default)]
     pub status: RunStatus,
+    /// 排队行被冻结重扫完全覆盖、未单独执行（gen-model ADR-011 §5）。
+    /// 新服务端在 absorbed 收口时带出这个标志；旧服务端以
+    /// `status = absorbed_by_running` 表达同一件事，判读走 [`Self::is_absorbed`]。
+    #[serde(default)]
+    pub absorbed: bool,
     #[serde(default)]
     pub batch: Option<BatchResult>,
     #[serde(default)]
@@ -546,6 +771,13 @@ impl Outcome {
         self.batch
             .as_ref()
             .is_some_and(|batch| batch.status == BatchStatus::Applied && batch.changed_elements > 0)
+    }
+
+    /// 这一行入队后被运行中批次覆盖、没有单独执行（ADR-011 §5 的 absorbed 收口）。
+    /// 两代服务端两种说法，这里收拢成一个判读：新的给 `absorbed = true`（status 是
+    /// `up_to_date`），旧的把 `status` 本身写成 `absorbed_by_running`。
+    pub fn is_absorbed(&self) -> bool {
+        self.absorbed || self.status == RunStatus::AbsorbedByRunning
     }
 
     /// 本次真正生成成功的交付单元及其原 / 新 OWNER。
@@ -579,6 +811,15 @@ pub enum RunStatus {
     Failed,
     #[default]
     UpToDate,
+    /// 旧服务端的 absorbed 收口（gen-model ADR-011 §5）：排队行被冻结重扫完全
+    /// 覆盖，工作在运行中的那一批里完成，这一行没有单独执行。新服务端不再用
+    /// 这个值（改发 `up_to_date` + `absorbed: true`），留着它是为了旧服务端。
+    AbsorbedByRunning,
+    /// 认不出的终态兜底。没有它，服务端多一种 result 形状就毒化整张
+    /// `/tasks` 列表（一条解不动，`Vec<TaskEntry>` 整个失败），队列面板会
+    /// 冻在旧快照上直到那一行被挤出 200 条窗口——宁可认不出，不许连坐。
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -590,6 +831,13 @@ pub struct BatchResult {
     pub file_path: String,
     pub start_sesno: i32,
     pub end_sesno: i32,
+    /// 窗口两端那两条保存的**写入时刻**（RFC3339）。终态行内明细摆的是这一对，
+    /// 序号只留作执行边界（ADR-0019 Q3）。任一端缺席就整格不画，不回落成 sesno。
+    #[serde(default)]
+    pub start_sesno_time: Option<String>,
+    /// 右端时刻。「水位推进至」那一段说的也是它（Q8），与右端重复是刻意的。
+    #[serde(default)]
+    pub end_sesno_time: Option<String>,
     #[serde(default)]
     pub status: BatchStatus,
     #[serde(default)]
@@ -597,8 +845,30 @@ pub struct BatchResult {
     /// 预览扫描之后才并入本批次的会话。契约明写结果摘要必须逐条列出。
     #[serde(default)]
     pub merged_sesnos: Vec<u32>,
+    /// 与 `merged_sesnos` **一一对应**的写入时刻（ADR-0019 Q5）。
+    ///
+    /// 服务端保证等长，按下标配对；读不到的那条是 `None`。**别按长度对齐**——
+    /// 老服务端根本不给这个字段，那时它是空数组而 `merged_sesnos` 有内容。
+    #[serde(default)]
+    pub merged_sesno_times: Vec<Option<String>>,
     #[serde(default)]
     pub changed_elements: u64,
+}
+
+impl BatchResult {
+    /// 并入的那几条保存，逐条配上时刻（ADR-0019 Q5）。
+    ///
+    /// **只有每一条都拿得到时刻才给**：漏掉几条却仍标着「并入 3 次」会让人以为
+    /// 列出来的就是全部。缺任何一条就返回 `None`，由调用点只报条数。
+    pub fn merged_save_times(&self) -> Option<Vec<&str>> {
+        if self.merged_sesno_times.len() != self.merged_sesnos.len() {
+            return None;
+        }
+        self.merged_sesno_times
+            .iter()
+            .map(|time| time.as_deref())
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -684,6 +954,13 @@ pub enum Feed {
     Live,
     /// 断开，附一句能说给人听的原因。
     Down(String),
+    /// 这个构建**压根不订阅**逐单元明细（wasm 端就是这样：进度走轮询）。
+    ///
+    /// 它与 `Down` 不是一回事，不许合成一个。断线是「连过、掉了、可以重连、
+    /// 中间那段确实漏了」；这一种是从来没连过——说「断线期间没收到事件」是在
+    /// 指控一次不存在的故障，摆一个「明细缺 N 条」更是把「本来就不收」讲成
+    /// 「丢了」，而那个数恰好等于服务端发过的全部。
+    NotSubscribed(String),
 }
 
 // ================================================================ 不可用与失败态
@@ -778,7 +1055,8 @@ pub enum Vm {
     Idle,
     Loading,
     Ready(Preview),
-    Starting,
+    /// 正在把这份预览重新扫描并入队。保留它，供终态行显示“预览时 N 项”。
+    Starting(Preview),
     Failed(Failure),
 }
 
@@ -789,7 +1067,7 @@ impl Vm {
             Self::Idle => 0,
             Self::Loading => 1,
             Self::Ready(_) => 2,
-            Self::Starting => 3,
+            Self::Starting(_) => 3,
             Self::Failed(_) => 4,
         }
     }
@@ -849,6 +1127,10 @@ pub struct State {
     cache: Option<Cached>,
     /// 显式点过的展开箭头。默认展开与否按行的种类定，这里只记「与默认相反」的那些。
     toggled: HashSet<String>,
+    /// 勾选集的补集（§2-G：默认全勾，记的是被取消的那些）。键是 dbnum——
+    /// **同库联动**（Q1 定案）：勾任何一个 SITE = 同库 SITE 全亮，只有勾 / 不勾
+    /// 两态、没有半选，所以状态天然按库记，不按 SITE 记。
+    unchecked: HashSet<u32>,
     only_model_affecting: bool,
     /// internal 那一类失败的原始 message，默认折起。
     detail_open: bool,
@@ -869,8 +1151,10 @@ impl State {
                 }
                 if switched {
                     // 预览一刷新就退回第一步：确认页上摆的是刚才那份的数字。
+                    // 勾选集同时归零（回到默认全勾）——旧勾选对着的是上一份预览。
                     self.step = Step::Preview;
                     self.detail_open = false;
+                    self.unchecked.clear();
                 }
             }
             Vm::Failed(_) if switched => self.detail_open = false,
@@ -888,9 +1172,67 @@ impl State {
         }
     }
 
+    fn db_checked(&self, dbnum: u32) -> bool {
+        !self.unchecked.contains(&dbnum)
+    }
+
+    fn toggle_db(&mut self, dbnum: u32) {
+        if !self.unchecked.remove(&dbnum) {
+            self.unchecked.insert(dbnum);
+        }
+    }
+
+    /// 勾选集折算成 execute 请求的 `dbnums[]`（ADR-020）：勾中的可执行库号，
+    /// 含首次导入库。**总是显式给名单**——预览之后新冒出来的库不在这份确认里，
+    /// 不该被顺手执行。
+    fn selected_dbnums(&self, preview: &Preview) -> Vec<u32> {
+        preview
+            .dbnums
+            .iter()
+            .filter(|db| db.will_run() && self.db_checked(db.dbnum))
+            .map(|db| db.dbnum)
+            .collect()
+    }
+
     fn cached(&self) -> Option<&Preview> {
         self.cache.as_ref().map(|c| &c.preview)
     }
+}
+
+/// 勾选集折算（§2-G 工具行 / 主按钮 / 确认页共用同一份算法，免得三处各算各的）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Selection {
+    /// 有变化的 SITE 总数（有名有姓的桶；归属未知桶与首次导入库不算 SITE）。
+    site_total: usize,
+    site_checked: usize,
+    /// 勾中折算出的数据批次数（含勾中的首次导入库）。
+    batches: usize,
+    batches_total: usize,
+    /// 勾中批次的交付单元数（按 `db.units` 去重口径，不用 SITE 桶——挪动的
+    /// 单元在两个桶里各出现一次，按桶相加会虚高）。
+    units: usize,
+    generating: usize,
+    transform_targets: usize,
+}
+
+fn selection(preview: &Preview, state: &State) -> Selection {
+    let mut s = Selection::default();
+    for db in &preview.dbnums {
+        if !db.will_run() {
+            continue;
+        }
+        let named = db.named_sites().count();
+        s.batches_total += 1;
+        s.site_total += named;
+        if state.db_checked(db.dbnum) {
+            s.batches += 1;
+            s.site_checked += named;
+            s.units += db.units.len();
+            s.generating += db.units.iter().filter(|u| u.will_generate).count();
+            s.transform_targets += db.transform_targets.len();
+        }
+    }
+    s
 }
 
 // ================================================================ 窗口外壳
@@ -904,6 +1246,8 @@ pub fn show(
     d: Density,
     api_url: &str,
     applying: usize,
+    scope_mdb: &str,
+    sync_live: Option<bool>,
     vm: &Vm,
     state: &mut State,
 ) -> Vec<Cmd> {
@@ -928,7 +1272,7 @@ pub fn show(
         )
         .show(ctx, |ui| {
             ui.spacing_mut().item_spacing = Vec2::ZERO;
-            header(ui, t, d, vm, state);
+            header(ui, t, d, scope_mdb, sync_live, vm, state);
             steps(ui, t, d, state.step);
 
             let footer_h = d.px(56.0);
@@ -939,13 +1283,13 @@ pub fn show(
                 match vm {
                     Vm::Idle => idle_body(ui, t, d),
                     Vm::Loading => previewing_body(ui, t, d, state),
-                    Vm::Starting => center_note(
+                    Vm::Starting(_) => center_note(
                         ui,
                         t,
                         d,
                         None,
                         "正在提交增量更新任务…",
-                        "服务端接下这次运行之后，这里会换成逐批次、逐单元的执行进度。",
+                        "服务端接下任务后，本窗会关闭并切到任务队列。",
                     ),
                     Vm::Failed(failure) => failure_body(ui, t, d, failure, state),
                     Vm::Ready(preview) if preview.up_to_date => up_to_date_body(ui, t, d, state),
@@ -961,8 +1305,16 @@ pub fn show(
     cmds
 }
 
-fn header(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, state: &mut State) {
-    let (title, sub, tone, icon) = header_text(vm, state);
+fn header(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    scope_mdb: &str,
+    sync_live: Option<bool>,
+    vm: &Vm,
+    state: &mut State,
+) {
+    let (title, sub, tone, icon) = header_text(vm, state, scope_mdb, sync_live);
     let rect = bar(ui, d.px(52.0), t.bg_chrome, Corner::Top);
     let mut ui = child(ui, rect.shrink2(vec2(d.px(16.0), 0.0)), Align::Center);
     ui.spacing_mut().item_spacing.x = d.px(12.0);
@@ -1000,42 +1352,61 @@ fn header(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, state: &mut State) {
     });
 }
 
-fn header_text(vm: &Vm, state: &State) -> (String, String, Status, &'static str) {
+fn header_text(
+    vm: &Vm,
+    state: &State,
+    scope_mdb: &str,
+    sync_live: Option<bool>,
+) -> (String, String, Status, &'static str) {
     let project = project_of(vm, state);
+    let identity = |mdb: &str| {
+        let mut parts = vec![project.clone()];
+        if !mdb.is_empty() {
+            parts.push(format!("MDB {mdb}"));
+        }
+        if let Some(live) = sync_live {
+            parts.push(if live {
+                "自动同步已开启".to_owned()
+            } else {
+                "自动同步已关闭".to_owned()
+            });
+        }
+        parts.join(" · ")
+    };
     match vm {
         Vm::Idle => (
             "模型更新".into(),
-            format!("{project} · 尚未预览"),
+            format!("{} · 尚未预览", identity(scope_mdb)),
             Status::Neutral,
             ph::ARROWS_CLOCKWISE,
         ),
         Vm::Loading => (
             "模型更新 · 正在预览".into(),
-            format!("{project} · 只读扫描"),
+            format!("{} · 只读扫描", identity(scope_mdb)),
             Status::Info,
             ph::ARROWS_CLOCKWISE,
         ),
-        Vm::Starting => (
+        Vm::Starting(preview) => (
             "模型更新 · 正在提交".into(),
-            format!("{project} · 等待服务端接下任务"),
+            format!("{} · 等待服务端接下任务", identity(&preview.mdb)),
             Status::Info,
             ph::ARROWS_CLOCKWISE,
         ),
         Vm::Failed(failure) => (
             format!("模型更新 · {}", failure.form().title()),
-            format!("{project} · {}", failure.code),
+            format!("{} · {}", identity(scope_mdb), failure.code),
             failure.form().tone(),
             failure.form().icon(),
         ),
         Vm::Ready(preview) if preview.up_to_date => (
             "模型更新 · 已是最新".into(),
-            format!("{project} · 没有可更新的内容"),
+            format!("{} · 没有可更新的内容", identity(&preview.mdb)),
             Status::Success,
             ph::CHECK_CIRCLE,
         ),
-        Vm::Ready(_) if state.step == Step::Confirm => (
+        Vm::Ready(preview) if state.step == Step::Confirm => (
             "模型更新 · 确认执行".into(),
-            format!("{project} · 开始后不可中途取消"),
+            format!("{} · 开始后不可中途取消", identity(&preview.mdb)),
             Status::Warn,
             ph::SEAL_WARNING,
         ),
@@ -1043,10 +1414,7 @@ fn header_text(vm: &Vm, state: &State) -> (String, String, Status, &'static str)
         // `mdb_name`，只说「仅扫描当前项目」的话，两边错开时界面一声不响。
         Vm::Ready(preview) => (
             "模型更新".into(),
-            match preview.mdb.as_str() {
-                "" => format!("{project} · 仅扫描当前项目"),
-                mdb => format!("{project} · MDB {mdb} · 仅扫描当前项目"),
-            },
+            identity(&preview.mdb),
             Status::Info,
             ph::ARROWS_CLOCKWISE,
         ),
@@ -1055,7 +1423,9 @@ fn header_text(vm: &Vm, state: &State) -> (String, String, Status, &'static str)
 
 fn project_of(vm: &Vm, state: &State) -> String {
     match vm {
-        Vm::Ready(preview) if !preview.project.is_empty() => preview.project.clone(),
+        Vm::Ready(preview) | Vm::Starting(preview) if !preview.project.is_empty() => {
+            preview.project.clone()
+        }
         _ => state
             .cached()
             .map(|p| p.project.clone())
@@ -1203,7 +1573,7 @@ fn footer_actions(
                 cmds.push(Cmd::CancelModelUpdatePreview);
             }
         }
-        Vm::Starting => {}
+        Vm::Starting(_) => {}
         Vm::Ready(preview) if preview.up_to_date => {
             if ui
                 .add(widgets::button(t, d, "重新预览").icon(ph::ARROWS_CLOCKWISE))
@@ -1216,34 +1586,38 @@ fn footer_actions(
             }
         }
         Vm::Ready(preview) => {
-            let totals = preview.totals();
+            // 批次数按勾选集折算（§2-G 主按钮），不再是全部可执行库数。
+            let sel = selection(preview, state);
             if state.step == Step::Confirm {
                 if ui
                     .add(
-                        widgets::button(
-                            t,
-                            d,
-                            &format!("确认并开始 · {} 个数据批次", totals.batches),
-                        )
-                        .icon(ph::PLAY)
-                        .primary(),
+                        widgets::button(t, d, &format!("确认并开始 · {} 个数据批次", sel.batches))
+                            .icon(ph::PLAY)
+                            .primary(),
                     )
                     .clicked()
                 {
-                    cmds.push(Cmd::ExecuteModelUpdate);
+                    // 勾选集折算成 execute 的 `dbnums[]`（ADR-020）。总是显式给
+                    // 名单：预览之后新冒出来的库不在这份确认里，不该被顺手执行。
+                    cmds.push(Cmd::ExecuteModelUpdate {
+                        dbnums: Some(state.selected_dbnums(preview)),
+                    });
                 }
                 if ui.add(widgets::button(t, d, "返回预览")).clicked() {
                     state.step = Step::Preview;
                 }
             } else {
+                // 一个批次都没勾时，待重试单元自己也够成一次运行（契约明写没有
+                // 新 sesno 也要显示并允许重试）——死信不算。
+                let executable = sel.batches > 0 || preview.retries_to_run().next().is_some();
                 if ui
                     .add_enabled(
-                        preview.executable(),
-                        widgets::button(t, d, &format!("开始更新 · {} 个批次", totals.batches))
+                        executable,
+                        widgets::button(t, d, &format!("开始更新 · {} 个批次", sel.batches))
                             .icon(ph::PLAY)
                             .primary(),
                     )
-                    .on_disabled_hover_text("没有可执行的数据批次，也没有待重试单元")
+                    .on_disabled_hover_text("没有勾选的数据批次，也没有待重试单元")
                     .clicked()
                 {
                     state.step = Step::Confirm;
@@ -1371,7 +1745,7 @@ fn preview_body(
     let full = ui.available_rect_before_wrap();
     let split = full.right() - rail_w;
 
-    // 左：工具行 + 变化树
+    // 左：工具行 + 变化树（§2-G：SITE 平铺三段式——可执行 / 首次导入 / 本期不执行）
     let mut left = child(
         ui,
         Rect::from_min_max(full.left_top(), pos2(split, full.bottom())),
@@ -1380,14 +1754,38 @@ fn preview_body(
     left.set_min_size(vec2(split - full.left(), full.height()));
     left.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
-        tree_toolbar(ui, t, d, &totals, state);
+        tree_toolbar(ui, t, d, preview, &totals, state);
         ScrollArea::vertical()
             .id_salt("model-update-change-tree")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.add_space(d.px(2.0));
+                // 段一：可执行（SITE 平铺顶层）。非 DESI 完全不展示（2026-08-07
+                // 验收定案），已是最新的库契约本就不返回。
                 for db in &preview.dbnums {
-                    db_rows(ui, t, d, db, state);
+                    if db.will_run() && !db.initialization_required {
+                        executable_rows(ui, t, d, db, state);
+                    }
+                }
+                // 段一末尾：首次导入库行（无段头，跟在 SITE 行之后——「不看文件」
+                // 的唯一例外，文件名是它仅有的身份）。
+                for db in &preview.dbnums {
+                    if db.will_run() && db.initialization_required {
+                        init_row(ui, t, d, db, state);
+                    }
+                }
+                // 段二：本期不执行（分隔行）——阻断行与够不着行，无勾选框，
+                // 行形态照 S2-E / S2-F 不变。
+                let parked: Vec<&DbPreview> = preview
+                    .dbnums
+                    .iter()
+                    .filter(|db| db.form().blocks() || db.form() == DbForm::NotInProject)
+                    .collect();
+                if !parked.is_empty() {
+                    section_sep(ui, t, d, "本期不执行");
+                    for db in parked {
+                        parked_row(ui, t, d, db);
+                    }
                 }
                 ui.add_space(d.px(8.0));
             });
@@ -1414,7 +1812,14 @@ fn preview_body(
         });
 }
 
-fn tree_toolbar(ui: &mut Ui, t: &Tokens, d: Density, totals: &Totals, state: &mut State) {
+fn tree_toolbar(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    preview: &Preview,
+    totals: &Totals,
+    state: &mut State,
+) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), d.px(38.0)), Sense::hover());
     let mut ui = child(ui, rect.shrink2(vec2(d.px(16.0), 0.0)), Align::Center);
     ui.spacing_mut().item_spacing.x = d.px(8.0);
@@ -1423,18 +1828,14 @@ fn tree_toolbar(ui: &mut Ui, t: &Tokens, d: Density, totals: &Totals, state: &mu
             .font(Font::strong(d))
             .color(t.text_primary),
     );
-    // 排除的理由现在有三条，得分开数：非 DESI、MDB 声明但项目里没有文件，
-    // 以及压根不在 MDB 里（那些库连行都没有，靠 desi 这个数与 MDB 一对就知道）。
-    // 合成一个数的话，人看到自己知道的某个设计库不见了只会以为是 bug。
+    // 范围行只交代 DESI 与「够不着」（2026-08-07 验收定案：非 DESI 的数据完全
+    // 不展示，连排除计数也不再交代）。「够不着」非 0 时才画。
     let mut scope = format!("{} 个 DESI 设计库在范围内", totals.desi);
     if totals.not_in_project > 0 {
         scope.push_str(&format!(
             " · {} 个 MDB 声明但项目内无文件",
             totals.not_in_project
         ));
-    }
-    if totals.excluded > 0 {
-        scope.push_str(&format!(" · {} 个非 DESI 已排除", totals.excluded));
     }
     ui.label(
         RichText::new(scope)
@@ -1454,58 +1855,190 @@ fn tree_toolbar(ui: &mut Ui, t: &Tokens, d: Density, totals: &Totals, state: &mu
         {
             state.only_model_affecting = !state.only_model_affecting;
         }
+        // 已勾选计数（§2-G 工具行）：人对着 SITE 做选择，机器按批次执行，
+        // 桥在这里搭——两个数都给。
+        let sel = selection(preview, state);
+        ui.label(
+            RichText::new(format!(
+                "已勾选 {} / {} 个 SITE · 折算 {} 个数据批次",
+                sel.site_checked, sel.site_total, sel.batches
+            ))
+            .font(Font::mono_meta(d))
+            .color(t.text_muted),
+        );
     });
 }
 
-fn db_rows(ui: &mut Ui, t: &Tokens, d: Density, db: &DbPreview, state: &mut State) {
+/// 段间分隔行（§2-G「本期不执行」）。
+fn section_sep(ui: &mut Ui, t: &Tokens, d: Density, title: &str) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), d.px(28.0)), Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let g = layout(ui, title, Font::meta(d));
+    let x = rect.left() + d.px(12.0);
+    ui.painter().galley(
+        pos2(x, rect.center().y - g.size().y / 2.0),
+        g.clone(),
+        t.text_muted,
+    );
+    let line_l = x + g.size().x + d.px(10.0);
+    ui.painter().rect_filled(
+        Rect::from_min_max(
+            pos2(line_l, rect.center().y),
+            pos2(rect.right() - d.px(12.0), rect.center().y + 1.0),
+        ),
+        CornerRadius::ZERO,
+        t.border,
+    );
+}
+
+/// 可执行库（§2-G 段一）：SITE 平铺顶层。每个有名有姓的 SITE 桶一行顶层行，
+/// 库级事实（时间对、sesno 区间、同库联动）在展开的详情行里按 SITE 重复画；
+/// 归属未知桶排同库 SITE 行之后、无勾选框；纯位姿目标单独成组。
+/// 老服务端没给 `sites[]`（或全部解不出 SITE 祖先）时退回文件身份行——
+/// 会跑的批次绝不能因为没有 SITE 可说就从树上消失。
+fn executable_rows(ui: &mut Ui, t: &Tokens, d: Density, db: &DbPreview, state: &mut State) {
+    let checked = state.db_checked(db.dbnum);
+    if db.named_sites().next().is_none() {
+        legacy_db_rows(ui, t, d, db, state);
+        return;
+    }
+
+    for site in &db.sites {
+        if site.unknown() {
+            continue;
+        }
+        let key = format!("db{}-site-{}", db.dbnum, site.site_refno);
+        // 勾中的 SITE 默认摊开（用户打开这个窗就是来看它们的），取消勾选的
+        // 默认收起——时间与区间是展开后的信息（原始诉求原文如此）。
+        let open = state.open_row(&key, checked);
+        let label = format!("SITE {}", site.display_name());
+        let hit = row(
+            ui,
+            t,
+            d,
+            Row {
+                check: Some(checked),
+                caret: Some(open),
+                icon: ph::MAP_PIN,
+                icon_color: if checked { t.accent } else { t.text_muted },
+                label: &label,
+                label_color: if checked {
+                    t.text_primary
+                } else {
+                    t.text_muted
+                },
+                strong: true,
+                counts: Some((site.added, site.modified, site.deleted)),
+                fill: t.bg_header,
+                ..Row::default()
+            },
+        );
+        if hit.check_clicked {
+            // 同库联动（Q1 定案）：勾任何一个 SITE = 同库 SITE 全部跟着变。
+            state.toggle_db(db.dbnum);
+        } else if hit.clicked() {
+            state.toggle_row(&key);
+        }
+        if !open {
+            continue;
+        }
+        detail_row(ui, t, d, 1, &db.site_detail_line(site.display_name()));
+        for unit in site
+            .units
+            .iter()
+            .filter(|u| !state.only_model_affecting || u.will_generate)
+        {
+            unit_row(ui, t, d, 1, unit);
+        }
+    }
+
+    for site in &db.sites {
+        if !site.unknown() {
+            continue;
+        }
+        let key = format!("db{}-site-unknown", db.dbnum);
+        let open = state.open_row(&key, false);
+        let hit = row(
+            ui,
+            t,
+            d,
+            Row {
+                caret: Some(open),
+                icon: ph::MAP_PIN,
+                icon_color: t.text_muted,
+                label: "SITE 归属未知",
+                label_color: t.text_muted,
+                strong: true,
+                counts: Some((site.added, site.modified, site.deleted)),
+                note: "解析不出 SITE 祖先 · 随本库批次执行",
+                note_color: t.text_muted,
+                fill: t.bg_header,
+                ..Row::default()
+            },
+        );
+        if hit.clicked() {
+            state.toggle_row(&key);
+        }
+        if open {
+            for unit in site
+                .units
+                .iter()
+                .filter(|u| !state.only_model_affecting || u.will_generate)
+            {
+                unit_row(ui, t, d, 1, unit);
+            }
+        }
+    }
+
+    transform_rows(ui, t, d, db, state);
+}
+
+/// 老服务端（无 `sites[]`）的文件身份行：旧 S2 形态 + 勾选框，单元与位姿目标
+/// 照旧挂在库行下。
+fn legacy_db_rows(ui: &mut Ui, t: &Tokens, d: Density, db: &DbPreview, state: &mut State) {
     let form = db.form();
-    let (tone_fg, tone_bg) = t.status(form.tone());
+    let (tone_fg, _) = t.status(form.tone());
+    let checked = state.db_checked(db.dbnum);
     let key = format!("db{}", db.dbnum);
-    // 会跑的库默认摊开——用户打开这个窗口就是来看它们的；不跑的默认收起。
-    let expandable = form == DbForm::Pending && !db.units.is_empty();
-    let open = expandable && state.open_row(&key, true);
+    let expandable = !db.units.is_empty();
+    let open = expandable && state.open_row(&key, checked);
     let head_label = if db.file_name.is_empty() {
         format!("db{} · {}", db.dbnum, db.db_type)
     } else {
         format!("{} · db{} · {}", db.file_name, db.dbnum, db.db_type)
     };
-
-    let head = Row {
-        depth: 0,
-        caret: expandable.then_some(open),
-        icon: form.icon(),
-        icon_color: tone_fg,
-        label: &head_label,
-        label_color: if form.blocks() {
-            t.danger
-        } else if form == DbForm::Excluded || form == DbForm::UpToDate {
-            t.text_muted
-        } else {
-            t.text_primary
+    let hit = row(
+        ui,
+        t,
+        d,
+        Row {
+            check: Some(checked),
+            caret: expandable.then_some(open),
+            icon: form.icon(),
+            icon_color: tone_fg,
+            label: &head_label,
+            label_color: if checked {
+                t.text_primary
+            } else {
+                t.text_muted
+            },
+            strong: true,
+            tag: form.label(),
+            tag_color: tone_fg,
+            meta: db.window(),
+            note: form.note(),
+            note_color: t.text_muted,
+            fill: t.bg_header,
+            ..Row::default()
         },
-        strong: true,
-        tag: form.label(),
-        tag_color: tone_fg,
-        // 不在范围内的库没有会话区间可说。`NotInProject` 尤其不能摆：它连文件都
-        // 不在这个项目里，`window()` 要么算出 `sesno 1 → 0`，要么说「首次导入 ·
-        // 尚无权威水位」——后者与同一行的「本期够不着」直接打架。
-        meta: if form == DbForm::Excluded || form == DbForm::NotInProject {
-            String::new()
-        } else {
-            db.window()
-        },
-        note: form.note(),
-        note_color: if form.blocks() {
-            t.danger
-        } else {
-            t.text_muted
-        },
-        fill: if form.blocks() { tone_bg } else { t.bg_header },
-    };
-    if row(ui, t, d, head).clicked() && expandable {
+    );
+    if hit.check_clicked {
+        state.toggle_db(db.dbnum);
+    } else if hit.clicked() && expandable {
         state.toggle_row(&key);
     }
-
     if !open {
         return;
     }
@@ -1514,16 +2047,134 @@ fn db_rows(ui: &mut Ui, t: &Tokens, d: Density, db: &DbPreview, state: &mut Stat
         .iter()
         .filter(|u| !state.only_model_affecting || u.will_generate)
     {
-        let moved = match (unit.moved_in, unit.moved_out) {
-            (0, 0) => String::new(),
-            (i, 0) => format!("迁入 {i}"),
-            (0, o) => format!("迁出 {o}"),
-            (i, o) => format!("迁入 {i} · 迁出 {o}"),
-        };
-        let ulabel = format!("{} {}", unit.noun, unit.root_refno);
-        let urow = Row {
-            depth: 1,
-            caret: None,
+        unit_row(ui, t, d, 1, unit);
+    }
+    transform_rows(ui, t, d, db, state);
+}
+
+/// 首次导入库行（§2-G）：有勾选框（会执行、可排除），无 SITE 行可给——
+/// 「不看文件」的唯一例外。绝不能显示成「无变化」（S2-E 铁律不变）。
+fn init_row(ui: &mut Ui, t: &Tokens, d: Density, db: &DbPreview, state: &mut State) {
+    let checked = state.db_checked(db.dbnum);
+    let (tone_fg, _) = t.status(Status::Warn);
+    let label = if db.file_name.is_empty() {
+        format!("db{} · {}", db.dbnum, db.db_type)
+    } else {
+        format!("{} · db{} · {}", db.file_name, db.dbnum, db.db_type)
+    };
+    let hit = row(
+        ui,
+        t,
+        d,
+        Row {
+            check: Some(checked),
+            icon: ph::SEAL_WARNING,
+            icon_color: tone_fg,
+            label: &label,
+            label_color: if checked {
+                t.text_primary
+            } else {
+                t.text_muted
+            },
+            strong: true,
+            tag: "需初始化",
+            tag_color: tone_fg,
+            meta: "从未应用".into(),
+            note: "首次导入 · 整库生成 · 会执行",
+            note_color: tone_fg,
+            fill: t.bg_header,
+            ..Row::default()
+        },
+    );
+    if hit.check_clicked {
+        state.toggle_db(db.dbnum);
+    }
+}
+
+/// 本期不执行的行（阻断 / 够不着）：无勾选框，行形态照 S2-E / S2-F 不变。
+/// 这两类也是文件级身份——没有 SITE 可说时才许露文件名。
+fn parked_row(ui: &mut Ui, t: &Tokens, d: Density, db: &DbPreview) {
+    let form = db.form();
+    let (tone_fg, tone_bg) = t.status(form.tone());
+    let head_label = if db.file_name.is_empty() {
+        format!("db{} · {}", db.dbnum, db.db_type)
+    } else {
+        format!("{} · db{} · {}", db.file_name, db.dbnum, db.db_type)
+    };
+    let _ = row(
+        ui,
+        t,
+        d,
+        Row {
+            icon: form.icon(),
+            icon_color: tone_fg,
+            label: &head_label,
+            label_color: if form.blocks() {
+                t.danger
+            } else {
+                t.text_muted
+            },
+            strong: true,
+            tag: form.label(),
+            tag_color: tone_fg,
+            // 够不着的库连文件都不在这个项目里，没有会话区间可说。
+            meta: if form == DbForm::NotInProject {
+                String::new()
+            } else {
+                db.window()
+            },
+            note: form.note(),
+            note_color: if form.blocks() {
+                t.danger
+            } else {
+                t.text_muted
+            },
+            fill: if form.blocks() { tone_bg } else { t.bg_header },
+            ..Row::default()
+        },
+    );
+}
+
+/// SITE 展开首行：库级事实的详情行（时间对 · 待应用区间 · 同库联动名单）。
+fn detail_row(ui: &mut Ui, t: &Tokens, d: Density, depth: usize, text: &str) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), d.px(24.0)), Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let x = rect.left() + d.px(10.0) + depth as f32 * d.px(16.0) + d.px(12.0) + d.px(6.0);
+    glyph(
+        ui,
+        pos2(x + d.px(6.0), rect.center().y),
+        ph::CLOCK,
+        d.px(12.0),
+        t.text_muted,
+    );
+    let g = layout(ui, text, Font::mono_meta(d));
+    let clip = Rect::from_min_max(
+        pos2(x + d.px(12.0) + d.px(6.0), rect.top()),
+        pos2(rect.right() - d.px(12.0), rect.bottom()),
+    );
+    ui.painter().with_clip_rect(clip).galley(
+        pos2(clip.left(), rect.center().y - g.size().y / 2.0),
+        g,
+        t.text_muted,
+    );
+}
+
+fn unit_row(ui: &mut Ui, t: &Tokens, d: Density, depth: usize, unit: &UnitPreview) {
+    let moved = match (unit.moved_in, unit.moved_out) {
+        (0, 0) => String::new(),
+        (i, 0) => format!("迁入 {i}"),
+        (0, o) => format!("迁出 {o}"),
+        (i, o) => format!("迁入 {i} · 迁出 {o}"),
+    };
+    let ulabel = format!("{} {}", unit.noun, unit.root_refno);
+    let _ = row(
+        ui,
+        t,
+        d,
+        Row {
+            depth,
             icon: crate::workbench::noun_icon(&unit.noun),
             icon_color: if unit.will_generate {
                 t.warn
@@ -1532,7 +2183,6 @@ fn db_rows(ui: &mut Ui, t: &Tokens, d: Density, db: &DbPreview, state: &mut Stat
             },
             label: &ulabel,
             label_color: t.text_primary,
-            strong: false,
             tag: unit.name.as_str(),
             tag_color: t.text_muted,
             meta: moved,
@@ -1546,9 +2196,72 @@ fn db_rows(ui: &mut Ui, t: &Tokens, d: Density, db: &DbPreview, state: &mut Stat
             } else {
                 t.text_muted
             },
-            fill: Color32::TRANSPARENT,
-        };
-        let _ = row(ui, t, d, urow);
+            ..Row::default()
+        },
+    );
+}
+
+/// 纯位姿目标单独成组：它们是「变换刷新」不是「重新生成」，混进交付单元里
+/// 会让人以为要重建网格。容器目标（ZONE/SITE）额外说明整棵子树都会跟着动。
+/// 契约不给它们的 SITE 归属，成组挂在本库 SITE 行之后、随本库批次勾选。
+fn transform_rows(ui: &mut Ui, t: &Tokens, d: Density, db: &DbPreview, state: &mut State) {
+    if db.transform_targets.is_empty() {
+        return;
+    }
+    let key = format!("db{}-transform", db.dbnum);
+    let open = state.open_row(&key, false);
+    let hit = row(
+        ui,
+        t,
+        d,
+        Row {
+            caret: Some(open),
+            icon: ph::ARROWS_CLOCKWISE,
+            icon_color: t.accent,
+            label: "位姿刷新目标",
+            label_color: t.text_primary,
+            strong: true,
+            meta: format!("{} 个", db.transform_targets.len()),
+            note: "变换刷新 · 不重建网格 · 随本库批次执行",
+            note_color: t.accent,
+            fill: t.bg_header,
+            ..Row::default()
+        },
+    );
+    if hit.clicked() {
+        state.toggle_row(&key);
+    }
+    if !open {
+        return;
+    }
+    for target in &db.transform_targets {
+        let tlabel = format!("{} {}", target.noun, target.refno);
+        let _ = row(
+            ui,
+            t,
+            d,
+            Row {
+                depth: 1,
+                icon: crate::workbench::noun_icon(&target.noun),
+                icon_color: t.accent,
+                label: &tlabel,
+                label_color: t.text_primary,
+                tag: target.name.as_str(),
+                tag_color: t.text_muted,
+                meta: if target.container {
+                    "整棵子树".to_owned()
+                } else {
+                    String::new()
+                },
+                note: if target.container {
+                    "位姿刷新 · 子树"
+                } else {
+                    "位姿刷新"
+                },
+                note_color: t.accent,
+                ..Row::default()
+            },
+        );
     }
 }
 
@@ -1616,6 +2329,19 @@ fn summary_block(ui: &mut Ui, t: &Tokens, d: Density, applying: usize, totals: &
         &totals.model_affecting.to_string(),
         false,
     );
+    if totals.transform_targets > 0 {
+        ui.add_space(d.px(8.0));
+        stat_row(
+            ui,
+            t,
+            d,
+            ph::ARROWS_CLOCKWISE,
+            t.accent,
+            "位姿刷新目标（不重建网格）",
+            &totals.transform_targets.to_string(),
+            false,
+        );
+    }
     // 预览与数据批次并发（合流后没有单飞预检）：正在被应用的会话也会被算进
     // 「待应用」。数字说不清来路就把来路说出来——为 0 时整条不画，不摆空话。
     if applying > 0 {
@@ -1631,6 +2357,51 @@ fn summary_block(ui: &mut Ui, t: &Tokens, d: Density, applying: usize, totals: &
     }
 }
 
+fn anomaly_copy(anomaly: &FileAnomaly) -> (&'static str, String) {
+    match anomaly {
+        FileAnomaly::Rollback {
+            file_latest_sesno,
+            applied_sesno,
+        } => (
+            "会话号回退，本次跳过",
+            format!(
+                "原因：文件最新会话号 {} 低于已应用 {}。\n影响：水位不回退，其他库照常执行。\n出路：换回正确文件。",
+                group_number((*file_latest_sesno).into()),
+                group_number((*applied_sesno).into())
+            ),
+        ),
+        FileAnomaly::PathMigrated { old_path, new_path } => (
+            "路径迁移，照常执行",
+            format!(
+                "原因：同号同类型且水位未变，文件从 {old_path} 移到 {new_path}。\n影响：本批次照常执行。\n出路：登记路径自动更新。"
+            ),
+        ),
+        FileAnomaly::TypeChanged {
+            stored_db_type,
+            observed_db_type,
+        } => (
+            "库类型变化，本次跳过",
+            format!(
+                "原因：登记为 {stored_db_type}，本次读到 {observed_db_type}。\n影响：身份不自动覆盖，水位不变。\n出路：人工确认正确库类型。"
+            ),
+        ),
+        FileAnomaly::Duplicate { paths } => (
+            "发现同号文件，本次跳过",
+            format!(
+                "原因：项目内发现 {} 个同号文件：\n· {}\n影响：不自动挑选，水位不变。\n出路：人工保留正确文件。",
+                paths.len(),
+                paths.join("\n· ")
+            ),
+        ),
+        FileAnomaly::Missing { path } => (
+            "登记文件缺失，本次跳过",
+            format!(
+                "原因：登记路径找不到文件：{path}\n影响：本库不执行，水位不变。\n出路：放回文件或注销登记。"
+            ),
+        ),
+    }
+}
+
 fn hints_block(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, totals: &Totals) {
     section(ui, t, d, "阻断与提示");
     ui.add_space(d.px(10.0));
@@ -1638,18 +2409,18 @@ fn hints_block(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, totals: &
 
     for db in preview.dbnums.iter().filter(|db| db.form().blocks()) {
         any = true;
-        let form = db.form();
+        let (title, body) = db.anomaly.as_ref().map(anomaly_copy).unwrap_or((
+            "文件异常，本次跳过",
+            "影响：水位不变。\n出路：检查项目文件。".into(),
+        ));
         note_card(
             ui,
             t,
             d,
             Status::Error,
             ph::WARNING_CIRCLE,
-            &format!("db{} {}，本次跳过", db.dbnum, form.label()),
-            &db.anomaly
-                .as_ref()
-                .map(FileAnomaly::to_string)
-                .unwrap_or_else(|| "文件异常，本次不执行这个 dbnum。水位不变。".into()),
+            &format!("db{} · {title}", db.dbnum),
+            &body,
         );
         ui.add_space(d.px(10.0));
     }
@@ -1660,17 +2431,33 @@ fn hints_block(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, totals: &
         .filter(|db| db.form() == DbForm::PathMigrated)
     {
         any = true;
+        let (title, body) = db
+            .anomaly
+            .as_ref()
+            .map(anomaly_copy)
+            .unwrap_or(("路径迁移，照常执行", String::new()));
         note_card(
             ui,
             t,
             d,
             Status::Warn,
             ph::GIT_MERGE,
-            &format!("db{} 路径迁移，照常执行", db.dbnum),
-            &db.anomaly
-                .as_ref()
-                .map(FileAnomaly::to_string)
-                .unwrap_or_default(),
+            &format!("db{} · {title}", db.dbnum),
+            &body,
+        );
+        ui.add_space(d.px(10.0));
+    }
+
+    if totals.transform_targets > 0 {
+        any = true;
+        note_card(
+            ui,
+            t,
+            d,
+            Status::Info,
+            ph::ARROWS_CLOCKWISE,
+            &format!("{} 个纯位姿目标走便宜路径刷新", totals.transform_targets),
+            "只更新世界变换、包围盒、空间树与房间归属，不重建网格；ZONE/SITE 容器目标会连带刷新整棵子树的模型实例。",
         );
         ui.add_space(d.px(10.0));
     }
@@ -1689,22 +2476,38 @@ fn hints_block(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, totals: &
         ui.add_space(d.px(10.0));
     }
 
-    if !preview.pending_model_retries.is_empty() {
-        any = true;
-        let list = preview
-            .pending_model_retries
-            .iter()
+    fn listed<'a>(units: impl Iterator<Item = &'a PendingModelUnit>) -> String {
+        units
             .map(|u| format!("{} {}（已尝试 {} 次）", u.noun, u.root_refno, u.attempts))
             .collect::<Vec<_>>()
-            .join("；");
+            .join("；")
+    }
+
+    let to_run = preview.retries_to_run().count();
+    let dead = preview.dead_retries().count();
+    if to_run + dead > 0 {
+        any = true;
+        let mut detail = Vec::new();
+        if to_run > 0 {
+            detail.push(format!(
+                "将合并：{}。按最新状态只生成一次。",
+                listed(preview.retries_to_run())
+            ));
+        }
+        if dead > 0 {
+            detail.push(format!(
+                "已放弃：{}。不再自动重试，也不并入手动更新；可在任务队列逐个重试。",
+                listed(preview.dead_retries())
+            ));
+        }
         note_card(
             ui,
             t,
             d,
             Status::Info,
             ph::ARROW_COUNTER_CLOCKWISE,
-            &format!("{} 个待重试单元将合并", preview.pending_model_retries.len()),
-            &format!("{list}。上次生成失败，本次按最新状态只生成一次。"),
+            &format!("{to_run} 个将合并 · {dead} 个已放弃"),
+            &detail.join("\n"),
         );
         ui.add_space(d.px(10.0));
     }
@@ -1730,6 +2533,7 @@ fn hints_block(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, totals: &
 /// 阻断的库不跑、非 DESI 压根不在范围内、需初始化的库会跑、上次失败的单元会并入。
 fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &State) {
     let totals = preview.totals();
+    let sel = selection(preview, state);
     let previewed_at = state
         .cache
         .as_ref()
@@ -1746,24 +2550,52 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
             ph::PLAY,
             t.accent,
             "本次会执行",
-            &format!(
-                "{} 个数据批次 · {} 个交付单元",
-                totals.batches, totals.units
-            ),
+            &format!("{} 个数据批次 · {} 个交付单元", sel.batches, sel.units),
             |ui| {
-                for db in preview.dbnums.iter().filter(|db| db.will_run()) {
+                // S2-H：批次行以同库 SITE 名单为题，dbnum 只在括号里露面
+                // （任务队列 S12 按 dbnum 键，去那儿对账要认得出这一批是谁）。
+                for db in preview
+                    .dbnums
+                    .iter()
+                    .filter(|db| db.will_run() && state.db_checked(db.dbnum))
+                {
+                    if db.initialization_required {
+                        line(
+                            ui,
+                            t,
+                            d,
+                            Dot::Tone(t.accent),
+                            &format!("db{} · {}", db.dbnum, db.db_type),
+                            &db.window(),
+                            "需初始化 · 整库生成 · 建立水位",
+                            t.text_secondary,
+                        );
+                        continue;
+                    }
+                    let sites = db.named_sites().count();
+                    let note = if sites > 1 {
+                        format!(
+                            "同库一批（db{}）· {} 个会话 · {} 项变化",
+                            db.dbnum,
+                            db.sessions.len(),
+                            db.changes()
+                        )
+                    } else {
+                        format!(
+                            "db{} · {} 个会话 · {} 项变化",
+                            db.dbnum,
+                            db.sessions.len(),
+                            db.changes()
+                        )
+                    };
                     line(
                         ui,
                         t,
                         d,
                         Dot::Tone(t.accent),
-                        &format!("db{} · {}", db.dbnum, db.db_type),
+                        &db.batch_title(),
                         &db.window(),
-                        &if db.initialization_required {
-                            "首次导入 · 全量建立水位".to_owned()
-                        } else {
-                            format!("{} 个会话 · {} 项变化", db.sessions.len(), db.changes())
-                        },
+                        &note,
                         t.text_secondary,
                     );
                 }
@@ -1772,12 +2604,25 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
                     t,
                     d,
                     Dot::Glyph(ph::STACK, t.accent),
-                    &format!("{} 个最小交付单元将重新生成", totals.units),
+                    &format!("{} 个最小交付单元将重新生成", sel.generating),
                     "",
-                    "本期执行范围：当前 MDB 声明的 DESI 库 + sesno",
+                    "按变化归并；初始化库的整库生成单元不计入此数",
                     t.text_muted,
                 );
+                if sel.transform_targets > 0 {
+                    line(
+                        ui,
+                        t,
+                        d,
+                        Dot::Glyph(ph::ARROWS_CLOCKWISE, t.accent),
+                        &format!("{} 个位姿目标只做变换刷新", sel.transform_targets),
+                        "",
+                        "不重建网格；容器目标连带整棵子树",
+                        t.text_muted,
+                    );
+                }
                 ui.add_space(d.px(6.0));
+                // 重扫提示限定勾选范围（ADR-020：过滤作用于重扫循环）。
                 strip(
                     ui,
                     t,
@@ -1785,14 +2630,21 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
                     Status::Info,
                     ph::GIT_MERGE,
                     &format!(
-                        "{previewed_at}开始时会重新扫描，期间新产生的会话自动并入本批次，结果摘要里会逐条列出"
+                        "{previewed_at}开始时对勾选范围重新扫描，新会话自动并入本批次并逐条列出；未勾选的不扫描、不入队"
                     ),
                 );
             },
         );
 
-        let not_running = totals.blocked
-            + totals.excluded
+        let dead = preview.dead_retries().count();
+        let unselected: Vec<&DbPreview> = preview
+            .dbnums
+            .iter()
+            .filter(|db| db.will_run() && !state.db_checked(db.dbnum))
+            .collect();
+        // 非 DESI 不占行也不进计数（2026-08-07 验收定案：排除行已删）。
+        let not_running = unselected.len()
+            + totals.blocked
             + totals.not_in_project
             + usize::from(totals.no_generation > 0);
         card_titled(
@@ -1804,6 +2656,20 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
             "本次不会执行",
             &format!("{not_running} 项"),
             |ui| {
+                // 未勾选行：人自己选的，出路就是回上一步勾上。与阻断、够不着
+                // 不是一回事，三类不许合成一行。
+                for db in &unselected {
+                    line(
+                        ui,
+                        t,
+                        d,
+                        Dot::Glyph(ph::SQUARE, t.text_muted),
+                        &db.batch_title(),
+                        &format!("{} · {} 个会话待应用", db.window(), db.sessions.len()),
+                        "未勾选 · 本次跳过，水位不变",
+                        t.text_muted,
+                    );
+                }
                 for db in preview.dbnums.iter().filter(|db| db.form().blocks()) {
                     line(
                         ui,
@@ -1814,22 +2680,6 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
                         db.form().label(),
                         "已阻断 · 水位不变",
                         t.danger,
-                    );
-                }
-                for db in preview
-                    .dbnums
-                    .iter()
-                    .filter(|db| db.form() == DbForm::Excluded)
-                {
-                    line(
-                        ui,
-                        t,
-                        d,
-                        Dot::Tone(t.text_muted),
-                        &format!("db{} · {}", db.dbnum, db.db_type),
-                        "非 DESI，本期不处理",
-                        "不在执行范围",
-                        t.text_muted,
                     );
                 }
                 for db in preview
@@ -1862,7 +2712,7 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
                 }
                 if not_running == 0 {
                     ui.label(
-                        RichText::new("没有阻断，也没有被排除的库。")
+                        RichText::new("没有未勾选、阻断或够不着的库。")
                             .font(Font::meta(d))
                             .color(t.text_muted),
                     );
@@ -1870,7 +2720,8 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
             },
         );
 
-        if !preview.pending_model_retries.is_empty() {
+        let to_run = preview.retries_to_run().count();
+        if to_run + dead > 0 {
             card_titled(
                 ui,
                 t,
@@ -1878,9 +2729,9 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
                 ph::ARROW_COUNTER_CLOCKWISE,
                 t.accent,
                 "会一并处理",
-                &format!("{} 个待重试单元", preview.pending_model_retries.len()),
+                &format!("{to_run} 个将合并 · {dead} 个已放弃"),
                 |ui| {
-                    for unit in &preview.pending_model_retries {
+                    for unit in preview.retries_to_run() {
                         line(
                             ui,
                             t,
@@ -1893,6 +2744,18 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
                             ),
                             "按最新状态只生成一次",
                             t.text_secondary,
+                        );
+                    }
+                    for unit in preview.dead_retries() {
+                        line(
+                            ui,
+                            t,
+                            d,
+                            Dot::Tone(t.danger),
+                            &format!("{} {}", unit.noun, unit.root_refno),
+                            &format!("已尝试 {} 次", unit.attempts),
+                            "已放弃 · 本次不执行 · 可在任务队列立刻重试",
+                            t.danger,
                         );
                     }
                 },
@@ -2300,6 +3163,9 @@ fn line(
 /// 而状态词恰恰是这棵树最要紧的一列，所以单独画。
 struct Row<'a> {
     depth: usize,
+    /// `Some(勾中与否)` 画一枚勾选框（§2-G SITE 行 / 首次导入行）。点它走
+    /// [`RowResponse::check_clicked`]，不与整行的展开点击混在一起。
+    check: Option<bool>,
     caret: Option<bool>,
     icon: &'a str,
     icon_color: Color32,
@@ -2308,17 +3174,58 @@ struct Row<'a> {
     strong: bool,
     tag: &'a str,
     tag_color: Color32,
+    /// `Some((增, 改, 删))` 在 meta 左侧画三段等宽计数 `+a ~m −d`
+    /// （success / accent-strong / danger，§2-G SITE 行）。零值段不画。
+    counts: Option<(u32, u32, u32)>,
     meta: String,
     note: &'a str,
     note_color: Color32,
     fill: Color32,
 }
 
-fn row(ui: &mut Ui, t: &Tokens, d: Density, r: Row<'_>) -> egui::Response {
+impl Default for Row<'_> {
+    fn default() -> Self {
+        Row {
+            depth: 0,
+            check: None,
+            caret: None,
+            icon: "",
+            icon_color: Color32::PLACEHOLDER,
+            label: "",
+            label_color: Color32::PLACEHOLDER,
+            strong: false,
+            tag: "",
+            tag_color: Color32::PLACEHOLDER,
+            counts: None,
+            meta: String::new(),
+            note: "",
+            note_color: Color32::PLACEHOLDER,
+            fill: Color32::TRANSPARENT,
+        }
+    }
+}
+
+struct RowResponse {
+    resp: egui::Response,
+    /// 勾选框被点了（这次点击不再算整行点击——两个动作互斥）。
+    check_clicked: bool,
+}
+
+impl RowResponse {
+    /// 整行点击（展开 / 收起），勾选框的点击已经被摘走。
+    fn clicked(&self) -> bool {
+        !self.check_clicked && self.resp.clicked()
+    }
+}
+
+fn row(ui: &mut Ui, t: &Tokens, d: Density, r: Row<'_>) -> RowResponse {
     let h = d.px(30.0);
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
     if !ui.is_rect_visible(rect) {
-        return resp;
+        return RowResponse {
+            resp,
+            check_clicked: false,
+        };
     }
     let bg = if r.fill != Color32::TRANSPARENT {
         r.fill
@@ -2333,6 +3240,36 @@ fn row(ui: &mut Ui, t: &Tokens, d: Density, r: Row<'_>) -> egui::Response {
 
     let gap = d.px(6.0);
     let mut x = rect.left() + d.px(10.0) + r.depth as f32 * d.px(16.0);
+    let mut check_clicked = false;
+    if let Some(checked) = r.check {
+        let side = d.px(14.0);
+        let check_rect =
+            Rect::from_center_size(pos2(x + side / 2.0, rect.center().y), Vec2::splat(side));
+        // 后注册的交互在命中测试里优先（与工具栏同一条规矩），点勾选框不会
+        // 顺带触发整行的展开。
+        let check_resp = ui.interact(
+            check_rect.expand(d.px(3.0)),
+            resp.id.with("check"),
+            Sense::click(),
+        );
+        check_clicked = check_resp.clicked();
+        if checked {
+            ui.painter()
+                .rect_filled(check_rect, CornerRadius::same(radius::SM), t.accent);
+            glyph(ui, check_rect.center(), ph::CHECK, d.px(10.0), t.accent_ink);
+        } else {
+            ui.painter().rect_stroke(
+                check_rect,
+                CornerRadius::same(radius::SM),
+                Stroke::new(1.0, t.border_strong),
+                StrokeKind::Inside,
+            );
+        }
+        if check_resp.hovered() {
+            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+        }
+        x += side + gap;
+    }
     if let Some(open) = r.caret {
         let icon = if open {
             ph::CARET_DOWN
@@ -2379,6 +3316,24 @@ fn row(ui: &mut Ui, t: &Tokens, d: Density, r: Row<'_>) -> egui::Response {
         );
         right -= gap * 2.0;
     }
+    if let Some((added, modified, deleted)) = r.counts {
+        // 从右往左画：−d、~m、+a，零值段不画（没有变化就别占地方）。
+        for (value, prefix, color) in [
+            (deleted, "−", t.danger),
+            (modified, "~", t.accent_strong),
+            (added, "+", t.success),
+        ] {
+            if value == 0 {
+                continue;
+            }
+            let g = layout(ui, &format!("{prefix}{value}"), Font::mono_meta(d));
+            right -= g.size().x;
+            ui.painter()
+                .galley(pos2(right, rect.center().y - g.size().y / 2.0), g, color);
+            right -= gap;
+        }
+        right -= gap;
+    }
 
     let font = if r.strong {
         Font::strong(d)
@@ -2402,7 +3357,10 @@ fn row(ui: &mut Ui, t: &Tokens, d: Density, r: Row<'_>) -> egui::Response {
             r.tag_color,
         );
     }
-    resp
+    RowResponse {
+        resp,
+        check_clicked,
+    }
 }
 
 fn stopwatch(ui: &mut Ui, t: &Tokens, d: Density, label: &str, elapsed: Duration) {
@@ -2604,6 +3562,63 @@ mod tests {
         assert!(!preview.executable());
     }
 
+    /// 死信不算「将合并」，也撑不起一次运行。
+    ///
+    /// 执行侧按服务端的重试上限封顶，到顶的行一次都不会跑；照旧算进去的话，
+    /// 「开始更新」在一个只剩死信的项目上会永远亮着，按下去扫一圈什么也没动，
+    /// 而那几个根的模型一直停在旧几何。
+    #[test]
+    fn dead_letters_are_neither_merged_nor_enough_to_start_a_run() {
+        let alive = PendingModelUnit {
+            root_refno: "24381/1".into(),
+            attempts: 2,
+            ..Default::default()
+        };
+        let dead = PendingModelUnit {
+            root_refno: "24381/2".into(),
+            attempts: 5,
+            dead: true,
+            ..Default::default()
+        };
+
+        let both = Preview {
+            pending_model_retries: vec![alive, dead.clone()],
+            ..Default::default()
+        };
+        assert_eq!(both.retries_to_run().count(), 1);
+        assert_eq!(both.dead_retries().count(), 1);
+        assert!(both.executable(), "还有活着的待重试单元就该能跑");
+
+        let only_dead = Preview {
+            pending_model_retries: vec![dead],
+            ..Default::default()
+        };
+        assert_eq!(only_dead.retries_to_run().count(), 0);
+        assert!(
+            !only_dead.executable(),
+            "只剩死信时按钮不该亮：这一次它一个都不会碰"
+        );
+    }
+
+    /// 契约里那面 `dead` 旗必须真解得出来。
+    ///
+    /// 它带 `serde(default)`（老服务端不给这个字段），所以服务端一旦改名，
+    /// 客户端不会报错、只会静默把每一行都当成「还在自动重试」——正是这次要修的
+    /// 那句假话。这里断的是「真解出来了」，不是「解得动」。
+    #[test]
+    fn the_dead_letter_flag_survives_deserialization() {
+        let units: Vec<PendingModelUnit> = serde_json::from_str(
+            r#"[{"dbnum":7997,"root_refno":"24381/2","noun":"BRAN",
+                 "source_end_sesno":42,"attempts":5,"last_error":"boom","dead":true},
+                {"dbnum":7997,"root_refno":"24381/3","noun":"EQUI",
+                 "source_end_sesno":42,"attempts":1}]"#,
+        )
+        .expect("契约要解得出来");
+        assert!(units[0].dead);
+        assert_eq!(units[0].last_error.as_deref(), Some("boom"));
+        assert!(!units[1].dead, "老 payload 缺字段时缺省不许标成已放弃");
+    }
+
     /// 「排除」与「阻断」来自契约的不同位置，汇总里也得分开数。
     #[test]
     fn totals_count_batches_excluded_and_blocked_separately() {
@@ -2615,6 +3630,8 @@ mod tests {
         pending.model_affecting = 361;
         pending.no_generation = 14;
         pending.units = vec![UnitPreview::default(); 23];
+        pending.units[0].will_generate = true;
+        pending.transform_targets = vec![TransformTargetPreview::default(); 2];
 
         let mut blocked = db(8003, "DESI");
         blocked.blocked = true;
@@ -2635,6 +3652,8 @@ mod tests {
             (128, 342, 17)
         );
         assert_eq!(totals.units, 23);
+        assert_eq!(totals.generating, 1);
+        assert_eq!(totals.transform_targets, 2);
         assert_eq!(totals.model_affecting, 361);
         assert_eq!(totals.no_generation, 14);
         assert_eq!(totals.batches, 1);
@@ -2744,7 +3763,50 @@ mod tests {
         // 一行都没排也要说得清是为什么——不然人只会以为按钮没反应。
         let idle: Enqueued =
             serde_json::from_str(r#"{"scanned":3,"up_to_date":3}"#).expect("空回执也要解得出来");
-        assert!(idle.summary().contains("没有需要入队的批次"));
+        assert!(
+            idle.summary().contains("3 个已是最新"),
+            "{}",
+            idle.summary()
+        );
+    }
+
+    /// 回执里的五个去向要与 `scanned` 算得平。
+    ///
+    /// 早先只在「一行都没排」的兜底分支里报 `up_to_date` 与 `already_covered`，
+    /// 于是只要有任意一条入队，那两个数就整个消失：人看到「扫描 29 个库；
+    /// 已入队 2 个数据批次」，剩下 27 个去哪了说不出来。
+    #[test]
+    fn the_enqueue_receipt_accounts_for_every_scanned_dbnum() {
+        let mut receipt = Enqueued {
+            scanned: 29,
+            enqueued: vec![EnqueuedBatch {
+                dbnum: 7997,
+                position: 1,
+                ..Default::default()
+            }],
+            already_covered: vec![8000, 8001],
+            up_to_date: 25,
+            blocked: vec![BlockedDbnum {
+                dbnum: 8003,
+                reason: "文件回退".into(),
+            }],
+            ..Default::default()
+        };
+
+        let summary = receipt.summary();
+        assert!(summary.contains("已入队 1 个数据批次"), "{summary}");
+        assert!(summary.contains("2 个已被排队中的批次覆盖"), "{summary}");
+        assert!(summary.contains("25 个已是最新"), "{summary}");
+        assert!(summary.contains("1 个阻断未入队"), "{summary}");
+        assert!(
+            !summary.contains("没交代去向"),
+            "1 + 2 + 25 + 1 = 29，算得平就不该有差额：{summary}"
+        );
+
+        // 算不平的时候差额必须说出来，不许让那几个库无声消失。
+        receipt.up_to_date = 20;
+        let short = receipt.summary();
+        assert!(short.contains("另有 5 个库回执没交代去向"), "{short}");
     }
 
     /// 会话区间从**水位的下一号**起算。需初始化的库契约不为它解区间，
@@ -2807,15 +3869,31 @@ mod tests {
             mdb: "/ALL".into(),
             ..Default::default()
         });
-        let (_, sub, _, _) = header_text(&scoped, &state);
+        let (_, sub, _, _) = header_text(&scoped, &state, "/ALL", None);
         assert!(sub.contains("AMS-8009") && sub.contains("/ALL"), "{sub}");
+
+        let (_, sub, _, _) = header_text(&Vm::Loading, &state, "/ALL", Some(true));
+        assert!(
+            sub.contains("MDB /ALL") && sub.contains("自动同步已开启"),
+            "{sub}"
+        );
+
+        let starting = Vm::Starting(match &scoped {
+            Vm::Ready(preview) => preview.clone(),
+            _ => unreachable!(),
+        });
+        let (_, sub, _, _) = header_text(&starting, &state, "/ALL", Some(false));
+        assert!(
+            sub.contains("/ALL") && sub.contains("自动同步已关闭"),
+            "{sub}"
+        );
 
         // 服务端没回显时不许编一个出来。
         let bare = Vm::Ready(Preview {
             project: "AMS-8009".into(),
             ..Default::default()
         });
-        let (_, sub, _, _) = header_text(&bare, &state);
+        let (_, sub, _, _) = header_text(&bare, &state, "", None);
         assert!(!sub.contains("MDB"), "回显缺席时不许摆一个假 MDB：{sub}");
     }
 
@@ -2889,5 +3967,139 @@ mod tests {
             state.open_row("db8191", false),
             "默认折叠的行 toggle 一次要展开"
         );
+    }
+
+    fn site(refno: &str, name: &str) -> SitePreview {
+        SitePreview {
+            site_refno: refno.into(),
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    /// 勾选状态按 dbnum 记（Q1 同库联动：勾任何一个 SITE = 同库全亮，无半选），
+    /// 折算出的 `dbnums[]` 只含勾中的**会跑**批次，且**总是显式名单**——
+    /// 全不勾时是空表而不是 `None`，`None` 会被服务端当全范围执行（ADR-020）。
+    #[test]
+    fn selected_dbnums_lists_exactly_the_checked_runnable_batches() {
+        let mut pending = db(8000, "DESI");
+        pending.sessions.push(SessionPreview::default());
+        pending.sites = vec![site("8000/1", "/1WCC-PIPE"), site("8000/2", "/1WCC-EQUI")];
+        let mut init = db(8021, "DESI");
+        init.initialization_required = true;
+        let mut blocked = db(8003, "DESI");
+        blocked.anomaly = Some(FileAnomaly::Missing { path: "a".into() });
+        blocked.blocked = true;
+        let preview = Preview {
+            dbnums: vec![
+                pending,
+                init,
+                blocked,
+                unreachable_db(7015),
+                db(8191, "CATA"),
+                db(8044, "DESI"), // 已是最新：不跑，也就无所谓勾不勾
+            ],
+            ..Default::default()
+        };
+
+        let mut state = State::default();
+        assert_eq!(
+            state.selected_dbnums(&preview),
+            vec![8000, 8021],
+            "默认全勾：会跑的两批（含首次导入），阻断/够不着/范围外/已最新都不在名单里"
+        );
+
+        // 界面上点的是 SITE 行的勾选框，落到状态里是库级 toggle——同库另一个
+        // SITE 没有独立状态可言，这就是联动的实现事实。
+        state.toggle_db(8000);
+        assert!(!state.db_checked(8000));
+        assert_eq!(state.selected_dbnums(&preview), vec![8021]);
+
+        state.toggle_db(8021);
+        assert_eq!(
+            state.selected_dbnums(&preview),
+            Vec::<u32>::new(),
+            "全不勾要交出空表：让服务端一个批次都不排、只等 worker 收重试"
+        );
+
+        state.toggle_db(8000);
+        assert_eq!(state.selected_dbnums(&preview), vec![8000], "再点一次回来");
+    }
+
+    /// §2-G 工具行 / 主按钮 / 确认页共用的折算口径：SITE 数只数有名有姓的桶
+    /// （归属未知桶没有勾选框），批次数含首次导入库，交付单元按 `db.units`
+    /// 去重口径（挪动的单元在两个 SITE 桶里各出现一次，按桶相加会虚高）。
+    #[test]
+    fn selection_counts_sites_by_name_and_batches_by_database() {
+        let mut pending = db(8000, "DESI");
+        pending.sessions.push(SessionPreview::default());
+        pending.sites = vec![
+            site("8000/1", "/1WCC-PIPE"),
+            site("8000/2", "/1WCC-EQUI"),
+            site("", ""), // 归属未知桶
+        ];
+        pending.units = vec![
+            UnitPreview {
+                will_generate: true,
+                ..Default::default()
+            },
+            UnitPreview::default(),
+        ];
+        pending.transform_targets = vec![TransformTargetPreview::default()];
+        let mut init = db(8021, "DESI");
+        init.initialization_required = true;
+        let preview = Preview {
+            dbnums: vec![pending, init],
+            ..Default::default()
+        };
+
+        let mut state = State::default();
+        let all = selection(&preview, &state);
+        assert_eq!(
+            (all.site_total, all.site_checked),
+            (2, 2),
+            "未知桶不算 SITE"
+        );
+        assert_eq!((all.batches_total, all.batches), (2, 2), "首次导入算一批");
+        assert_eq!(all.units, 2, "交付单元按库去重，不按 SITE 桶相加");
+        assert_eq!(all.generating, 1);
+        assert_eq!(all.transform_targets, 1);
+
+        state.toggle_db(8000);
+        let partial = selection(&preview, &state);
+        assert_eq!((partial.site_total, partial.site_checked), (2, 0));
+        assert_eq!(
+            (partial.batches_total, partial.batches),
+            (2, 1),
+            "取消 db8000 之后剩首次导入那一批"
+        );
+        assert_eq!(
+            (partial.units, partial.generating, partial.transform_targets),
+            (0, 0, 0),
+            "未勾选库的单元与位姿目标不许再进确认页的数字"
+        );
+    }
+
+    /// 预览一刷新，勾选集要跟着归零（回到默认全勾）——旧勾选对着的是上一份
+    /// 预览里的库，新一份里同一个 dbnum 的内容可能已经完全不同。
+    #[test]
+    fn a_fresh_preview_resets_the_checkboxes_to_all_on() {
+        let mut state = State::default();
+        let ready = Vm::Ready(Preview {
+            project: "AMS-8009".into(),
+            ..Default::default()
+        });
+
+        state.sync(&ready);
+        state.toggle_db(8000);
+        state.sync(&ready);
+        assert!(
+            !state.db_checked(8000),
+            "同一相位内反复 sync 不许把人勾好的选择洗掉"
+        );
+
+        state.sync(&Vm::Loading);
+        state.sync(&ready);
+        assert!(state.db_checked(8000), "重新预览回来，勾选回到默认全勾");
     }
 }

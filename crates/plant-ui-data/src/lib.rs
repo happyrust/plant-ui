@@ -7,9 +7,16 @@ use anyhow::Result;
 pub use aios_core::pdms_types::EleTreeNode;
 pub use aios_core::{RefU64, RefnoEnum};
 
+pub mod room;
+
 /// 连接本地 SurrealDB（读取工作目录的 DbOption.toml，走 aios_core 全局句柄 SUL_DB）。
 pub async fn connect() -> Result<()> {
-    aios_core::init_surreal().await
+    aios_core::init_surreal().await?;
+    // 平表读连接池后台预热（P4）：4 条连接的握手+签入约 2s，放启动期消化，
+    // 首次整场重载不再吃这口冷启动（并发安全，重载若抢先会等同一次初始化）。
+    #[cfg(not(target_arch = "wasm32"))]
+    tokio::spawn(aios_core::prewarm_flat_read_pool());
+    Ok(())
 }
 
 /// M0-4 验收：读一批带名称的元素（refno, name, noun）。
@@ -29,8 +36,12 @@ pub async fn site_nodes() -> Result<Vec<EleTreeNode>> {
 }
 
 /// 任意元素的直接子层（无名节点由查询侧按 noun 补默认名）。
+///
+/// 走 [`aios_core::get_children_tree_nodes`] 精简查询：模型树只吃
+/// refno / noun / name / children_count，旧壳树才用的 `order` / `mod_cnt`
+/// 两个逐行子查询占了近半耗时（769 子的 ZONE 实测 330ms → ~190ms）。
 pub async fn child_nodes(refno: RefnoEnum) -> Result<Vec<EleTreeNode>> {
-    aios_core::get_children_ele_nodes(refno).await
+    aios_core::get_children_tree_nodes(refno).await
 }
 
 /// 元素到库顶的祖先链，顺序是「自己 -> 上级 -> …」（第 0 项就是它本人）。
@@ -51,122 +62,263 @@ pub async fn ancestor_refnos(refno: RefnoEnum) -> Result<Vec<RefU64>> {
 /// 网格文件仍由 Bevy AssetServer 从 `assets/meshes` 加载。
 ///
 /// **这是整个界面里最贵的一次查询**，而调用点（`Req::Models`）在它之前刚
-/// `invalidate_all` 过，所以每次都是冷的。AvevaMarineSample / MDB ALL 上实测
-/// 一次冷启动 88 秒，构成是：
+/// `invalidate_all` 过，所以每次都是冷的。旧路径在 AvevaMarineSample / MDB ALL
+/// 上实测一次冷启动 88 秒，八成时间花在按根串行解可见实例集
+/// （`query_deep_visible_inst_refnos`，69.9 s / 79%）。
 ///
-/// | 阶段 | 耗时 | 占比 |
-/// |---|---|---|
-/// | `query_deep_visible_inst_refnos` | 69.9 s | 79% |
-/// | `query_insts`（107 批 × 500） | 15.9 s | 18% |
-/// | `query_filter_deep_children` | 2.2 s | 2.5% |
-/// | `query_tubi_insts_by_brans` | 0.2 s | 0.2% |
-/// | `get_self_and_owner_type_name` | ~0 s | 0% |
-///
-/// 19 个根、53373 个可见 refno、38048 个实例。**贵的不是这里的循环结构**：
-/// 「每个 root 多打两次库」那两次合起来占 2.5%，深子树过滤也不是瓶颈；
-/// 八成时间花在按根逐个解可见实例集上，而那 19 次调用是串行的。真要优化就从
-/// 那一层入手（并发发起，或者由查询侧一次解完多个根），改这里的调用次数没用。
+/// 现在默认走 anc 索引路径（见 [`model_instances_anc`]）：解析成本归零，
+/// 剩下的地板是实例投影本身；根间 8 路并发。合成 AMS 量级对拍实测
+/// 346 s → 16 s（gen-model `docs/plans/2026-08-07-inst-relate-anc-u64-
+/// hierarchy-query-plan.md` P2 前置验证节）。
 pub async fn model_instances(roots: &[RefU64]) -> Result<Vec<aios_core::GeomInstQuery>> {
     model_instances_with_progress(roots, |_, _| {}).await
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BranchQuery {
-    Root,
-    Descendants,
-}
-
-fn branch_query(noun: &str) -> BranchQuery {
-    match noun {
-        "BRAN" | "HANG" => BranchQuery::Root,
-        _ => BranchQuery::Descendants,
+/// 查询已经生成好的模型，并按查询分块报告进度。
+///
+/// 唯一路径是 [`model_instances_anc`]（每根一条 `anc CONTAINS` 索引查询，
+/// 根间并发）。旧深遍历路径（`model_instances_legacy`）与
+/// `PLANT_UI_LEGACY_MODEL_QUERY` 回退开关已随层级查询优化 P3 退役——它经
+/// `query_inst_refnos_by_zone` 消费 `inst_relate.zone_refno`，而 gen-model
+/// 已不再写该列，旧路径对新行只会静默漏，不配再当回退保险丝。
+///
+/// `anc` 未回填的库不再静默降级，而是响亮失败：升级 gen-model 并对该库启动
+/// 一次（启动序列的幂等自愈回填）即恢复。这里仍然只读 SurrealDB；mesh 文件
+/// 由 View3d 的 AssetLoader 消费，不会触发模型生成。
+pub async fn model_instances_with_progress(
+    roots: &[RefU64],
+    progress: impl FnMut(usize, usize),
+) -> Result<Vec<aios_core::GeomInstQuery>> {
+    match aios_core::inst_relate_anc_ready().await {
+        Ok(true) => model_instances_anc(roots, progress).await,
+        Ok(false) => anyhow::bail!(
+            "inst_relate.anc 未回填，模型查询无法进行：用新版 gen-model 对该库启动一次\
+             （启动序列自愈回填）后重试"
+        ),
+        Err(error) => Err(error.context("anc 覆盖探测失败")),
     }
 }
 
-/// 查询已经生成好的模型，并在范围解析完成后按查询分块报告进度。
+/// 新路径（层级查询优化 P2）：每根一条 `anc CONTAINS $root` 索引查询解出
+/// 实例/支管 refno 列表（替代深遍历解析，id 列表载荷百 KB 级封顶），投影仍走
+/// 久经考验的分批 `query_insts` / `query_tubi_insts_by_brans`（500/批——整根
+/// 全投影一条响应在大 SITE 上会撑爆单条 WS 消息，AMS 实测教训）。根间 8 路
+/// 并发（`buffered` 保输入序，结果顺序确定）。根类型无关——SITE/ZONE/PIPE/
+/// BRAN/叶子一律同一条查询，不再需要辨名词、SITE→ZONE 中转与深遍历。
 ///
-/// 这里仍然只读 SurrealDB；mesh 文件由 View3d 的 AssetLoader 消费，不会触发模型生成。
-pub async fn model_instances_with_progress(
+/// 进度口径：每根完成算 1 步（退役前的旧路径按 500 行分块计步，粒度不同但
+/// 语义同为「已完成/总数」）。pub 供计时探针（`tests/anc_model_query_parity.rs`
+/// 的 timing 用例；对拍基线已随旧路径退役，验收记录见 gen-model 方案文档 P2 节）
+/// 与排障直接调用。
+pub async fn model_instances_anc(
     roots: &[RefU64],
     mut progress: impl FnMut(usize, usize),
 ) -> Result<Vec<aios_core::GeomInstQuery>> {
-    let mut refnos = Vec::new();
-    let mut branch_refnos = Vec::new();
-    let mut zone_refnos = Vec::new();
-    let roots = roots
-        .iter()
-        .copied()
-        .map(Into::into)
-        .collect::<Vec<aios_core::RefnoEnum>>();
-    let nouns = aios_core::get_type_names(roots.iter()).await?;
-    for (root, noun) in roots.into_iter().zip(nouns) {
-        match noun.as_str() {
-            "ZONE" => zone_refnos.push(root),
-            "SITE" => {
-                zone_refnos.extend(aios_core::query_filter_deep_children(root, &["ZONE"]).await?);
-            }
-            _ => refnos.extend(aios_core::query_deep_visible_inst_refnos(root).await?),
-        }
-        match branch_query(&noun) {
-            BranchQuery::Root => branch_refnos.push(root),
-            BranchQuery::Descendants => {
-                branch_refnos
-                    .extend(aios_core::query_filter_deep_children(root, &["BRAN", "HANG"]).await?);
-            }
-        }
-    }
-    for chunk in zone_refnos.chunks(500) {
-        refnos.extend(aios_core::query_inst_refnos_by_zone(chunk.iter()).await?);
-    }
-    let mut models = Vec::new();
-    let total = refnos.len().div_ceil(500) + branch_refnos.len().div_ceil(500);
+    use futures::stream::StreamExt;
+    const CONCURRENCY: usize = 8;
+    let total = roots.len();
     let mut done = 0;
     progress(done, total);
-    for chunk in refnos.chunks(500) {
-        models.extend(aios_core::query_insts(chunk.iter(), false).await?);
-        done += 1;
-        progress(done, total);
+
+    // 1) 解析：每根两条 anc 索引查询（8 路真任务）。
+    let resolutions = roots.iter().copied().map(|root| {
+        spawn_query(async move {
+            let root: aios_core::RefnoEnum = root.into();
+            futures::future::try_join(
+                aios_core::query_inst_refnos_by_root_anc(root),
+                aios_core::query_bran_refnos_by_root_anc(root),
+            )
+            .await
+        })
+    });
+    let resolved: Vec<(Vec<aios_core::RefnoEnum>, Vec<aios_core::RefnoEnum>)> =
+        futures::stream::iter(resolutions)
+            .buffered(CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<_>>()?;
+
+    // 2) 全局块队列：跨根摊平再并行。按根并发时，巨型 SITE 的十几个批在自己根
+    //    的 future 里串成链、成为整场的尾巴（AMS 实测根偏斜让 8 路根并发几乎
+    //    白并）；摊平后所有块在同一池子里跑，尾巴只剩最后一个块。
+    enum Job {
+        Inst(usize, Vec<aios_core::RefnoEnum>),
+        Bran(usize, Vec<aios_core::RefnoEnum>),
     }
-    for chunk in branch_refnos.chunks(500) {
-        models.extend(
-            aios_core::query_tubi_insts_by_brans(chunk)
-                .await?
-                .into_iter()
-                .map(|tubi| {
-                    let refno = tubi.refno;
-                    aios_core::GeomInstQuery {
-                        refno,
-                        old_refno: tubi.old_refno,
-                        owner: refno,
-                        world_aabb: tubi.world_aabb,
-                        world_trans: tubi.world_trans,
-                        insts: vec![aios_core::ModelHashInst {
-                            geo_hash: tubi.geo_hash,
-                            transform: Default::default(),
-                            is_tubi: true,
-                        }],
-                        has_neg: false,
-                        generic: tubi.generic.unwrap_or_else(|| "PIPE".into()),
-                        pts: None,
-                        date: tubi.date,
+    let mut jobs = Vec::new();
+    let mut remaining = vec![0usize; total];
+    for (idx, (inst_refnos, bran_refnos)) in resolved.iter().enumerate() {
+        // 平表行很瘦（~0.4KB），1500/批约 600KB 一响应，离 WS 单条上限很远
+        // （撑爆上限的是整根全投影那种 MB 级载荷）。
+        for chunk in inst_refnos.chunks(1500) {
+            jobs.push(Job::Inst(idx, chunk.to_vec()));
+            remaining[idx] += 1;
+        }
+        for chunk in bran_refnos.chunks(500) {
+            jobs.push(Job::Bran(idx, chunk.to_vec()));
+            remaining[idx] += 1;
+        }
+    }
+    for &r in &remaining {
+        if r == 0 {
+            done += 1;
+        }
+    }
+    progress(done, total);
+
+    // 3) 执行：平表两段式（P4 写时物化）——第一段平表副本零解引用零子查询；
+    //    缺副本的行（清扫未及、pre-P4 存量）聚拢走 slim 现值兜底。正确性不依赖
+    //    物化覆盖率，覆盖率只买速度。
+    let executions = jobs.into_iter().map(|job| {
+        spawn_query(async move {
+            match job {
+                Job::Inst(idx, chunk) => {
+                    let (mut models, missing) = aios_core::query_insts_flat(chunk.iter()).await?;
+                    if !missing.is_empty() {
+                        models.extend(aios_core::query_insts_slim(missing.iter()).await?);
                     }
-                }),
-        );
-        done += 1;
-        progress(done, total);
+                    anyhow::Ok((idx, models))
+                }
+                Job::Bran(idx, chunk) => anyhow::Ok((
+                    idx,
+                    aios_core::query_tubi_insts_by_brans(&chunk)
+                        .await?
+                        .into_iter()
+                        .map(tubi_to_geom)
+                        .collect(),
+                )),
+            }
+        })
+    });
+    let mut models = Vec::new();
+    let mut stream = futures::stream::iter(executions).buffered(CONCURRENCY);
+    while let Some(result) = stream.next().await {
+        let (idx, batch) = result?;
+        models.extend(batch);
+        remaining[idx] -= 1;
+        if remaining[idx] == 0 {
+            done += 1;
+            progress(done, total);
+        }
     }
     Ok(models)
 }
 
-#[cfg(test)]
-mod model_scope_tests {
-    use super::{BranchQuery, branch_query};
+/// 非 wasm 下把查询未来包进 `tokio::spawn` 真任务：`buffered` 本身是单任务
+/// 轮询，51k 行的响应反序列化会全部挤在一个线程上（release 实测 ~56µs/行，
+/// 单线程地板 ~3s）——spawn 让解析散到多线程运行时，与 rs-core 侧的平表读
+/// 连接池（4 条 WS）配对才能真并行。wasm 无多线程运行时，原样轮询。
+#[cfg(not(target_arch = "wasm32"))]
+fn spawn_query<F>(fut: F) -> impl std::future::Future<Output = F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let handle = tokio::spawn(fut);
+    async move { handle.await.expect("查询任务 join 失败") }
+}
 
-    #[test]
-    fn site_and_zone_scopes_include_descendant_straight_tubes() {
-        assert_eq!(branch_query("ZONE"), BranchQuery::Descendants);
-        assert_eq!(branch_query("SITE"), BranchQuery::Descendants);
+#[cfg(target_arch = "wasm32")]
+fn spawn_query<F: std::future::Future>(fut: F) -> F {
+    fut
+}
+
+/// 直管段实例 → 几何实例的统一换装（`owner` 取自身、单实例 `is_tubi`、
+/// generic 缺省 PIPE 都是退役前旧路径的既有口径，anc 路径原样继承）。
+fn tubi_to_geom(tubi: aios_core::rs_surreal::inst::TubiInstQuery) -> aios_core::GeomInstQuery {
+    let refno = tubi.refno;
+    aios_core::GeomInstQuery {
+        refno,
+        old_refno: tubi.old_refno,
+        owner: refno,
+        world_aabb: tubi.world_aabb,
+        world_trans: tubi.world_trans,
+        insts: vec![aios_core::ModelHashInst {
+            geo_hash: tubi.geo_hash,
+            transform: Default::default(),
+            is_tubi: true,
+            is_invalid_tubi: tubi.invalid,
+        }],
+        has_neg: false,
+        generic: tubi.generic.unwrap_or_else(|| "PIPE".into()),
+        pts: None,
+        date: tubi.date,
     }
+}
+
+/// 一个范围里**已经生成过模型**的元素，连同各自的祖先链（refno 的 u64 原值）。
+///
+/// 「重新生成模型」的取材查询。走的是模型查询同一条 `inst_relate.anc` 索引，
+/// 任意根类型通吃（SITE / ZONE / PIPE / BRAN / 叶子一律同一条），所以右键
+/// 落在容器行上也不必先展开子层。
+///
+/// 两条纪律：
+///
+/// - **必须在任何删除之前调**。它认的是 `inst_relate` 行，删完就查不到了；
+///   删完再查回的是空集，而空集在调用方那里长得像「这里本来就没模型」。
+/// - `anc` 未回填的库响亮失败，与 [`model_instances_with_progress`] 同一句话。
+///   这条路没有深遍历回退——那条旧路径已随层级查询优化 P3 退役。
+/// **直管段单独算一份。** 隐含直管走 `tubi_relate` 而不是 `inst_relate`，
+/// 只有直管没有管件的 BRAN 在上一条查询里一行都没有。漏掉它们的话，一整根
+/// 光管的支管会被当成「没生成过」，重新生成时直接跳过。
+pub async fn generated_scope(root: RefU64) -> Result<GeneratedScope> {
+    match aios_core::inst_relate_anc_ready().await {
+        Ok(true) => {}
+        Ok(false) => anyhow::bail!(
+            "inst_relate.anc 未回填，取不到已生成元素：用新版 gen-model 对该库启动一次\
+             （启动序列自愈回填）后重试"
+        ),
+        Err(error) => return Err(error.context("anc 覆盖探测失败")),
+    }
+    let root: RefnoEnum = root.into();
+    let (elements, tubing) = futures::future::try_join(
+        aios_core::query_generated_subtree_with_anc(root),
+        aios_core::query_bran_refnos_by_root_anc(root),
+    )
+    .await?;
+    Ok(GeneratedScope {
+        elements,
+        tubing_branches: tubing.into_iter().map(|refno| refno.refno()).collect(),
+    })
+}
+
+/// 一个范围里已经生产出来的模型，按两张边表分开装。
+#[derive(Debug, Clone, Default)]
+pub struct GeneratedScope {
+    /// `inst_relate` 上的几何元素，各自带祖先链。
+    pub elements: Vec<aios_core::rs_surreal::inst::GeneratedElement>,
+    /// `tubi_relate` 上带直管的 BRAN / HANG。它们本身就是交付单元粒度。
+    pub tubing_branches: Vec<RefU64>,
+}
+
+impl GeneratedScope {
+    /// 确认框上报的「已生成元素」数。两张表各数各的，不去重——
+    /// 一根 BRAN 既有管件又有直管时，那是两类产物，都要重做。
+    pub fn element_count(&self) -> usize {
+        self.elements.len() + self.tubing_branches.len()
+    }
+}
+
+/// 一批 refno 的 noun。缺行的不进表——**按对返回而不是按位置**，
+/// 中间少一行不会把后面所有 noun 都错位一格。
+pub async fn nouns_of(refnos: &[RefU64]) -> Result<std::collections::HashMap<RefU64, String>> {
+    // 与模型查询同一个分批口径：id 列表载荷太大时单条 WS 消息会撑爆。
+    const CHUNK: usize = 1500;
+    let mut out = std::collections::HashMap::with_capacity(refnos.len());
+    for chunk in refnos.chunks(CHUNK) {
+        let keys = chunk
+            .iter()
+            .map(|refno| RefnoEnum::from(*refno).to_pe_key())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut response = SUL_DB
+            .query(format!("select value [id, noun] from [{keys}]"))
+            .await?;
+        let rows: Vec<(RefnoEnum, String)> = response.take(0)?;
+        out.extend(rows.into_iter().map(|(refno, noun)| (refno.refno(), noun)));
+    }
+    Ok(out)
 }
 
 /// 设计库里还没被应用到模型的会话数。

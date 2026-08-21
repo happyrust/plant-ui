@@ -25,6 +25,7 @@ pub enum Pane {
     CommandLine,
     Logs,
     Properties,
+    Room,
     TaskQueue,
 }
 
@@ -36,6 +37,7 @@ impl Pane {
             Pane::CommandLine => (ph::TERMINAL_WINDOW, "命令行"),
             Pane::Logs => (ph::LIST_DASHES, "日志"),
             Pane::Properties => (ph::SLIDERS_HORIZONTAL, "属性"),
+            Pane::Room => (ph::DOOR_OPEN, "房间"),
             Pane::TaskQueue => (ph::LIST_CHECKS, "任务队列"),
         }
     }
@@ -114,6 +116,7 @@ impl TabViewer for Viewer<'_> {
         match tab {
             Pane::ModelTree => super::tree::show(ui, self.t, self.d, self.vm, self.cmds),
             Pane::Properties => super::props::show(ui, self.t, self.d, self.vm, self.cmds),
+            Pane::Room => super::room::show(ui, self.t, self.d, self.vm, self.cmds),
             Pane::CommandLine => {
                 super::command_line::show(ui, self.t, self.d, self.vm, self.command, self.cmds)
             }

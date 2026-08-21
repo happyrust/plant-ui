@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$version = "0.1.4"
+$version = "0.1.7"
 $uiRoot = Split-Path $PSScriptRoot -Parent
 $backendRoot = Join-Path (Split-Path $uiRoot -Parent) "gen-model"
 $releaseRoot = Join-Path $uiRoot "release\plant-suite-$version"

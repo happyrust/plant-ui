@@ -4,12 +4,14 @@
 //! 这里用 `show_rows` 只画视口内的行；行内文字裁剪由 `tree_row_ui` 保证，
 //! 长 PDMS 名不会撑破行。
 
+use egui::text::{LayoutJob, TextFormat};
 use egui::{Id, ScrollArea, Ui, UiBuilder};
 use egui_phosphor::regular as ph;
 
+use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Status, Tokens, space};
 use crate::style::widgets::{self, Eye, PaneNote, PaneState, RowIcon, TreeRow};
-use crate::vm::{RowVisibility, Selection, TreeRowVm, TreeVm, WorkbenchVm};
+use crate::vm::{RoomVm, RowVisibility, Selection, TreeRowVm, TreeVm, WorkbenchVm};
 use crate::{Cmd, ModelAction};
 
 pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Vec<Cmd>) {
@@ -94,6 +96,18 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                                     )
                                 })
                                 .inner;
+                            // 自动化只认真正的树行：AccessKit 角色负责排除命令历史、
+                            // 属性面板和状态栏，标签里的 refno 则提供跨重命名稳定身份。
+                            // 当前名称仍随数据刷新，便于同时断言 rename 的新旧语义。
+                            let accessible_label =
+                                tree_item_accessible_label(row.refno, row.name.as_str());
+                            ui.ctx().accesskit_node_builder(out.response.id, |node| {
+                                node.set_role(egui::accesskit::Role::TreeItem);
+                                node.set_label(accessible_label);
+                                if let Some(expanded) = row.expandable {
+                                    node.set_expanded(expanded);
+                                }
+                            });
                             // 点箭头只折叠 / 展开；点眼睛只切可见性；点行其他区域选中；
                             // 双击整行也展开。`clicked` / `double_clicked` 都只认主键，
                             // 右键落不进这几支——右键在下面单独处理。
@@ -142,13 +156,29 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                             {
                                 cmds.push(Cmd::SelectElement(row.refno));
                             }
-                            out.response
-                                .context_menu(|ui| row_menu(ui, row, &vm.selection, live, cmds));
+                            out.response.context_menu(|ui| {
+                                row_menu(
+                                    ui,
+                                    t,
+                                    d,
+                                    row,
+                                    &vm.selection,
+                                    &vm.rooms,
+                                    live,
+                                    vm.regen_busy,
+                                    cmds,
+                                )
+                            });
                         }
                     });
                 });
         }
     }
+}
+
+fn tree_item_accessible_label(refno: aios_core::RefU64, name: &str) -> String {
+    // E3D 形式自带等号，前缀里就不再补一个，否则读屏念出来是「refno 等于 等于」。
+    format!("refno {}; name={name}", refno.to_e3d_id())
 }
 
 /// Vm 的四态可见性翻成组件层的画法。两个枚举是同一件事在两层的说法——
@@ -195,16 +225,24 @@ fn click_selection(
 ///
 /// 「隐藏全部」是全局动作，只在工具栏出现：每个节点的菜单里重复一遍，看着像
 /// 「隐藏这一支的全部」，其实不是。
-fn row_menu(ui: &mut Ui, row: &TreeRowVm, selection: &Selection, live: bool, cmds: &mut Vec<Cmd>) {
+#[allow(clippy::too_many_arguments)]
+fn row_menu(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    row: &TreeRowVm,
+    selection: &Selection,
+    rooms: &RoomVm,
+    live: bool,
+    regen_busy: bool,
+    cmds: &mut Vec<Cmd>,
+) {
     // 右键落在集内 = 对整批操作；落在集外 = 只对这一行。
     let targets: Vec<_> = if selection.contains(row.refno) {
         selection.to_vec()
     } else {
         vec![row.refno]
     };
-    // 「1 项」是废话，只有真成批时才报数。
-    let count = (targets.len() > 1).then(|| format!(" {} 项", targets.len()));
-    let suffix = count.as_deref().unwrap_or_default();
 
     let mut grouped = false;
     if let Some(open) = row.expandable {
@@ -219,6 +257,33 @@ fn row_menu(ui: &mut Ui, row: &TreeRowVm, selection: &Selection, live: bool, cmd
         }
         grouped = true;
     }
+    element_menu(
+        ui, t, d, row.refno, &targets, rooms, live, regen_busy, cmds, grouped,
+    );
+}
+
+/// 元素菜单的公共部分：模型动作 + 房间归属 + 复制 REFNO。模型树的行菜单与
+/// 三维视口的右键菜单是同一件事的两个入口，内容必须一致，所以收在一处。
+///
+/// `refno` 是右键落点那一个元素（定位与房间归属对它），`targets` 是批量动作的
+/// 作用集（显示 / 隐藏 / 复制对它们）。
+#[allow(clippy::too_many_arguments)]
+pub(super) fn element_menu(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    refno: aios_core::RefU64,
+    targets: &[aios_core::RefU64],
+    rooms: &RoomVm,
+    live: bool,
+    regen_busy: bool,
+    cmds: &mut Vec<Cmd>,
+    mut grouped: bool,
+) {
+    // 「1 项」是废话，只有真成批时才报数。
+    let count = (targets.len() > 1).then(|| format!(" {} 项", targets.len()));
+    let suffix = count.as_deref().unwrap_or_default();
+
     if live {
         if grouped {
             ui.separator();
@@ -228,7 +293,7 @@ fn row_menu(ui: &mut Ui, row: &TreeRowVm, selection: &Selection, live: bool, cmd
                 ph::EYE,
                 format!("显示模型{suffix}"),
                 ModelAction::SetVisible {
-                    refnos: targets.clone(),
+                    refnos: targets.to_vec(),
                     visible: true,
                 },
             ),
@@ -236,7 +301,7 @@ fn row_menu(ui: &mut Ui, row: &TreeRowVm, selection: &Selection, live: bool, cmd
                 ph::EYE_SLASH,
                 format!("隐藏模型{suffix}"),
                 ModelAction::SetVisible {
-                    refnos: targets.clone(),
+                    refnos: targets.to_vec(),
                     visible: false,
                 },
             ),
@@ -244,7 +309,7 @@ fn row_menu(ui: &mut Ui, row: &TreeRowVm, selection: &Selection, live: bool, cmd
             (
                 ph::CROSSHAIR_SIMPLE,
                 "定位模型".to_owned(),
-                ModelAction::Focus(row.refno),
+                ModelAction::Focus(refno),
             ),
         ] {
             if ui.button(format!("{icon}  {label}")).clicked() {
@@ -254,9 +319,32 @@ fn row_menu(ui: &mut Ui, row: &TreeRowVm, selection: &Selection, live: bool, cmd
         }
         grouped = true;
     }
+    // 房间归属是数据查询，不吃 live 门禁——独立壳里照样能看（计划目标 7）；
+    // 点击后的隔离 / 取景由宿主按 live 自行降级。
     if grouped {
         ui.separator();
     }
+    room_menu_section(ui, t, d, refno, rooms, live, cmds);
+    // 自成一组。上面那几项改的是「我看不看得见」，这一项改的是模型库里的产物
+    // ——删掉的几何只能重新算回来。挤进同一组里，手滑的代价差得太远。
+    //
+    // 吃 `live` 门禁：跑完要把结果显示出来，没有渲染器的壳里点了只能改库、
+    // 看不见结果，而现有约定是「不接线就不显示」，不摆灰色占位。
+    if live {
+        ui.separator();
+        let label = format!("{}  重新生成模型{suffix}", ph::ARROWS_CLOCKWISE);
+        if ui
+            .add_enabled(!regen_busy, egui::Button::new(label))
+            .on_disabled_hover_text("已经有一趟重新生成在跑了")
+            .clicked()
+        {
+            cmds.push(Cmd::RegenerateModels {
+                targets: targets.to_vec(),
+            });
+            ui.close();
+        }
+    }
+    ui.separator();
     if ui
         .button(format!("{}  复制 REFNO{suffix}", ph::COPY_SIMPLE))
         .clicked()
@@ -269,6 +357,149 @@ fn row_menu(ui: &mut Ui, row: &TreeRowVm, selection: &Selection, live: bool, cmd
             .collect::<Vec<_>>()
             .join("\n");
         ui.ctx().copy_text(text);
+        ui.close();
+    }
+}
+
+/// 「查看所属房间 ▸」子菜单（S13 稿）。
+///
+/// 归属数据随选中预取（计划决定 5），这里只读现成的 `vm.rooms`；数据还没
+/// 追上这一行时（右键刚把选中切过来、或右键落在多选集里非主选中的行上）
+/// 老老实实说「查询中…」，不拿别的元素的归属顶数。
+fn room_menu_section(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    refno: aios_core::RefU64,
+    rooms: &RoomVm,
+    live: bool,
+    cmds: &mut Vec<Cmd>,
+) {
+    ui.menu_button(format!("{}  查看所属房间", ph::DOOR_OPEN), |ui| {
+        ui.set_min_width(d.px(220.0));
+        room_menu_items(ui, t, d, refno, rooms, live, cmds);
+        ui.separator();
+        // 浏览器看的是全部房间，不依赖这个元素的归属，所以哪个分支里都有它。
+        if ui
+            .button(format!("{}  打开房间浏览器…", ph::LAYOUT))
+            .clicked()
+        {
+            cmds.push(Cmd::OpenRoomBrowser);
+            ui.close();
+        }
+    });
+}
+
+/// 子菜单里随元素归属而变的那部分（房间行 + 显示房间模型 + 页签入口 / 三种占位态）。
+fn room_menu_items(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    refno: aios_core::RefU64,
+    rooms: &RoomVm,
+    live: bool,
+    cmds: &mut Vec<Cmd>,
+) {
+    let data = match rooms {
+        RoomVm::Ready(data) | RoomVm::Loading(Some(data)) if data.refno == refno => data,
+        RoomVm::Failed(_) => {
+            ui.add_enabled(false, egui::Button::new("归属查询失败，详见日志"));
+            return;
+        }
+        _ => {
+            ui.add_enabled(false, egui::Button::new("查询中…"));
+            return;
+        }
+    };
+    if data.relations.is_empty() {
+        ui.add_enabled(false, egui::Button::new("无所属房间"));
+        return;
+    }
+    for (i, rel) in data.relations.iter().enumerate() {
+        let mut job = LayoutJob::default();
+        job.append(
+            &rel.room_num,
+            0.0,
+            TextFormat {
+                font_id: Font::strong(d),
+                color: t.text_primary,
+                ..Default::default()
+            },
+        );
+        // 首条即最强（数据层已按 ADR-010 §5 排好），只有它标「主归属」。
+        if i == 0 {
+            job.append(
+                "  主归属",
+                0.0,
+                TextFormat {
+                    font_id: Font::meta(d),
+                    color: t.success,
+                    ..Default::default()
+                },
+            );
+        }
+        if rel.via_member {
+            job.append(
+                "  来自成员",
+                0.0,
+                TextFormat {
+                    font_id: Font::meta(d),
+                    color: t.text_muted,
+                    ..Default::default()
+                },
+            );
+        }
+        job.append(
+            &format!(
+                "\n{} · 顶点 {}/8 · 距中心 {}",
+                rel.room_code.as_deref().unwrap_or("—"),
+                rel.inside_count,
+                super::room::format_dist(rel.center_dist),
+            ),
+            0.0,
+            TextFormat {
+                font_id: Font::mono_micro(d),
+                color: t.text_muted,
+                ..Default::default()
+            },
+        );
+        let room = rel.room;
+        let resp = ui.add_enabled(room.is_some(), egui::Button::new(job));
+        if resp.clicked()
+            && let Some(room) = room
+        {
+            cmds.push(Cmd::FocusRoom(room));
+            cmds.push(Cmd::ShowRooms(refno));
+            ui.close();
+        }
+        resp.on_disabled_hover_text("面板不在册（陈旧归属边），无法聚焦");
+    }
+    ui.separator();
+    // 只给主归属那一间：右键菜单答的是「这个构件在哪」，一键直达最强那间房就够了。
+    // 跨房构件要看第二间，去「房间」页签点中它再按同名芯片——那里本来就摆着
+    // 全部归属，不必把这份列表在菜单里再展开一遍。
+    if live && let Some(primary) = data.relations.first() {
+        let resp = ui.add_enabled(
+            primary.room.is_some(),
+            egui::Button::new(format!(
+                "{}  显示房间模型（{}）",
+                ph::CUBE,
+                primary.room_num
+            )),
+        );
+        if resp.clicked()
+            && let Some(room) = primary.room
+        {
+            cmds.push(Cmd::ShowRoomModel(room));
+            ui.close();
+        }
+        resp.on_disabled_hover_text("面板不在册（陈旧归属边），取不到房间模型");
+    }
+    if ui
+        .button(format!("{}  在「房间」页签中查看", ph::SIDEBAR_SIMPLE))
+        .clicked()
+    {
+        cmds.push(Cmd::ShowRooms(refno));
         ui.close();
     }
 }
@@ -310,4 +541,22 @@ fn note(ui: &mut Ui, t: &Tokens, d: Density, state: PaneState, icon: &str, text:
             retry: state == PaneState::Error,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tree_item_accessible_label;
+    use aios_core::RefU64;
+
+    #[test]
+    fn accessible_tree_identity_survives_rename_without_name_matching() {
+        let refno = RefU64(0x1234);
+        let before = tree_item_accessible_label(refno, "OLD-EQUI");
+        let after = tree_item_accessible_label(refno, "NEW-EQUI");
+        assert!(before.contains("refno =0/4660"));
+        assert!(after.contains("refno =0/4660"));
+        assert!(!after.contains("0_4660"));
+        assert!(!after.contains("OLD-EQUI"));
+        assert!(after.contains("name=NEW-EQUI"));
+    }
 }

@@ -72,6 +72,14 @@ pub fn apply(ctx: &Context, t: &Tokens, d: Density) {
     style.spacing.interact_size = Vec2::new(d.px(28.0), d.px(24.0));
     style.spacing.scroll = ScrollStyle::thin();
     style.animation_time = 0.08;
+    // egui 0.35 的 warn_if_rect_changes_id（debug 构建默认开）对虚拟滚动列表必然
+    // 误报：折叠、或展开把行挤出视口时，消失行的矩形被别的行占据，egui 便给那些
+    // 矩形逐行描红框闪一帧——行 id 再稳也躲不掉。id 稳定性契约由 tree_id_clash /
+    // queue_row_id 两个测试守着（它们各自的 Context 不经过这里，检查仍然默认开）。
+    #[cfg(debug_assertions)]
+    {
+        style.debug.warn_if_rect_changes_id = false;
+    }
     // egui 0.32+ 默认跟随系统主题，存在 dark/light 两个样式槽；全部覆盖，
     // 避免系统亮色主题时 egui 自身部件与令牌配色错位。
     ctx.all_styles_mut(|s| *s = style.clone());

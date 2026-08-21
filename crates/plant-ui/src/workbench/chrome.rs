@@ -93,7 +93,11 @@ pub fn command_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: 
                     ui.separator();
                     // 没连上库时取回工作无从谈起：没有树可重查，也没有
                     // 模型可重载。禁用而不是隐藏——菜单项换位置比灰着更难找。
+                    //
+                    // 重新生成跑着的时候也灰。那一趟正在逐个删掉并重做库里的产物，
+                    // 中间插一次清场重装，重装的是一份删了一半的模型。
                     let busy = vm.get_work_busy;
+                    let regen = vm.regen_busy;
                     let label = if busy {
                         "正在取回工作…"
                     } else {
@@ -101,16 +105,22 @@ pub fn command_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: 
                     };
                     let get_work = ui
                         .add_enabled(
-                            vm.data_source_ok && !busy,
+                            vm.data_source_ok && !busy && !regen,
                             command_menu_action(
                                 d,
                                 ph::ARROW_CLOCKWISE,
                                 label,
-                                if busy { "请稍候" } else { "GET WORK" },
+                                if busy || regen {
+                                    "请稍候"
+                                } else {
+                                    "GET WORK"
+                                },
                             ),
                         )
                         .on_disabled_hover_text(if busy {
                             "取回工作正在进行"
+                        } else if regen {
+                            "重新生成模型正在进行"
                         } else {
                             "连接数据源后可用"
                         });
@@ -227,20 +237,7 @@ pub fn status_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
                         .font(Font::micro(d))
                         .color(t.text_muted),
                 );
-                if !vm.project.is_empty() {
-                    divider(ui, t, d);
-                    meta_icon(ui, d, ph::DATABASE, t.accent);
-                    ui.label(
-                        RichText::new(format!("项目名 {}", vm.project))
-                            .font(Font::micro(d))
-                            .color(t.text_secondary),
-                    );
-                    ui.label(
-                        RichText::new(format!("项目代号 {}", vm.project_code))
-                            .font(Font::mono_micro(d))
-                            .color(t.text_muted),
-                    );
-                }
+                access_point_chip(ui, t, d, vm);
                 divider(ui, t, d);
                 meta_icon(ui, d, ph::CURSOR, t.text_secondary);
                 // 多选时报主选中加余量：状态栏这一格只有一行，列不下整批，
@@ -249,9 +246,9 @@ pub fn status_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
                     Some(refno) => {
                         let rest = vm.selection.len() - 1;
                         let text = if rest > 0 {
-                            format!("{refno} +{rest}")
+                            format!("{} +{rest}", refno.to_e3d_id())
                         } else {
-                            refno.to_string()
+                            refno.to_e3d_id()
                         };
                         ui.label(
                             RichText::new(text)
@@ -267,6 +264,13 @@ pub fn status_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
                 };
 
                 queue_count(ui, t, d, vm);
+
+                divider(ui, t, d);
+                ui.label(
+                    RichText::new(format!("刷新 {}", vm.refresh_generation))
+                        .font(Font::mono_micro(d))
+                        .color(t.text_muted),
+                );
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(
@@ -316,6 +320,96 @@ fn model_load_progress(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
     );
 }
 
+/// 状态栏那枚数据库芯片。点开是当前接入点的完整交代。
+///
+/// **连上之前也画。** 「连不上」正是最需要知道自己冲着谁去的那一刻，而那时候摆的是
+/// 配置里的库名而不是项目名——项目名要连上才算数，不许拿配置里的字面值冒充。
+fn access_point_chip(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
+    let ap = &vm.access_point;
+    let connected = !vm.project.is_empty();
+    if !connected && ap.db_url.trim().is_empty() {
+        return;
+    }
+    divider(ui, t, d);
+    let icon = ui.label(
+        RichText::new(ph::DATABASE)
+            .font(egui::FontId::new(
+                d.px(12.0),
+                egui::FontFamily::Proportional,
+            ))
+            .color(if connected { t.accent } else { t.text_muted }),
+    );
+    let response = if connected {
+        let name = ui.label(
+            RichText::new(format!("项目名 {}", vm.project))
+                .font(Font::micro(d))
+                .color(t.text_secondary),
+        );
+        let code = ui.label(
+            RichText::new(format!("项目代号 {}", vm.project_code))
+                .font(Font::mono_micro(d))
+                .color(t.text_muted),
+        );
+        icon.union(name).union(code)
+    } else {
+        let label = if ap.database.trim().is_empty() {
+            "接入点".to_owned()
+        } else {
+            format!("接入点 {}", ap.database)
+        };
+        let name = ui.label(
+            RichText::new(label)
+                .font(Font::micro(d))
+                .color(t.text_muted),
+        );
+        icon.union(name)
+    };
+    let response = response
+        .interact(Sense::click())
+        .on_hover_text("点击查看当前接入点");
+    egui::Popup::menu(&response).show(|ui| access_point_detail(ui, t, d, ap));
+}
+
+fn access_point_detail(ui: &mut Ui, t: &Tokens, d: Density, ap: &crate::vm::AccessPointVm) {
+    ui.set_min_width(d.px(420.0));
+    for (label, value) in [
+        ("模型本体库", ap.db_url.as_str()),
+        ("命名空间", ap.namespace.as_str()),
+        ("数据库", ap.database.as_str()),
+        ("MDB", ap.mdb.as_str()),
+        ("用户", ap.user.as_str()),
+        ("模型服务", ap.model_api_url.as_str()),
+        ("数据中心", ap.data_api_url.as_str()),
+    ] {
+        access_point_row(ui, t, d, label, value);
+    }
+    ui.separator();
+    // 这一行是整块面板存在的理由：没有它，静默回落到工作目录 `DbOption.toml` 的那次
+    // 启动与正常启动在界面上一模一样。
+    access_point_row(ui, t, d, "配置来自", &ap.source);
+}
+
+fn access_point_row(ui: &mut Ui, t: &Tokens, d: Density, label: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.set_width(d.px(72.0));
+            ui.label(
+                RichText::new(label)
+                    .font(Font::micro(d))
+                    .color(t.text_muted),
+            );
+        });
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let (text, color) = if value.trim().is_empty() {
+                ("未配置".to_owned(), t.text_muted)
+            } else {
+                (value.to_owned(), t.text_secondary)
+            };
+            ui.label(RichText::new(text).font(Font::mono_micro(d)).color(color));
+        });
+    });
+}
+
 /// 队列计数。队列视图被折起时由它叫住人，**不重复面板上的明细**——同一组数字
 /// 两处渲染就是两处维护。
 ///
@@ -356,6 +450,15 @@ fn queue_count(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
             RichText::new(format!("{} 条历史行缺 dbnum 未显示", queue.malformed))
                 .font(Font::micro(d))
                 .color(t.warn),
+        );
+    }
+    // 死信不进「队列 N」：那一格数的是还会被干掉的活，而这些非人工不动。
+    // 队列空成 0 的时候它更要在——那正是最容易以为「都干完了」的一刻。
+    if queue.dead_letters > 0 {
+        ui.label(
+            RichText::new(format!("{} 个单元已放弃重试", queue.dead_letters))
+                .font(Font::micro(d))
+                .color(t.danger),
         );
     }
 }

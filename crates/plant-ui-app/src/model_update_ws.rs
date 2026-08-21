@@ -117,8 +117,13 @@ pub struct Feed;
 #[cfg(target_arch = "wasm32")]
 impl Feed {
     pub fn open(_base: &str, tx: Sender<Evt>, ctx: egui::Context) -> Self {
-        // ponytail: 浏览器端先用已有轮询收口；需要逐单元实时明细时再保留 wasm socket。
-        let _ = tx.send(Evt::QueueFeedDown("浏览器端使用轮询获取任务进度".into()));
+        // 浏览器端先用已有轮询收口；需要逐单元实时明细时再保留 wasm socket。
+        //
+        // 发的是「没订阅」而**不是**「断线」：这个构建从来没连过，说断线是在指控
+        // 一次不存在的故障，而随之而来的「明细缺 N 条」会等于服务端发过的全部。
+        let _ = tx.send(Evt::QueueFeedUnsubscribed(
+            "浏览器端进度走轮询，不建实时连接".into(),
+        ));
         ctx.request_repaint();
         Self
     }
