@@ -562,7 +562,7 @@ fn hud(
                 );
                 ui.label(
                     RichText::new(if live {
-                        "实时模型 · Bevy"
+                        "实时模型"
                     } else {
                         "占位纹理 · 未接渲染器"
                     })
@@ -575,7 +575,7 @@ fn hud(
                     RichText::new(if live {
                         "相机渲染目标"
                     } else {
-                        "实时视口在 M3 接回 Bevy"
+                        "实时视口尚未接入"
                     })
                     .font(Font::mono_meta(d))
                     .color(t.text_muted),
