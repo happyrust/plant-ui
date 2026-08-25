@@ -7,6 +7,15 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      operation:
+        description: Action to run
+        type: choice
+        required: true
+        default: release
+        options:
+          - release
+          - provision-tls
 
 permissions:
   contents: write
@@ -15,13 +24,19 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  diagnose_tls:
-    name: Diagnose production TLS
-    if: github.event_name == 'workflow_dispatch'
+  provision_tls:
+    name: Provision production HTTPS
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'provision-tls'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
-      - name: Inspect production TLS prerequisites
+      - uses: actions/checkout@v4
+      - name: Install SSH client
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+      - name: Provision and verify trusted IP certificate
         shell: bash
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
@@ -30,27 +45,22 @@ jobs:
           DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq sshpass
           install -d -m 700 ~/.ssh
           printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
           export SSHPASS="$DEPLOY_PASSWORD"
-          sshpass -e ssh -o StrictHostKeyChecking=yes "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
-          set -u
-          id
-          if sudo -n true 2>/dev/null; then echo 'SUDO_NOPASSWD=yes'; else echo 'SUDO_NOPASSWD=no'; fi
-          python3 --version || true
-          certbot --version || true
-          nginx -v || true
-          ss -ltn 2>/dev/null | grep -E ':(80|443|8020|8021)[[:space:]]' || true
-          ls -ld /etc/nginx /etc/nginx/conf.d /etc/nginx/sites-enabled /var/www/plant-ui /var/www/plant3d-web 2>/dev/null || true
-          if sudo -n true 2>/dev/null; then sudo -n nginx -T 2>&1; else nginx -T 2>&1 || true; fi
-          REMOTE
+          remote_script="/tmp/plant-ui-provision-tls-${GITHUB_RUN_ID}.sh"
+          sshpass -e scp -o StrictHostKeyChecking=yes \
+            scripts/provision-production-tls.sh \
+            "$DEPLOY_USER@$DEPLOY_HOST:$remote_script"
+          sshpass -e ssh -o StrictHostKeyChecking=yes "$DEPLOY_USER@$DEPLOY_HOST" \
+            "bash '$remote_script' '$DEPLOY_HOST'; rm -f '$remote_script'"
+          curl --fail --silent --show-error --retry 5 --retry-delay 3 \
+            "https://$DEPLOY_HOST/plant-ui/" >/dev/null
 
   build:
     name: Windows and Web release artifacts
-    if: github.event_name != 'workflow_dispatch'
+    if: github.event_name != 'workflow_dispatch' || inputs.operation == 'release'
     runs-on: windows-latest
     timeout-minutes: 120
 
@@ -136,6 +146,9 @@ jobs:
       url: ${{ vars.PLANT_UI_URL }}
 
     steps:
+      - name: Check out deployment scripts
+        uses: actions/checkout@v4
+
       - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
@@ -168,16 +181,16 @@ jobs:
           config = {
               "db": {
                   "host": host,
-                  "port": 8020,
-                  "secure": False,
+                  "port": 443,
+                  "secure": True,
                   "namespace": "1516",
                   "database": "AvevaMarineSample",
                   "mdb": "/ALL",
                   "username": os.environ["PLANT_DB_USER"],
                   "password": os.environ["PLANT_DB_PASSWORD"],
               },
-              "model_api_url": f"http://{host}",
-              "data_api_url": f"http://{host}",
+              "model_api_url": f"https://{host}",
+              "data_api_url": f"https://{host}",
           }
           Path("deploy/config.json").write_text(
               json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -203,9 +216,13 @@ jobs:
           export SSHPASS="$DEPLOY_PASSWORD"
 
           archive="/tmp/plant-ui-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar.gz"
+          tls_script="/tmp/plant-ui-provision-tls-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.sh"
           sshpass -e scp -o StrictHostKeyChecking=yes \
             dist/plant-ui-web-deploy.tar.gz \
             "$DEPLOY_USER@$DEPLOY_HOST:$archive"
+          sshpass -e scp -o StrictHostKeyChecking=yes \
+            scripts/provision-production-tls.sh \
+            "$DEPLOY_USER@$DEPLOY_HOST:$tls_script"
 
           cat > remote-deploy.sh <<'REMOTE'
           set -euo pipefail
@@ -213,11 +230,15 @@ jobs:
           attempt="$2"
           run_id="$3"
           host="$4"
+          tls_script="$5"
           archive="/tmp/plant-ui-${run_id}-${attempt}.tar.gz"
           release="/var/www/plant-ui/releases/${sha}-${attempt}"
           link="/var/www/plant3d-web/plant-ui"
           rollback="/var/www/plant-ui/rollback.sh"
-          trap 'rm -f "$archive"' EXIT
+          tls_conf="/etc/nginx/conf.d/plant-ui-tls.conf"
+          tls_backup="/var/www/plant-ui/plant-ui-tls.conf.rollback"
+          tls_absent="/var/www/plant-ui/plant-ui-tls.conf.was-absent"
+          trap 'rm -f "$archive" "$tls_script"' EXIT
 
           install -d "$release"
           tar -xzf "$archive" -C "$release"
@@ -232,14 +253,25 @@ jobs:
             printf '#!/usr/bin/env bash\nset -euo pipefail\nrm -f %q\n' \
               "$link" > "$rollback"
           fi
+
+          rm -f "$tls_backup" "$tls_absent"
+          if [[ -f "$tls_conf" ]]; then
+            cp -f "$tls_conf" "$tls_backup"
+            printf 'cp -f %q %q\n' "$tls_backup" "$tls_conf" >> "$rollback"
+          else
+            touch "$tls_absent"
+            printf 'rm -f %q\n' "$tls_conf" >> "$rollback"
+          fi
+          printf 'nginx -t\nsystemctl reload nginx\n' >> "$rollback"
           chmod 700 "$rollback"
 
           ln -sfn "$release" "$link"
           curl -fsS -H "Host: $host" http://127.0.0.1/plant-ui/ >/dev/null
+          bash "$tls_script" "$host"
           REMOTE
 
           sshpass -e ssh -o StrictHostKeyChecking=yes "$DEPLOY_USER@$DEPLOY_HOST" \
-            "bash -s -- '$GITHUB_SHA' '$GITHUB_RUN_ATTEMPT' '$GITHUB_RUN_ID' '$DEPLOY_HOST'" \
+            "bash -s -- '$GITHUB_SHA' '$GITHUB_RUN_ATTEMPT' '$GITHUB_RUN_ID' '$DEPLOY_HOST' '$tls_script'" \
             < remote-deploy.sh
 
       - name: Verify public deployment
