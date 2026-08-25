@@ -1,0 +1,49 @@
+name: Diagnose production TLS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Inspect production TLS prerequisites
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          export SSHPASS="$DEPLOY_PASSWORD"
+
+          sshpass -e ssh -o StrictHostKeyChecking=yes "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
+          set -u
+          echo '=== identity ==='
+          id
+          if sudo -n true 2>/dev/null; then echo 'SUDO_NOPASSWD=yes'; else echo 'SUDO_NOPASSWD=no'; fi
+          echo '=== versions ==='
+          python3 --version || true
+          certbot --version || true
+          nginx -v || true
+          echo '=== listeners ==='
+          ss -ltn 2>/dev/null | grep -E ':(80|443|8020|8021)[[:space:]]' || true
+          echo '=== paths ==='
+          ls -ld /etc/nginx /etc/nginx/conf.d /etc/nginx/sites-enabled /var/www/plant-ui /var/www/plant3d-web 2>/dev/null || true
+          echo '=== nginx config ==='
+          if sudo -n true 2>/dev/null; then
+            sudo -n nginx -T 2>&1
+          else
+            nginx -T 2>&1 || true
+          fi
+          REMOTE
