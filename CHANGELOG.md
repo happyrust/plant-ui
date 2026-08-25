@@ -13,6 +13,8 @@
   `ERR_CONNECTION_CLOSED`；短期证书由 systemd 定时自动续期。
 - Web 端数据库、模型 API 与数据 API 统一使用同源 HTTPS/WSS，避免安全页面中的
   mixed-content 请求被浏览器拦截。
+- 数据库连接优先使用配置中的数据库级账号，并保留 Root 账号回退；生产只读账号不再
+  因被误当作 Root 登录而以 WebSocket 1006 断开。
 
 ### 三维与交互
 

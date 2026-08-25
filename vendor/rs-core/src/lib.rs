@@ -115,7 +115,7 @@ pub type BHashMap<K, V> = BTreeMap<K, V>;
 use crate::function::define_common_functions;
 use crate::options::{DbOption, SecondUnitDbOption};
 use once_cell_serde::sync::OnceCell;
-use surrealdb::opt::auth::Root;
+use surrealdb::opt::auth::{Database, Root};
 
 static DB_OPTION: OnceCell<DbOption> = OnceCell::new();
 
@@ -272,12 +272,29 @@ pub async fn init_surreal_with(db_option: &DbOption) -> anyhow::Result<()> {
         .use_ns(&db_option.surreal_ns)
         .use_db(&db_option.project_name)
         .await?;
-    SUL_DB
-        .signin(Root {
+    // 生产 Web 端使用数据库级只读账号；旧桌面部署仍可能配置 Root 账号。
+    // 优先按最小权限的数据库用户登录，失败时再兼容旧 Root 配置。
+    if let Err(database_error) = SUL_DB
+        .signin(Database {
+            namespace: &db_option.surreal_ns,
+            database: &db_option.project_name,
             username: &db_option.v_user,
             password: &db_option.v_password,
         })
-        .await?;
+        .await
+    {
+        SUL_DB
+            .signin(Root {
+                username: &db_option.v_user,
+                password: &db_option.v_password,
+            })
+            .await
+            .map_err(|root_error| {
+                anyhow::anyhow!(
+                    "database signin failed: {database_error}; root signin failed: {root_error}"
+                )
+            })?;
+    }
     // Define common functions
     define_common_functions()
         .await
