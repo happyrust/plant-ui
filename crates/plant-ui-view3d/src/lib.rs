@@ -2018,8 +2018,8 @@ fn zoom_camera(camera: &mut Transform, focus: Vec3, amount: f32) {
 }
 
 fn orbit_camera(camera: &mut Transform, focus: Vec3, x: f32, y: f32) {
-    // 右键向右拖时相机应沿 +X 绕焦点运动；负号会让左右手感完全反转。
-    let yaw = Quat::from_rotation_y(x * 0.005);
+    // 视图采用“拖动场景”的 CAD 手感：右键向右拖时，相机沿 -X 绕焦点运动。
+    let yaw = Quat::from_rotation_y(-x * 0.005);
     let right = camera.rotation * Vec3::X;
     let pitch = Quat::from_axis_angle(right, -y * 0.005);
     camera.rotate_around(focus, yaw * pitch);
@@ -2299,15 +2299,15 @@ mod tests {
     }
 
     #[test]
-    fn horizontal_orbit_follows_right_button_drag_direction() {
+    fn horizontal_orbit_matches_cad_drag_direction() {
         let focus = Vec3::ZERO;
         let mut camera = Transform::from_xyz(0.0, 0.0, 10.0);
 
         orbit_camera(&mut camera, focus, 20.0, 0.0);
 
         assert!(
-            camera.translation.x > 0.0,
-            "dragging right should orbit the camera toward +X, got {:?}",
+            camera.translation.x < 0.0,
+            "dragging right should orbit the camera toward -X, got {:?}",
             camera.translation
         );
     }
