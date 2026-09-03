@@ -10,6 +10,7 @@ mod logs;
 mod model_update_api;
 mod model_update_ws;
 mod regenerate;
+mod search_index;
 mod settings_store;
 mod sim;
 mod startup;
@@ -41,6 +42,7 @@ use logs::Retry;
 use plant_ui::Cmd;
 use plant_ui::data_publish::{self, State as DataPublishState};
 use plant_ui::fonts;
+use plant_ui::model_regenerate::{self, DeliveryUnits};
 use plant_ui::model_update::{
     self, Feed as ModelUpdateFeed, State as ModelUpdateState, Vm as ModelUpdateVm,
 };
@@ -53,7 +55,8 @@ use plant_ui::task_queue;
 use plant_ui::vm::{
     AccessPointVm, CommandLineKind, CommandLineVm, LogElement, ModelLoadVm, PropKind, PropRowVm,
     PropsDataVm, PropsVm, RoomDetailDataVm, RoomDetailVm, RoomMemberVm, RoomRelationVm, RoomViewVm,
-    RoomVm, RoomsDataVm, RowVisibility, Selection, TreeRowVm, TreeVm, View3dVm, WorkbenchVm,
+    RoomVm, RoomsDataVm, RowVisibility, SearchHitVm, SearchRunVm, SearchVm, Selection, SubIndexVm,
+    TreeRowVm, TreeVm, View3dVm, WorkbenchVm,
 };
 use plant_ui::workbench::{self, Pane, WorkbenchState};
 use plant_ui_data::{EleTreeNode, RefU64};
@@ -210,6 +213,11 @@ fn run_native() -> anyhow::Result<()> {
         data_api_url: data_publish_api::base_url(),
         ..settings::Settings::default()
     });
+    // DirectTree 的启动查询走 `model_update_api::base_url()`，不是 `App` 保存的
+    // 请求地址。原生端既然已经采用了落盘设置，就必须在启动数据线程之前把同一份
+    // 地址交给全局 API 客户端；否则界面显示的是设置值，首个 SITE 查询却仍会连
+    // 出厂默认端口。
+    model_update_api::set_base_url(settings.model_api_url.clone())?;
     let default_mesh_dir =
         settings_store::resolve_mesh_dir("", std::env::var_os(PLANT_MESH_DIR), &asset_root);
     let mesh_dir = settings_store::resolve_mesh_dir(
@@ -863,6 +871,28 @@ struct App {
     mdb: String,
     /// 当前数据源的 Surreal namespace；与项目、MDB 一起校验 gen-model 固定服务范围。
     namespace: String,
+    /// 当前 MDB 声明的设计库编号。搜索用它做两件事：包含匹配的搜索范围，
+    /// 以及判断一条命中在不在模型树里（不在的是树外元素）。
+    desi_dbs: Vec<u32>,
+    /// 搜索框每敲一下就发一次查询。晚到的旧结果靠它认出来丢掉——包含匹配要跑
+    /// 几秒，那期间用户早就改了输入。
+    search_epoch: u64,
+    /// 「重新生成模型」的确认框，`None` = 没开。
+    ///
+    /// 这条路**只走到确认为止**：清点是只读的 deep query，按下确认之后的删除与
+    /// 逐根 ensure 还不在本端。
+    regenerate: Option<model_regenerate::Vm>,
+    /// 清点的帧号。换过目标、或者窗关了之后，上一次的数字不许再贴回来——
+    /// 一片 SITE 数几千个元素要跑几秒，那期间人早就右键了别处。
+    ///
+    /// 确认之后这个号不再变：删除与逐根 ensure 的回执都拿它认帧。
+    regenerate_epoch: u64,
+    /// 确认之后正在跑的那一趟。`None` = 没在跑。
+    regenerate_run: Option<RegenerateRun>,
+    /// 这一趟跑完要显示出来的生成根。确认框答应过「跑完会把这些模型全部显示
+    /// 出来，包括本来隐藏的」——取回工作只按重装前的可见性回放，兑现那句话
+    /// 得等场景重装落地之后再显式显示一次。
+    regenerate_show: Vec<RefU64>,
     /// 任务队列视图的数据。它不跟着任何一次运行走——队列是常驻的，进程活着它就在。
     queue: task_queue::Vm,
     /// 队列的明细长连接：订阅全部任务，逐条带 task_id 回来。
@@ -891,10 +921,15 @@ struct App {
     model_reload_owed: bool,
     /// 已经发出一次为清偿欠账的模型刷新；失败时必须把欠账恢复。
     model_reload_in_flight: bool,
-    /// 取回工作清场前的场景快照：(模型 refno, 取回前是否可见)。只记第一次——
+    /// 取回工作清场前的场景快照：模型集 + 方向，外加点过眼睛的范围目标。只记第一次——
     /// 清场之后场景一直是空的，重试轮次再拍只会拍到空白；重载成功落地才消费，
-    /// 失败后的欠账补载仍按这份最初的快照回放。
-    model_reload_restore: Option<Vec<(RefU64, bool)>>,
+    /// 失败后的欠账补载仍按这份最初的快照先 ensure 再重查、再回放。
+    model_reload_restore: Option<ReloadSnapshot>,
+    /// 清场前点过眼睛、且范围回包非空的树目标——取回工作重装前要 ensure 的名单
+    /// （ADR-0024）。`model_scopes` 混着每个模型的自映射条目，不拿它当名单。
+    scope_targets: HashSet<RefU64>,
+    /// 本次重装前那一轮 ensure 的流水账，落地时汇成一句日志。
+    reload_ensure_tally: ReloadEnsureTally,
     /// 增量整场查询已经完成，正等 View3d 报 mesh/AABB 全部落地。
     refresh_generation_pending: bool,
     /// 还没回包的那一次房间视图请求（`Cmd::FocusRoom` -> `Req::RoomDetail`）。
@@ -952,6 +987,79 @@ struct App {
 
 const COMMAND_CAP: usize = 2000;
 
+/// 子串有命中时留给前缀那一段的行数上限（ADR-0023 决定 7）。总行数仍是
+/// `data::SEARCH_LIMIT`，余下的补给子串——不切一刀的话前缀一满 20 条，
+/// 下面那一段就永远露不出来。
+const PREFIX_QUOTA: usize = 15;
+
+/// 一条命中折成下拉里的一行。
+///
+/// `in_tree` 在**库名单还没到手时一律算真**：那一刻人人都在树外，满屏的「树外」
+/// 标只是在说「我还不知道」。
+fn hit_row(hit: plant_ui_data::NameHit, desi_dbs: &[u32]) -> SearchHitVm {
+    SearchHitVm {
+        refno: hit.refno,
+        name: hit.name,
+        noun: hit.noun,
+        in_tree: desi_dbs.is_empty() || desi_dbs.contains(&hit.dbnum),
+    }
+}
+
+/// 确认之后那一趟重新生成：删了什么、还要做哪些、做到哪儿了。
+///
+/// `roots` 在**清点**那一刻就定死了。它是从 `inst_relate` 上数出来的，删完
+/// 那张表上没有它们了——中途丢掉这份名单，剩下的单元就真的找不回来，
+/// 确认框那句「没重做完的那些找不回来」说的正是这件事。
+struct RegenerateRun {
+    label: String,
+    /// 右键那几行。删除按它们整片删，跑完也按它们重查树。
+    targets: Vec<RefU64>,
+    roots: Vec<RefU64>,
+    /// 真删空了几个落点。删除失败时它多半不是零，收尾那句话要照它说。
+    deleted: usize,
+    /// 下一个要派发的下标。它同时是「已经派出去多少」。
+    next: usize,
+    tally: regenerate::Tally,
+    /// 「停在这里」按过了。已经发出去的那一个停不了，停的是下一个。
+    stopping: bool,
+}
+
+/// 一趟重新生成的收尾话，以及它该不该是告警。
+///
+/// **「找不回来」只在真删过的时候说。** 删除自己就失败的那一趟，库里那一片
+/// 还原样立着；把它说成丢了，人就会去做一次不必要的重做。反过来，删过又没
+/// 派完的那些是真没了，这句话正是确认框那条警告兑现的地方。
+fn regenerate_summary(
+    label: &str,
+    tally: &regenerate::Tally,
+    total: usize,
+    dispatched: usize,
+    deleted: usize,
+) -> (String, bool) {
+    let mut line = format!("{label}：{}", tally.summary(total));
+    let undispatched = total.saturating_sub(dispatched);
+    if undispatched > 0 && deleted > 0 {
+        line.push_str(&format!(
+            "。还有 {undispatched} 个没派发就停了，它们的模型已经删掉、找不回来"
+        ));
+    } else if undispatched > 0 {
+        line.push_str(&format!(
+            "。还有 {undispatched} 个一个都没派发；也没删成东西"
+        ));
+    }
+    (line, tally.failed > 0 || undispatched > 0)
+}
+
+/// 确认框标题里的那个范围。单选就报那一行，多选点名头一个再报总数——
+/// 「1 项」是废话，右键菜单那边也是这个口径。
+fn regenerate_label(head: String, targets: usize) -> String {
+    if targets > 1 {
+        format!("{head} 等 {targets} 项")
+    } else {
+        head
+    }
+}
+
 fn command_reply_is_current(reply_epoch: u64, command_epoch: u64) -> bool {
     reply_epoch == command_epoch
 }
@@ -971,18 +1079,34 @@ fn begin_get_work(pending: bool, reload_models: bool, deferred: &mut Option<bool
     }
 }
 
-/// 取回工作清场前的快照：场景里每个模型 refno 配上「取回前是否可见」。
+/// 取回工作清场前拍下的场景（ADR-0021 / ADR-0024）。只记第一次：清场之后场景一直
+/// 是空的，重试轮次再拍只会拍到空白；重装成功落地才消费。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ReloadSnapshot {
+    /// 场景里每个模型 refno 配上「取回前是否可见」。重查范围就是这份名单。
+    models: Vec<(RefU64, bool)>,
+    /// 清场前点过眼睛、且范围回包非空的树目标。重查之前先对它们逐个 `ensure`
+    /// （与 eye 同路），让模型面追到文件最新；空表 = 跳过 ensure、按上次产物重装。
+    targets: Vec<RefU64>,
+}
+
+/// 取回工作清场前的快照：场景里每个模型 refno 配上「取回前是否可见」，外加
+/// 点过眼睛的范围目标名单。
 ///
 /// 方向的优先序：用户最后一次指令（`pending_direction`，模型行直接命中）>
 /// 三维实际回执（`visibility`）> 可见。最后一档兜的是「刚被显示指令带进场景、
 /// 回执还没上来」的模型。容器行上还没落地的在途指令拍不进来——反解要走范围表，
 /// 清场重装拿到的就是那条指令发出前的样子，边缘窄且诚实。
+///
+/// 目标名单只按 refno 排序去重，不按树序：ensure 对同一片范围幂等（凭证当前的根
+/// 直接算命中），先做 ZONE 还是先做它底下的 BRAN 总工作量一样。
 fn reload_snapshot(
     loaded: &HashSet<RefU64>,
     pending_direction: &HashMap<RefU64, bool>,
     visibility: &HashMap<RefU64, ModelVisibility>,
-) -> Vec<(RefU64, bool)> {
-    let mut snapshot: Vec<(RefU64, bool)> = loaded
+    scope_targets: &HashSet<RefU64>,
+) -> ReloadSnapshot {
+    let mut models: Vec<(RefU64, bool)> = loaded
         .iter()
         .map(|refno| {
             let visible = pending_direction
@@ -994,23 +1118,71 @@ fn reload_snapshot(
         })
         .collect();
     // HashSet 迭代序不稳定，而重查请求与日志都吃这份序：排一下，可复现。
-    snapshot.sort_by_key(|(refno, _)| refno.0);
-    snapshot
+    models.sort_by_key(|(refno, _)| refno.0);
+    let mut targets: Vec<RefU64> = scope_targets.iter().copied().collect();
+    targets.sort_by_key(|refno| refno.0);
+    targets.dedup();
+    ReloadSnapshot { models, targets }
 }
 
 /// 重载落地这一刻要回放的隐藏集：快照里方向为隐藏、且这次真的查了回来的那批。
 /// 快照就此消费——回放只认清场那一刻的样子，成功之后它的使命就结束了。
 fn take_hidden_for_replay(
-    restore: &mut Option<Vec<(RefU64, bool)>>,
+    restore: &mut Option<ReloadSnapshot>,
     loaded: &HashSet<RefU64>,
 ) -> Vec<RefU64> {
     restore
         .take()
         .unwrap_or_default()
+        .models
         .into_iter()
         .filter(|(refno, visible)| !visible && loaded.contains(refno))
         .map(|(refno, _)| refno)
         .collect()
+}
+
+/// 取回工作重装前那一轮 ensure 的流水账，落地时汇成一句日志。
+///
+/// 三个数分别对应服务端回执的三档（ADR-0009）：真算了几个生成根、几个凭证当前直接
+/// 命中、几个范围压根没 ensure 成（连不上 / 超时 / 目标已不在库中）。失败不阻断重查
+/// ——空场景比旧几何更坏——但必须数出来，否则「三维已就绪」那句就是在替旧几何背书。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ReloadEnsureTally {
+    targets: usize,
+    generated_roots: usize,
+    cached_roots: usize,
+    failed_targets: usize,
+}
+
+impl ReloadEnsureTally {
+    fn note(&mut self, result: &anyhow::Result<model_update_api::EnsureReply>) {
+        self.targets += 1;
+        match result {
+            Ok(reply) => {
+                self.generated_roots += reply.generated_root_count;
+                self.cached_roots += reply.cached_root_count;
+            }
+            Err(_) => self.failed_targets += 1,
+        }
+    }
+
+    /// `None` = 这次没有范围目标可核对（老快照 / 旧路径加载的模型），日志不必多嘴。
+    fn summary(&self) -> Option<String> {
+        if self.targets == 0 {
+            return None;
+        }
+        let mut line = format!(
+            "核对 {} 个范围 → 重算 {} 个生成根、命中 {} 个",
+            self.targets, self.generated_roots, self.cached_roots
+        );
+        if self.failed_targets > 0 {
+            line.push_str(&format!(
+                "；{} 个范围核对失败，其下的模型可能仍是旧几何",
+                self.failed_targets
+            ));
+        }
+        Some(line)
+    }
 }
 
 fn task_matches_project(task_project: &str, project: &str) -> bool {
@@ -1296,6 +1468,12 @@ impl App {
             data_api_url,
             mdb: String::new(),
             namespace: String::new(),
+            desi_dbs: Vec::new(),
+            search_epoch: 0,
+            regenerate: None,
+            regenerate_epoch: 0,
+            regenerate_run: None,
+            regenerate_show: Vec::new(),
             queue: task_queue::Vm::default(),
             queue_feed: None,
             // 开机就欠一拍：第一帧立刻去取第一份快照，别让面板空等一秒。
@@ -1314,6 +1492,8 @@ impl App {
             model_reload_owed: false,
             model_reload_in_flight: false,
             model_reload_restore: None,
+            scope_targets: HashSet::new(),
+            reload_ensure_tally: ReloadEnsureTally::default(),
             refresh_generation_pending: false,
             focus_room_pending: None,
             xray_room_pending: None,
@@ -1374,6 +1554,8 @@ impl App {
                     self.logs.info(&mut self.vm.logs, msg);
                     self.vm.data_source_ok = true;
                     self.vm.project = info.project;
+                    self.desi_dbs = info.db_nums;
+                    self.vm.search.scope_dbs = self.desi_dbs.len();
                     self.mdb = info.mdb;
                     self.namespace = info.ns.clone();
                     self.data_observed_at = Some(info.observed_at);
@@ -1385,7 +1567,6 @@ impl App {
                     self.queue.namespace = self.namespace.clone();
                     self.vm.project_code = info.ns;
                     self.tree.roots = info.sites;
-                    let _ = self.bridge.req.send(data::Req::PendingSessions);
                     dirty = true;
                 }
                 data::Evt::Ready(Err(e)) => {
@@ -1649,6 +1830,11 @@ impl App {
                             // 说「已显示」。
                             self.tree.visibility.clear();
                             self.tree.pending_direction.clear();
+                            // 范围目标名单随快照放回来：重装后它们仍是「点过眼睛的
+                            // 范围」，下一次取回工作还要拿它们去 ensure（ADR-0024）。
+                            if let Some(snapshot) = self.model_reload_restore.as_ref() {
+                                self.scope_targets.extend(snapshot.targets.iter().copied());
+                            }
                             // 清场快照到此消费：取回前隐藏着、这次又查回来的那批
                             // 稍后按原方向回放。
                             let replay_hidden = take_hidden_for_replay(
@@ -1660,10 +1846,14 @@ impl App {
                             } else {
                                 format!("；回放隐藏 {} 个", replay_hidden.len())
                             };
+                            let ensured = std::mem::take(&mut self.reload_ensure_tally)
+                                .summary()
+                                .map(|line| format!("；{line}"))
+                                .unwrap_or_default();
                             self.logs.info(
                                 &mut self.vm.logs,
                                 format!(
-                                    "三维模型已就绪：{} 个元素，{} 个网格实例{replay}",
+                                    "三维模型已就绪：{} 个元素，{} 个网格实例{replay}{ensured}",
                                     models.len(),
                                     mesh_count
                                 ),
@@ -1674,6 +1864,13 @@ impl App {
                             self.pending_models = Some(models);
                             if !replay_hidden.is_empty() {
                                 self.set_model_visible(replay_hidden, false);
+                            }
+                            // 「跑完会把这些模型全部显示出来，包括本来隐藏的」
+                            // ——确认框那句话在这里兑现。回放隐藏是按重装**之前**
+                            // 的可见性走的，刚重做出来的那几个不受它管。
+                            if !self.regenerate_show.is_empty() {
+                                let shown = std::mem::take(&mut self.regenerate_show);
+                                self.set_model_visible(shown, true);
                             }
                             dirty = true;
                         }
@@ -1689,6 +1886,89 @@ impl App {
                             );
                         }
                     }
+                }
+                // 取回工作重装前对一个范围目标的 ensure 回执（ADR-0024）。成败都记账、
+                // 都不阻断随后的重查：空场景比旧几何更坏。失败要把出路说出来。
+                data::Evt::ReloadEnsured { target, result } => {
+                    self.reload_ensure_tally.note(&result);
+                    let total = self
+                        .model_reload_restore
+                        .as_ref()
+                        .map(|snapshot| snapshot.targets.len())
+                        .unwrap_or(self.reload_ensure_tally.targets);
+                    let element = self.tree.element(target);
+                    match &result {
+                        Ok(reply) => match reply.status {
+                            model_update_api::EnsureStatus::Generated => self.logs.info_of(
+                                &mut self.vm.logs,
+                                element,
+                                format!(
+                                    "取回工作·范围已追到文件最新：重算 {}/{} 个生成根，其余 {} 个命中",
+                                    reply.generated_root_count,
+                                    reply.generation_root_count,
+                                    reply.cached_root_count
+                                ),
+                            ),
+                            model_update_api::EnsureStatus::AlreadyAvailable => self.logs.info_of(
+                                &mut self.vm.logs,
+                                element,
+                                format!(
+                                    "取回工作·范围模型已是最新：{} 个生成根命中",
+                                    reply.cached_root_count
+                                ),
+                            ),
+                            model_update_api::EnsureStatus::NoRenderableGeometry => {
+                                self.logs.info_of(
+                                    &mut self.vm.logs,
+                                    element,
+                                    format!(
+                                        "取回工作·范围内无可渲染几何：{} 个生成根",
+                                        reply.generation_root_count
+                                    ),
+                                )
+                            }
+                            model_update_api::EnsureStatus::Unknown => self.logs.warn_of(
+                                &mut self.vm.logs,
+                                element,
+                                "取回工作·模型服务返回未知按需生成状态，按「做过了」计",
+                            ),
+                        },
+                        Err(error) => {
+                            let failure = model_update_api::failure_of(error);
+                            let way_out = match failure.form() {
+                                model_update::FailForm::Timeout => {
+                                    "服务端可能仍在后台生成，完成后再点一次「取回工作」"
+                                }
+                                _ if failure.code == "conflict" => {
+                                    "该库正在被别的生成 / 数据批次占用，稍后再点「取回工作」"
+                                }
+                                _ => "其下的模型按上次生成的产物重装，可能仍是旧几何",
+                            };
+                            self.logs.warn_of(
+                                &mut self.vm.logs,
+                                element,
+                                format!(
+                                    "取回工作·范围核对失败（{}：{}）；{way_out}",
+                                    failure.code, failure.message
+                                ),
+                            );
+                        }
+                    }
+                    self.vm.model_load = Some(ModelLoadVm::Resolving(format!(
+                        "已清空三维，正在核对范围 {}/{total}…",
+                        self.reload_ensure_tally.targets
+                    )));
+                }
+                data::Evt::ReloadProgress { done, total } => {
+                    self.vm.model_load = Some(if total == 0 {
+                        ModelLoadVm::Resolving("正在重查模型…".into())
+                    } else {
+                        ModelLoadVm::Loading {
+                            label: "重查模型".into(),
+                            done,
+                            total,
+                        }
+                    });
                 }
                 data::Evt::ModelScopeProgress {
                     epoch,
@@ -1708,6 +1988,44 @@ impl App {
                             }
                         });
                     }
+                }
+                data::Evt::ModelScopeEnsured {
+                    epoch,
+                    target,
+                    result,
+                } if epoch == self.model_scope_epoch => {
+                    let element = self.tree.element(target);
+                    match result.status {
+                        model_update_api::EnsureStatus::Generated => self.logs.info_of(
+                            &mut self.vm.logs,
+                            element,
+                            format!(
+                                "按需生成完成：{}/{} 个生成根，本次其余 {} 个命中缓存",
+                                result.generated_root_count,
+                                result.generation_root_count,
+                                result.cached_root_count
+                            ),
+                        ),
+                        model_update_api::EnsureStatus::AlreadyAvailable => self.logs.info_of(
+                            &mut self.vm.logs,
+                            element,
+                            format!("模型缓存命中：{} 个生成根", result.cached_root_count),
+                        ),
+                        model_update_api::EnsureStatus::NoRenderableGeometry => self.logs.info_of(
+                            &mut self.vm.logs,
+                            element,
+                            format!(
+                                "模型范围已确认无可渲染几何：{} 个生成根",
+                                result.generation_root_count
+                            ),
+                        ),
+                        model_update_api::EnsureStatus::Unknown => self.logs.warn_of(
+                            &mut self.vm.logs,
+                            element,
+                            "模型服务返回未知按需生成状态",
+                        ),
+                    }
+                    self.vm.model_load = Some(ModelLoadVm::Resolving("读取最新模型…".into()));
                 }
                 data::Evt::ModelScope(epoch, target, result) if epoch == self.model_scope_epoch => {
                     self.model_scope_pending.remove(&target);
@@ -1742,6 +2060,8 @@ impl App {
                                 cache_model_scope(&mut self.model_scopes, refno, refno);
                             }
                             self.model_scopes.insert(target, refs.clone());
+                            // 登记成范围目标：取回工作重装前要对它 ensure（ADR-0024）。
+                            self.scope_targets.insert(target);
                             let element = self.tree.element(target);
                             self.logs.info_of(
                                 &mut self.vm.logs,
@@ -1870,7 +2190,9 @@ impl App {
                         }
                     }
                 }
-                data::Evt::ModelScopeProgress { .. } | data::Evt::ModelScope(..) => {}
+                data::Evt::ModelScopeProgress { .. }
+                | data::Evt::ModelScopeEnsured { .. }
+                | data::Evt::ModelScope(..) => {}
                 data::Evt::ResolvedName(name, result) => match result {
                     // `/名称` 与 `=参考号` 之后走的是同一条定位路径，只有回执文案不同。
                     Ok(Some(refno)) => {
@@ -1887,6 +2209,150 @@ impl App {
                         self.command_error(format!("名称查询失败：{}", logs::error_chain(&error)))
                     }
                 },
+                // 搜索框每敲一下发一条，回来时输入多半已经变过：只认最后发出的那一条。
+                data::Evt::SearchElements { epoch, .. } if epoch != self.search_epoch => {}
+                data::Evt::SearchElements {
+                    query,
+                    prefix,
+                    substring,
+                    ..
+                } => {
+                    let dbs = self.desi_dbs.clone();
+                    let mut sub_hits: Vec<SearchHitVm> = match substring {
+                        search_index::SubstringHits::Hits(hits) => {
+                            hits.into_iter().map(|hit| hit_row(hit, &dbs)).collect()
+                        }
+                        // 「还没就绪」与「不提供」都不是空结果，界面靠 sub_state
+                        // 那一行说清楚，这里只是没有行可列。
+                        search_index::SubstringHits::Building
+                        | search_index::SubstringHits::Unavailable => Vec::new(),
+                    };
+                    let sub_full = sub_hits.len() >= data::SEARCH_LIMIT;
+                    let prefix = prefix.map(|hits| {
+                        hits.into_iter()
+                            .map(|hit| hit_row(hit, &dbs))
+                            .collect::<Vec<SearchHitVm>>()
+                    });
+                    let search = &mut self.vm.search;
+                    search.running = None;
+                    search.query = query;
+                    match prefix {
+                        Ok(mut hits) => {
+                            let prefix_full = hits.len() >= data::SEARCH_LIMIT;
+                            // 配额（ADR-0023 决定 7）：总行数照旧 ≤ SEARCH_LIMIT；
+                            // 子串有命中时前缀最多占 PREFIX_QUOTA，余下留给子串。
+                            // 不这么切的话前缀一满，子串那一段永远露不出来。
+                            if !sub_hits.is_empty() {
+                                hits.truncate(PREFIX_QUOTA);
+                            }
+                            sub_hits.truncate(data::SEARCH_LIMIT - hits.len());
+                            search.truncated = prefix_full || sub_full;
+                            search.error = None;
+                            search.hits = hits;
+                        }
+                        Err(error) => {
+                            // 前缀那一路断了不牵连子串：索引是本地的，库不在也照查。
+                            search.hits.clear();
+                            search.truncated = sub_full;
+                            search.error = Some(format!("搜索失败：{}", logs::error_chain(&error)));
+                        }
+                    }
+                    search.sub_hits = sub_hits;
+                    dirty = true;
+                }
+                data::Evt::SearchIndex(state) => {
+                    use search_index::SearchIndexState as State;
+                    let next = match &state {
+                        State::Ready(_) => SubIndexVm::Ready,
+                        State::Building { done, total } => SubIndexVm::Building {
+                            done: *done,
+                            total: *total,
+                        },
+                        State::Failed(reason) => SubIndexVm::Failed(reason.clone()),
+                        State::Off => SubIndexVm::Off,
+                    };
+                    // 日志只记状态**变化**：重建期间每拉完一个库就来一条进度，
+                    // 全记下来会把面板刷满，而它们在下拉里已经逐格看得见了。
+                    let current = &self.vm.search.sub_state;
+                    match &state {
+                        State::Ready(names) if !matches!(current, SubIndexVm::Ready) => {
+                            let msg = format!("子串索引已就绪：{names} 个名字");
+                            self.logs.info(&mut self.vm.logs, msg);
+                        }
+                        State::Building { total, .. }
+                            if !matches!(current, SubIndexVm::Building { .. }) =>
+                        {
+                            let msg = format!("子串索引开始后台重建（{total} 个设计库）");
+                            self.logs.info(&mut self.vm.logs, msg);
+                        }
+                        State::Failed(reason) if *current != next => {
+                            let msg =
+                                format!("子串索引不可用：{reason}（命令行输入 reindex 重建）");
+                            self.logs.warn(&mut self.vm.logs, msg);
+                        }
+                        _ => {}
+                    }
+                    self.vm.search.sub_state = next;
+                    dirty = true;
+                }
+                // 换过目标、或者窗已经关了：这份数字贴上去就成了另一个范围的账。
+                data::Evt::RegenerateScope { epoch, .. } if epoch != self.regenerate_epoch => {}
+                data::Evt::RegenerateScope { result, .. } => {
+                    // 标题从在途那一份取——清点期间窗上写的就是它。
+                    if let Some(model_regenerate::Vm::Counting { label }) = self.regenerate.take() {
+                        self.regenerate = Some(match result {
+                            Ok(count) => {
+                                let roots = count.roots.len();
+                                // 名单落进这一趟：删完 `inst_relate` 上没有它们了，
+                                // 这是唯一一次算得出来的机会。
+                                if let Some(run) = self.regenerate_run.as_mut() {
+                                    run.roots = count.roots;
+                                }
+                                model_regenerate::Vm::Ready(model_regenerate::Plan {
+                                    label,
+                                    elements: count.elements,
+                                    roots,
+                                })
+                            }
+                            Err(error) => {
+                                self.regenerate_run = None;
+                                model_regenerate::Vm::Failed {
+                                    label,
+                                    reason: logs::error_chain(&error),
+                                }
+                            }
+                        });
+                    }
+                }
+                // 删除与逐根回执都拿确认那一刻钉住的帧号认；对不上的一律不认
+                // ——这一趟已经收了，回来的是上一趟的尾巴。
+                data::Evt::RegenerateDeleted { epoch, .. } if epoch != self.regenerate_epoch => {}
+                data::Evt::RegenerateDeleted {
+                    deleted, result, ..
+                } => match result {
+                    Ok(()) => {
+                        if let Some(run) = self.regenerate_run.as_mut() {
+                            run.deleted = deleted;
+                        }
+                        self.dispatch_next_regenerate_unit();
+                    }
+                    Err(error) => {
+                        // 删都删不动：往下发 ensure 只会在没删干净的范围上重做，
+                        // 谁也说不清结果。前面已经删空的那几片得当场点名。
+                        let Some(run) = self.regenerate_run.as_mut() else {
+                            continue;
+                        };
+                        run.deleted = deleted;
+                        run.stopping = true;
+                        let what = format!("{} 删除失败（已删掉 {deleted} 个落点）", run.label);
+                        self.logs.error(&mut self.vm.logs, what, &error, None);
+                        self.finish_regenerate();
+                    }
+                },
+                data::Evt::RegenerateUnit { epoch, .. } if epoch != self.regenerate_epoch => {}
+                data::Evt::RegenerateUnit { index, result, .. } => {
+                    self.settle_regenerate_unit(index, result)
+                }
                 data::Evt::Ancestors(refno, Ok(chain)) => {
                     // 同一条链可能是两件事要的：一次定位，或者一次「新增子树该刷哪一层」
                     // 的锚点解析。两边各取所需，互不干扰。
@@ -1977,12 +2443,7 @@ impl App {
                         }
                     }
                 }
-                // 查不动就把那行提示收起来，不为它报错——它本来就只是提示。
-                data::Evt::PendingSessions(result) => {
-                    self.vm.pending_sessions = result.ok();
-                }
                 data::Evt::GetWork(result) => {
-                    let _ = self.bridge.req.send(data::Req::PendingSessions);
                     match result {
                         Ok(fresh) => {
                             let refreshed = std::mem::take(&mut self.get_work_task_ids);
@@ -1998,13 +2459,10 @@ impl App {
                                 // 不再是全部 SITE 根：取回工作刷的是「已加载的三维
                                 // 模型」（CONTEXT.md），叶子 refno 当根走的是同一条
                                 // anc 索引查询（决定 6）。
-                                let roots: Vec<RefU64> = self
-                                    .model_reload_restore
-                                    .as_deref()
-                                    .unwrap_or_default()
-                                    .iter()
-                                    .map(|(refno, _)| *refno)
-                                    .collect();
+                                let snapshot =
+                                    self.model_reload_restore.clone().unwrap_or_default();
+                                let roots: Vec<RefU64> =
+                                    snapshot.models.iter().map(|(refno, _)| *refno).collect();
                                 if roots.is_empty() {
                                     // 清场前一个模型都没有：无可重查，忙碌态与在途
                                     // 标记就地收尾，别让人等一个不存在的回包。
@@ -2015,7 +2473,18 @@ impl App {
                                 } else if self
                                     .bridge
                                     .req
-                                    .send(data::Req::Models(roots, true))
+                                    .send(data::Req::Models {
+                                        roots,
+                                        // 重查之前先让模型面追到文件最新（ADR-0024）：
+                                        // 与 eye 同一条 ensure 路，范围是清场前点过眼睛
+                                        // 的那些目标，不是逐个模型。
+                                        ensure_targets: snapshot.targets,
+                                        debt_reload: true,
+                                        base: model_update_api::base_url(),
+                                        project: self.vm.project.clone(),
+                                        mdb: self.mdb.clone(),
+                                        namespace: self.namespace.clone(),
+                                    })
                                     .is_err()
                                 {
                                     restore_model_reload(
@@ -2122,6 +2591,9 @@ impl App {
                             self.queue.mdb = self.mdb.clone();
                             self.queue.namespace = self.namespace.clone();
                             self.queue.adopt(poll);
+                            // 取回工作旁那行提示从这份 `/dbnums` 算：队列轮询常驻
+                            // （忙 1 s / 闲 5 s），提示随每拍刷新，不再单独打一次水位表。
+                            self.vm.pending_saves = Some(self.queue.pending_saves());
                             match plan {
                                 AutoRefresh::FullReload => {
                                     self.get_work_with_models_for_tasks(true, task_ids)
@@ -2426,6 +2898,20 @@ impl App {
                 },
                 Cmd::ClearLogs => self.logs.clear(&mut self.vm.logs),
                 Cmd::SubmitCommand(command) => dirty |= self.submit_command(command),
+                Cmd::SearchElements { query } => self.search_elements(query),
+                Cmd::CloseSearch => {
+                    // epoch 一进就把在途那次隔在门外：回来时框可能已经关了、
+                    // 或者装着另一个词。
+                    self.search_epoch = self.search_epoch.wrapping_add(1);
+                    // 索引状态不跟着搜索框走：它是常驻的，关一次框不该让「正在
+                    // 重建」的进度从头开始报。
+                    let search = SearchVm {
+                        scope_dbs: self.vm.search.scope_dbs,
+                        sub_state: std::mem::take(&mut self.vm.search.sub_state),
+                        ..Default::default()
+                    };
+                    self.vm.search = search;
+                }
                 Cmd::OpenProjectPicker => self.project_picker_state.open = true,
                 Cmd::LoadProject(_) => self.project_picker_state.open = false,
                 Cmd::OpenSettings => self.settings_state.open(),
@@ -2455,7 +2941,7 @@ impl App {
                     );
                 }
                 Cmd::ExecuteModelUpdate { dbnums } => {
-                    if !self.model_service_writable() {
+                    if !self.model_service_executable() {
                         continue;
                     }
                     let ModelUpdateVm::Ready(preview) = &self.model_update else {
@@ -2474,7 +2960,7 @@ impl App {
                 // 与「确认执行」打同一个接口。它不插队，作用只是别等服务端下一个
                 // 30 秒轮询——回执照样进日志，进度在队列面板上。
                 Cmd::ScanNow => {
-                    if !self.model_service_writable() {
+                    if !self.model_service_executable() {
                         continue;
                     }
                     // 队列面板的即时扫描没有勾选语境，走全范围（ADR-020 缺省）。
@@ -2500,7 +2986,7 @@ impl App {
                 // 一行——变化要等下一拍轮询，界面上那句「已提交 · 等下一拍」说的
                 // 就是这件事。
                 Cmd::RetryPendingUnit { dbnum, root_refno } => {
-                    if !self.model_service_writable() {
+                    if !self.model_service_executable() {
                         continue;
                     }
                     self.logs.info(
@@ -2584,6 +3070,19 @@ impl App {
                 | Cmd::SetViewportBackground { .. }
                 | Cmd::SnapView { .. }
                 | Cmd::RetryFailedMeshes) => self.view3d_commands.push(command),
+                Cmd::RegenerateModels { targets } => self.begin_regenerate_count(targets),
+                Cmd::RegenerateConfirm { accepted } => self.settle_regenerate_confirm(accepted),
+                // 「停在这里」**只停派发**。已经发出去的那一个停不了——服务端是
+                // `await_background_without_cancelling`，收到回执后才收摊。
+                Cmd::RegenerateStop => {
+                    if let Some(run) = self.regenerate_run.as_mut() {
+                        run.stopping = true;
+                    }
+                    if let Some(model_regenerate::Vm::Running(progress)) = self.regenerate.as_mut()
+                    {
+                        progress.stopping = true;
+                    }
+                }
             }
         }
         if dirty {
@@ -2603,13 +3102,22 @@ impl App {
             ParsedCommand::Empty => false,
             ParsedCommand::Help => {
                 self.command_output(
-                    "help          显示帮助\nclear         清空命令会话\nq help        显示模型查询帮助\nq <属性>      查询当前元素属性\n/<名称>       按名称定位元素\n=<参考号>     按参考号定位元素",
+                    "help          显示帮助\nclear         清空命令会话\nreindex       重建子串搜索索引\nq help        显示模型查询帮助\nq <属性>      查询当前元素属性\n/<名称>       按名称定位元素\n=<参考号>     按参考号定位元素",
                 );
                 false
             }
             ParsedCommand::Clear => {
                 self.vm.command.lines.clear();
                 self.command_epoch = self.command_epoch.wrapping_add(1);
+                false
+            }
+            ParsedCommand::Reindex => {
+                match self.bridge.req.send(data::Req::RebuildSearchIndex) {
+                    // 回执只说「开始了」：重建在后台跑几十秒，就绪与失败都由
+                    // `Evt::SearchIndex` 落进 logs 面板。
+                    Ok(()) => self.command_output("搜索索引重建已开始（后台），完成后日志可见"),
+                    Err(_) => self.command_error("重建失败：数据线程已关闭"),
+                }
                 false
             }
             ParsedCommand::Query(query) => {
@@ -2694,6 +3202,277 @@ impl App {
                 .ok_or_else(|| format!("属性不存在：{}", attr.to_ascii_uppercase()))?
         };
         Ok(format!("{} = {value}", attr.to_ascii_uppercase()))
+    }
+
+    /// 标题栏搜索框发起的一次查询。两路一起走，一条 Evt 回来。
+    ///
+    /// 不做防抖也不排队：前缀是索引范围扫、子串是本地索引，都在毫秒量级，多发
+    /// 几条比压着不发划算；晚到的旧结果由 epoch 认出来丢掉。所以这里只管发，
+    /// 认领在 `Evt::SearchElements` 那一侧。
+    fn search_elements(&mut self, query: String) {
+        self.search_epoch = self.search_epoch.wrapping_add(1);
+        let request = data::Req::SearchElements {
+            epoch: self.search_epoch,
+            query: query.clone(),
+        };
+        if self.bridge.req.send(request).is_err() {
+            self.vm.search.running = None;
+            self.vm.search.error = Some("搜索失败：数据线程已关闭".into());
+            return;
+        }
+        self.vm.search.running = Some(SearchRunVm { query });
+    }
+
+    /// 「重新生成模型」的第一步：清点。
+    ///
+    /// 这一步一行都不删——deep query 数出「多少个已生成元素、归成多少个生成
+    /// 单元」，把两个真数字摆进确认框等人拍板。右键换一行就重开一次，上一次
+    /// 在途的清点由 `regenerate_epoch` 认出来丢掉。
+    fn begin_regenerate_count(&mut self, targets: Vec<RefU64>) {
+        let Some(first) = targets.first().copied() else {
+            return;
+        };
+        let label = regenerate_label(self.tree.label(first), targets.len());
+        self.regenerate_epoch = self.regenerate_epoch.wrapping_add(1);
+        // 上一次备着的那份名单作废：右键换了一行，它说的是另一个范围。
+        // 跑起来的那一趟不会走到这里——`Vm::Running` 挡着右键菜单（regen_busy）。
+        self.regenerate_run = None;
+        // 名词表是**服务端**此刻的配置，不是那四个默认值：不知道就数不出生成
+        // 单元数，而那正是人拿来判断这一按值不值的数字。删除一步都还没走，
+        // 所以这里只是不往下走。
+        let units = DeliveryUnits::from_health(
+            self.queue
+                .health
+                .as_ref()
+                .map(|health| health.delivery_unit_types.as_slice())
+                .unwrap_or_default(),
+        );
+        let Some(nouns) = units.nouns() else {
+            self.regenerate = Some(model_regenerate::Vm::Failed {
+                label,
+                reason: model_regenerate::UNKNOWN_DELIVERY_UNITS.to_owned(),
+            });
+            return;
+        };
+        let request = data::Req::RegenerateScope {
+            epoch: self.regenerate_epoch,
+            targets: targets.clone(),
+            delivery_units: nouns.iter().cloned().collect(),
+        };
+        if self.bridge.req.send(request).is_err() {
+            self.regenerate = Some(model_regenerate::Vm::Failed {
+                label,
+                reason: "数据线程已关闭".into(),
+            });
+            return;
+        }
+        self.regenerate_run = Some(RegenerateRun {
+            label: label.clone(),
+            targets,
+            roots: Vec::new(),
+            deleted: 0,
+            next: 0,
+            tally: regenerate::Tally::default(),
+            stopping: false,
+        });
+        self.regenerate = Some(model_regenerate::Vm::Counting { label });
+    }
+
+    /// 确认框的回执。接受就动手：先整片删一次，再逐根重做。
+    ///
+    /// 跑起来之后这个窗不再关得掉（`Vm::Running` 那一档没有叉），所以取消只可能
+    /// 来自清点阶段——那时一个请求都还没发出去。
+    fn settle_regenerate_confirm(&mut self, accepted: bool) {
+        let closed = self.regenerate.take();
+        let Some(model_regenerate::Vm::Ready(plan)) = closed else {
+            // 清点中 / 失败态被关掉：在途那次清点的数字回来也没地方贴。
+            self.regenerate_epoch = self.regenerate_epoch.wrapping_add(1);
+            self.regenerate_run = None;
+            return;
+        };
+        if !accepted {
+            self.regenerate_epoch = self.regenerate_epoch.wrapping_add(1);
+            // 那份根名单跟着这一次决定作废。留着它，下一次确认就会对着上一个
+            // 范围动手，而窗上写的是这一个。
+            self.regenerate_run = None;
+            return;
+        }
+        let Some(run) = self.regenerate_run.as_ref() else {
+            // 清点回执里那份根名单没接住。删除一步都还没走，如实说一句就停。
+            self.regenerate_epoch = self.regenerate_epoch.wrapping_add(1);
+            self.logs.warn(
+                &mut self.vm.logs,
+                format!("{}：生成根名单没接住，这一趟没有开始", plan.label),
+            );
+            return;
+        };
+        // 帧号从这里起不再变：删除与逐根回执都拿它认帧。
+        let request = data::Req::RegenerateDelete {
+            epoch: self.regenerate_epoch,
+            base: self.model_api_url.clone(),
+            targets: run.targets.clone(),
+            project: self.vm.project.clone(),
+            mdb: self.mdb.clone(),
+            namespace: self.namespace.clone(),
+        };
+        let (label, total) = (run.label.clone(), run.roots.len());
+        if self.bridge.req.send(request).is_err() {
+            self.regenerate_run = None;
+            self.regenerate_epoch = self.regenerate_epoch.wrapping_add(1);
+            self.logs.warn(
+                &mut self.vm.logs,
+                format!("{label}：数据线程已关闭，这一趟没有开始"),
+            );
+            return;
+        }
+        self.logs.info(
+            &mut self.vm.logs,
+            format!(
+                "{label}：正在删除 {} 个已生成元素，随后重做最多 {total} 个生成单元…",
+                plan.elements
+            ),
+        );
+        self.vm.regen_busy = true;
+        self.regenerate = Some(model_regenerate::Vm::Running(model_regenerate::Progress {
+            label,
+            settled: 0,
+            total,
+            stopping: false,
+        }));
+    }
+
+    /// 派发下一个生成根；没有下一个（或者已经喊停）就收尾。
+    fn dispatch_next_regenerate_unit(&mut self) {
+        let Some(run) = self.regenerate_run.as_mut() else {
+            return;
+        };
+        let done = run.stopping || run.next >= run.roots.len();
+        if done {
+            self.finish_regenerate();
+            return;
+        }
+        let refno = run.roots[run.next];
+        let index = run.next;
+        run.next += 1;
+        let request = data::Req::RegenerateUnit {
+            epoch: self.regenerate_epoch,
+            index,
+            base: self.model_api_url.clone(),
+            refno,
+            project: self.vm.project.clone(),
+            mdb: self.mdb.clone(),
+            namespace: self.namespace.clone(),
+        };
+        if self.bridge.req.send(request).is_err() {
+            self.logs
+                .warn(&mut self.vm.logs, "数据线程已关闭：这一趟就停在这里");
+            self.finish_regenerate();
+        }
+    }
+
+    /// 一个生成根的回执落账。
+    ///
+    /// 五档各归各的（见 `regenerate::outcome_of_*`）：`container` 与服务端换过的
+    /// 新状态名都要**当场点名**——它们的意思是客户端归根与服务端策略对不上，
+    /// 静默计数的话这个分歧可以错开好几个月没人发现。
+    fn settle_regenerate_unit(
+        &mut self,
+        index: usize,
+        result: anyhow::Result<model_update_api::EnsureReply>,
+    ) {
+        let Some(run) = self.regenerate_run.as_mut() else {
+            return;
+        };
+        let refno = run.roots.get(index).copied().unwrap_or_default();
+        let outcome = match &result {
+            Ok(reply) => {
+                if reply.status == model_update_api::EnsureStatus::Unknown {
+                    let root = &reply.generation_root;
+                    self.logs.warn(
+                        &mut self.vm.logs,
+                        format!(
+                            "{} 回了一个不认识的状态（生成根 {root}），当成做过了计数",
+                            refno.to_slash_string()
+                        ),
+                    );
+                }
+                // 「做完了」却「没有模型」是自相矛盾的一档。它不是失败——服务端
+                // 认为自己尽到了责任——但人会盯着一片空白等一个不会来的模型。
+                if reply.status == model_update_api::EnsureStatus::Generated
+                    && !reply.model_available
+                {
+                    self.logs.warn(
+                        &mut self.vm.logs,
+                        format!(
+                            "{} 报「已生成」但没有可用模型（生成根 {}），三维里不会多出东西",
+                            refno.to_slash_string(),
+                            reply.generation_root
+                        ),
+                    );
+                }
+                regenerate::outcome_of_status(reply.status)
+            }
+            Err(error) => {
+                let failure = model_update_api::failure_of(error);
+                let outcome = regenerate::outcome_of_failure(&failure);
+                if matches!(
+                    outcome,
+                    regenerate::UnitOutcome::Failed | regenerate::UnitOutcome::Abort
+                ) {
+                    self.logs.error(
+                        &mut self.vm.logs,
+                        format!("{} 重做失败", refno.to_slash_string()),
+                        error,
+                        None,
+                    );
+                }
+                outcome
+            }
+        };
+        let Some(run) = self.regenerate_run.as_mut() else {
+            return;
+        };
+        run.tally.record(outcome);
+        // 中止的那一个不进账，但整趟到此为止：连不上 / 服务没起来的时候，
+        // 剩下几百个只会一个个重复同一次失败。
+        if outcome == regenerate::UnitOutcome::Abort {
+            run.stopping = true;
+        }
+        let settled = run.tally.settled();
+        if let Some(model_regenerate::Vm::Running(progress)) = self.regenerate.as_mut() {
+            progress.settled = settled;
+        }
+        self.dispatch_next_regenerate_unit();
+    }
+
+    /// 收尾：报账、解禁、把重做出来的模型显示出来。
+    ///
+    /// 「取回工作」是这里唯一靠得住的刷新——库里这一片的几何整批换过了，
+    /// 本进程的查询缓存与三维场景都还停在删除之前那个世界。
+    fn finish_regenerate(&mut self) {
+        let Some(run) = self.regenerate_run.take() else {
+            return;
+        };
+        self.regenerate = None;
+        self.vm.regen_busy = false;
+        self.regenerate_epoch = self.regenerate_epoch.wrapping_add(1);
+        let (line, alarming) = regenerate_summary(
+            &run.label,
+            &run.tally,
+            run.roots.len(),
+            run.next,
+            run.deleted,
+        );
+        if alarming {
+            self.logs.warn(&mut self.vm.logs, line);
+        } else {
+            self.logs.info(&mut self.vm.logs, line);
+        }
+        // 已经派出去过的那些才值得显示；没派发的那几个库里什么都没有。
+        self.regenerate_show = run.roots[..run.next].to_vec();
+        // 元素本体一行没动（删的是产物），但本进程的查询缓存与三维场景都还停在
+        // 删除之前那个世界。取回工作是唯一会把两者一起换掉的那条路。
+        self.get_work_with_models(true);
     }
 
     /// 树定位：选中目标并让属性跟上，再想办法把它那一行露出来（ADR-0014）。
@@ -3107,6 +3886,10 @@ impl App {
                 .send(data::Req::ModelScopes {
                     epoch: self.model_scope_epoch,
                     targets: targets.clone(),
+                    base: model_update_api::base_url(),
+                    project: self.vm.project.clone(),
+                    mdb: self.mdb.clone(),
+                    namespace: self.namespace.clone(),
                 })
                 .is_err()
             {
@@ -3219,11 +4002,20 @@ impl App {
                 &self.loaded_models,
                 &self.tree.pending_direction,
                 &self.tree.visibility,
+                &self.scope_targets,
             ));
         }
-        let snapshot = self.model_reload_restore.as_deref().unwrap_or_default();
-        let total = snapshot.len();
-        let hidden = snapshot.iter().filter(|(_, visible)| !visible).count();
+        let snapshot = self.model_reload_restore.clone().unwrap_or_default();
+        let total = snapshot.models.len();
+        let hidden = snapshot
+            .models
+            .iter()
+            .filter(|(_, visible)| !visible)
+            .count();
+        let targets = snapshot.targets.len();
+        self.reload_ensure_tally = ReloadEnsureTally::default();
+        // 名单已经拍进快照；重装落地时按快照放回来（ADR-0024）。
+        self.scope_targets.clear();
         self.pending_models = Some(Vec::new());
         self.pending_incremental_models.clear();
         self.model_show_waiting.clear();
@@ -3243,12 +4035,25 @@ impl App {
             self.vm.model_load = None;
             self.logs
                 .info(&mut self.vm.logs, "三维本来就空着，这次只刷新树");
-        } else {
-            self.vm.model_load =
-                Some(ModelLoadVm::Resolving("已清空三维，正在重查模型…".into()));
+        } else if targets == 0 {
+            // 老快照 / 旧路径加载的模型没有范围目标可核对：按上次生成的产物重装，
+            // 这件事要说出来——那批几何未必是文件最新（ADR-0024）。
+            self.vm.model_load = Some(ModelLoadVm::Resolving("已清空三维，正在重查模型…".into()));
             self.logs.info(
                 &mut self.vm.logs,
-                format!("已清空三维场景：将重查 {total} 个模型（其中 {hidden} 个保持隐藏）"),
+                format!(
+                    "已清空三维场景：无范围目标记录，按上次生成的产物重装 {total} 个模型（其中 {hidden} 个保持隐藏）"
+                ),
+            );
+        } else {
+            self.vm.model_load = Some(ModelLoadVm::Resolving(format!(
+                "已清空三维，正在核对 {targets} 个范围的模型是否最新…"
+            )));
+            self.logs.info(
+                &mut self.vm.logs,
+                format!(
+                    "已清空三维场景：先核对 {targets} 个范围（点过眼睛的目标）的模型是否最新，再重查 {total} 个模型（其中 {hidden} 个保持隐藏）"
+                ),
             );
         }
     }
@@ -3270,6 +4075,7 @@ impl App {
         };
         let first = !self.queue_refresh_baselined;
         let mut data_applied = false;
+        let mut terminal_batches = false;
         let mut units = Vec::new();
         let mut task_ids = Vec::new();
         for task in &poll.tasks {
@@ -3284,6 +4090,9 @@ impl App {
             {
                 continue;
             }
+            // 一个数据批次走到终态（成功 / 部分 / 失败都算），就意味着库里可能
+            // 多了、少了或改了名字——子串索引该去对一次戳了。
+            terminal_batches = true;
             if let Some(outcome) = task.result.as_ref() {
                 data_applied |= outcome.data_applied();
                 let refresh = outcome.refresh_units();
@@ -3294,6 +4103,10 @@ impl App {
             }
         }
         self.queue_refresh_baselined = true;
+        if terminal_batches {
+            // 校验是单飞的：同一拍里几个批次一起到终态也只会跑一次。
+            let _ = self.bridge.req.send(data::Req::CheckSearchIndex);
+        }
         (data_applied, units, task_ids)
     }
 
@@ -3403,6 +4216,8 @@ impl App {
         // 那几秒里「立刻扫一遍」还亮着，按下去带的是上一次连接的 MDB。
         self.queue.mdb.clear();
         self.queue.namespace.clear();
+        // 那行「N 次保存未应用」说的是旧接入点，下一拍轮询会按新的重算。
+        self.vm.pending_saves = None;
         self.queue_finished.clear();
         self.refresh_anchors.clear();
         self.data_observed_at = None;
@@ -3413,6 +4228,8 @@ impl App {
         self.model_reload_owed = false;
         self.model_reload_in_flight = false;
         self.model_reload_restore = None;
+        self.scope_targets.clear();
+        self.reload_ensure_tally = ReloadEnsureTally::default();
         self.refresh_generation_pending = false;
         self.vm.refresh_generation = 0;
         self.vm.project_code.clear();
@@ -3457,6 +4274,7 @@ impl App {
         });
     }
 
+    /// 身份闸门：预览、暂停 / 恢复队列走它——这些不需要 worker 在场。
     fn model_service_writable(&mut self) -> bool {
         if self.queue.can_mutate() {
             return true;
@@ -3466,6 +4284,22 @@ impl App {
             "模型服务写操作已阻断：请先连接数据源，并确认 project / MDB / namespace 与服务范围一致",
         );
         false
+    }
+
+    /// 执行闸门：开始更新 / 立刻扫一遍 / 立刻重试走它。身份之外还要服务**会消化**——
+    /// 执行请求一律 202 入队，服务以 direct 形态运行、没起 worker 时它会永远排队，
+    /// 服务端不会替界面说「不行」（`task_queue::Vm::execution_blocked_reason`）。
+    /// 按钮本来就该灰着；这里是命令行 / 快捷键那类绕过按钮的入口的最后一道。
+    fn model_service_executable(&mut self) -> bool {
+        if !self.model_service_writable() {
+            return false;
+        }
+        if let Some(reason) = self.queue.execution_blocked_reason() {
+            self.logs
+                .warn(&mut self.vm.logs, format!("执行请求已阻断：{reason}"));
+            return false;
+        }
+        true
     }
 
     /// 重开队列的明细通道。断线期间的事件不会补发，所以重连只让后续的行重新流进来，
@@ -3592,15 +4426,17 @@ impl App {
 mod tests {
     use super::{
         AutoRefresh, EleTreeNode, ModelVisibility, ModelVisibilityPlan, PanelRoomResolution,
-        RefU64, RowVisibility, TreeModel, TreeRowVm, Window, auto_refresh,
-        background_models_settled, begin_get_work, cache_model_scope, claim_unloaded_model_refnos,
-        command_reply_is_current, complete_refresh_generation, expand_room_model_targets,
-        finished_after, in_mdb_path, mark_model_scope_unavailable, model_drains_idle,
-        model_progress_terminal, model_visibility_plan, needs_children_query, refresh_anchor,
-        reload_snapshot, resolve_panel_room_reply, restore_model_reload,
-        settle_pending_directions, settle_refresh_generation, settled_pending_roots,
-        sync_ime_window, take_hidden_for_replay, task_matches_project,
+        RefU64, ReloadEnsureTally, ReloadSnapshot, RowVisibility, TreeModel, TreeRowVm, Window,
+        auto_refresh, background_models_settled, begin_get_work, cache_model_scope,
+        claim_unloaded_model_refnos, command_reply_is_current, complete_refresh_generation,
+        expand_room_model_targets, finished_after, in_mdb_path, mark_model_scope_unavailable,
+        model_drains_idle, model_progress_terminal, model_visibility_plan, needs_children_query,
+        refresh_anchor, regenerate_label, regenerate_summary, reload_snapshot,
+        resolve_panel_room_reply, restore_model_reload, settle_pending_directions,
+        settle_refresh_generation, settled_pending_roots, sync_ime_window, take_hidden_for_replay,
+        task_matches_project,
     };
+    use crate::model_update_api;
     use chrono::{TimeZone, Utc};
     use plant_ui::model_update::PendingModelUnit;
     use std::collections::{HashMap, HashSet};
@@ -3709,6 +4545,54 @@ mod tests {
             expand_room_model_targets(vec![member], &scopes),
             vec![member, branch]
         );
+    }
+
+    /// 确认框标题跟着右键落点走，成批时才报数。「/ZONE-A 等 1 项」是废话，
+    /// 而它出现的地方正是那句「将删除 … 范围内 N 个已生成元素」的主语。
+    #[test]
+    fn the_regenerate_label_only_counts_a_real_batch() {
+        assert_eq!(regenerate_label("ZONE /ZONE-A".into(), 1), "ZONE /ZONE-A");
+        assert_eq!(
+            regenerate_label("ZONE /ZONE-A".into(), 3),
+            "ZONE /ZONE-A 等 3 项"
+        );
+    }
+
+    /// 「找不回来」是这一趟唯一不可逆的后果，只有真删过才轮得到它说。
+    /// 删除自己就失败的那一趟库里原样立着，把它说成丢了，人会去做一次
+    /// 不必要的重做——而那一次是真会删东西的。
+    #[test]
+    fn only_a_run_that_deleted_something_claims_the_work_is_gone() {
+        let tally = crate::regenerate::Tally {
+            done: 2,
+            ..Default::default()
+        };
+
+        let (stopped, alarming) = regenerate_summary("/ZONE-A", &tally, 10, 2, 1);
+        assert!(stopped.contains("还有 8 个"), "{stopped}");
+        assert!(stopped.contains("找不回来"), "{stopped}");
+        assert!(alarming, "没派完就该是告警：{stopped}");
+
+        let (nothing_deleted, alarming) = regenerate_summary("/ZONE-A", &tally, 10, 0, 0);
+        assert!(!nothing_deleted.contains("找不回来"), "{nothing_deleted}");
+        assert!(
+            nothing_deleted.contains("也没删成东西"),
+            "{nothing_deleted}"
+        );
+        assert!(alarming, "{nothing_deleted}");
+    }
+
+    /// 全做完、一个没失败的那一趟不该报警——它也不该在句尾挂一条「还有 0 个」。
+    #[test]
+    fn a_clean_run_says_nothing_about_leftovers() {
+        let tally = crate::regenerate::Tally {
+            done: 3,
+            skipped: 1,
+            ..Default::default()
+        };
+        let (line, alarming) = regenerate_summary("/ZONE-A", &tally, 4, 4, 1);
+        assert!(!line.contains("还有"), "{line}");
+        assert!(!alarming, "{line}");
     }
 
     fn node(refno: RefU64, noun: &str, children: u16) -> EleTreeNode {
@@ -4401,10 +5285,33 @@ mod tests {
         let pending = HashMap::from([(toggling, false)]);
 
         assert_eq!(
-            reload_snapshot(&loaded, &pending, &visibility),
-            vec![(shown, true), (hidden, false), (toggling, false), (fresh, true)],
+            reload_snapshot(&loaded, &pending, &visibility, &HashSet::new()).models,
+            vec![
+                (shown, true),
+                (hidden, false),
+                (toggling, false),
+                (fresh, true)
+            ],
             "刚进场没回执的按可见记，其余按指令 > 回执"
         );
+    }
+
+    /// 快照除了模型集，还要带上清场前点过眼睛的范围目标（ADR-0024）：重装前先对
+    /// 它们 ensure。名单按 refno 排序、去重，与模型集一样可复现；没点过眼睛就是空表
+    /// ——那是「跳过 ensure、按上次产物重装」的信号，不许伪造。
+    #[test]
+    fn reload_snapshot_records_scope_targets_sorted_and_deduped() {
+        let zone = RefU64(20);
+        let bran = RefU64(7);
+        let loaded = HashSet::from([RefU64(1)]);
+        let targets = HashSet::from([zone, bran]);
+
+        let snapshot = reload_snapshot(&loaded, &HashMap::new(), &HashMap::new(), &targets);
+        assert_eq!(snapshot.targets, vec![bran, zone]);
+        assert_eq!(snapshot.models, vec![(RefU64(1), true)]);
+
+        let bare = reload_snapshot(&loaded, &HashMap::new(), &HashMap::new(), &HashSet::new());
+        assert!(bare.targets.is_empty());
     }
 
     #[test]
@@ -4412,13 +5319,62 @@ mod tests {
         let kept = RefU64(1);
         let gone = RefU64(2);
         let shown = RefU64(3);
-        let mut restore = Some(vec![(kept, false), (gone, false), (shown, true)]);
+        let mut restore = Some(ReloadSnapshot {
+            models: vec![(kept, false), (gone, false), (shown, true)],
+            targets: vec![RefU64(9)],
+        });
         // 库里删掉的 gone 这次没查回来：不回放，免得对着空气记一笔隐藏账。
         let loaded = HashSet::from([kept, shown]);
 
         assert_eq!(take_hidden_for_replay(&mut restore, &loaded), vec![kept]);
         assert!(restore.is_none(), "快照回放即消费，下一次取回重新拍");
         assert!(take_hidden_for_replay(&mut restore, &loaded).is_empty());
+    }
+
+    /// 重装前那一轮 ensure 的流水账：三档回执各记各的，失败不吞——「三维已就绪」
+    /// 后面那半句就是靠它说出「哪几个范围可能仍是旧几何」。没有范围可核对时不多嘴。
+    #[test]
+    fn ensure_tally_counts_generated_cached_and_failed_separately() {
+        let reply = |status, generated, cached| model_update_api::EnsureReply {
+            status,
+            generation_root: String::new(),
+            model_available: true,
+            generation_root_count: generated + cached,
+            cached_root_count: cached,
+            generated_root_count: generated,
+        };
+        let mut tally = ReloadEnsureTally::default();
+        assert_eq!(tally.summary(), None, "没有范围目标就不该多嘴");
+
+        tally.note(&Ok(reply(model_update_api::EnsureStatus::Generated, 2, 5)));
+        tally.note(&Ok(reply(
+            model_update_api::EnsureStatus::AlreadyAvailable,
+            0,
+            3,
+        )));
+        tally.note(&Err(anyhow::anyhow!("connection refused")));
+        assert_eq!(
+            tally,
+            ReloadEnsureTally {
+                targets: 3,
+                generated_roots: 2,
+                cached_roots: 8,
+                failed_targets: 1,
+            }
+        );
+        let line = tally.summary().unwrap();
+        assert!(line.contains("核对 3 个范围"), "{line}");
+        assert!(line.contains("重算 2 个生成根、命中 8 个"), "{line}");
+        assert!(line.contains("1 个范围核对失败"), "{line}");
+
+        let mut clean = ReloadEnsureTally::default();
+        clean.note(&Ok(reply(
+            model_update_api::EnsureStatus::AlreadyAvailable,
+            0,
+            4,
+        )));
+        let line = clean.summary().unwrap();
+        assert!(!line.contains("失败"), "全部命中时不该提失败：{line}");
     }
 
     #[test]
@@ -4727,8 +5683,15 @@ impl App {
             self.queue.applying(),
             &self.mdb,
             self.queue.health.as_ref().map(|health| health.sync_live),
+            self.queue.execution_blocked_reason(),
             &self.model_update,
             &mut self.model_update_state,
+        ));
+        cmds.extend(model_regenerate::show(
+            ui.ctx(),
+            &t,
+            d,
+            self.regenerate.as_ref(),
         ));
         cmds.extend(room_browser::show(
             ui.ctx(),

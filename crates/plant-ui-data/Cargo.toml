@@ -11,6 +11,12 @@ futures = "0.3"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio.workspace = true
+# 名称子串搜索的本地 ngram 索引（ADR-0023）。浏览器端不建索引，因此只进本组；
+# 模块 name_index 整体带同一条 cfg 门。
+tantivy = "0.26.1"
+# 陈旧戳的分组计数（`SELECT dbnum, count() AS rows … GROUP BY dbnum`）要一个
+# 具名结构体来接。锁里早就有它，不新增下载。
+serde.workspace = true
 
 [dev-dependencies]
 # 几何类集成测试（winding_probe / bran_*）用，锁到与 rs-core 同一个 glam 版本，

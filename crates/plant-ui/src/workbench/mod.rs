@@ -9,6 +9,7 @@ pub mod logs;
 pub mod panes;
 pub mod props;
 pub mod room;
+pub mod search;
 pub mod tree;
 pub mod view3d;
 pub mod viewcube;
@@ -44,6 +45,7 @@ pub struct WorkbenchState {
     dock: DockState<Pane>,
     command: command_line::State,
     queue: crate::task_queue::State,
+    search: search::State,
 }
 
 impl Default for WorkbenchState {
@@ -67,6 +69,7 @@ impl Default for WorkbenchState {
             dock,
             command: command_line::State::default(),
             queue: crate::task_queue::State::default(),
+            search: search::State::default(),
         }
     }
 }
@@ -107,7 +110,9 @@ pub fn show(
         .exact_size(d.title_bar_h() + 1.0)
         .frame(egui::Frame::NONE)
         .show_separator_line(false)
-        .show(ui, |ui| chrome::title_bar(ui, t, d, vm));
+        .show(ui, |ui| {
+            chrome::title_bar(ui, t, d, vm, &mut state.search, &mut cmds)
+        });
     egui::Panel::top("wb-command")
         .exact_size(d.command_bar_h() + 1.0)
         .frame(egui::Frame::NONE)
@@ -126,6 +131,7 @@ pub fn show(
                 dock,
                 command,
                 queue: queue_state,
+                search: _,
             } = state;
             let mut viewer = panes::Viewer {
                 t,

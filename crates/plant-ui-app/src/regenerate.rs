@@ -1,6 +1,9 @@
 //! 「重新生成模型」的纯逻辑：把已生成元素归并成生成根、把服务端回执分档。
 //!
 //! 这里一行 IO 都不做，全部可单测。状态机与接线在 `main.rs`。
+//!
+//! 确认框那句提示词不在这里——它在绘制层的 `plant_ui::model_regenerate`，
+//! 和画出它的那个窗口在一起。同一句话摆两份就是两份要维护的口径。
 
 use std::collections::{HashMap, HashSet};
 
@@ -9,9 +12,13 @@ use plant_ui_data::{GeneratedScope, RefU64};
 
 use crate::model_update_api::EnsureStatus;
 
-/// 恒不做生成根的粗层级名词。**只有一处用到**：判断右键那一行本身能不能直接
-/// 交给 `ensure`。真正的归根不依赖它——交付单元名词表里本来就不可能出现
-/// 这几个（服务端配置解析会把它们剔掉）。
+/// 恒不做生成根的粗层级名词。
+///
+/// **现在没有调用者，这是有意的。** 归根不依赖它——交付单元名词表里本来就不
+/// 可能出现这几个（服务端配置解析会把它们剔掉）。而拿它在客户端预筛候选根
+/// 恰恰是错的：服务端那个 `container` 400 是「两边名词表错开了」唯一的信号，
+/// 提前滤掉就等于把这个分歧永远藏起来（见 [`outcome_of_failure`]）。
+/// 它留在这里，是为了下次有人想加那道预筛时先读到这段话。
 const COARSE_HIERARCHY_NOUNS: [&str; 4] = ["WORL", "WORLD", "SITE", "ZONE"];
 
 pub fn is_coarse_hierarchy_noun(noun: &str) -> bool {
@@ -161,14 +168,6 @@ impl Tally {
         }
         line
     }
-}
-
-/// 确认框那句话。两个数字都来自真实查询，`roots` 标明是上限。
-pub fn confirm_prompt(label: &str, elements: usize, roots: usize) -> String {
-    format!(
-        "将删除 {label} 范围内 {elements} 个已生成元素，归成最多 {roots} 个生成单元重做。\n\
-         中途中断的话，没重做完的那些找不回来。"
-    )
 }
 
 #[cfg(test)]
@@ -415,15 +414,9 @@ mod tests {
         };
         let line = messy.summary(4);
         assert!(line.contains("待重试单元"), "{line}");
-        assert!(line.contains("取回工作"), "后台那几个要说清怎么看到: {line}");
-    }
-
-    /// 确认框必须把「中断会丢」说出来。这是本特性接受「整片删一次」之后
-    /// 唯一的补偿——`model_update` 那边也有一条同型的文案断言。
-    #[test]
-    fn the_confirm_prompt_says_an_interruption_loses_work() {
-        let prompt = confirm_prompt("/ZONE-A", 12431, 340);
-        assert!(prompt.contains("12431") && prompt.contains("340"), "{prompt}");
-        assert!(prompt.contains("找不回来"), "{prompt}");
+        assert!(
+            line.contains("取回工作"),
+            "后台那几个要说清怎么看到: {line}"
+        );
     }
 }

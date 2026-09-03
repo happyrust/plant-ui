@@ -155,6 +155,16 @@ pub enum Cmd {
     ClearLogs,
     /// 提交一条命令；解析与执行由宿主负责。
     SubmitCommand(String),
+    /// 标题栏搜索框：按名称找元素。
+    ///
+    /// 一条命令两路结果：前缀走 `pe.name` 索引（全库范围，毫秒级），子串走本地
+    /// ngram 索引（当前 MDB 范围，亚毫秒）。两路都跟着按键走——子串那一路曾经
+    /// 是秒级的库内逐行扫，只能由回车显式发起，ADR-0023 之后不再是了。
+    SearchElements {
+        query: String,
+    },
+    /// 关掉搜索：结果作废，在途的那次回来也不再上屏。
+    CloseSearch,
     /// 打开项目选择窗口。
     OpenProjectPicker,
     /// 使用宿主提供的配置加载一个项目。
@@ -257,9 +267,13 @@ pub enum Cmd {
     ///
     /// 这一条只发起**清点**：宿主先跑 deep query 数出「多少个已生成元素、归成多少个
     /// 生成单元」，把数字摆进确认框，等 [`Self::RegenerateConfirm`] 才动手。
-    RegenerateModels { targets: Vec<aios_core::RefU64> },
+    RegenerateModels {
+        targets: Vec<aios_core::RefU64>,
+    },
     /// 确认框的回执。`false`（取消 / 关窗）时一个请求都不发。
-    RegenerateConfirm { accepted: bool },
+    RegenerateConfirm {
+        accepted: bool,
+    },
     /// 「停在这里」。**只停派发**：已经发出去的那一个停不了——服务端那边是
     /// `await_background_without_cancelling`，连超时都不杀后台任务。所以按钮文案
     /// 里不许出现「取消」，见 `model_regenerate::STOP_LABEL`。

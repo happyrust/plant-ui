@@ -13,7 +13,14 @@ use crate::style::tokens::{Density, Status, Tokens, radius, space};
 use crate::style::widgets;
 use crate::vm::{ModelLoadVm, WorkbenchVm};
 
-pub fn title_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
+pub fn title_bar(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    vm: &WorkbenchVm,
+    search: &mut super::search::State,
+    cmds: &mut Vec<Cmd>,
+) {
     // 栏体(Frame)与 hairline 必须严丝合缝：全局 item_spacing.y=6 会把
     // hairline 推出面板裁剪区（Panel 只比栏体高 1px）。
     ui.spacing_mut().item_spacing.y = 0.0;
@@ -55,7 +62,7 @@ pub fn title_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
                     );
                     avatar(ui, t, d, &vm.user);
                     divider(ui, t, d);
-                    search_box(ui, t, d, d.px(320.0), "搜索元素、REFNO 或命令", "Ctrl K");
+                    super::search::search_box(ui, t, d, vm, search, cmds);
                 });
             });
         });
@@ -110,7 +117,11 @@ pub fn command_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: 
                                 d,
                                 ph::ARROW_CLOCKWISE,
                                 label,
-                                if busy || regen { "请稍候" } else { "GET WORK" },
+                                if busy || regen {
+                                    "请稍候"
+                                } else {
+                                    "GET WORK"
+                                },
                             ),
                         )
                         .on_disabled_hover_text(if busy {
@@ -124,15 +135,13 @@ pub fn command_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: 
                         cmds.push(Cmd::GetWork);
                         ui.close();
                     }
-                    // 取回工作只取界面。设计库里还躺着没应用的会话时，
+                    // 取回工作只取界面。设计库里还躺着没应用的保存时，
                     // 这一行是唯一告诉人「该去的是另一个入口」的地方。
-                    if let Some(pending) = vm.pending_sessions.filter(|n| *n > 0) {
+                    if let Some(pending) = vm.pending_saves.filter(|p| !p.is_empty()) {
                         ui.label(
-                            RichText::new(format!(
-                                "设计库还有 {pending} 个会话未应用 · 去「模型更新」"
-                            ))
-                            .font(Font::micro(d))
-                            .color(t.text_muted),
+                            RichText::new(pending_saves_hint(pending))
+                                .font(Font::micro(d))
+                                .color(t.text_muted),
                         );
                     }
                 });
@@ -532,50 +541,47 @@ fn open_menu_marker(ui: &mut Ui, t: &Tokens, d: Density, response: &egui::Respon
     }
 }
 
-/// 纯视觉搜索框（M1-1）；真实的命令面板 / 搜索交互不在本里程碑。
-fn search_box(ui: &mut Ui, t: &Tokens, d: Density, width: f32, placeholder: &str, key: &str) {
-    let h = d.px(26.0);
-    let (rect, _) = ui.allocate_exact_size(vec2(width, h), Sense::click());
-    let cr = CornerRadius::same(radius::MD);
-    ui.painter().rect_filled(rect, cr, t.bg_input);
-    ui.painter().rect_stroke(
-        rect,
-        cr,
-        Stroke::new(1.0_f32, t.border),
-        egui::StrokeKind::Inside,
-    );
-    let pad = d.px(10.0);
-    let ig = ui.painter().layout_no_wrap(
-        ph::MAGNIFYING_GLASS.to_owned(),
-        egui::FontId::new(d.px(13.0), egui::FontFamily::Proportional),
-        t.text_muted,
-    );
-    let iw = ig.size().x;
-    ui.painter().galley(
-        pos2(rect.left() + pad, rect.center().y - ig.size().y / 2.0),
-        ig,
-        t.text_muted,
-    );
-    let pg = ui
-        .painter()
-        .layout_no_wrap(placeholder.to_owned(), Font::meta(d), t.text_muted);
-    ui.painter().galley(
-        pos2(
-            rect.left() + pad + iw + d.px(8.0),
-            rect.center().y - pg.size().y / 2.0,
-        ),
-        pg,
-        t.text_muted,
-    );
-    let kg = ui
-        .painter()
-        .layout_no_wrap(key.to_owned(), Font::mono_micro(d), t.text_muted);
-    ui.painter().galley(
-        pos2(
-            rect.right() - pad - kg.size().x,
-            rect.center().y - kg.size().y / 2.0,
-        ),
-        kg,
-        t.text_muted,
-    );
+/// 取回工作旁那行提示。说「保存」不说「会话」（ADR-0019）；「需初始化」单独一句，
+/// 它不是「N 次保存」的一部分（那些库契约不为它解保存区间，CONTEXT.md「需初始化」）。
+fn pending_saves_hint(pending: crate::task_queue::PendingSaves) -> String {
+    let mut parts = Vec::new();
+    if pending.saves > 0 {
+        parts.push(format!("设计库还有 {} 次保存未应用", pending.saves));
+    }
+    if pending.uninitialized > 0 {
+        parts.push(format!("{} 个库需初始化", pending.uninitialized));
+    }
+    parts.push("去「模型更新」".to_owned());
+    parts.join(" · ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pending_saves_hint;
+    use crate::task_queue::PendingSaves;
+
+    /// 文案按 ADR-0019 说「保存」；需初始化的库单独一句，不并进保存次数。
+    #[test]
+    fn the_pending_saves_hint_speaks_saves_and_keeps_uninitialized_apart() {
+        assert_eq!(
+            pending_saves_hint(PendingSaves {
+                saves: 8,
+                uninitialized: 0,
+            }),
+            "设计库还有 8 次保存未应用 · 去「模型更新」"
+        );
+        assert_eq!(
+            pending_saves_hint(PendingSaves {
+                saves: 8,
+                uninitialized: 2,
+            }),
+            "设计库还有 8 次保存未应用 · 2 个库需初始化 · 去「模型更新」"
+        );
+        let only_init = pending_saves_hint(PendingSaves {
+            saves: 0,
+            uninitialized: 1,
+        });
+        assert_eq!(only_init, "1 个库需初始化 · 去「模型更新」");
+        assert!(!only_init.contains("会话"), "界面上不说会话号：{only_init}");
+    }
 }

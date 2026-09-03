@@ -19,6 +19,10 @@
 //! - db8001：CATA，非 DESI 不进本期执行范围；
 //! - 数据批次跑空后收一轮房间归属重算（泳道 Converging → Converged）。
 //!
+//! 另有一档服务形态开关 `PLANT_UI_SIM_SERVICE=direct-no-worker`（见 [`ServiceMode`]）：
+//! 演 gen-model 以 direct 形态运行、没起 worker——预览照常、执行入口该灰、入了队的
+//! 批次永远排队。
+//!
 //! 时间一律用 `chrono`（wasm 上 `std::time::Instant` 不可用；虽然浏览器端读不到
 //! 环境变量、引擎永远不会被构造，但这个模块要在两个目标上都编译过）。
 
@@ -62,6 +66,43 @@ pub fn enabled() -> bool {
             .map(|v| !v.is_empty() && v != "0")
             .unwrap_or(false)
     })
+}
+
+/// 剧本演的是哪一种服务形态。`PLANT_UI_SIM_SERVICE=direct-no-worker` 演「gen-model 以
+/// direct 形态运行、没起数据批次 worker」：`/health` 报 `data_read_mode = "direct"`、
+/// `worker_alive = null`（与真服务 `handlers.rs` 逐字相同），入队的批次**永远排队**——
+/// 这正是 M1 要让界面拦下来的形状。缺省演有 worker 的老形态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceMode {
+    Legacy,
+    DirectNoWorker,
+}
+
+impl ServiceMode {
+    fn from_env() -> Self {
+        Self::parse(std::env::var("PLANT_UI_SIM_SERVICE").ok().as_deref())
+    }
+
+    fn parse(raw: Option<&str>) -> Self {
+        match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("direct-no-worker") | Some("direct_no_worker") => Self::DirectNoWorker,
+            _ => Self::Legacy,
+        }
+    }
+
+    fn data_read_mode(self) -> &'static str {
+        match self {
+            Self::Legacy => "db",
+            Self::DirectNoWorker => "direct",
+        }
+    }
+
+    fn worker_alive(self) -> Option<bool> {
+        match self {
+            Self::Legacy => Some(true),
+            Self::DirectNoWorker => None,
+        }
+    }
 }
 
 fn stamp(at: DateTime<Utc>) -> String {
@@ -370,16 +411,18 @@ pub struct Engine {
     last_activity: DateTime<Utc>,
     seq: u32,
     tree: SimTree,
+    service: ServiceMode,
 }
 
 impl Engine {
     pub fn from_env() -> Option<Self> {
-        enabled().then(Self::new)
+        enabled().then(|| Self::new(ServiceMode::from_env()))
     }
 
-    fn new() -> Self {
+    fn new(service: ServiceMode) -> Self {
         let now = Utc::now();
         Engine {
+            service,
             service_started_at: now - Duration::minutes(10),
             epoch: now,
             dbs: script(),
@@ -442,6 +485,50 @@ impl Engine {
         ]
     }
 
+    /// 剧本里的名称搜索：一次回两路（前缀 / 子串），与真链路同形。
+    ///
+    /// 两路在这里是同一段内存过滤，只按「开头 / 中间」分拣——几十个节点，分不出
+    /// 快慢，也就没有真链路上那条「前缀打库、子串查本地索引」的分界可演。分拣
+    /// 口径必须一致：一条既开头又中间含的名字只算前缀那一路，不许在下拉里出现两次。
+    pub fn search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> (Vec<plant_ui_data::NameHit>, Vec<plant_ui_data::NameHit>) {
+        let needle = query.trim().to_uppercase();
+        let bare = needle.trim_start_matches('/');
+        let dbnum = self
+            .dbs
+            .iter()
+            .find(|db| db.db_type == "DESI")
+            .map_or(0, |db| db.dbnum);
+        let (mut prefix, mut substring) = (Vec::new(), Vec::new());
+        for node in self.tree.nodes.values() {
+            let name = node.name.to_uppercase();
+            let starts = name.starts_with(&needle) || name.starts_with(&format!("/{needle}"));
+            if !starts && !name.contains(bare) {
+                continue;
+            }
+            let hit = plant_ui_data::NameHit {
+                refno: node.refno.refno(),
+                name: node.name.clone(),
+                noun: node.noun.clone(),
+                dbnum,
+            };
+            if starts { &mut prefix } else { &mut substring }.push(hit);
+        }
+        for lane in [&mut prefix, &mut substring] {
+            lane.sort_by(|a, b| a.name.cmp(&b.name));
+            lane.truncate(limit);
+        }
+        (prefix, substring)
+    }
+
+    /// 剧本里「索引」的规模。子串那一路永远就绪，日志照真链路的句式说这个数。
+    pub fn name_count(&self) -> u64 {
+        self.tree.nodes.len() as u64
+    }
+
     pub fn resolve_name(&self, name: &str) -> Option<RefU64> {
         let name = name.trim();
         self.tree
@@ -475,15 +562,6 @@ impl Engine {
                 .collect(),
             failed: Vec::new(),
         }
-    }
-
-    /// 与真查询同口径：DESI、登记过（applied > 0）、文件比水位新。
-    pub fn pending_sessions(&self) -> u32 {
-        self.dbs
-            .iter()
-            .filter(|db| db.db_type == "DESI" && db.applied > 0 && db.latest > db.applied)
-            .map(|db| (db.latest - db.applied) as u32)
-            .sum()
     }
 
     // ------------------------------------------------ 预览与执行
@@ -727,8 +805,9 @@ impl Engine {
                 started_at: stamp(self.service_started_at),
                 gen_spatial_tree: true,
                 queue_paused: self.paused,
-                worker_alive: Some(true),
+                worker_alive: self.service.worker_alive(),
                 worker_idle_secs: Some((now - self.last_activity).num_seconds().max(0) as u64),
+                data_read_mode: Some(self.service.data_read_mode().into()),
                 delivery_unit_types: ["BRAN", "HANG", "SUPPO", "EQUI"]
                     .map(str::to_owned)
                     .to_vec(),
@@ -741,6 +820,11 @@ impl Engine {
                 .map(|db| DbnumStatus {
                     dbnum: db.dbnum,
                     db_type: db.db_type.into(),
+                    // 与真服务同口径：登记过 = 有权威水位（applied > 0）。取回工作旁那行
+                    // 「N 次保存未应用」从这两端算。
+                    applied_sesno: db.applied,
+                    file_latest_sesno: db.latest,
+                    initialized: db.applied > 0,
                     anomaly: db.anomaly.clone(),
                     blocked: db.blocked,
                     excluded: db.db_type != "DESI",
@@ -913,6 +997,11 @@ impl Engine {
     }
 
     fn step_worker(&mut self, now: DateTime<Utc>, out: &mut Vec<Evt>) {
+        // direct 形态没有 worker：入了队的批次谁也不出队，永远「排队中」。
+        // 界面上该拦的是入口（M1），不是把这里演成会跑。
+        if self.service == ServiceMode::DirectNoWorker {
+            return;
+        }
         // 推进正在跑的批次。
         if let Some(idx) = self.batches.iter().position(SimBatch::running) {
             let batch = &mut self.batches[idx];
@@ -1471,7 +1560,38 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
             let result = engine.resolve_name(&name);
             Evt::ResolvedName(name, Ok(result))
         }
+        Req::SearchElements { epoch, query } => {
+            let (prefix, substring) = engine.search(&query, crate::data::SEARCH_LIMIT);
+            Evt::SearchElements {
+                epoch,
+                query,
+                prefix: Ok(prefix),
+                substring: crate::search_index::SubstringHits::Hits(substring),
+            }
+        }
+        // 剧本里索引永远就绪：语料就在内存里，没有建与开这回事。
+        Req::CheckSearchIndex | Req::RebuildSearchIndex => Evt::SearchIndex(
+            crate::search_index::SearchIndexState::Ready(engine.name_count()),
+        ),
         Req::Ancestors(refno) => Evt::Ancestors(refno, Ok(engine.ancestors(refno))),
+        // 剧本里没有 `inst_relate`，「已经生成过多少」无从数起。回一句失败而不是
+        // 零——零在确认框那边长得像「这一片本来就没生成过模型」。
+        Req::RegenerateScope { epoch, .. } => Evt::RegenerateScope {
+            epoch,
+            result: Err(anyhow::anyhow!("演示模式没有模型库，数不出已生成的元素")),
+        },
+        // 清点在剧本里就失败了，这两条到不了这里。真到了也不许装作删过 /
+        // 做过：那会让人以为演示模式动过库。
+        Req::RegenerateDelete { epoch, .. } => Evt::RegenerateDeleted {
+            epoch,
+            deleted: 0,
+            result: Err(anyhow::anyhow!("演示模式没有模型库，删不了模型产物")),
+        },
+        Req::RegenerateUnit { epoch, index, .. } => Evt::RegenerateUnit {
+            epoch,
+            index,
+            result: Err(anyhow::anyhow!("演示模式没有模型服务，生成不了模型")),
+        },
         Req::ModelUpdatePreview { .. } => Evt::ModelUpdatePreview(Ok(engine.preview())),
         Req::ModelUpdateExecute {
             dbnums,
@@ -1485,7 +1605,6 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
             branches,
             reload_models,
         } => Evt::GetWork(Ok(engine.get_work(&branches, reload_models))),
-        Req::PendingSessions => Evt::PendingSessions(Ok(engine.pending_sessions())),
         Req::QueuePoll { .. } => Evt::QueuePoll(Ok(engine.poll())),
         Req::QueueSetPaused { paused, .. } => {
             engine.set_paused(paused);
@@ -1509,7 +1628,7 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
             label,
             result: Ok(query_fixture(&tool, &arguments)),
         },
-        Req::Models(..) | Req::ModelScopes { .. } => {
+        Req::Models { .. } | Req::ModelScopes { .. } => {
             unreachable!("模型请求已在桥上路由到专用通道")
         }
     };

@@ -41,6 +41,7 @@ jobs:
           Copy-Item target/release/plant-ui-app.exe "$name/"
           Copy-Item DbOption.toml "$name/"
           Copy-Item resource "$name/resource" -Recurse
+          Copy-Item web/public/assets "$name/assets" -Recurse
           Compress-Archive -Path "$name/*" -DestinationPath "$name.zip"
 
           $wasmName = "plant-ui-$env:GITHUB_REF_NAME-wasm"

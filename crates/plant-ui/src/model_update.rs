@@ -989,6 +989,11 @@ pub enum FailForm {
     IdentityMismatch,
     /// 504 · timeout：连不上或超时。
     Timeout,
+    /// 422 · worker_disabled：服务以 direct 形态运行、没起数据批次 worker，执行请求
+    /// 入队后没人出队。本地闸门（`task_queue::Vm::can_execute`）按 `/health` 拦下时
+    /// 也用同一个 code 合成；服务端若在 direct 下直接拒绝（gen-model G1 的备选路径）
+    /// 也走这一格。预览不受影响——它不需要 worker。
+    WorkerDisabled,
     /// 其余一律 500 · internal——**只有这一类**才需要把原始 message 摊出来。
     Internal,
 }
@@ -998,6 +1003,7 @@ impl Failure {
         match self.code.as_str() {
             "identity_mismatch" => FailForm::IdentityMismatch,
             "timeout" => FailForm::Timeout,
+            "worker_disabled" => FailForm::WorkerDisabled,
             _ => FailForm::Internal,
         }
     }
@@ -1016,6 +1022,7 @@ impl FailForm {
         match self {
             Self::IdentityMismatch => "范围与模型服务对不上",
             Self::Timeout => "连不上模型服务",
+            Self::WorkerDisabled => "模型服务此刻不消化执行请求",
             Self::Internal => "模型服务出错",
         }
     }
@@ -1026,6 +1033,9 @@ impl FailForm {
                 "请求的 project / MDB / namespace 与模型服务的固定范围不一致。确认当前数据源与模型服务连的是同一套项目配置，再重新预览。"
             }
             Self::Timeout => "模型服务没有响应。没有任何数据被改动，可以直接重试。",
+            Self::WorkerDisabled => {
+                "模型服务以 direct 形态运行，没有启动数据批次 worker：预览照常，但执行请求入队后不会被处理。没有任何数据被改动。等服务端切换形态或联系管理员后再试。"
+            }
             Self::Internal => "服务端未能完成这次请求。原始信息收在下面的详情里。",
         }
     }
@@ -1034,13 +1044,14 @@ impl FailForm {
         match self {
             Self::IdentityMismatch => ph::LINK_BREAK,
             Self::Timeout => ph::WARNING,
+            Self::WorkerDisabled => ph::PAUSE_CIRCLE,
             Self::Internal => ph::WARNING_CIRCLE,
         }
     }
 
     fn tone(self) -> Status {
         match self {
-            Self::IdentityMismatch => Status::Warn,
+            Self::IdentityMismatch | Self::WorkerDisabled => Status::Warn,
             _ => Status::Error,
         }
     }
@@ -1240,6 +1251,11 @@ fn selection(preview: &Preview, state: &State) -> Selection {
 /// `applying` 是此刻正在应用的数据批次数（队列快照里本项目 `running` 的行，
 /// 由 `task_queue::Vm::applying` 算出）。预览与批次并发时，正在被应用的会话会被
 /// 算进「待应用」，S2 拿它标注「N 个库正在应用，数字可能偏大」（ADR-0011）。
+///
+/// `execution_blocked` 是「执行请求此刻为什么会白点」（`task_queue::Vm::execution_blocked_reason`）：
+/// `Some` 时「开始更新」与「确认并开始」灰掉并把原因摆在旁边；预览不受影响——
+/// 它不需要 worker 在场。
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ctx: &egui::Context,
     t: &Tokens,
@@ -1248,6 +1264,7 @@ pub fn show(
     applying: usize,
     scope_mdb: &str,
     sync_live: Option<bool>,
+    execution_blocked: Option<&str>,
     vm: &Vm,
     state: &mut State,
 ) -> Vec<Cmd> {
@@ -1300,7 +1317,17 @@ pub fn show(
                 }
             });
 
-            footer(ui, t, d, footer_h, api_url, vm, state, &mut cmds);
+            footer(
+                ui,
+                t,
+                d,
+                footer_h,
+                api_url,
+                execution_blocked,
+                vm,
+                state,
+                &mut cmds,
+            );
         });
     cmds
 }
@@ -1494,6 +1521,7 @@ fn footer(
     d: Density,
     h: f32,
     api_url: &str,
+    execution_blocked: Option<&str>,
     vm: &Vm,
     state: &mut State,
     cmds: &mut Vec<Cmd>,
@@ -1507,7 +1535,7 @@ fn footer(
     let mut ui = child(ui, rect.shrink2(vec2(d.px(16.0), 0.0)), Align::Center);
     ui.spacing_mut().item_spacing.x = d.px(8.0);
 
-    let (icon, hint, tone) = footer_hint(vm, state, api_url);
+    let (icon, hint, tone) = footer_hint(vm, state, api_url, execution_blocked);
     let (fg, _) = t.status(tone);
     let (mark, _) = ui.allocate_exact_size(vec2(d.px(14.0), d.px(14.0)), Sense::hover());
     glyph(&ui, mark.center(), icon, d.px(13.0), fg);
@@ -1522,16 +1550,31 @@ fn footer(
     );
 
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        footer_actions(ui, t, d, vm, state, cmds);
+        footer_actions(ui, t, d, execution_blocked, vm, state, cmds);
     });
 }
 
-fn footer_hint(vm: &Vm, state: &State, api_url: &str) -> (&'static str, String, Status) {
+fn footer_hint(
+    vm: &Vm,
+    state: &State,
+    api_url: &str,
+    execution_blocked: Option<&str>,
+) -> (&'static str, String, Status) {
     match vm {
         Vm::Loading => (
             ph::LOCK_SIMPLE,
             "预览为只读：不修改元素数据、模型或已应用会话号；关闭窗口不影响后台扫描".into(),
             Status::Neutral,
+        ),
+        // 服务此刻不消化执行请求：这句要顶掉「预览为只读」——人对着一份预览、
+        // 按钮却灰着，唯一用得上的信息就是为什么。
+        Vm::Ready(preview) if !preview.up_to_date && execution_blocked.is_some() => (
+            ph::PAUSE_CIRCLE,
+            format!(
+                "{}。预览照常可看，执行要等服务端",
+                execution_blocked.unwrap_or_default()
+            ),
+            Status::Warn,
         ),
         Vm::Ready(preview) if !preview.up_to_date && state.step == Step::Confirm => (
             ph::WARNING,
@@ -1551,6 +1594,7 @@ fn footer_actions(
     ui: &mut Ui,
     t: &Tokens,
     d: Density,
+    execution_blocked: Option<&str>,
     vm: &Vm,
     state: &mut State,
     cmds: &mut Vec<Cmd>,
@@ -1589,12 +1633,16 @@ fn footer_actions(
             // 批次数按勾选集折算（§2-G 主按钮），不再是全部可执行库数。
             let sel = selection(preview, state);
             if state.step == Step::Confirm {
+                // 服务此刻不消化执行请求（direct 无 worker / worker 已死）：确认键灰掉。
+                // 人在确认页上等着服务端起来，这里的判定随每拍 /health 变，不用退回预览。
                 if ui
-                    .add(
+                    .add_enabled(
+                        execution_blocked.is_none(),
                         widgets::button(t, d, &format!("确认并开始 · {} 个数据批次", sel.batches))
                             .icon(ph::PLAY)
                             .primary(),
                     )
+                    .on_disabled_hover_text(execution_blocked.unwrap_or_default())
                     .clicked()
                 {
                     // 勾选集折算成 execute 的 `dbnums[]`（ADR-020）。总是显式给
@@ -1609,7 +1657,8 @@ fn footer_actions(
             } else {
                 // 一个批次都没勾时，待重试单元自己也够成一次运行（契约明写没有
                 // 新 sesno 也要显示并允许重试）——死信不算。
-                let executable = sel.batches > 0 || preview.retries_to_run().next().is_some();
+                let has_work = sel.batches > 0 || preview.retries_to_run().next().is_some();
+                let executable = has_work && execution_blocked.is_none();
                 if ui
                     .add_enabled(
                         executable,
@@ -1617,7 +1666,11 @@ fn footer_actions(
                             .icon(ph::PLAY)
                             .primary(),
                     )
-                    .on_disabled_hover_text("没有勾选的数据批次，也没有待重试单元")
+                    .on_disabled_hover_text(
+                        // 先说服务不消化——那才是真正的原因；有活可干但服务不接，
+                        // 「没有勾选的批次」这句就是在说反话。
+                        execution_blocked.unwrap_or("没有勾选的数据批次，也没有待重试单元"),
+                    )
                     .clicked()
                 {
                     state.step = Step::Confirm;
@@ -2822,9 +2875,12 @@ fn failure_body(ui: &mut Ui, t: &Tokens, d: Density, failure: &Failure, state: &
                     }
                 });
             }
-        } else if form == FailForm::IdentityMismatch && !failure.message.is_empty() {
+        } else if matches!(form, FailForm::IdentityMismatch | FailForm::WorkerDisabled)
+            && !failure.message.is_empty()
+        {
             // 服务端的 message 会点名是 project / mdb / namespace 里哪一项错开
-            // （本地闸门合成的那条则说明身份尚未就绪），它是人接下来唯一用得上的东西。
+            // （本地闸门合成的那条则说明身份尚未就绪 / 服务为何不消化），
+            // 它是人接下来唯一用得上的东西。
             ui.label(
                 RichText::new(&failure.message)
                     .font(Font::mono_meta(d))
@@ -3712,6 +3768,29 @@ mod tests {
         );
     }
 
+    /// 「服务以 direct 形态运行、没起 worker」自己是一格（S2-D）：它不是出错、
+    /// 也不是身份不对——预览照常，只是执行没人消化。归 internal 会把它讲成故障，
+    /// 归 identity_mismatch 会让人去查一处并不存在的配置错位。
+    #[test]
+    fn worker_disabled_is_its_own_fail_form() {
+        let failure = Failure::new(
+            "worker_disabled",
+            "模型服务以 direct 形态运行，未启动数据批次 worker",
+        );
+        assert_eq!(failure.form(), FailForm::WorkerDisabled);
+        assert_eq!(
+            FailForm::WorkerDisabled.tone(),
+            Status::Warn,
+            "不是故障，是形态"
+        );
+        assert!(FailForm::WorkerDisabled.body().contains("预览照常"));
+        assert!(
+            FailForm::WorkerDisabled
+                .body()
+                .contains("没有任何数据被改动")
+        );
+    }
+
     /// 结果摘要按契约字段名解。`status` 是 snake_case 的串，不是数字；
     /// **`batch` 是单数**——合流之后一个任务就是一个数据批次。
     /// 消费者是任务队列视图（`TaskEntry.result`），向导不再跟任何一次运行。
@@ -3837,7 +3916,7 @@ mod tests {
         let mut state = State::default();
 
         state.step = Step::Confirm;
-        let (_, hint, tone) = footer_hint(&vm, &state, API);
+        let (_, hint, tone) = footer_hint(&vm, &state, API, None);
         assert_eq!(tone, Status::Warn);
         assert!(
             hint.contains("不可中途取消"),
@@ -3845,7 +3924,7 @@ mod tests {
         );
 
         state.step = Step::Preview;
-        let (_, hint, tone) = footer_hint(&vm, &state, API);
+        let (_, hint, tone) = footer_hint(&vm, &state, API, None);
         assert_eq!(tone, Status::Neutral);
         assert!(hint.contains("只读"), "{hint}");
 
@@ -3855,8 +3934,34 @@ mod tests {
             ..Default::default()
         });
         state.step = Step::Confirm;
-        let (_, hint, _) = footer_hint(&fresh, &state, API);
+        let (_, hint, _) = footer_hint(&fresh, &state, API, None);
         assert!(hint.contains(API), "{hint}");
+    }
+
+    /// 服务此刻不消化执行请求（direct 无 worker）时，脚注要说的是**为什么按钮灰着**，
+    /// 而且要顶掉「预览为只读」与「不可中途取消」——人对着一份预览、按钮却灰着，
+    /// 唯一用得上的信息就是原因。已是最新的那一份没有按钮，不该被顶掉。
+    #[test]
+    fn a_blocked_service_takes_over_the_footer_hint_on_both_steps() {
+        const API: &str = "http://127.0.0.1:8080";
+        const REASON: &str = "模型服务以 direct 形态运行，未启动数据批次 worker";
+        let vm = Vm::Ready(Preview::default());
+        let mut state = State::default();
+
+        for step in [Step::Preview, Step::Confirm] {
+            state.step = step;
+            let (_, hint, tone) = footer_hint(&vm, &state, API, Some(REASON));
+            assert_eq!(tone, Status::Warn, "{step:?}");
+            assert!(hint.contains(REASON), "{step:?}: {hint}");
+            assert!(!hint.contains("只读"), "{step:?}: {hint}");
+        }
+
+        let fresh = Vm::Ready(Preview {
+            up_to_date: true,
+            ..Default::default()
+        });
+        let (_, hint, _) = footer_hint(&fresh, &state, API, Some(REASON));
+        assert!(hint.contains(API), "已是最新没有按钮可灰：{hint}");
     }
 
     /// 副标题必须点名 MDB。范围由 MDB 定，而服务端与客户端各有一份 `mdb_name`

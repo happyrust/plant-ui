@@ -243,6 +243,7 @@ S2-H 在 S2-B 形态上改五处（含删一行），其余逐格照旧。
 | 范围不一致 | 422 · `identity_mismatch` | 契约 + 本地 | 服务端 `ServiceIdentity::validate`（显式 project / mdb / namespace 与服务不符，message 点名是哪一项）；本地闸门 `task_queue::Vm::can_mutate` 拦下时同码合成、不发请求。两处一个画面 |
 | 已是最新 | 200 | 契约 | `ManualUpdatePreview.up_to_date = true` |
 | 连不上 / 超时 | 504 · `timeout` | 契约 | `ApiError::timeout`，或客户端 600 秒上限到点 |
+| 服务不消化执行请求 | 422 · `worker_disabled` | 契约 + 本地 | 服务以 direct 形态运行、没起数据批次 worker：预览照常，执行入队后没人出队。本地闸门（`task_queue::Vm::can_execute`，读 `/health` 的 `data_read_mode` 与 `worker_alive`）按同一 code 合成；服务端若在 direct 下直接拒绝也走这一格。`Warn` 而非 `Error`——它是形态不是故障；「没有任何数据被改动」这句不许省（2026-09-02 M1） |
 | 其余 | 500 · `internal` | 契约 | **只有这一类**才需要把原始 message 摊出来，且收进「详情」默认折起 |
 
 > ~~「自动同步接管 · 422 · precondition」与「已有任务在跑 · 409 · conflict」~~ 随合流退役

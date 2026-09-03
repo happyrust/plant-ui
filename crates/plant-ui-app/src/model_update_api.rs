@@ -128,6 +128,62 @@ pub async fn query(
     .await
 }
 
+#[derive(Debug, Deserialize)]
+struct TreeNodesReply {
+    source: String,
+    nodes: Vec<aios_core::pdms_types::EleTreeNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TreeAncestorsReply {
+    source: String,
+    refnos: Vec<aios_core::RefnoEnum>,
+}
+
+fn require_direct(source: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        source == "direct",
+        "模型树接口返回了非 direct 数据源: {source}"
+    );
+    Ok(())
+}
+
+pub async fn tree_roots(base: &str) -> anyhow::Result<Vec<aios_core::pdms_types::EleTreeNode>> {
+    let reply: TreeNodesReply = get(base, "/api/v1/tree/roots").await?;
+    require_direct(&reply.source)?;
+    Ok(reply.nodes)
+}
+
+pub async fn tree_children(
+    base: &str,
+    refno: aios_core::RefU64,
+) -> anyhow::Result<Vec<aios_core::pdms_types::EleTreeNode>> {
+    let path = format!(
+        "/api/v1/tree/children?refno={}",
+        urlencode(&refno.to_slash_string())
+    );
+    let reply: TreeNodesReply = get(base, &path).await?;
+    require_direct(&reply.source)?;
+    Ok(reply.nodes)
+}
+
+pub async fn tree_ancestors(
+    base: &str,
+    refno: aios_core::RefU64,
+) -> anyhow::Result<Vec<aios_core::RefU64>> {
+    let path = format!(
+        "/api/v1/tree/ancestors?refno={}",
+        urlencode(&refno.to_slash_string())
+    );
+    let reply: TreeAncestorsReply = get(base, &path).await?;
+    require_direct(&reply.source)?;
+    Ok(reply
+        .refnos
+        .into_iter()
+        .map(|refno| refno.refno())
+        .collect())
+}
+
 /// `None` 必须**整个不发** `dbnums` 键——发 `null` 或空表都不行：老服务端的
 /// 请求体解析没有这个字段，多出来的键无害，但语义上 `Some([])` 是「一个批次
 /// 都不排」，与「全范围」是两个相反的东西，混了会把勾选门变成摆设。
@@ -268,6 +324,9 @@ pub struct EnsureReply {
     /// 服务端解出来的生成根。客户端归根算错时，这一份是唯一的对照物。
     pub generation_root: String,
     pub model_available: bool,
+    pub generation_root_count: usize,
+    pub cached_root_count: usize,
+    pub generated_root_count: usize,
 }
 
 #[derive(Deserialize)]
@@ -278,6 +337,12 @@ struct EnsureBody {
     generation_root: String,
     #[serde(default)]
     model_available: bool,
+    #[serde(default)]
+    generation_root_count: usize,
+    #[serde(default)]
+    cached_root_count: usize,
+    #[serde(default)]
+    generated_root_count: usize,
 }
 
 /// 让一个 refno 有可渲染模型。`force` 只在人明确要求「无论如何重跑一遍」时为真。
@@ -314,6 +379,9 @@ pub async fn ensure_model(
         status: ensure_status(&reply.status),
         generation_root: reply.generation_root,
         model_available: reply.model_available,
+        generation_root_count: reply.generation_root_count,
+        cached_root_count: reply.cached_root_count,
+        generated_root_count: reply.generated_root_count,
     })
 }
 

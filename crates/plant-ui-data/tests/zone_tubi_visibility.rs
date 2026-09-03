@@ -56,3 +56,40 @@ async fn zone_scope_includes_implicit_straight_tubes() {
         "真实 ZONE 应覆盖同一 BRAN 下有多段 TUBI 的回归场景"
     );
 }
+
+/// e3d-model 新直管存储回归：每段是 `inst_relate:derived_*`，不再依赖
+/// `tubi_relate` 边。24383/73948 当前应为 8 个普通构件 + 5 段直管。
+#[tokio::test]
+#[ignore = "需要目标运行环境的 SurrealDB、DbOption.toml 与 mesh 目录"]
+async fn branch_scope_includes_e3d_derived_tubes() {
+    let workspace = std::env::var_os("PLANT_TEST_WORKSPACE").expect("PLANT_TEST_WORKSPACE 未设置");
+    std::env::set_current_dir(workspace).expect("无法切换到目标运行目录");
+    plant_ui_data::connect().await.unwrap();
+
+    let branch = "24383_73948".parse::<plant_ui_data::RefU64>().unwrap();
+    let models = plant_ui_data::model_instances(&[branch]).await.unwrap();
+    let derived = models
+        .iter()
+        .filter(|model| model.generic == "TUBI")
+        .collect::<Vec<_>>();
+
+    println!(
+        "BRAN {branch}: {} models, {} e3d derived TUBI",
+        models.len(),
+        derived.len()
+    );
+    assert_eq!(models.len(), 13, "BRAN 应返回 8 个普通构件和 5 段直管");
+    assert_eq!(derived.len(), 5, "e3d-model 派生直管段数量不一致");
+    for model in derived {
+        assert_eq!(model.refno.refno(), branch);
+        assert_eq!(model.insts.len(), 1);
+        let inst = &model.insts[0];
+        assert!(inst.is_tubi);
+        assert!(inst.geo_hash.starts_with("e3d_baked_v2_"));
+        let path = format!("assets/meshes/{}.mesh", inst.geo_hash);
+        assert!(
+            std::path::Path::new(&path).is_file(),
+            "缺少直段网格：{path}"
+        );
+    }
+}

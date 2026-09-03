@@ -180,10 +180,18 @@ pub struct Health {
     pub gen_spatial_tree: bool,
     #[serde(default)]
     pub queue_paused: bool,
+    /// `None` 有两种来路，界面上必须分得开：老服务端压根不给这个键；或者服务端以
+    /// direct 形态运行、根本没起 worker（gen-model `handlers.rs` 在 direct 下回 `null`）。
+    /// 靠 [`Health::data_read_mode`] 区分。
     #[serde(default)]
     pub worker_alive: Option<bool>,
     #[serde(default)]
     pub worker_idle_secs: Option<u64>,
+    /// `"direct"` = gen-model 以 e3d-io 直读形态运行（gen-model ADR-053）：树与模型
+    /// 从库文件按需读，旧增量 watcher / worker 默认**不启动**——预览照常可用，
+    /// 执行请求会入队却没人出队。老服务端不给这个键 → `None`，视同 `"db"`。
+    #[serde(default)]
+    pub data_read_mode: Option<String>,
     /// 本项目此刻生效的最小交付单元名词表（默认 `[BRAN, HANG, SUPPO, EQUI]`，
     /// 项目配置可整体替换或扩充）。「重新生成模型」按元素归并生成根时只认这一份。
     ///
@@ -211,6 +219,17 @@ pub struct DbnumStatus {
     pub dbnum: u32,
     #[serde(default)]
     pub db_type: String,
+    /// 数据水位：该库已应用到的会话号（`0` = 从未导入，需初始化）。服务端一直给，
+    /// 取回工作旁那行「N 次保存未应用」从这里算（原先直读 SurrealDB 水位表，
+    /// 零解析库那张表是空的）。界面上一律说「保存」不说会话号（ADR-0019）。
+    #[serde(default)]
+    pub applied_sesno: i32,
+    /// 文件此刻自报的最新会话号。与 `applied_sesno` 的差就是待应用的保存次数。
+    #[serde(default)]
+    pub file_latest_sesno: i32,
+    /// 服务端的登记判定：登记过且有权威水位。与 `applied_sesno > 0` 同义，取这一份。
+    #[serde(default)]
+    pub initialized: bool,
     #[serde(default)]
     pub anomaly: Option<FileAnomaly>,
     /// 不入队、不应用，水位不动。五种异常里**只有路径迁移不阻断**。
@@ -234,6 +253,26 @@ pub struct DbnumStatus {
 pub struct DbnumReport {
     #[serde(default)]
     pub dbnums: Vec<DbnumStatus>,
+}
+
+/// 取回工作旁那行提示的材料：本期执行范围内还没应用进模型的东西有多少。
+///
+/// 两个数分开给，不许相加：「需初始化」的库契约不为它解保存区间，`file_latest − applied`
+/// 在它身上是整库的会话数而不是「待应用的保存」，加进去数字就是假的；而它又确实会跑，
+/// 绝不能显示成「无变化」（CONTEXT.md「需初始化」）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PendingSaves {
+    /// 已登记的 DESI 库里，文件比水位新的那部分保存次数之和。
+    pub saves: u32,
+    /// 范围内从未导入过的 DESI 库数。
+    pub uninitialized: usize,
+}
+
+impl PendingSaves {
+    /// 有没有值得提示的东西。两个数都是 0 那一行整个不画。
+    pub fn is_empty(self) -> bool {
+        self.saves == 0 && self.uninitialized == 0
+    }
 }
 
 /// 一次轮询取回来的全部四份。四个请求打包成一次事件，免得界面上四份数据各更新各的、
@@ -454,6 +493,56 @@ impl Vm {
             && !self.mdb.trim().is_empty()
             && !self.namespace.trim().is_empty()
             && self.identity_status() != IdentityStatus::Mismatch
+    }
+
+    /// 执行类写操作（开始更新 / 立刻扫一遍 / 立刻重试）此刻为什么会白点；
+    /// `None` = 服务会消化。
+    ///
+    /// `can_mutate` 管的是**身份**对不对；这一档管的是**服务会不会消化**：
+    /// 执行请求一律 202 入队，服务端不会替界面说「不行」，没人出队就是永远排队。
+    /// 两种形状：worker 明说自己死了（`Some(false)`），或者服务以 direct 形态运行、
+    /// 压根没起 worker（`data_read_mode == "direct"` 且 `worker_alive` 为空——
+    /// direct 下 gen-model 就是这么报的）。老服务端两个键都不给 → 不拦，与今天一致。
+    ///
+    /// 暂停 / 恢复队列**不受它管**：那两个只改调度器旗标，不需要 worker 在场。
+    pub fn execution_blocked_reason(&self) -> Option<&'static str> {
+        let health = self.health.as_ref()?;
+        match (health.worker_alive, health.data_read_mode.as_deref()) {
+            (Some(false), _) => Some("增量 worker 未存活：新批次不会被处理"),
+            (None, Some(mode)) if mode.trim().eq_ignore_ascii_case("direct") => {
+                Some("模型服务以 direct 形态运行，未启动数据批次 worker：预览可用，执行不可用")
+            }
+            _ => None,
+        }
+    }
+
+    /// 身份对得上，且服务会消化。执行类按钮都看它；暂停 / 恢复看 [`Self::can_mutate`]。
+    pub fn can_execute(&self) -> bool {
+        self.can_mutate() && self.execution_blocked_reason().is_none()
+    }
+
+    /// 本期执行范围内还没应用进模型的保存有多少（取回工作旁那行提示的材料）。
+    ///
+    /// 只数**会执行**的 DESI 库：排除、阻断、够不着的都不算——阻断的库水位本来就不会动，
+    /// 把它的差额算进「待应用」等于许诺一件不会发生的事。`/dbnums` 取不到时
+    /// `dbnums` 是空表，算出来两个 0，那一行整个不画，与此前「查不动就不显示」一致。
+    pub fn pending_saves(&self) -> PendingSaves {
+        let mut pending = PendingSaves::default();
+        for db in &self.dbnums {
+            if !db.db_type.trim().eq_ignore_ascii_case("DESI")
+                || db.excluded
+                || db.blocked
+                || db.not_in_project
+            {
+                continue;
+            }
+            if !db.initialized || db.applied_sesno <= 0 {
+                pending.uninitialized += 1;
+                continue;
+            }
+            pending.saves += (db.file_latest_sesno - db.applied_sesno).max(0) as u32;
+        }
+        pending
     }
 
     /// 此刻正在应用的数据批次数（本项目、`state == "running"` 的队列行）。
@@ -1211,6 +1300,17 @@ fn service_status_banners(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm) {
             ph::X_CIRCLE,
             &format!("增量 worker 未存活{idle}：队列可以查看，但新批次不会被处理。"),
         );
+    } else if vm.execution_blocked_reason().is_some() {
+        // worker 没死，是压根没起：服务以 direct 形态运行。预览照常，执行入队后
+        // 没人出队——不出声的话人只会看见一行永远「排队中」。
+        hint_banner(
+            ui,
+            t,
+            d,
+            Status::Warn,
+            ph::WARNING,
+            "模型服务以 direct 形态运行、未启动数据批次 worker：预览可用，执行不可用（入队的批次不会被处理）。",
+        );
     }
 }
 
@@ -1327,6 +1427,12 @@ fn rebuilt_banner(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm) {
     );
 }
 
+/// 执行类按钮灰着时的悬停说明：先说服务不会消化（那是真正的原因），再说身份。
+fn execution_disabled_hint(vm: &Vm) -> &'static str {
+    vm.execution_blocked_reason()
+        .unwrap_or("当前数据源身份未就绪，或与模型服务固定范围不一致")
+}
+
 fn hint_banner(ui: &mut Ui, t: &Tokens, d: Density, tone: Status, icon: &str, text: &str) {
     let (fg, _) = t.status(tone);
     let rect = strip_rect(ui, t, d.px(28.0), t.bg_header);
@@ -1400,11 +1506,11 @@ fn summary_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, all: &[RowVm], cmds
         }
         if ui
             .add_enabled(
-                vm.can_mutate(),
+                vm.can_execute(),
                 widgets::button(t, d, "立刻扫一遍").icon(ph::ARROWS_CLOCKWISE),
             )
             .on_hover_text("不插队，只是别等下一个 30 秒轮询")
-            .on_disabled_hover_text("当前数据源身份未就绪，或与模型服务固定范围不一致")
+            .on_disabled_hover_text(execution_disabled_hint(vm))
             .clicked()
         {
             cmds.push(Cmd::ScanNow);
@@ -2413,11 +2519,11 @@ fn pending_line(
         }
         if ui
             .add_enabled(
-                vm.can_mutate(),
+                vm.can_execute(),
                 widgets::button(t, d, "立刻重试").icon(ph::ARROW_COUNTER_CLOCKWISE),
             )
             .on_hover_text("清零重试次数并叫醒调度器；不排新的数据批次，结果等下一拍轮询")
-            .on_disabled_hover_text("当前数据源身份未就绪，或与模型服务固定范围不一致")
+            .on_disabled_hover_text(execution_disabled_hint(vm))
             .clicked()
         {
             in_flight.insert(unit.root_refno.clone(), unit.attempts);
@@ -2704,6 +2810,170 @@ mod tests {
             assert_eq!(model.identity_status(), IdentityStatus::Mismatch);
             assert!(!model.can_mutate());
         }
+    }
+
+    /// direct 形态下 gen-model 不起 worker，`/health` 把 `worker_alive` 报成 `null`、
+    /// 另给 `data_read_mode: "direct"`。执行请求会入队却没人出队——这一档必须把
+    /// 执行类按钮灰掉，但暂停 / 恢复（只改调度器旗标）与预览不受影响。
+    #[test]
+    fn direct_mode_without_a_worker_blocks_execution_but_not_pause() {
+        let mut model = vm(Vec::new(), Vec::new());
+        model.health = Some(Health {
+            project: "ProjAMS".into(),
+            mdb: Some("ALL".into()),
+            namespace: Some("plant".into()),
+            data_read_mode: Some("direct".into()),
+            worker_alive: None,
+            ..Default::default()
+        });
+        assert!(model.can_mutate(), "身份对得上，暂停 / 恢复照常");
+        assert!(!model.can_execute());
+        let reason = model.execution_blocked_reason().expect("必须说出原因");
+        assert!(
+            reason.contains("direct") && reason.contains("worker"),
+            "{reason}"
+        );
+
+        // 服务端换了大小写或带空格，判定不许因此失守。
+        model.health.as_mut().unwrap().data_read_mode = Some(" Direct ".into());
+        assert!(!model.can_execute());
+    }
+
+    /// 老服务端两个键都不给：不是 direct，也没说 worker 死了——行为与今天逐字节一致。
+    /// `data_read_mode: "db"` 同理。
+    #[test]
+    fn old_servers_without_data_read_mode_stay_executable() {
+        let mut model = vm(Vec::new(), Vec::new());
+        model.health = Some(Health {
+            project: "ProjAMS".into(),
+            mdb: Some("ALL".into()),
+            namespace: Some("plant".into()),
+            ..Default::default()
+        });
+        assert_eq!(model.execution_blocked_reason(), None);
+        assert!(model.can_execute());
+
+        model.health.as_mut().unwrap().data_read_mode = Some("db".into());
+        assert!(model.can_execute());
+
+        // direct 形态但 worker 已起（gen-model G1 落地后）：不再拦。
+        model.health.as_mut().unwrap().data_read_mode = Some("direct".into());
+        model.health.as_mut().unwrap().worker_alive = Some(true);
+        assert!(model.can_execute());
+
+        // 还没取到过 /health：不知道就不拦，与今天一致。
+        model.health = None;
+        assert!(model.can_execute());
+    }
+
+    /// worker 明说自己死了，比「direct 没起」更要紧，理由要说前者；身份不对时
+    /// `can_execute` 与 `can_mutate` 一起为假。
+    #[test]
+    fn a_dead_worker_outranks_direct_mode_in_the_reason() {
+        let mut model = vm(Vec::new(), Vec::new());
+        model.health = Some(Health {
+            project: "ProjAMS".into(),
+            mdb: Some("ALL".into()),
+            namespace: Some("plant".into()),
+            data_read_mode: Some("direct".into()),
+            worker_alive: Some(false),
+            ..Default::default()
+        });
+        let reason = model.execution_blocked_reason().expect("必须说出原因");
+        assert!(reason.contains("未存活"), "{reason}");
+        assert!(!model.can_execute());
+
+        model.health.as_mut().unwrap().worker_alive = Some(true);
+        model.health.as_mut().unwrap().mdb = Some("/OTHER".into());
+        assert!(!model.can_mutate());
+        assert!(!model.can_execute());
+        assert_eq!(
+            model.execution_blocked_reason(),
+            None,
+            "身份不对是 can_mutate 的账，不在这一档里重复报"
+        );
+    }
+
+    /// 取回工作旁那行提示只数会执行的 DESI：排除 / 阻断 / 够不着的不算，需初始化的
+    /// 单独数——它的 `file_latest − applied` 是整库会话数，不是「待应用的保存」。
+    #[test]
+    fn pending_saves_counts_only_in_scope_desi_and_splits_uninitialized() {
+        let db = |dbnum, db_type: &str, applied, latest| DbnumStatus {
+            dbnum,
+            db_type: db_type.into(),
+            applied_sesno: applied,
+            file_latest_sesno: latest,
+            initialized: applied > 0,
+            ..Default::default()
+        };
+        let mut model = vm(Vec::new(), Vec::new());
+        model.dbnums = vec![
+            db(7997, "DESI", 41, 49),
+            db(8000, "desi", 100, 100),
+            db(8021, "DESI", 0, 66),
+            db(8003, "CATA", 5, 9),
+            DbnumStatus {
+                blocked: true,
+                ..db(8004, "DESI", 20, 30)
+            },
+            DbnumStatus {
+                excluded: true,
+                ..db(8005, "DESI", 20, 30)
+            },
+            DbnumStatus {
+                not_in_project: true,
+                ..db(8006, "DESI", 0, 30)
+            },
+            // 文件回退到水位之下：差额为负，按 0 计，不许变成 u32 回绕。
+            db(8007, "DESI", 50, 40),
+        ];
+        assert_eq!(
+            model.pending_saves(),
+            PendingSaves {
+                saves: 8,
+                uninitialized: 1,
+            }
+        );
+
+        model.dbnums.clear();
+        assert!(
+            model.pending_saves().is_empty(),
+            "取不到 /dbnums 时那一行不画"
+        );
+    }
+
+    /// `/dbnums` 早就带着水位两端，plant-ui 只是没解——解出来才算真接上。
+    #[test]
+    fn dbnum_status_decodes_the_watermark_pair() {
+        let report: DbnumReport = serde_json::from_str(
+            r#"{"dbnums":[{"dbnum":7997,"db_type":"DESI","file_name":"ams7997_0001",
+                "file_path":"C:/p/ams7997_0001","file_size":1,"file_latest_sesno":49,
+                "applied_sesno":41,"initialized":true,"blocked":false,"excluded":false}]}"#,
+        )
+        .unwrap();
+        let db = &report.dbnums[0];
+        assert_eq!((db.applied_sesno, db.file_latest_sesno), (41, 49));
+        assert!(db.initialized);
+
+        let legacy: DbnumStatus = serde_json::from_str(r#"{"dbnum":1,"db_type":"DESI"}"#).unwrap();
+        assert_eq!((legacy.applied_sesno, legacy.file_latest_sesno), (0, 0));
+        assert!(!legacy.initialized);
+    }
+
+    /// `/health` 多出来的 `data_read_mode` 键要真解出来，而不是被 `serde(default)`
+    /// 静默吞成 None——那样 direct 判定永远不会亮。
+    #[test]
+    fn health_decodes_data_read_mode() {
+        let health: Health = serde_json::from_str(
+            r#"{"project":"ProjAMS","mdb":"/ALL","namespace":"plant",
+                "data_read_mode":"direct","worker_alive":null,"worker_idle_secs":null}"#,
+        )
+        .unwrap();
+        assert_eq!(health.data_read_mode.as_deref(), Some("direct"));
+        assert_eq!(health.worker_alive, None);
+
+        let legacy: Health = serde_json::from_str(r#"{"project":"ProjAMS"}"#).unwrap();
+        assert_eq!(legacy.data_read_mode, None);
     }
 
     /// 契约形状对不上是最贵的一类错：终态摘要的 `batch` 是**单数**，

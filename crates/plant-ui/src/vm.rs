@@ -26,12 +26,14 @@ pub struct WorkbenchVm {
     /// 而重新生成中途还会删库里的产物，两条路交叉起来说不清谁踩了谁。
     /// eye 不受影响：显示 / 隐藏改的只是画面。
     pub regen_busy: bool,
-    /// 设计库里还没被应用到模型的会话数；`None` = 还没读到，那一行整个不画。
+    /// 本期执行范围内还没应用进模型的保存有多少；`None` = 还没取到过队列快照，
+    /// 那一行整个不画。
     ///
     /// 摆在取回工作旁边，是为了把两个入口的分工说清楚：取回工作只取界面，
-    /// 真要把这些会话应用进模型得走「模型更新」。它是提示不是判据——
-    /// 数据侧的 `file_latest_sesno` 只有上一次扫描时那么新。
-    pub pending_sessions: Option<u32>,
+    /// 真要把这些保存应用进模型得走「模型更新」。它是提示不是判据——
+    /// 数据来自 `/dbnums` 的上一拍轮询，只有那时那么新。界面上说「保存」不说
+    /// 「会话」（ADR-0019）。
+    pub pending_saves: Option<crate::task_queue::PendingSaves>,
     /// 已加载元素计数（状态栏右侧）。
     pub element_count: usize,
     /// 当前选择集（状态栏 + 属性视图跟随其 `primary`）。
@@ -54,6 +56,8 @@ pub struct WorkbenchVm {
     pub room_detail: RoomDetailVm,
     /// 命令交互视图。
     pub command: CommandVm,
+    /// 标题栏搜索框的查询结果。
+    pub search: SearchVm,
     /// 应用运行日志。
     pub logs: LogsVm,
     /// 三维视口的画面（M1-5 是占位纹理，M3 换成 Bevy 的渲染目标）。
@@ -300,6 +304,65 @@ pub enum CommandLineKind {
     Input,
     Output,
     Error,
+}
+
+/// 标题栏搜索框的查询**结果**。输入串与下拉高亮是绘制状态，不进 Vm。
+///
+/// `query` 与 `running` 分成两个字段，是因为结果总要晚一拍回来：那段时间里手上的
+/// `hits` 仍是上一个查询串的结果，合用一个字段就分不出「这些命中是给谁的」，
+/// 下拉会把旧结果挂在新输入下面。
+#[derive(Debug, Clone, Default)]
+pub struct SearchVm {
+    /// `hits` 与 `sub_hits` 是**哪一个**输入串的结果（原样回显用户输入，
+    /// 绘制层拿它对表）。
+    pub query: String,
+    /// 在途的那次查询；`None` = 没有。
+    pub running: Option<SearchRunVm>,
+    /// 名字**以输入开头**的命中。走库的名称索引，不限设计库，可能含树外元素。
+    pub hits: Vec<SearchHitVm>,
+    /// 名字**中间含输入**的命中。走本地 ngram 索引，范围是当前 MDB 的设计库。
+    pub sub_hits: Vec<SearchHitVm>,
+    /// 子串那一路此刻的状态。它决定下拉里该说哪句话，也决定该不该有子串这一节。
+    pub sub_state: SubIndexVm,
+    /// 任一路命中数触到上限，后面还有没显示出来的。
+    pub truncated: bool,
+    /// 前缀那一路失败的原因。子串那一路的失败在 `sub_state` 里——库断了子串
+    /// 照样能搜，两件事不该合成一句话。
+    pub error: Option<String>,
+    /// 子串能搜的设计库个数（当前 MDB 声明的那些）。0 = 没有可搜的范围。
+    pub scope_dbs: usize,
+}
+
+/// 子串索引这一刻的状态。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SubIndexVm {
+    /// 索引就绪，子串那一节说话算数。
+    Ready,
+    /// 正在建（首次启动或数据变了）。这期间只有前缀那半。
+    Building { done: usize, total: usize },
+    /// 建不起来。带上原因，并告诉人 `reindex` 这个门。
+    Failed(String),
+    /// 这个构建不提供子串搜索（浏览器端），或者还没连上库。
+    #[default]
+    Off,
+}
+
+/// 在途的那次搜索。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchRunVm {
+    pub query: String,
+}
+
+/// 搜索命中的一行。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchHitVm {
+    pub refno: RefU64,
+    /// PDMS 全名，带前导 `/`。
+    pub name: String,
+    pub noun: String,
+    /// 命中落在当前 MDB 的设计库里。false = 树外元素：选得中、看得到属性，
+    /// 但模型树上没有它那一行，下拉里要提前说清楚。
+    pub in_tree: bool,
 }
 
 #[derive(Debug, Clone)]

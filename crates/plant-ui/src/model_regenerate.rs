@@ -5,11 +5,53 @@
 //! 之前，跑完手上正好有「多少个已生成元素」和「归成多少个生成单元」。右键一根
 //! BRAN 时它显示 1 和 1，弹一下不痛不痒；右键错一个 SITE 时它当场把人拦下来。
 
+use std::collections::HashSet;
+
 use egui::RichText;
 
 use crate::Cmd;
 use crate::style::tokens::{Density, Status, Tokens};
 use crate::style::widgets;
+
+/// 本项目此刻生效的最小交付单元名词表（`/api/v1/health` 的 `delivery_unit_types`）。
+///
+/// **空表是「不知道」，不是「没有交付单元」。** 老服务端不给这个键，模型服务
+/// 连不上时更是一个字都没有——两种情形解出来都是空 `Vec`。拿空集合去归根，
+/// 每个元素都会当自己的生成根，确认框上那句「归成最多 N 个生成单元」当场涨
+/// 十几倍；而那正是人拿来判断这一按值不值的数字。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeliveryUnits {
+    Known(HashSet<String>),
+    Unknown,
+}
+
+/// 名词表不知道时，清点停在这里的理由。数不出生成单元数就别摆一个假的。
+pub const UNKNOWN_DELIVERY_UNITS: &str = "模型服务没报交付单元名词表（服务没连上，或版本旧到不带这个键），\
+     数不出这一片会归成多少个生成单元";
+
+impl DeliveryUnits {
+    /// 按 `/health` 那份名单解一次。名词一律折成大写，与归根那侧的比对口径对齐。
+    pub fn from_health(types: &[String]) -> Self {
+        let nouns: HashSet<String> = types
+            .iter()
+            .map(|noun| noun.trim().to_ascii_uppercase())
+            .filter(|noun| !noun.is_empty())
+            .collect();
+        if nouns.is_empty() {
+            Self::Unknown
+        } else {
+            Self::Known(nouns)
+        }
+    }
+
+    /// 归根用的那份名单。`None` = 不知道，这一趟就该停在清点前。
+    pub fn nouns(&self) -> Option<&HashSet<String>> {
+        match self {
+            Self::Known(nouns) => Some(nouns),
+            Self::Unknown => None,
+        }
+    }
+}
 
 /// 「停在这里」而不是「取消」。
 ///
@@ -25,8 +67,31 @@ pub enum Vm {
     Counting { label: String },
     /// 数字出来了，等人按。
     Ready(Plan),
+    /// 删除已经跑完，正在逐个重做。**这一档没有回头路**，所以窗口右上角那个叉
+    /// 也不给：关掉它并不能让库里已经删掉的几何回来，只会让人以为自己躲开了。
+    Running(Progress),
     /// 清点失败。删除一步都还没走，所以这里只有关闭。
     Failed { label: String, reason: String },
+}
+
+/// 一趟重新生成跑到哪儿了。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Progress {
+    pub label: String,
+    /// 已经有结果的生成单元数——成功、跳过、失败都算，它们都不会再动了。
+    pub settled: usize,
+    pub total: usize,
+    /// 「停在这里」按过了。已经发出去的那一个还在服务端跑，停的只是下一个。
+    pub stopping: bool,
+}
+
+impl Progress {
+    fn fraction(&self) -> f32 {
+        if self.total == 0 {
+            return 1.0;
+        }
+        (self.settled as f32 / self.total as f32).clamp(0.0, 1.0)
+    }
 }
 
 /// 清点结果：这一按会付出的代价。
@@ -61,18 +126,23 @@ pub fn show(ctx: &egui::Context, t: &Tokens, d: Density, vm: Option<&Vm>) -> Vec
 
     let mut cmds = Vec::new();
     let mut open = true;
-    egui::Window::new("重新生成模型")
+    // 跑起来之后不给叉。这一档关窗关不掉任何东西——几何已经删了，唯一的出路
+    // 是「停在这里」，而它连已经发出去的那一个都停不了。
+    let closable = !matches!(vm, Vm::Running(_));
+    let mut window = egui::Window::new("重新生成模型")
         .id(egui::Id::new("plant-model-regenerate"))
         .collapsible(false)
         .resizable(false)
-        .open(&mut open)
-        .default_width(460.0)
-        .show(ctx, |ui| {
-            body(ui, t, d, vm, &mut cmds);
-        });
+        .default_width(460.0);
+    if closable {
+        window = window.open(&mut open);
+    }
+    window.show(ctx, |ui| {
+        body(ui, t, d, vm, &mut cmds);
+    });
     // 关窗等于不做。窗口右上角那个叉与「取消」必须是同一件事，不然人以为
     // 自己躲开了这个决定，而那一趟已经开跑了。
-    if !open {
+    if closable && !open {
         cmds.push(Cmd::RegenerateConfirm { accepted: false });
     }
     cmds
@@ -81,7 +151,9 @@ pub fn show(ctx: &egui::Context, t: &Tokens, d: Density, vm: Option<&Vm>) -> Vec
 fn body(ui: &mut egui::Ui, t: &Tokens, d: Density, vm: &Vm, cmds: &mut Vec<Cmd>) {
     match vm {
         Vm::Counting { label } => {
-            ui.label(RichText::new(format!("正在清点 {label} 范围内已生成的模型…")));
+            ui.label(RichText::new(format!(
+                "正在清点 {label} 范围内已生成的模型…"
+            )));
             ui.label(
                 RichText::new("这一步只读，还没有删掉任何东西。")
                     .small()
@@ -91,6 +163,33 @@ fn body(ui: &mut egui::Ui, t: &Tokens, d: Density, vm: &Vm, cmds: &mut Vec<Cmd>)
             ui.horizontal(|ui| {
                 if ui.add(widgets::button(t, d, "取消")).clicked() {
                     cmds.push(Cmd::RegenerateConfirm { accepted: false });
+                }
+            });
+        }
+        Vm::Running(progress) => {
+            ui.label(RichText::new(format!(
+                "{}：{} / {} 个生成单元",
+                progress.label, progress.settled, progress.total
+            )));
+            ui.add(
+                egui::ProgressBar::new(progress.fraction())
+                    .desired_height(d.px(14.0))
+                    .fill(t.accent),
+            );
+            // 已经删了的那些只能靠这一趟回来，这句话在按钮上方而不是事后补。
+            let note = if progress.stopping {
+                "不再派发下一个。已经发出去的那一个停不了，等它自己回来。"
+            } else {
+                "库里这一片已经删空了，只能靠这一趟重做回来。"
+            };
+            ui.label(RichText::new(note).small().color(t.text_muted));
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!progress.stopping, widgets::button(t, d, STOP_LABEL))
+                    .clicked()
+                {
+                    cmds.push(Cmd::RegenerateStop);
                 }
             });
         }
@@ -155,7 +254,8 @@ pub fn tone(vm: &Vm) -> Status {
         Vm::Counting { .. } => Status::Info,
         Vm::Failed { .. } => Status::Error,
         Vm::Ready(plan) if plan.elements == 0 => Status::Neutral,
-        Vm::Ready(_) => Status::Warn,
+        // 删除已经发生了，这一档比 Ready 只重不轻。
+        Vm::Ready(_) | Vm::Running(_) => Status::Warn,
     }
 }
 
@@ -199,6 +299,29 @@ mod tests {
     fn the_stop_button_never_promises_a_cancel() {
         assert!(!STOP_LABEL.contains("取消"), "{STOP_LABEL}");
         assert!(!STOP_LABEL.contains("撤销"), "{STOP_LABEL}");
+    }
+
+    /// 空表必须解成「不知道」。解成空集合的话归根会把每个元素都当生成根，
+    /// 确认框上那个单元数当场涨十几倍，而它长得跟一个真数字一模一样。
+    #[test]
+    fn an_empty_noun_table_means_unknown_not_empty() {
+        assert_eq!(DeliveryUnits::from_health(&[]), DeliveryUnits::Unknown);
+        assert_eq!(
+            DeliveryUnits::from_health(&["  ".to_owned()]),
+            DeliveryUnits::Unknown
+        );
+        assert!(DeliveryUnits::Unknown.nouns().is_none());
+    }
+
+    /// 名词折大写，与归根那侧的比对口径对齐——服务端报小写时不该静默漏掉。
+    #[test]
+    fn the_noun_table_is_compared_in_upper_case() {
+        let units = DeliveryUnits::from_health(&["bran".to_owned(), " Equi ".to_owned()]);
+        let nouns = units.nouns().expect("非空表就是知道");
+        assert!(
+            nouns.contains("BRAN") && nouns.contains("EQUI"),
+            "{nouns:?}"
+        );
     }
 
     /// 空集不是警告。这一档按下去什么都不会发生，给它挂上删除那一档的黄色，

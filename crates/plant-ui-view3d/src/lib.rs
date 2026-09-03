@@ -123,6 +123,29 @@ const DEFAULT_GRID: Color = Color::srgb(0.275, 0.345, 0.416);
 
 pub struct View3dPlugin;
 
+/// World-origin axes are a diagnostic overlay, not model geometry. Keep one
+/// resolved switch for both the Bevy meshes and the egui labels so disabled
+/// mode cannot leave orphan X/Y/Z labels behind.
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq)]
+struct WorldAxesEnabled(bool);
+
+impl Default for WorldAxesEnabled {
+    fn default() -> Self {
+        Self(parse_world_axes_flag(
+            std::env::var("PLANT_UI_WORLD_AXES").ok().as_deref(),
+        ))
+    }
+}
+
+fn parse_world_axes_flag(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 const INVALID_TUBI_LINE_SHADER: Handle<Shader> =
     weak_handle!("fd65ad9b-1e39-4c83-8f44-d03b65fb443d");
 
@@ -139,6 +162,7 @@ impl Plugin for View3dPlugin {
             Shader::from_wgsl
         );
         app.init_resource::<ViewportResizeSync>()
+            .init_resource::<WorldAxesEnabled>()
             .add_plugins(MaterialPlugin::<InvalidTubiLineMaterial> {
                 prepass_enabled: false,
                 shadows_enabled: false,
@@ -820,6 +844,7 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut line_materials: ResMut<Assets<InvalidTubiLineMaterial>>,
+    world_axes: Res<WorldAxesEnabled>,
 ) {
     let image = images.add(viewport_image(INITIAL_SIZE));
     let texture = egui_textures.add_image(image.clone());
@@ -959,43 +984,48 @@ fn setup(
         })),
         Transform::IDENTITY,
     ));
-    // 杆径不跟着臂长等比走：臂长收到一格后按比例算出来的杆会细进亚像素，
-    // 这里单独定在屏幕上约 3px 的粗细上。
-    let rod_mesh = meshes.add(Cylinder::new(0.015, AXIS_CELLS));
-    let tip_mesh = meshes.add(Cone {
-        radius: 0.05,
-        height: AXIS_TIP_HEIGHT,
-    });
-    // 把「+Y 朝向」的圆柱掰到各轴的世界方向上：X 红、Y(PDMS) 绿即 -Z、Z(PDMS) 蓝即 +Y。
-    let axis_rotations = [
-        Quat::from_rotation_z(-FRAC_PI_2),
-        Quat::from_rotation_x(-FRAC_PI_2),
-        Quat::IDENTITY,
-    ];
-    commands
-        .spawn((Transform::IDENTITY, Visibility::Visible, AxesRoot))
-        .with_children(|root| {
-            for (axis, rotation) in axis_rotations.into_iter().enumerate() {
-                let material = materials.add(StandardMaterial {
-                    base_color: AXIS_COLORS[axis],
-                    unlit: true,
-                    ..default()
-                });
-                root.spawn((Transform::from_rotation(rotation), Visibility::Visible))
-                    .with_children(|arm| {
-                        arm.spawn((
-                            Mesh3d(rod_mesh.clone()),
-                            MeshMaterial3d(material.clone()),
-                            Transform::from_xyz(0.0, AXIS_CELLS / 2.0, 0.0),
-                        ));
-                        arm.spawn((
-                            Mesh3d(tip_mesh.clone()),
-                            MeshMaterial3d(material),
-                            Transform::from_xyz(0.0, AXIS_CELLS + AXIS_TIP_HEIGHT / 2.0, 0.0),
-                        ));
-                    });
-            }
+    // 世界原点可能离当前模型很远；拟合模型时原点轴会落到相机近裁剪面附近，
+    // 被透视放大成贯穿视口的红/蓝色条带。视角方向已有 ViewCube 表达，所以
+    // 默认不创建轴 mesh；现场诊断时仍可通过环境变量显式开启。
+    if world_axes.0 {
+        // 杆径不跟着臂长等比走：臂长收到一格后按比例算出来的杆会细进亚像素，
+        // 这里单独定在屏幕上约 3px 的粗细上。
+        let rod_mesh = meshes.add(Cylinder::new(0.015, AXIS_CELLS));
+        let tip_mesh = meshes.add(Cone {
+            radius: 0.05,
+            height: AXIS_TIP_HEIGHT,
         });
+        // 把「+Y 朝向」的圆柱掰到各轴的世界方向上：X 红、Y(PDMS) 绿即 -Z、Z(PDMS) 蓝即 +Y。
+        let axis_rotations = [
+            Quat::from_rotation_z(-FRAC_PI_2),
+            Quat::from_rotation_x(-FRAC_PI_2),
+            Quat::IDENTITY,
+        ];
+        commands
+            .spawn((Transform::IDENTITY, Visibility::Visible, AxesRoot))
+            .with_children(|root| {
+                for (axis, rotation) in axis_rotations.into_iter().enumerate() {
+                    let material = materials.add(StandardMaterial {
+                        base_color: AXIS_COLORS[axis],
+                        unlit: true,
+                        ..default()
+                    });
+                    root.spawn((Transform::from_rotation(rotation), Visibility::Visible))
+                        .with_children(|arm| {
+                            arm.spawn((
+                                Mesh3d(rod_mesh.clone()),
+                                MeshMaterial3d(material.clone()),
+                                Transform::from_xyz(0.0, AXIS_CELLS / 2.0, 0.0),
+                            ));
+                            arm.spawn((
+                                Mesh3d(tip_mesh.clone()),
+                                MeshMaterial3d(material),
+                                Transform::from_xyz(0.0, AXIS_CELLS + AXIS_TIP_HEIGHT / 2.0, 0.0),
+                            ));
+                        });
+                }
+            });
+    }
 }
 
 /// 全屏渐变面片：2×2 的四边形，顶点色下底上顶。配正交 Fixed{2,2} 相机恰好铺满。
@@ -1128,6 +1158,7 @@ fn aim_headlight(
 fn publish_camera(
     mut view: ResMut<View3d>,
     grid: Res<GridState>,
+    world_axes: Res<WorldAxesEnabled>,
     camera: Query<(&Camera, &GlobalTransform), With<ViewCamera>>,
 ) {
     let Ok((camera, transform)) = camera.single() else {
@@ -1140,6 +1171,10 @@ fn publish_camera(
         m.z_axis.to_array(),
     ];
     view.grid_cell_mm = grid.level * MM_PER_WORLD;
+    if !world_axes.0 {
+        view.axis_labels = [None; 3];
+        return;
+    }
     // 标签落在箭尖再往外一个箭头高的位置，跟轴端留出一点空隙。
     let tip = (AXIS_CELLS + AXIS_TIP_HEIGHT * 2.0) * grid.level;
     for (axis, dir) in AXIS_DIRS.into_iter().enumerate() {
@@ -2190,6 +2225,17 @@ mod tests {
     use super::*;
     use bevy::asset::AssetPlugin;
     use bevy::render::mesh::VertexAttributeValues;
+
+    #[test]
+    fn world_axes_are_opt_in_with_explicit_true_values_only() {
+        for enabled in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(parse_world_axes_flag(Some(enabled)), "{enabled}");
+        }
+        for disabled in ["", "0", "false", "off", "no", "unexpected"] {
+            assert!(!parse_world_axes_flag(Some(disabled)), "{disabled}");
+        }
+        assert!(!parse_world_axes_flag(None));
+    }
 
     #[test]
     fn invalid_tubi_line_starts_at_the_connection_origin() {

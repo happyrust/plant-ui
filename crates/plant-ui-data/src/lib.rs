@@ -7,6 +7,10 @@ use anyhow::Result;
 pub use aios_core::pdms_types::EleTreeNode;
 pub use aios_core::{RefU64, RefnoEnum};
 
+/// 名称子串搜索的本地 ngram 索引（ADR-0023）。浏览器端不建索引，整模块只在
+/// 原生端存在——`plant-ui-data` 是 wasm 双端 crate，tantivy 编不进那一端。
+#[cfg(not(target_arch = "wasm32"))]
+pub mod name_index;
 pub mod room;
 
 /// 连接本地 SurrealDB（读取工作目录的 DbOption.toml，走 aios_core 全局句柄 SUL_DB）。
@@ -131,13 +135,27 @@ pub async fn model_instances_anc(
             .await
         })
     });
-    let resolved: Vec<(Vec<aios_core::RefnoEnum>, Vec<aios_core::RefnoEnum>)> =
+    let mut resolved: Vec<(Vec<aios_core::RefnoEnum>, Vec<aios_core::RefnoEnum>)> =
         futures::stream::iter(resolutions)
             .buffered(CONCURRENCY)
             .collect::<Vec<_>>()
             .await
             .into_iter()
             .collect::<Result<_>>()?;
+    // `anc CONTAINS root` only returns descendants: a leaf element's own
+    // inst_relate/tubi_relate row has no self entry in `anc`.  Include the
+    // requested root in both probe lists so clicking a directly-rendered
+    // element (for example `=24384/23264`) does not produce an empty scene.
+    // The projection queries are noun-agnostic and simply return no rows for
+    // the list that does not apply (inst vs BRAN/tubi).
+    include_query_roots(roots, &mut resolved);
+    // e3d-model 的隐式直管按 `inst_relate:derived_*` 存储，同一 BRAN 的每一段
+    // 都会让 anc 解析返回一次相同的 `in`。先按 refno 去重，随后一次查询取回
+    // 该 BRAN 的全部派生行；否则分块边界会把同一批直管重复装进场景。
+    for (inst_refnos, _) in &mut resolved {
+        inst_refnos.sort_by_key(|refno| refno.refno().0);
+        inst_refnos.dedup();
+    }
 
     // 2) 全局块队列：跨根摊平再并行。按根并发时，巨型 SITE 的十几个批在自己根
     //    的 future 里串成链、成为整场的尾巴（AMS 实测根偏斜让 8 路根并发几乎
@@ -174,10 +192,15 @@ pub async fn model_instances_anc(
         spawn_query(async move {
             match job {
                 Job::Inst(idx, chunk) => {
-                    let (mut models, missing) = aios_core::query_insts_flat(chunk.iter()).await?;
+                    let ((mut models, missing), derived) = futures::future::try_join(
+                        aios_core::query_insts_flat(chunk.iter()),
+                        query_derived_insts_by_inputs(&chunk),
+                    )
+                    .await?;
                     if !missing.is_empty() {
                         models.extend(aios_core::query_insts_slim(missing.iter()).await?);
                     }
+                    models.extend(derived);
                     anyhow::Ok((idx, models))
                 }
                 Job::Bran(idx, chunk) => anyhow::Ok((
@@ -203,6 +226,58 @@ pub async fn model_instances_anc(
         }
     }
     Ok(models)
+}
+
+fn include_query_roots(
+    roots: &[RefU64],
+    resolved: &mut [(Vec<aios_core::RefnoEnum>, Vec<aios_core::RefnoEnum>)],
+) {
+    debug_assert_eq!(roots.len(), resolved.len());
+    for (root, (inst_refnos, bran_refnos)) in roots.iter().copied().zip(resolved) {
+        inst_refnos.push(root.into());
+        bran_refnos.push(root.into());
+    }
+}
+
+/// e3d-model 新路径把一根 BRAN 的每段隐式直管分别落为
+/// `inst_relate:derived_*`。这些记录的 id 不是 PE refno，旧的
+/// `query_insts_flat([bran])` 只会点查 `inst_relate:<bran>`，因此必须按 `in`
+/// 补取。旧 `tubi_relate` 仍由 [`tubi_to_geom`] 兼容读取，两条路径互不替代。
+async fn query_derived_insts_by_inputs(
+    refnos: &[aios_core::RefnoEnum],
+) -> Result<Vec<aios_core::GeomInstQuery>> {
+    if refnos.is_empty() {
+        return Ok(Vec::new());
+    }
+    let inputs = refnos
+        .iter()
+        .map(|refno| refno.to_pe_key().to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let direct = aios_core::get_inst_relate_keys(refnos);
+    let mut response = SUL_DB
+        .query(format!(
+            r#"SELECT
+                   in AS refno, in.old_pe AS old_refno, in.owner AS owner,
+                   generic, aabb.d AS world_aabb, world_trans.d AS world_trans,
+                   out.ptset.d.pt AS pts,
+                   IF booled_id != NONE {{
+                       [{{ "geo_hash": booled_id, "is_tubi": generic = 'TUBI' }}]
+                   }} ELSE {{
+                       (SELECT trans.d AS transform, record::id(out) AS geo_hash,
+                               generic = 'TUBI' AS is_tubi
+                        FROM out->geo_relate
+                        WHERE visible && out.meshed && trans.d != NONE && geo_type = 'Pos')
+                   }} AS insts,
+                   generic != 'TUBI' && booled_id != NONE AS has_neg,
+                   dt AS date
+               FROM inst_relate
+               WHERE in IN [{inputs}] AND id NOT IN [{direct}]
+                 AND aabb.d != NONE AND world_trans.d != NONE"#
+        ))
+        .await?
+        .check()?;
+    Ok(response.take(0)?)
 }
 
 /// 非 wasm 下把查询未来包进 `tokio::spawn` 真任务：`buffered` 本身是单任务
@@ -321,33 +396,10 @@ pub async fn nouns_of(refnos: &[RefU64]) -> Result<std::collections::HashMap<Ref
     Ok(out)
 }
 
-/// 设计库里还没被应用到模型的会话数。
-///
-/// 直连 gen-model 的 `dbnum_watermark` 表读，不走它的 HTTP 接口：取回工作是纯
-/// 数据库操作，不该因为那个服务没起就连提示都给不出。**代价是这里认得后端的表名
-/// 和字段名**——那张表改了结构，这一处得跟着改，而编译器不会提醒。
-///
-/// 两个边界必须知道：
-///
-/// - `file_latest_sesno` 是**上一次扫描或应用时记下的**，不是实时读文件。所以这个
-///   数只配当提示，不能拿来判断「需不需要取回」。
-/// - 水位为 0 的库是从没应用过的（gen-model 那边叫「需初始化」），不参与这个加法。
-///   算进去的话一个新登记的库会报出一个天文数字。
-pub async fn pending_sessions() -> Result<u32> {
-    let sql = format!(
-        "SELECT VALUE [applied_sesno, file_latest_sesno] FROM {WATERMARK_TABLE} \
-         WHERE db_type = 'DESI' AND applied_sesno > 0 AND file_latest_sesno > applied_sesno"
-    );
-    let mut response = SUL_DB.query(&sql).await?;
-    let rows: Vec<(i32, i32)> = response.take(0)?;
-    Ok(rows
-        .into_iter()
-        .map(|(applied, latest)| (latest - applied).max(0) as u32)
-        .sum())
-}
-
-/// gen-model 的水位表。跟着 `gen-model/src/data_interface/dbnum_state.rs` 走。
-const WATERMARK_TABLE: &str = "dbnum_watermark";
+// 「设计库里还没应用的保存数」不再从这里直读 gen-model 的 `dbnum_watermark` 表：
+// 那张表在零解析（direct）部署里是空的，而且它让本 crate 认得后端的表名与字段名。
+// 提示现在从队列轮询的 `GET /api/v1/dbnums` 回包算（`task_queue::Vm::pending_saves`），
+// 那份本来就每拍都取、每行都带 `applied_sesno` / `file_latest_sesno`。
 
 /// 取回工作前先把本进程的查询缓存丢干净。
 ///
@@ -363,6 +415,79 @@ pub async fn resolve_name(name: &str) -> Result<Option<RefU64>> {
     Ok(aios_core::get_refno_by_name(name)
         .await?
         .map(|refno| refno.refno()))
+}
+
+/// 名称搜索的一条命中。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameHit {
+    pub refno: RefU64,
+    /// PDMS 全名，带前导 `/`。
+    pub name: String,
+    pub noun: String,
+    /// 元素所在的设计库编号。调用方拿它分辨命中是不是在当前 MDB 的模型树里。
+    pub dbnum: u32,
+}
+
+/// 按名称前缀找元素，走 `pe.name` 索引的范围扫。
+///
+/// 范围扫是这条路便宜的**唯一**理由：`name >= 前缀 AND name < 前缀+最大字符`
+/// 在 8,819,107 行的 pe 上实测 1~2ms（查询计划 `Iterate Index`）。凡是改成
+/// `string::starts_with` 之类的函数写法，规划器立刻退回 `Iterate Table`，同一个
+/// 前缀要 37 秒——两者在结果上等价，在能不能用上差着四个数量级。
+///
+/// 前导 `/` 可省：库里存的是 `/1RX-210` 这种全名，而人念的是 `1RX-210`。
+/// 大小写也可省：库里 878 万行里有 784 个小写开头的名字（元件库居多），所以
+/// 原样与全大写各扫一遍再并起来，而不是假装名字一定是大写的。
+///
+/// **不限当前 MDB。** 这里回的是模型本体里的全部命中，其中可能有树外元素；
+/// 拿 `dbnum` 与当前 MDB 的设计库名单一比就知道是哪一种，那是调用方的事
+/// （树定位本来就允许选中树外元素，只是不切换 MDB）。
+pub async fn search_names_by_prefix(prefix: &str, limit: usize) -> Result<Vec<NameHit>> {
+    let prefix = aios_core::helper::to_e3d_name(prefix.trim()).into_owned();
+    if prefix.len() <= 1 {
+        return Ok(Vec::new());
+    }
+    let upper = prefix.to_uppercase();
+    let mut hits = prefix_scan(&prefix, limit).await?;
+    if upper != prefix {
+        let more = prefix_scan(&upper, limit).await?;
+        let known = hits.iter().map(|hit| hit.refno).collect::<Vec<_>>();
+        hits.extend(more.into_iter().filter(|hit| !known.contains(&hit.refno)));
+        hits.sort_by(|a, b| a.name.cmp(&b.name));
+        hits.truncate(limit);
+    }
+    Ok(hits)
+}
+
+async fn prefix_scan(prefix: &str, limit: usize) -> Result<Vec<NameHit>> {
+    // 索引按名称升序迭代，所以结果天然按名称排好，不必再 ORDER BY——加上它
+    // 规划器就得先把整段范围收齐再排，宽前缀（一个 `/A` 几十万行）会当场卡住。
+    // `?? ''` / `?? 0` 不是装饰：整批行里只要有一行缺 noun 或 dbnum，
+    // 反序列化就整条查询失败，搜索框会为了一行没关系的元素报「搜索失败」。
+    let sql = "SELECT VALUE [id, name, noun ?? '', dbnum ?? 0] FROM pe \
+               WHERE name >= $lo AND name < $hi LIMIT $limit";
+    let mut response = SUL_DB
+        .query(sql)
+        .bind(("lo", prefix.to_owned()))
+        .bind(("hi", format!("{prefix}\u{10FFFF}")))
+        .bind(("limit", limit))
+        .await?;
+    let rows: Vec<(RefnoEnum, String, String, u32)> = response.take(0)?;
+    Ok(rows.into_iter().map(into_hit).collect())
+}
+
+// 这里曾经有一个 `search_names_containing`：库内逐行 `string::contains`。
+// ADR-0023 把它整个删掉了——三种写法（子查询限库 83.6s / 一句到底 88.9s /
+// NOINDEX 116.4s）说的是同一件事，在 `pe` 上逐行读 11 列文档本身就是九十秒的
+// 活，SQL 层面无药可救。子串这一路改由 `name_index` 的本地 ngram 索引承担。
+
+fn into_hit((refno, name, noun, dbnum): (RefnoEnum, String, String, u32)) -> NameHit {
+    NameHit {
+        refno: refno.refno(),
+        name,
+        noun,
+        dbnum,
+    }
 }
 
 /// 连接后的工程标识：项目名、当前 MDB 名、SurrealDB 命名空间、当前 MDB（DESI）
@@ -508,5 +633,22 @@ fn fmt_attr(v: &aios_core::NamedAttrValue) -> String {
         "unset".into()
     } else {
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leaf_model_queries_include_the_clicked_root_itself() {
+        let root = RefU64::from_two_nums(24384, 23264);
+        let descendant = RefU64::from_two_nums(24384, 23265);
+        let mut resolved = vec![(vec![descendant.into()], Vec::new())];
+
+        include_query_roots(&[root], &mut resolved);
+
+        assert!(resolved[0].0.iter().any(|refno| refno.refno() == root));
+        assert!(resolved[0].1.iter().any(|refno| refno.refno() == root));
     }
 }
