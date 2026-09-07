@@ -180,6 +180,14 @@ pub struct GeomPtsQuery {
 /// # 返回值
 ///
 /// 返回几何实例查询结果的向量
+///
+/// # 本地变换有两种写法
+///
+/// insts 子查询里的 `transform ?? trans.d` 不是冗余：本地变换过去一律是 `geo_relate.trans`
+/// 指向的一条 `trans` 行，2026-09-04 起 gen-model 的模型面直接把它写成边上的 `transform`
+/// 字段（对象形状逐字相同）——那条 `trans` 行当年只能叫 `direct_local_<id>`，因为世界变换
+/// 已经占了同一张表的 `<id>`；挪到边上，id 前缀与后缀一起没了，还少一次解引用。旧行（旧
+/// 生成器写的、以及切换前的存量）仍走 `trans.d`，两种一起认。
 pub async fn query_insts(
     refnos: impl IntoIterator<Item = &RefnoEnum>,
     enable_holes: bool,
@@ -197,7 +205,7 @@ pub async fn query_insts(
                 in.id as refno,
                 in.old_pe as old_refno,
                 in.owner as owner, generic, aabb.d as world_aabb, world_trans.d as world_trans, out.ptset.d.pt as pts,
-                if booled_id != none {{ [{{ "geo_hash": booled_id }}] }} else {{ (select trans.d as transform, record::id(out) as geo_hash from out->geo_relate where visible && out.meshed && trans.d != none && geo_type='Pos')  }} as insts,
+                if booled_id != none {{ [{{ "geo_hash": booled_id }}] }} else {{ (select (transform ?? trans.d) as transform, record::id(out) as geo_hash from out->geo_relate where visible && out.meshed && (transform ?? trans.d) != none && geo_type='Pos')  }} as insts,
                 booled_id != none as has_neg,
                 dt as date
             from {inst_keys} where aabb.d != none
@@ -210,7 +218,7 @@ pub async fn query_insts(
                 in.id as refno,
                 in.old_pe as old_refno,
                 in.owner as owner, generic, aabb.d as world_aabb, world_trans.d as world_trans, out.ptset.d.pt as pts,
-                (select trans.d as transform, record::id(out) as geo_hash from out->geo_relate where visible && out.meshed && trans.d != none && geo_type='Pos') as insts,
+                (select (transform ?? trans.d) as transform, record::id(out) as geo_hash from out->geo_relate where visible && out.meshed && (transform ?? trans.d) != none && geo_type='Pos') as insts,
                 booled_id != none as has_neg,
                 dt as date
             from {inst_keys} where aabb.d != none "#
@@ -254,7 +262,7 @@ pub async fn query_insts_slim(
         select
             in as refno, anc, generic, aabb.d as world_aabb, world_trans.d as world_trans,
             booled_id,
-            (select trans.d as transform, record::id(out) as geo_hash from out->geo_relate where visible && out.meshed && trans.d != none && geo_type='Pos') as insts
+            (select (transform ?? trans.d) as transform, record::id(out) as geo_hash from out->geo_relate where visible && out.meshed && (transform ?? trans.d) != none && geo_type='Pos') as insts
         from {inst_keys} where aabb.d != none "#
     );
     let mut response = SUL_DB.query(sql).await?;
@@ -640,7 +648,7 @@ pub async fn inst_relate_anc_ready() -> anyhow::Result<bool> {
 //                 in.id as refno,
 //                 in.old_pe as old_refno,
 //                 in.owner as owner, generic, aabb.d as world_aabb, world_trans.d as world_trans, out.ptset.d.pt as pts,
-//                 if booled_id != none {{ [{{ "geo_hash": booled_id }}] }} else {{ (select trans.d as transform, record::id(out) as geo_hash from out->geo_relate where visible && out.meshed && trans.d != none && geo_type='Pos')  }} as insts,
+//                 if booled_id != none {{ [{{ "geo_hash": booled_id }}] }} else {{ (select (transform ?? trans.d) as transform, record::id(out) as geo_hash from out->geo_relate where visible && out.meshed && (transform ?? trans.d) != none && geo_type='Pos')  }} as insts,
 //                 fn::ses_date(in.id) as date
 //             from {inst_keys} where aabb.d != none
 //         "#
