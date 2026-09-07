@@ -10,6 +10,10 @@
   surreal 子进程，绑到配置里那对 `v_ip:v_port`；**plant-ui 的读面一行不改**。gen-model 侧的施工计划另出一份：
   `gen-model/docs/plans/2026-09-04-spawned-memory-store-out-of-box.md`。
   本仓剩下的活是 §3 的 N4 / N5 / N6 / N7 四条**冷库诚实性**——它们与 D1 无关，A′ 之后一条不少。
+- **2026-09-07 追记**：读面已整条换到 gen-model HTTP（服务供数，提交 `f58580aff`：树 / 属性 / 搜索 / 三维实例，
+  启动不再连 SurrealDB），本文「plant-ui 的读面一行不改」与 §7「不为 kv-mem 单开一套数据层抽象」两句**已被越过**；
+  直连库那一半作为「库供数」保留档接回，见 `docs/plans/2026-09-07-read-face-dual-mode.md` 与 ADR-0026。
+  §3 的 N5（CATA 元素定论文案）在库供数下由那份计划的 M3 接管；N7 的 `Health` 新格已随 `f58580aff` 解出。
 
 ---
 

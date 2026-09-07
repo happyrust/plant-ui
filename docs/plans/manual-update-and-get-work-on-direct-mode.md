@@ -13,6 +13,8 @@
   `docs/plans/2026-09-02-gen-model-increment-cleanup-inventory.md`（§6.3 预览 = 渲染计划）。
 - 状态：**已定案**（2026-09-02 用户拍板：D1–D4 全按推荐项）。**M1、M2、M3a 已完工**（`plant-ui` 121 / `plant-ui-app` 87
   单测全绿，新增 12 条；ADR-0024、CHANGELOG、CONTEXT.md、两份 FIELD-MAP 已补）；M3b（等 G3）、M4（等 G4）、M5 未动。
+  **2026-09-07 追记**：M4（属性面板走 gen-model 直读端点 `POST /api/v1/element/attributes`）已随提交 `f58580aff` 落地，
+  整条读面同时换到服务供数；双轨见 `docs/plans/2026-09-07-read-face-dual-mode.md`。
 
 ---
 
