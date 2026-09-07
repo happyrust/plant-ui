@@ -21,6 +21,16 @@
   **M2b 已完成**（2026-09-07：设置窗「供数模式」下拉（`ComboBox`，环境变量在场时锁上并标注）、接入点面板「供数」一行、
   `Req::SwitchReadFace` 热切两半——数据线程排干在途 → 丢缓存 → 两条通道同拍换面 → 重跑 `ready()`；宿主拍快照 → 重连那套
   复位 → 清空三维 → 新面 `Ready` 后按取回工作那条路重装；`CHANGELOG.md`「设置」一节；测试见 §六 M2 行）。**M2 收口。**
+  **M2 实机补丁**（2026-09-07 晚，实机切一次所见，两处都不在计划里：① 是用户点名要修的，② 是验 ① 时撞上的）：① `vendor/rs-core`
+  `rs_surreal/mdb.rs` 的 `MDB_DESI_DBNOS` 把 `STYP` 两边 `type::string()` 后再比——现在 gen-model 写进库的 `CURD.STYP`
+  是字符串 `"1"`、老库是整数，SurrealQL 里 `"1" = 1` 恒假，库供数对着开发库 8009 解出零个设计库、根层零个 SITE；
+  已记进 `docs/plans/ui-rearchitecture.md`「`vendor/rs-core` 的改动记录」（换钉版要重放），并钉在本仓 `plant-ui-data` 的
+  `mdb_desi_dbnos_compares_styp_as_text_on_both_sides` 上（重放漏了会红）。② `store.rs` 的 `sites()` 多一行 `plant_ui_data::connect().await?`——`data::ready`
+  把 `identity()` 与 `sites()` 并发跑，v0.1.9 是先连库再顺序取，逐字接回就抢在连接前打库，`PLANT_READ_FACE=store`
+  启动直接报「Connection uninitialised」；这是九条「逐字」的唯一偏离，`identity_and_sites_each_wait_for_the_connection`
+  钉着。顺带一条给 M4 / M6 的事实：开发库 8009（ns 1516）里 `SITE` 行只有 dbnum 7997（13）与 8000（3），
+  库供数根层 16 个 SITE / 2 个设计库；同一接入点服务供数是 37 个 SITE / 7997、7998、8000 三库——两边数据本身不齐，
+  对拍要另找一台与服务同源的库（D1 本意的已落盘 rocksdb）。
 
 ---
 
@@ -298,6 +308,7 @@ plant-ui-app --read-face-parity --depth 2 --sample 200 [--roots 24381/2,…] [--
 - **库供数的时点是水位、服务供数是文件最新**：同一个元素两边属性可能不同，这不是缺陷；对拍报告头写两枚凭证，
   界面上库供数不额外标时点（ADR-0019 的措辞留给队列面板）。
 - **HEAD 接回来的九条要对着 4ec446f5a 逐字比**，别顺手「改进」——那是保留档，改了就没有对拍的参照。
+  （唯一偏离：`sites()` 多一行等连接，见开头「M2 实机补丁」②；读的内容一个字没变。）
 - **`.codex-*` 与 `_*.log` 不入库**（M0）；`vendor/` 两处改动来路不明（`ordered-float` / `rs-core inst.rs`），M0 单提并写清。
 - **不做**：房间的服务供数（D6）；网格走 HTTP（D5，另立 ADR）；自动探测退回（D2）；认 `PLANT_TREE_DATA_MODE`（D11）；
   动 `plant-ui-view3d`；改 gen-model；对等双轨（D1）。

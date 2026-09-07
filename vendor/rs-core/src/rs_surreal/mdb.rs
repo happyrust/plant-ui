@@ -33,8 +33,12 @@ pub enum DBType {
 /// 挑中目录侧就只剩一个库可展，模型树看着像"只加载了一个库"。
 ///
 /// 用 `$mdb` / `$db_type` 两个绑定参数，调用点 `bind` 上即可。
+///
+/// `STYP` 两边按字符串比：老库里它是整数，现在的 gen-model 写进库的是字符串 `"1"`，
+/// 而 SurrealQL 里 `"1" = 1` 恒假——库供数（plant-ui ADR-0026 的保留档）对着新写的库
+/// 会解出零个设计库、根层零个 SITE，三维实例却照常，看着像「树坏了」。
 const MDB_DESI_DBNOS: &str = r#"(select dbnos, array::len(dbnos) as n
-    from (select (select value DBNO from CURD.refno where STYP = $db_type) as dbnos
+    from (select (select value DBNO from CURD.refno where type::string(STYP) = type::string($db_type)) as dbnos
           from MDB where NAME = $mdb)
     order by n desc limit 1)[0].dbnos ?? []"#;
 

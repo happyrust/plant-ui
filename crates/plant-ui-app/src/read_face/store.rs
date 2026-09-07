@@ -36,7 +36,11 @@ impl StoreReadFace {
         })
     }
 
+    /// 也先连库：`data::ready` 把 `identity()` 与 `sites()` 并发跑（v0.1.9 是先连库再
+    /// 顺序取），这一条若不自己等连接就会在 `connect()` 还没落地时打 `SUL_DB`，报
+    /// 「Connection uninitialised」。`connect()` 是 `OnceCell`，第二个调用者等第一个，不重连。
     pub async fn sites(&self) -> anyhow::Result<Vec<EleTreeNode>> {
+        plant_ui_data::connect().await?;
         plant_ui_data::site_nodes().await
     }
 
@@ -203,6 +207,27 @@ mod tests {
             "plant_ui_data::invalidate_all()",
         ] {
             assert!(body.contains(expected), "store.rs 少了库读调用：{expected}");
+        }
+    }
+
+    /// 启动序列把 `identity()` 与 `sites()` 并发跑，两条都得自己把连接等到手——只在
+    /// `identity()` 里连，`sites()` 就会抢在连接落地前打库（实机：`PLANT_READ_FACE=store`
+    /// 启动报「Connection uninitialised」）。
+    #[test]
+    fn identity_and_sites_each_wait_for_the_connection() {
+        let source = include_str!("store.rs");
+        for method in ["pub async fn identity(", "pub async fn sites("] {
+            let body = source
+                .split_once(method)
+                .expect(method)
+                .1
+                .split_once("\n    }\n")
+                .expect("方法结尾")
+                .0;
+            assert!(
+                body.contains("plant_ui_data::connect().await?"),
+                "{method} 没有先等连接"
+            );
         }
     }
 }

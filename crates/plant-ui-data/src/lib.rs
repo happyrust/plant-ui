@@ -670,4 +670,28 @@ mod tests {
         assert!(resolved[0].0.iter().any(|refno| refno.refno() == root));
         assert!(resolved[0].1.iter().any(|refno| refno.refno() == root));
     }
+
+    /// 库供数的根层靠 rs-core 的 `MDB_DESI_DBNOS` 从 `MDB.CURD` 解出设计库号。老库里
+    /// `STYP` 是整数 1，现在 gen-model 写进库的是字符串 `"1"`，而 SurrealQL 里 `"1" = 1`
+    /// 恒假——按原类型比就解出零个库、根层零个 SITE（2026-09-07 实机所见）。两边都转成
+    /// 字符串再比，两种形状都认。vendor 一旦重新同步会把这一行悄悄改回去，所以钉在本仓这边。
+    #[test]
+    fn mdb_desi_dbnos_compares_styp_as_text_on_both_sides() {
+        let source = include_str!("../../../vendor/rs-core/src/rs_surreal/mdb.rs");
+        let sql = source
+            .split_once("const MDB_DESI_DBNOS: &str = r#\"")
+            .expect("MDB_DESI_DBNOS")
+            .1
+            .split_once("\"#;")
+            .expect("常量结尾")
+            .0;
+        assert!(
+            sql.contains("where type::string(STYP) = type::string($db_type)"),
+            "STYP 又按原类型比了：{sql}"
+        );
+        assert!(
+            !sql.contains("STYP = $db_type"),
+            "整数比那一句还留着：{sql}"
+        );
+    }
 }
