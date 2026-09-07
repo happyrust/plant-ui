@@ -1564,7 +1564,8 @@ fn query_fixture(tool: &str, arguments: &serde_json::Value) -> crate::model_upda
 pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mpsc::Sender<Evt>) {
     use crate::data::Req;
     let evt = match req {
-        Req::Reconnect => Evt::Ready(Ok(engine.ready_info())),
+        // 剧本引擎不分供数模式：换面与重连一样，回一份同样的假身份。
+        Req::Reconnect | Req::SwitchReadFace(_) => Evt::Ready(Ok(engine.ready_info())),
         Req::Children(refno) => Evt::Children(refno, Ok(engine.children(refno))),
         Req::Props(refno) => Evt::Props(refno, Ok(engine.props(refno))),
         // 剧本里没有房间数据：空归属即「无所属房间」，界面照常走 Ready 空态。

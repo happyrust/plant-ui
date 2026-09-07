@@ -106,6 +106,18 @@ pub struct ResolvedReadFace {
     pub warning: Option<String>,
 }
 
+impl ResolvedReadFace {
+    /// 设置窗那一格锁上时的说明（悬停与右下小字同一句）。没被压过就没有。
+    pub fn lock_notice(&self) -> Option<String> {
+        self.overridden.then(|| {
+            format!(
+                "由 {READ_FACE_ENV}={} 压过，改这一格这次不会生效；撤掉环境变量再启动才按设置走",
+                self.kind.key()
+            )
+        })
+    }
+}
+
 /// 解出这次启动实际要用的供数模式。
 ///
 /// 与网格目录那条**相反**的优先级——环境变量压过设置项。理由：这一格是开发期给人
@@ -279,6 +291,24 @@ mod tests {
         let warning = garbled.warning.expect("认不出的值要出声");
         assert!(warning.contains("PLANT_READ_FACE"), "{warning}");
         assert!(warning.contains("库供数"), "{warning}");
+    }
+
+    /// 只有真被压过才锁设置窗那一格，锁上的话要把「设的是哪个值」说出来——人照着
+    /// 这句话就知道去撤哪个环境变量。认不出的值不算压过，不锁。
+    #[test]
+    fn only_an_effective_override_locks_the_dropdown() {
+        let pinned = resolve_read_face(ReadFaceKind::Service, Some("store".into()));
+        let notice = pinned.lock_notice().expect("压过了就要锁");
+        assert!(notice.contains("PLANT_READ_FACE=store"), "{notice}");
+
+        assert_eq!(
+            resolve_read_face(ReadFaceKind::Store, None).lock_notice(),
+            None
+        );
+        assert_eq!(
+            resolve_read_face(ReadFaceKind::Store, Some("db".into())).lock_notice(),
+            None
+        );
     }
 
     /// 存量文件里没有 `read_face` 的要按服务供数读出来（计划 D11：老 `settings.ron`

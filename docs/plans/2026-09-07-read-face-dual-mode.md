@@ -18,7 +18,9 @@
   **M2a 已完成**（2026-09-07：`read_face/store.rs` 从 v0.1.9 逐字接回九条、`ReadFace::Store` 接上；
   `Settings.read_face` + `resolve_read_face` + `PLANT_READ_FACE`；`ModelInstancesReq` / `SearchOutcome.index_failure`
   两处签名定形；测试 123+2 / 113 / 18，wasm check 过——`PLANT_READ_FACE=store` 已能整机跑库供数，只是还没有界面入口）。
-  M2b（设置窗下拉 / 接入点一行 / 热切）未动。
+  **M2b 已完成**（2026-09-07：设置窗「供数模式」下拉（`ComboBox`，环境变量在场时锁上并标注）、接入点面板「供数」一行、
+  `Req::SwitchReadFace` 热切两半——数据线程排干在途 → 丢缓存 → 两条通道同拍换面 → 重跑 `ready()`；宿主拍快照 → 重连那套
+  复位 → 清空三维 → 新面 `Ready` 后按取回工作那条路重装；`CHANGELOG.md`「设置」一节；测试见 §六 M2 行）。**M2 收口。**
 
 ---
 
@@ -190,22 +192,39 @@ impl ReadFace {
   未设置 → 设置值。**不认 `PLANT_TREE_DATA_MODE`**。它与网格目录那条**相反**（环境变量压过设置）：这一格是开发期
   临时切面用的，进程一起就该说了算。结果放进 `settings_store::Startup.read_face`，`App::new` 据此造读面、
   存 `App.read_face`；浏览器端没交底 = `Service`。启动日志「已连接 …」尾巴上带当前供数模式。
-- 设置窗（`settings.rs::show`）在「模型服务地址」下面加一格下拉「供数模式：服务供数 / 库供数」；`overridden` 时
-  禁用 + 一句「由 PLANT_READ_FACE 压过」。保存路径与今天三格同一条（`main.rs` 收到 `saved` → `persist_settings`）。
-- 接入点面板 `AccessPointVm` 加 `read_face: ReadFaceKind`，绘制层一行「供数：服务 / 库」。
+- 设置窗（`settings.rs::show`）在「模型服务地址」下面加一格下拉「供数模式：服务供数 / 库供数」
+  （`egui::ComboBox`，用户点的「下拉框」原词；两项来自 `ReadFaceKind::ALL`）。锁的口径由宿主给：
+  `State.read_face_lock: Option<String>`，`Some` = 下拉 `add_enabled_ui(false)` + 悬停同一句 + 右下一行黄字
+  （仿网格目录那条校验提示）；文案由 `settings_store::ResolvedReadFace::lock_notice()` 拼——
+  「由 PLANT_READ_FACE=store 压过，改这一格这次不会生效；撤掉环境变量再启动才按设置走」，
+  `ReadFaceKind::key()` 给那个小写字面（与 serde 同一份，测试钉着）。绘制层不读环境变量。
+  保存路径与今天三格同一条（`main.rs` 收到 `saved` → `persist_settings`），之后才判要不要热切（§5.3）。
+- 接入点面板 `AccessPointVm` 加 `read_face: ReadFaceKind`，绘制层一行「供数：服务供数 / 库供数」；
+  `main.rs::access_point_vm` 多一个参数填它，热切时随 `App.read_face` 一起改。状态栏不动（默认清单 ③）。
 
-### 5.3 热切
+### 5.3 热切（M2b 落地形状）
 
-`main.rs` 收到 `saved.read_face != self.read_face`：
+`main.rs` 收到 `saved` 之后先 `persist_settings`，再问纯函数 `read_face_switch(current, saved, overridden)`：
+只有设置值与此刻生效的那一面不同、且没被 `PLANT_READ_FACE` 压过才回 `Some(kind)`（压过时那一格是灰的，
+进程活着就一直按环境变量走）。回了就 `switch_read_face(kind)`：
 
-1. 拍快照：与取回工作同一份（已加载集 + 范围目标 + 显隐方向，ADR-0021 / ADR-0024 的 `model_reload_restore`）。
-2. 清场：`ModelAction::Unload` 全部、`TreeModel` 归零、选中清空、属性面板清空、搜索下拉清空。
-3. 发 `Req::SwitchReadFace(kind)`。数据线程按「全局手术」处理（与 `Reconnect` 同席，`data.rs:1065`）：
-   排干在途 → 旧面 `invalidate()` → 换面 → 新面 `identity()` + `sites()` → `Evt::Ready`。
-4. `Evt::Ready` 到了之后走取回工作那条路（`Req::GetWork` + `Req::Models { ensure_targets, debt_reload: true }`）
-   把快照重装回来。相机不动。
-5. 命令行视图一条日志：「供数模式：服务 → 库；已清场并重装 N 个已加载范围」。
-6. 换面期间下拉框禁用；`Evt::Ready` 失败则界面停在未连接态、下拉框可再改回去（与连库失败后「重试」同形）。
+1. 拍快照：与取回工作同一份 `reload_snapshot(...)`（已加载集 + 显隐方向 + 范围目标，ADR-0021 / ADR-0024），
+   **另放一格 `App.read_face_switch_restore`**——下一步那套复位会清掉 `model_reload_restore`。只记第一次：
+   换面失败再换回来时场景已经空了，再拍只会拍到空白（与 `clear_scene_for_reload` 同一条规矩）。
+2. 清场：`reconnect()` 拆成 `reset_for_reconnect()` + 发信两步，这里复用前一半（`TreeModel` 归零、选中 / 属性 /
+   房间 / 队列身份全清、`data_source_ok = false`），再 `pending_models = Some(空)`——`Replace(空)` despawn 全部
+   场景根，重连本身不清几何，换面必须清（D10：三维不许留旧供数方的几何）。相机不动。
+3. `App.read_face` 与 `vm.access_point.read_face` 改成新值；命令行视图与日志各一句
+   「供数模式：服务供数 → 库供数；已清场，重装 N 个已加载模型 / M 个范围目标」；发 `Req::SwitchReadFace(kind)`。
+4. 数据线程按「全局手术」处理（与 `Reconnect` 同席）：排干在途 → `invalidate_all()` + 旧面 `invalidate()` →
+   `face = Arc::new(ReadFace::new(kind))` → `model_tx.send(ModelLoad::Switch(kind))`（模型通道串行，在途那条装载
+   做完才换，其后排队的全是新面）→ 新面 `ready()` → `Evt::Ready` → `refresh_search_index`（库供数开 / 建索引，
+   服务供数报 `Off`）。`route_model_load` 不认 `Switch`，由 worker 自己转发；`sim.rs` 把它与 `Reconnect` 同样回假身份。
+5. `Evt::Ready(Ok)` 末尾：`read_face_switch_restore` 有模型就移进 `model_reload_restore` 再 `get_work()`——
+   `clear_scene_for_reload` 见已有快照不重拍，`Evt::GetWork` 按快照里的模型 `ensure` 再重查、显隐照原样回放
+   （取回工作那条现成路）；换面前三维空着就只记一句、不发重查。
+6. `Evt::Ready(Err)` 走现有失败路（红字带 `Retry::Connect`）；快照留在那一格，重试成功或改回去成功都会把它装回来。
+   服务地址没变就不重开队列长连接。
 
 不重启客户端的理由：接入点没变，只换了一条读路；两条既有路（`Reconnect` + 取回工作）拼起来正是它。
 
@@ -246,10 +265,10 @@ plant-ui-app --read-face-parity --depth 2 --sample 200 [--roots 24381/2,…] [--
 |---|---|---|---|
 | ✅ **M0** | 落地工作树：13 个已改文件（`CONTEXT.md` 只取模型来源 / 翻面那一段）+ 未跟踪的 `model_record_union.rs` / `source_versions.rs` / `fixtures/` / 两条 live 测试 / `docs/adr/0025-*.md` / `docs/plans/2026-09-04-kv-mem-*.md`，一次提交「服务供数成为唯一读面」（**`f58580aff`**）；`vendor/registry/ordered-float` 与 `vendor/rs-core` + `Cargo.lock` **单独**一提（**`12a9d93e9`**，它们不是本仓的读面） | 已核：13 个文件最后写入 09-07 11:09，之后无人动 | **已过**：`cargo test -p plant-ui -p plant-ui-app -p plant-ui-data` 全绿，基线 plant-ui 121（+2 集成）/ plant-ui-app 104 / plant-ui-data 18，增量编译 23.7 s；日志 / `.codex-*` / 截图 / `web/public/assets/meshes`（667 MB）均未入库 |
 | ✅ **M1** | `read_face/{mod,service}.rs` + `ReadFace::Service` 接进 `data.rs` 五处（`ready` / `get_work` / `handle_read` / 模型通道两处）；纯重构 | M0 | **已过**（2026-09-07）：既有测试一个不少，`cargo test -p plant-ui -p plant-ui-app -p plant-ui-data` = 121+2 / 109 / 18；净增 5 条——源码钉 `data_rs_reads_only_through_read_face`（§5.1）与 `service_face_never_touches_the_store`、`desi_dbnums` 纯函数两条（读透含 ISOD 带 `cache_versions` / 摄入只 DESI）、`a_face_reports_the_kind_it_was_built_from`；`property_requests_have_no_database_fallback` 改名 `property_requests_go_through_the_read_face`，钉 `face.props(`；`cargo check --target wasm32-unknown-unknown -p plant-ui-app` 过（`Arc<ReadFace>` 与 `Progress` 的 `Send` 在 `LocalBoxFuture` 下同样成立） |
-| **M2** | `read_face/store.rs`（从 HEAD `git show 4ec446f5a:crates/plant-ui-app/src/data.rs` 接回九条）；`Settings.read_face` + `resolve_read_face` + `PLANT_READ_FACE`；设置窗下拉；`AccessPointVm` 一行；`Req::SwitchReadFace` 热切（§5.3） | M1 | 单测：`resolve_read_face` 三态（设置 / 环境变量压过 / 认不出出声）；`the_default_read_face_is_service`；`old_settings_without_read_face_are_service`；`a_switch_drains_inflight_before_swapping`；`a_switch_clears_the_scene_and_reloads_the_snapshot`（沿 `data.rs` 既有的 `route_model_load` 测试形状）；设置窗 8 帧高度测试补一档（`settings.rs::window_heights` 同款） |
+| ✅ **M2** | `read_face/store.rs`（从 HEAD `git show 4ec446f5a:crates/plant-ui-app/src/data.rs` 接回九条）；`Settings.read_face` + `resolve_read_face` + `PLANT_READ_FACE`；设置窗下拉；`AccessPointVm` 一行；`Req::SwitchReadFace` 热切（§5.3） | M1 | **已过**（2026-09-07，两个提交：M2a 库供数 + 设置格 + 环境变量，M2b 下拉 + 接入点一行 + 热切）。`cargo test -p plant-ui -p plant-ui-data -p plant-ui-app` = **124+2 / 118 / 18**（M1 基线 121+2 / 109 / 18；净增 3 / 9 / 0）。M2a：`the_default_read_face_is_service`、`read_face_kind_round_trips_as_lowercase_words`、`store_face_never_touches_the_service`、`a_model_request_carries_both_root_sets`、`resolve_read_face_prefers_the_environment_then_the_setting`（三态）、`old_settings_without_read_face_are_service`。M2b：`an_overridden_read_face_disables_the_dropdown`（从 M3 提前：控件在这儿出生；数设置窗那一层灰掉的控件——锁上 > 0、没锁 = 0，头几帧是 egui 量尺寸那一遍要跳过）、设置窗 8 帧高度测试补「锁上」一档、`only_an_effective_override_locks_the_dropdown`、`a_switch_drains_inflight_before_swapping`、`a_switch_swaps_both_lanes`、`a_face_is_only_chosen_at_spawn_or_switch`（默认清单 ⑤：`ReadFace::new(` 在 `data.rs` 正文恰 3 处、`handle_read` 内 0 处）、`a_switch_clears_the_scene_and_reloads_the_snapshot`（`read_face_switch` 三态 + 源码钉两段顺序）。`cargo check --target wasm32-unknown-unknown -p plant-ui-app` 过。实机那一遍留 M6 |
 | **M3** | 不说谎五格（§5.5）；命令行视图切换日志 | M2 | `a_catalogue_element_in_store_mode_gets_a_verdict`、`store_mode_search_names_its_coverage`、`store_mode_never_paints_a_model_source`、`an_overridden_read_face_disables_the_dropdown`、`a_missing_model_service_in_store_mode_does_not_block_ready` |
 | **M4** | 对拍探针（§5.4）+ `scripts/Run-ReadFaceParity.ps1` | M2 | AvevaMarineSample `depth 2 / sample 200` 出一份报告存 `docs/evidence/2026-09-xx-read-face-parity.md`；树 roots 集合与原序零差异是硬标准，属性四档计数入档 |
-| **M5** | ADR-0026、`CONTEXT.md` 三词条、09-02 / 09-04 两份计划状态行追记（§2.3）——**这三样已随本计划落下**；剩 `CHANGELOG.md` 用户可见条目（等 M2 有东西可说时写） | — | 文档互引核对：ADR-0026 ↔ 本计划 ↔ `CONTEXT.md` 三处名字一致 |
+| ✅ **M5** | ADR-0026、`CONTEXT.md` 三词条、09-02 / 09-04 两份计划状态行追记（§2.3）——**这三样已随本计划落下**；`CHANGELOG.md`「未发布 · 设置」一节（供数模式下拉、换了当场清场重装、`PLANT_READ_FACE` 压过时下拉灰掉）**随 M2b 落下** | — | 文档互引核对：ADR-0026 ↔ 本计划 ↔ `CONTEXT.md` 三处名字一致；M3 不说谎五格落地时 CHANGELOG 再补一条 |
 | **M6** | 实机验收（§七） | M3、M4 | 记进 `docs/2026-08-12_live-test-ledger.md` 同款格式 |
 
 **顺序**：M0 → M1 → M2 → M3；M4 / M5 与 M3 并行；M6 收尾。**首次可发布点在 M3 之后**（D15）。

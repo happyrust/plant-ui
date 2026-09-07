@@ -373,6 +373,9 @@ fn access_point_detail(ui: &mut Ui, t: &Tokens, d: Density, ap: &crate::vm::Acce
         ("用户", ap.user.as_str()),
         ("模型服务", ap.model_api_url.as_str()),
         ("数据中心", ap.data_api_url.as_str()),
+        // 树 / 属性 / 搜索 / 三维实例此刻从哪儿读（ADR-0026）。库供数是保留档，
+        // 用着它的人得看得出来。
+        ("供数", ap.read_face.label()),
     ] {
         access_point_row(ui, t, d, label, value);
     }

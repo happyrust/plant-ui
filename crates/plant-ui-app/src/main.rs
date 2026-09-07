@@ -955,6 +955,11 @@ struct App {
     /// 清场之后场景一直是空的，重试轮次再拍只会拍到空白；重载成功落地才消费，
     /// 失败后的欠账补载仍按这份最初的快照先 ensure 再重查、再回放。
     model_reload_restore: Option<ReloadSnapshot>,
+    /// 换供数模式（ADR-0026 热切）清场前拍的那份快照。另放一格而不借
+    /// `model_reload_restore`：换面走的是重连那套复位，它会把那一格清掉；新面 `Ready`
+    /// 之后这份才移过去、按取回工作那条路重装。只记第一次——换面失败再换回来时场景
+    /// 已经空了，再拍只会拍到空白。
+    read_face_switch_restore: Option<ReloadSnapshot>,
     /// 清场前点过眼睛、且范围回包非空的树目标——取回工作重装前要 ensure 的名单
     /// （ADR-0024）。`model_scopes` 混着每个模型的自映射条目，不拿它当名单。
     scope_targets: HashSet<RefU64>,
@@ -1210,6 +1215,19 @@ fn take_hidden_for_replay(
         .filter(|(refno, visible)| !visible && loaded.contains(refno))
         .map(|(refno, _)| refno)
         .collect()
+}
+
+/// 设置窗保存之后要不要换供数模式（ADR-0026 热切）。
+///
+/// 只有设置值真的与此刻生效的那一面不同才换；被 `PLANT_READ_FACE` 压过时不换——
+/// 环境变量在场时那一格是灰的，进程活着就该一直按它走，落盘的值等下次不带环境变量
+/// 启动时再生效（计划 D11）。
+fn read_face_switch(
+    current: settings::ReadFaceKind,
+    saved: settings::ReadFaceKind,
+    overridden: bool,
+) -> Option<settings::ReadFaceKind> {
+    (!overridden && saved != current).then_some(saved)
 }
 
 /// 取回工作重装前那一轮 ensure 的流水账，落地时汇成一句日志。
@@ -1478,10 +1496,15 @@ fn settled_pending_roots(
 /// 走 `try_get_db_option`：`get_db_option` 读不着配置时会 panic，而「读不着」恰恰是这块
 /// 面板要说清楚的情形之一——为它崩掉整个界面说不过去。解不出来就留空，面板照画，
 /// 每一格显示「未配置」。
-fn access_point_vm(model_api_url: &str, data_api_url: &str) -> AccessPointVm {
+fn access_point_vm(
+    model_api_url: &str,
+    data_api_url: &str,
+    read_face: settings::ReadFaceKind,
+) -> AccessPointVm {
     let mut vm = AccessPointVm {
         model_api_url: model_api_url.to_owned(),
         data_api_url: data_api_url.to_owned(),
+        read_face,
         source: startup::config_source().unwrap_or("未记录").to_owned(),
         ..Default::default()
     };
@@ -1526,13 +1549,15 @@ impl App {
         settings_state.mesh_dir_hint = startup
             .map(|startup| startup.default_mesh_dir.clone())
             .unwrap_or_default();
+        // 环境变量压过设置时，设置窗那一格锁上并说明为什么（计划 D11）。
+        settings_state.read_face_lock = startup.and_then(|startup| startup.read_face.lock_notice());
         settings_state.adopt(adopted);
         let mut app = Self {
             // 连接前不摆任何工程数据：项目 / 库标识等 Ready 事件带真实值。
             // 接入点是例外——它说的是「这次冲着谁去」，连不上时反而最该看得见。
             vm: WorkbenchVm {
                 user: std::env::var("USERNAME").unwrap_or_else(|_| "user".into()),
-                access_point: access_point_vm(&model_api_url, &data_api_url),
+                access_point: access_point_vm(&model_api_url, &data_api_url, read_face),
                 ..Default::default()
             },
             state: WorkbenchState::default(),
@@ -1573,6 +1598,7 @@ impl App {
             model_reload_owed: false,
             model_reload_in_flight: false,
             model_reload_restore: None,
+            read_face_switch_restore: None,
             scope_targets: HashSet::new(),
             reload_ensure_tally: ReloadEnsureTally::default(),
             refresh_generation_pending: false,
@@ -1651,6 +1677,29 @@ impl App {
                     self.queue.namespace = self.namespace.clone();
                     self.vm.project_code = info.ns;
                     self.tree.roots = info.sites;
+                    // 换面之后的重装（ADR-0026 热切，计划 §5.3）：清场前的快照到这儿才
+                    // 移进取回工作那一格，随后走取回工作那条现成路——`clear_scene_for_reload`
+                    // 见已有快照就不重拍（此刻场景是空的，重拍只会拍到空白），
+                    // `Evt::GetWork` 按快照里的模型 ensure 再重查，显隐照原样回放。
+                    if let Some(snapshot) = self.read_face_switch_restore.take() {
+                        if snapshot.models.is_empty() {
+                            self.logs.info(
+                                &mut self.vm.logs,
+                                "供数模式已切换；换面前三维空着，没有要重装的模型",
+                            );
+                        } else {
+                            self.logs.info(
+                                &mut self.vm.logs,
+                                format!(
+                                    "供数模式已切换；按换面前的快照重装 {} 个模型（{} 个范围目标）",
+                                    snapshot.models.len(),
+                                    snapshot.targets.len()
+                                ),
+                            );
+                            self.model_reload_restore = Some(snapshot);
+                            self.get_work();
+                        }
+                    }
                     dirty = true;
                 }
                 data::Evt::Ready(Err(e)) => {
@@ -4333,7 +4382,53 @@ impl App {
     }
 
     fn reconnect(&mut self) {
-        // 新连接必须从空缓存开始：否则失败时状态栏和属性仍在说旧模型已经就绪。
+        self.reset_for_reconnect();
+        self.logs.info(&mut self.vm.logs, "正在重连数据源…");
+        let _ = self.bridge.req.send(data::Req::Reconnect);
+    }
+
+    /// 换供数模式（ADR-0026 热切，计划 §5.3）。与重连同一副骨架，多三步：清场前先拍
+    /// 快照（另放一格，重连那套复位会清掉取回工作的那一格）、把三维真正清空（重连不
+    /// 清几何，这里必须清——三维不许留旧供数方的几何，计划 D10）、告诉数据线程换面。
+    /// 新面 `Evt::Ready(Ok)` 到了再按快照重装；失败则停在未连接态，下拉可再改回去。
+    fn switch_read_face(&mut self, kind: settings::ReadFaceKind) {
+        let from = self.read_face;
+        // 只记第一次：换面失败后再换回来时场景早就空了，再拍只会拍到空白，把用户
+        // 真正的显示 / 隐藏冲掉（与 `clear_scene_for_reload` 同一条规矩）。
+        if self.read_face_switch_restore.is_none() {
+            self.read_face_switch_restore = Some(reload_snapshot(
+                &self.loaded_models,
+                &self.tree.pending_direction,
+                &self.tree.visibility,
+                &self.scope_targets,
+            ));
+        }
+        let snapshot = self.read_face_switch_restore.clone().unwrap_or_default();
+        self.reset_for_reconnect();
+        // `Replace(空)` despawn 全部场景根（与取回工作的清场同一招）。相机不动。
+        self.pending_models = Some(Vec::new());
+        // 搜索下拉里的是旧面的结果，在途那次也隔在门外；子串索引的状态由新面的
+        // `refresh_search_index` 重报（库供数开 / 建，服务供数 Off），不留旧面那份。
+        self.search_epoch = self.search_epoch.wrapping_add(1);
+        self.vm.search = SearchVm::default();
+        self.read_face = kind;
+        // 接入点面板报的是这一刻真正在用的那一面。
+        self.vm.access_point.read_face = kind;
+        let line = format!(
+            "供数模式：{} → {}；已清场，重装 {} 个已加载模型 / {} 个范围目标",
+            from.label(),
+            kind.label(),
+            snapshot.models.len(),
+            snapshot.targets.len()
+        );
+        self.command_output(line.clone());
+        self.logs.info(&mut self.vm.logs, line);
+        let _ = self.bridge.req.send(data::Req::SwitchReadFace(kind));
+    }
+
+    /// 重连 / 换面前把上一段连接的一切归零。新连接必须从空缓存开始：否则失败时状态栏
+    /// 和属性仍在说旧模型已经就绪。
+    fn reset_for_reconnect(&mut self) {
         self.clear_room_xray();
         self.room_panel_cache.clear();
         self.model_scope_epoch = self.model_scope_epoch.wrapping_add(1);
@@ -4394,8 +4489,6 @@ impl App {
         } else {
             self.rooms_overview = RoomBrowserVm::Idle;
         }
-        self.logs.info(&mut self.vm.logs, "正在重连数据源…");
-        let _ = self.bridge.req.send(data::Req::Reconnect);
     }
 
     fn refresh_model_update(&mut self) {
@@ -4574,7 +4667,7 @@ mod tests {
         claim_unloaded_model_refnos, command_reply_is_current, complete_refresh_generation,
         expand_room_model_targets, finished_after, in_mdb_path, mark_model_scope_unavailable,
         model_drains_idle, model_progress_terminal, model_visibility_plan, needs_children_query,
-        refresh_anchor, regenerate_label, regenerate_summary, reload_snapshot,
+        read_face_switch, refresh_anchor, regenerate_label, regenerate_summary, reload_snapshot,
         resolve_panel_room_reply, restore_model_reload, settle_pending_directions,
         settle_refresh_generation, settled_pending_roots, sync_ime_window, take_hidden_for_replay,
         task_matches_project,
@@ -5488,6 +5581,63 @@ mod tests {
         assert!(bare.targets.is_empty());
     }
 
+    /// 换供数模式（ADR-0026 热切，计划 §5.3）。只有设置值与此刻生效的那一面不同、且没被
+    /// `PLANT_READ_FACE` 压过才换。换面那一步的顺序是「拍快照 → 重连那套复位 → 清空三维
+    /// → 发 `SwitchReadFace`」——复位在拍照之前就是对着空场景拍；新面 `Ready(Ok)` 之后
+    /// 快照要先移进取回工作那一格再 `get_work()`，反过来 `clear_scene_for_reload` 会重拍
+    /// 一份空白快照顶掉它。
+    #[test]
+    fn a_switch_clears_the_scene_and_reloads_the_snapshot() {
+        use plant_ui::settings::ReadFaceKind::{Service, Store};
+
+        assert_eq!(read_face_switch(Service, Store, false), Some(Store));
+        assert_eq!(read_face_switch(Store, Service, false), Some(Service));
+        assert_eq!(read_face_switch(Store, Store, false), None);
+        assert_eq!(
+            read_face_switch(Service, Store, true),
+            None,
+            "被 PLANT_READ_FACE 压过时那一格是灰的，进程活着就一直按环境变量走"
+        );
+
+        let source = include_str!("main.rs");
+        let switch = source
+            .split("fn switch_read_face(")
+            .nth(1)
+            .unwrap()
+            .split("fn reset_for_reconnect(")
+            .next()
+            .unwrap();
+        let snapshot = switch
+            .find("self.read_face_switch_restore = Some(reload_snapshot(")
+            .expect("清场前先拍快照");
+        let reset = switch
+            .find("self.reset_for_reconnect()")
+            .expect("重连那套复位");
+        let clear = switch
+            .find("self.pending_models = Some(Vec::new())")
+            .expect("三维不许留旧供数方的几何");
+        let send = switch
+            .find("data::Req::SwitchReadFace(kind)")
+            .expect("告诉数据线程换面");
+        assert!(snapshot < reset && reset < clear && clear < send);
+
+        let ready = source
+            .split("data::Evt::Ready(Ok(info)) => {")
+            .nth(1)
+            .unwrap()
+            .split("data::Evt::Ready(Err(e)) => {")
+            .next()
+            .unwrap();
+        let restore = ready
+            .find("self.read_face_switch_restore.take()")
+            .expect("新面 Ready 之后接过换面前的快照");
+        let hand_over = ready
+            .find("self.model_reload_restore = Some(snapshot)")
+            .expect("移进取回工作那一格");
+        let get_work = ready.find("self.get_work()").expect("按取回工作那条路重装");
+        assert!(restore < hand_over && hand_over < get_work);
+    }
+
     #[test]
     fn replay_hides_only_survivors_and_consumes_the_snapshot() {
         let kept = RefU64(1);
@@ -5904,6 +6054,15 @@ impl App {
                 self.poll_queue_now();
             }
             self.persist_settings(&saved);
+            // 供数模式变了就热切（ADR-0026）：先落盘再换，换面失败也不丢这次改动——
+            // 界面停在未连接态，下拉可再改回去。
+            if let Some(kind) = read_face_switch(
+                self.read_face,
+                saved.read_face,
+                self.settings_state.read_face_lock.is_some(),
+            ) {
+                self.switch_read_face(kind);
+            }
             ui.ctx().request_repaint();
         }
         // 绘制层只读、消费不掉自己的滚动请求，所以由这里判断它落地没有。

@@ -90,6 +90,9 @@ pub struct AccessPointVm {
     pub user: String,
     pub model_api_url: String,
     pub data_api_url: String,
+    /// 这一刻实际生效的供数模式（ADR-0026）。设置里那一格可能被 `PLANT_READ_FACE`
+    /// 压过，这里报的是真正在用的那一面，不是文件里写的。
+    pub read_face: crate::settings::ReadFaceKind,
     /// 这组配置来自哪儿。`get_db_option()` 在没人注入配置时会**静默回落**去读工作
     /// 目录的 `DbOption.toml`——不把来源说出来，人就没法知道自己连到了哪儿。
     pub source: String,

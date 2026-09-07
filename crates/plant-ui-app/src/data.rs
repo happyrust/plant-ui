@@ -136,6 +136,11 @@ pub enum Req {
     /// 丢查询缓存并重跑启动序列。连库失败后命令行上的「重试」走这条，结果仍走
     /// `Evt::Ready`。
     Reconnect,
+    /// 换供数模式（ADR-0026 热切）：排干在途 → 丢缓存 → **两条通道同拍换面** → 重跑
+    /// 启动序列，结果仍走 `Evt::Ready`。宿主在发它之前已经清场并拍好快照，`Ready` 之后
+    /// 按取回工作那条路重装（计划 §5.3）。这是数据线程里换面的**唯一**入口——数据线程
+    /// 自己不许根据错误换面。
+    SwitchReadFace(ReadFaceKind),
     ModelUpdatePreview {
         base: String,
         project: String,
@@ -384,6 +389,10 @@ enum ModelLoad {
         mdb: String,
         namespace: String,
     },
+    /// 换面。模型通道是串行的：排在它前面的那条在途装载做完才换，其后排队的全是新面
+    /// ——与交互通道「排干在途再换」是同一个意思。只由 worker 在处理
+    /// `Req::SwitchReadFace` 时转发，不经 [`route_model_load`]。
+    Switch(ReadFaceKind),
 }
 
 fn route_model_load(req: Req, tx: &mpsc::Sender<ModelLoad>) -> Result<Option<Req>, ModelLoad> {
@@ -731,7 +740,7 @@ async fn handle_read(
                 result,
             });
         }
-        Req::Reconnect | Req::GetWork { .. } => {
+        Req::Reconnect | Req::SwitchReadFace(_) | Req::GetWork { .. } => {
             unreachable!("全局手术在 worker 循环里独占处理")
         }
         Req::Models { .. } | Req::ModelScopes { .. } => {
@@ -755,9 +764,14 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>, kind: ReadF
     let model_evt_tx = evt_tx.clone();
     let model_ctx = ctx.clone();
     let model_worker = move |mut task_ctx: bevy_wasm_tasks::TaskContext| async move {
+        let mut model_face = model_face;
         loop {
             while let Ok(load) = model_rx.try_recv() {
                 match load {
+                    ModelLoad::Switch(kind) => {
+                        // 串行通道：走到这儿说明前面排着的装载都已做完，换了就是新面。
+                        model_face = Arc::new(ReadFace::new(kind));
+                    }
                     ModelLoad::Replace {
                         roots,
                         ensure_targets,
@@ -936,6 +950,8 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>, kind: ReadF
         }
     };
     let worker = move |mut task_ctx: bevy_wasm_tasks::TaskContext| async move {
+        // 交互通道手上的那一面。只在下面 `Req::SwitchReadFace` 那一臂整体替换，别处不动。
+        let mut face = face;
         // sim 模式：整个数据线程改由进程内引擎供数——假身份直接 Ready，
         // 后续请求全部路由到剧本状态机，WS 同形明细由 pump 推送。
         let mut sim_engine = crate::sim::Engine::from_env();
@@ -999,6 +1015,9 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>, kind: ReadF
                         ctx.request_repaint();
                         continue;
                     }
+                    Err(ModelLoad::Switch(_)) => {
+                        unreachable!("换面由 worker 自己转发到模型通道，不经 route_model_load")
+                    }
                 };
                 if let Some(engine) = sim_engine.as_mut() {
                     crate::sim::handle(engine, req, &evt_tx);
@@ -1029,6 +1048,39 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>, kind: ReadF
                         }
                         let _ = evt_tx.send(Evt::Ready(reconnected));
                         ctx.request_repaint();
+                    }
+                    // 热切（ADR-0026）：与重连同一副骨架，多两步——换掉手上的面、
+                    // 叫模型通道同拍换。排干在途的理由同上：旧面上晚到的回包不该落在
+                    // 新面后面，而且它们要的缓存刚被丢掉。
+                    Req::SwitchReadFace(kind) => {
+                        while inflight.next().await.is_some() {}
+                        plant_ui_data::invalidate_all().await;
+                        face.invalidate().await;
+                        face = Arc::new(ReadFace::new(kind));
+                        // 两条通道必须永远是同一面：树是库、三维是服务就是按读面混源。
+                        // 模型通道停了就没有三维可言，那条路上的失败由后续装载自己报。
+                        let _ = model_tx.send(ModelLoad::Switch(kind));
+                        let switched = ready(&face).await;
+                        if let Ok(info) = switched.as_ref() {
+                            scope = Scope {
+                                project: info.project.clone(),
+                                ns: info.ns.clone(),
+                                mdb: info.mdb.clone(),
+                                dbnums: info.db_nums.clone(),
+                                cache_versions: info.cache_versions.clone(),
+                            };
+                        }
+                        let _ = evt_tx.send(Evt::Ready(switched));
+                        ctx.request_repaint();
+                        // 子串索引的状态跟着面走：库供数要开 / 建，服务供数报 Off。
+                        face.refresh_search_index(
+                            index.clone(),
+                            scope.clone(),
+                            false,
+                            evt_tx.clone(),
+                            ctx.clone(),
+                        )
+                        .await;
                     }
                     Req::GetWork {
                         branches,
@@ -1162,6 +1214,64 @@ mod tests {
         ] {
             assert!(body.contains(expected), "data.rs 少了读面调用：{expected}");
         }
+    }
+
+    /// worker 循环里处理 `Req::SwitchReadFace` 的那一臂。
+    fn switch_arm() -> &'static str {
+        body()
+            .split_once("Req::SwitchReadFace(kind) => {")
+            .expect("热切那一臂")
+            .1
+            .split_once("Req::GetWork {")
+            .expect("下一臂")
+            .0
+    }
+
+    /// 热切与重连同席：先排干在途、丢掉旧面的缓存，然后才换面——否则旧面上晚到的
+    /// 回包会落在新面后面，而且刚丢掉的缓存会被它填回旧数据。
+    #[test]
+    fn a_switch_drains_inflight_before_swapping() {
+        let arm = switch_arm();
+        let drain = arm
+            .find("while inflight.next().await.is_some() {}")
+            .expect("排干在途");
+        let invalidate = arm.find("face.invalidate().await").expect("丢旧面缓存");
+        let swap = arm
+            .find("face = Arc::new(ReadFace::new(kind))")
+            .expect("换面");
+        let ready = arm.find("ready(&face).await").expect("新面重跑启动序列");
+        assert!(drain < invalidate && invalidate < swap && swap < ready);
+    }
+
+    /// 两条通道同拍换面（ADR-0026）：交互通道换了自己那份，还要叫模型通道换它那份，
+    /// 而模型通道那头确实接了——漏一条就是「树是库、三维是服务」。
+    #[test]
+    fn a_switch_swaps_both_lanes() {
+        assert!(switch_arm().contains("model_tx.send(ModelLoad::Switch(kind))"));
+        let lane = body()
+            .split_once("ModelLoad::Switch(kind) => {")
+            .expect("模型通道的换面臂")
+            .1
+            .split_once("ModelLoad::Replace {")
+            .expect("下一臂")
+            .0;
+        assert!(lane.contains("model_face = Arc::new(ReadFace::new(kind))"));
+    }
+
+    /// 面只在三处造：`spawn` 造第一份，热切时两条通道各换一份。数据线程别处——尤其
+    /// `handle_read`——不许根据错误自行换面（计划默认清单 ⑤）。
+    #[test]
+    fn a_face_is_only_chosen_at_spawn_or_switch() {
+        let body = body();
+        assert_eq!(body.matches("ReadFace::new(").count(), 3);
+        let handle_read = body
+            .split_once("async fn handle_read(")
+            .expect("handle_read")
+            .1
+            .split_once("pub fn spawn(")
+            .expect("spawn")
+            .0;
+        assert!(!handle_read.contains("ReadFace::new("));
     }
 
     fn reload(roots: Vec<RefU64>, ensure_targets: Vec<RefU64>, debt_reload: bool) -> Req {
