@@ -34,6 +34,15 @@
   **M3 已完成**（2026-09-08：不说谎那几格落地——库行「模型来源」整格不画 + 翻面通告改口、CATA / 未同步 / 说不清
   三档属性定论、搜索标「只覆盖已入库元素」、队列面板「模型服务离线」；顺带修掉服务供数那句「按中间片段搜索仅桌面端
   提供」。三 crate 测试 128+2 / 122 / 19 全绿，wasm check 过；落地形状与三处偏离记在 §5.5 末，T5 留到 M6 前）。
+  **M4 已完成**（2026-09-08：`read_face/parity.rs` + `main.rs` 无头子命令 `--read-face-parity` + `scripts/Run-ReadFaceParity.ps1`；
+  对着开发接入点（gen-model 8022 `ingest` 形态 + SurrealDB 8009）跑 `depth 2 / sample 200` 出了
+  `docs/evidence/2026-09-08-read-face-parity.md`——roots 服务 37 / 库 16 / 共有 16、只在服务 21、原序一致；第 1 / 2 层
+  151 / 2548 个子节点集合与原序**零差异**；属性四档 1227 / 1 / 0 / 1756；实例 db7997 一桶 2014 键零差异。
+  **roots 那条硬标准在这台库上没过、也过不了**：只在服务的 21 个 SITE 全落在 `/dbnums` 标「MDB 声明了、项目目录里没有」
+  （`not_in_project`，`applied_sesno = 0`）的库里——1112、7999、7009 与 7321–7356 那批 MDS 模板 / 标准库，8009 里从没
+  导入过它们（库里 SITE 行只有 7997 的 13 行与 8000 的 3 行）；正是「M2 实机补丁」末尾记的那件事——两边数据本身不同源，
+  不是查询问题；要拿零差异得对着与服务同源的库（D1 本意的已落盘 rocksdb）再跑一遍，留 M6。落地形状与偏离记在 §5.4 末；
+  `plant-ui-app` 测试 133（122 + 11），wasm check 过）。
 
 ---
 
@@ -259,6 +268,41 @@ plant-ui-app --read-face-parity --depth 2 --sample 200 [--roots 24381/2,…] [--
   （`/dbnums` 的 `file_latest_sesno` / `applied_sesno`）。
 - 不进 CI（要活的 gen-model + SurrealDB）；`scripts/` 加一条一键跑法。
 
+**M4 落地形状**（2026-09-08，与上面的偏离都在这儿）：
+
+- **入口**：`main()` 先看 `--read-face-parity`，有就走 `run_parity` 不起 Bevy；接入点的读法与界面同一条
+  （`configure_native_access_point()` 从 `run_native` 里抽出来共用：资产根 → `config/e3d.project.ron` 给库账号，
+  没有就回落工作目录 `DbOption.toml`；`settings.ron` 给模型服务地址）。多一个 **`--service`** 压过设置里的地址
+  ——对拍常常要对着一台不是日常那台的服务。供数模式那一格不看：两面都要。没有 Bevy 替它起运行时，
+  `plant-ui-app` 原生端多依赖一个 `tokio`（`bevy-wasm-tasks` 本来就带着它，`Cargo.lock` 只多一行依赖名，不引新包）。
+  `the_probe_is_the_only_place_two_faces_coexist` 钉着：`parity.rs` 正文恰两处 `ReadFace::new(`，`main.rs` 零处。
+- **树**：按计划——roots 集合 diff，逐层 `children` 按 refno 集合 + 原序比，只往两边都有的节点底下走；
+  重复 refno 只认第一次出现；一边查询失败不拖累另一边，失败单列。两边并发、同时在途 8 个父节点。
+- **属性**：从两边共有的节点里等距抽 `--sample` 个，四档照 §5.4 原文；空表两侧分列、不猜元件库还是未同步。
+  **多出来的一张表**：「不同」与只在一边有的字段**按字段名归堆**（次数倒序）——实机跑出来「不同」1756 个字段里
+  `OWNER` / `REFNO` 各 200、`ORI` / `POS` 155、`AREA` / `NUMB` 150 上下，一眼看出是两面**写法**不一样
+  （服务给 refno `24381/42520`、库给 `24381_42520`；服务 `OWNER` 给 refno、库给名字；`ORI` 服务 `0, 0, 0`、
+  库 `Y is N and Z is U`；未设值服务 `unset`、库 `0` 或反过来）而不是数据不一样；只落在个别元素上的
+  （`DESC` 11 个：服务有文字、库 `unset`）才值得对着凭证看。四档本身没改口径——那是给表达式文本定的，
+  对显示串它把写法差异全归进「不同」，归堆那张表就是为了让人还读得出来。
+- **三维实例**：抽样根各读一次 `model_instances`（两面都只给这一个根），键 `(refno, geo_hash)` 按**集合**比
+  （同一元素下重复的键只算一次，报告里写明），按库分桶。**库号的来路与计划原文不同**：refno 高 32 位是 db ref
+  不是库号（与 §5.5 那条偏离同源），客户端算不出，所以拿根的名字打一次搜索、从命中的 `NameHit.dbnum` 解；
+  解不出的桶按 db ref 列「ref24381（dbnum 未解）」。不给 `--roots` 时从第 1 层共有节点里等距抽 ≤ 10 个。
+- **报告**：Markdown，`--out` 给路径就写文件（目录不在就建），不给打到标准输出；标准错误上 `[对拍]` 逐步报进度
+  与一句收尾。差异逐条最多列 50 行、超出只计数。里面**不出现「正确 / 错误」**（测试钉着）。
+- **脚本** `scripts/Run-ReadFaceParity.ps1`：`-Service` / `-Depth` / `-Sample` / `-Roots` / `-Out`（默认
+  `docs/evidence/<今天>-read-face-parity.md`，`-` = 标准输出）/ `-Exe`（不给就 `cargo build` 后用 target 里的）/
+  `-AssetRoot` / `-SettingsFile` / `-Release`。
+- **实机所见**（开发接入点，8022 沙箱 gen-model `ingest` 形态、`watch_dbnums = 7998, 8000` + 8009）：22 秒跑完；
+  roots 37 / 16 / 共有 16。只在服务的 21 个 SITE 按 `/dbnums` 的 `ref0s` 反查，全落在标 `not_in_project`
+  （「MDB 声明了、项目目录里没有」）、`applied_sesno = 0` 的库：`/1RS-CIVI` 在 1112，`/1WCC-PIPEBJ` 等四个在 7999，
+  `/Steel_Template_Site` 在 7009，`/MDS/*` 那十几个在 7321–7356——8009 里这些库一行都没导入过（SITE 行只有 7997 的 13
+  行与 8000 的 3 行），7998 一个 SITE 也没贡献。**顺带一条给 gen-model 的事实**（只列不判）：`/tree/roots` 列出了这些库的
+  SITE，`/dbnums` 却说它们不在项目目录里，两个端点对同一批库说的话不一致。工程标识那张表「设计库」一行服务
+  `7997, 7998, 8000`、库 `7997, 8000`。第 1 / 2 层 151 / 2548 零差异、原序一致；实例 db7997 2014 键零差异。
+  roots 硬标准要等与服务同源的库。
+
 ### 5.5 库供数下不说谎（M3）
 
 | 格 | 服务供数 | 库供数 |
@@ -309,7 +353,7 @@ plant-ui-app --read-face-parity --depth 2 --sample 200 [--roots 24381/2,…] [--
 | ✅ **M1** | `read_face/{mod,service}.rs` + `ReadFace::Service` 接进 `data.rs` 五处（`ready` / `get_work` / `handle_read` / 模型通道两处）；纯重构 | M0 | **已过**（2026-09-07）：既有测试一个不少，`cargo test -p plant-ui -p plant-ui-app -p plant-ui-data` = 121+2 / 109 / 18；净增 5 条——源码钉 `data_rs_reads_only_through_read_face`（§5.1）与 `service_face_never_touches_the_store`、`desi_dbnums` 纯函数两条（读透含 ISOD 带 `cache_versions` / 摄入只 DESI）、`a_face_reports_the_kind_it_was_built_from`；`property_requests_have_no_database_fallback` 改名 `property_requests_go_through_the_read_face`，钉 `face.props(`；`cargo check --target wasm32-unknown-unknown -p plant-ui-app` 过（`Arc<ReadFace>` 与 `Progress` 的 `Send` 在 `LocalBoxFuture` 下同样成立） |
 | ✅ **M2** | `read_face/store.rs`（从 HEAD `git show 4ec446f5a:crates/plant-ui-app/src/data.rs` 接回九条）；`Settings.read_face` + `resolve_read_face` + `PLANT_READ_FACE`；设置窗下拉；`AccessPointVm` 一行；`Req::SwitchReadFace` 热切（§5.3） | M1 | **已过**（2026-09-07，两个提交：M2a 库供数 + 设置格 + 环境变量，M2b 下拉 + 接入点一行 + 热切）。`cargo test -p plant-ui -p plant-ui-data -p plant-ui-app` = **124+2 / 118 / 18**（M1 基线 121+2 / 109 / 18；净增 3 / 9 / 0）。M2a：`the_default_read_face_is_service`、`read_face_kind_round_trips_as_lowercase_words`、`store_face_never_touches_the_service`、`a_model_request_carries_both_root_sets`、`resolve_read_face_prefers_the_environment_then_the_setting`（三态）、`old_settings_without_read_face_are_service`。M2b：`an_overridden_read_face_disables_the_dropdown`（从 M3 提前：控件在这儿出生；数设置窗那一层灰掉的控件——锁上 > 0、没锁 = 0，头几帧是 egui 量尺寸那一遍要跳过）、设置窗 8 帧高度测试补「锁上」一档、`only_an_effective_override_locks_the_dropdown`、`a_switch_drains_inflight_before_swapping`、`a_switch_swaps_both_lanes`、`a_face_is_only_chosen_at_spawn_or_switch`（默认清单 ⑤：`ReadFace::new(` 在 `data.rs` 正文恰 3 处、`handle_read` 内 0 处）、`a_switch_clears_the_scene_and_reloads_the_snapshot`（`read_face_switch` 三态 + 源码钉两段顺序）。`cargo check --target wasm32-unknown-unknown -p plant-ui-app` 过。实机那一遍留 M6 |
 | ✅ **M3** | 不说谎五格（§5.5）；命令行视图切换日志 | M2 | **已过**（2026-09-08）。`cargo test -p plant-ui -p plant-ui-app -p plant-ui-data` = **128+2 / 122 / 19**（M2 实机补丁后的基线 124+2 / 119 / 19；净增 4 / 3 / 0）。五格里两格 M2b 已提前收口：设置窗下拉（`an_overridden_read_face_disables_the_dropdown`）、房间不动（D6，两面都是 `require_mirror_feature`）。本轮四格：`store_mode_never_paints_a_model_source` + `a_flip_in_store_mode_says_it_changes_nothing_here`（T1）、`a_catalogue_element_in_store_mode_gets_a_verdict`（T2，三档 + 服务供数不进这条路）、`store_mode_search_names_its_coverage` + `service_mode_never_claims_substring_search_is_desktop_only`（T3，后者源码钉那一臂的门）、`a_missing_model_service_in_store_mode_says_which_half_is_down` + `a_missing_model_service_in_store_mode_does_not_block_ready`（T4，后者源码钉 `ready()`）。落地形状与三处偏离见 §5.5 末。实机那一遍留 M6 |
-| **M4** | 对拍探针（§5.4）+ `scripts/Run-ReadFaceParity.ps1` | M2 | AvevaMarineSample `depth 2 / sample 200` 出一份报告存 `docs/evidence/2026-09-xx-read-face-parity.md`；树 roots 集合与原序零差异是硬标准，属性四档计数入档 |
+| ✅ **M4** | 对拍探针（§5.4）+ `scripts/Run-ReadFaceParity.ps1` | M2 | **已过（工具 + 报告）；roots 硬标准待同源库**（2026-09-08）。`crates/plant-ui-app/src/read_face/parity.rs` + `main.rs` 的 `run_parity` / `configure_native_access_point`；`plant-ui-app` 测试 **133**（M3 基线 122；净增 11：`parse_args_*` 两条、`diff_children_reports_sets_and_order_separately`、`a_level_only_walks_into_nodes_both_sides_have`、`classify_value_follows_the_dialect_ladder`、`props_compare_files_each_field_and_lists_empty_tables_apart`、`evenly_spaced_*`、`bucket_instances_groups_by_resolved_dbnum_then_db_ref`、`the_report_lists_and_never_judges`、`the_report_groups_field_differences_by_name`、`the_probe_is_the_only_place_two_faces_coexist`（源码钉两面并存只此一处））；`cargo check --target wasm32-unknown-unknown -p plant-ui-app` 过。报告 `docs/evidence/2026-09-08-read-face-parity.md`（AvevaMarineSample `depth 2 / sample 200`，22 s）：roots 37 / 16 / 共有 16、只在服务 21、原序一致；第 1 / 2 层 151 / 2548 零差异；属性四档 **1227 / 1 / 0 / 1756**（「不同」按字段归堆见报告）；实例 db7997 一桶 2014 键零差异。**roots 零差异这台库上过不了**：只在服务的 21 个 SITE 全在 `/dbnums` 标 `not_in_project`、`applied_sesno = 0` 的库里（1112 / 7999 / 7009 / 7321–7356），8009 从没导入过它们，两边数据不同源（「M2 实机补丁」已记）——换与服务同源的库再跑一遍归 M6 |
 | ✅ **M5** | ADR-0026、`CONTEXT.md` 三词条、09-02 / 09-04 两份计划状态行追记（§2.3）——**这三样已随本计划落下**；`CHANGELOG.md`「未发布 · 设置」一节（供数模式下拉、换了当场清场重装、`PLANT_READ_FACE` 压过时下拉灰掉）**随 M2b 落下**；不说谎那几格与搜索那句谎的两条**随 M3 落下**（2026-09-08） | — | 文档互引核对：ADR-0026 ↔ 本计划 ↔ `CONTEXT.md` 三处名字一致 |
 | **M6** | 实机验收（§七） | M3、M4 | 记进 `docs/2026-08-12_live-test-ledger.md` 同款格式 |
 
@@ -329,6 +373,8 @@ plant-ui-app --read-face-parity --depth 2 --sample 200 [--roots 24381/2,…] [--
 5. **库供数下关掉 gen-model**：树可展开、属性可看、已生成模型可装；队列面板「模型服务离线」；点未生成元素的眼睛 → 失败出声、不崩。
 6. **`PLANT_READ_FACE=store` 启动**：下拉禁用并标注；改设置无效且界面说明为什么。
 7. **对拍**：M4 报告 roots 与原序零差异；属性四档计数；实例按桶差异只在两枚凭证不同的库上出现。
+   **要对着与服务同源的库跑**（2026-09-08 对着开发库 8009 的那份 `docs/evidence/2026-09-08-read-face-parity.md`
+   roots 差 21 个，全是库里没有的库，见 §5.4 末）。
 8. **wasm 构建**跑一遍 1–2（网格从站点 `meshes/`）。
 
 ---

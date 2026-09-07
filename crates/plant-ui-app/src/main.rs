@@ -65,7 +65,16 @@ use plant_ui_data::{EleTreeNode, RefU64};
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() {
-    let gallery = std::env::args().any(|a| a == "--gallery");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == read_face::parity::FLAG) {
+        // 对拍探针：无头子命令，不起 Bevy、不开窗（计划 §5.4 / D14）。
+        if let Err(error) = run_parity(args) {
+            eprintln!("对拍失败：{error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    let gallery = args.iter().any(|a| a == "--gallery");
     if gallery {
         run_gallery().expect("组件画廊启动失败");
     } else if let Err(error) = run_native() {
@@ -112,6 +121,99 @@ extern "C" {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn run_native() -> anyhow::Result<()> {
+    let asset_root = configure_native_access_point()?;
+
+    // 设置项要在起 Bevy 之前读出来：网格资产源必须早于 `AssetPlugin` 注册，
+    // 那时候界面还一帧都没画。
+    let mut warnings = Vec::new();
+    let stored = match settings_store::load() {
+        Ok(stored) => stored,
+        Err(error) => {
+            warnings.push(format!("{error:#}；这次先用默认设置"));
+            None
+        }
+    };
+    // 没有设置文件时，服务地址仍旧走环境变量 / 出厂默认那条老路；有文件时它说了算
+    // （ADR-0008 的优先级）。
+    let settings = stored.unwrap_or_else(|| settings::Settings {
+        model_api_url: model_update_api::base_url(),
+        data_api_url: data_publish_api::base_url(),
+        ..settings::Settings::default()
+    });
+    // DirectTree 的启动查询走 `model_update_api::base_url()`，不是 `App` 保存的
+    // 请求地址。原生端既然已经采用了落盘设置，就必须在启动数据线程之前把同一份
+    // 地址交给全局 API 客户端；否则界面显示的是设置值，首个 SITE 查询却仍会连
+    // 出厂默认端口。
+    model_update_api::set_base_url(settings.model_api_url.clone())?;
+    // 供数模式（ADR-0026）：设置项那一格，开发期可由 PLANT_READ_FACE 压过。认不出的值
+    // 出声一次、按设置走——不悄悄退回出厂默认。
+    let read_face = settings_store::resolve_read_face(
+        settings.read_face,
+        std::env::var_os(settings_store::READ_FACE_ENV),
+    );
+    if let Some(warning) = read_face.warning.clone() {
+        warnings.push(warning);
+    }
+    let default_mesh_dir =
+        settings_store::resolve_mesh_dir("", std::env::var_os(PLANT_MESH_DIR), &asset_root);
+    let mesh_dir = settings_store::resolve_mesh_dir(
+        &settings.mesh_dir,
+        std::env::var_os(PLANT_MESH_DIR),
+        &asset_root,
+    );
+    if !mesh_dir.is_dir() {
+        warnings.push(format!(
+            "网格目录不存在：{}；三维会一个网格都加载不出来，去设置里改",
+            mesh_dir.display()
+        ));
+    }
+    plant_ui_view3d::mesh_source::set_mesh_dir(&mesh_dir);
+    settings_store::set_startup(settings_store::Startup {
+        settings,
+        default_mesh_dir: default_mesh_dir.to_string_lossy().into_owned(),
+        read_face,
+        warnings,
+    });
+
+    run("#plant-ui", asset_root.to_string_lossy().into_owned());
+    Ok(())
+}
+
+/// 对拍探针（计划 §5.4 / D14）：`plant-ui-app --read-face-parity …`。
+///
+/// 接入点的读法与界面同一条——项目配置给库账号、`settings.ron` 给模型服务地址
+/// （`--service` 压过它）；供数模式那一格**不看**：探针两面都要，读面在 `parity::run`
+/// 里各造一份。不起 Bevy，所以数据线程的运行时也得自己起一个。
+#[cfg(not(target_arch = "wasm32"))]
+fn run_parity(args: Vec<String>) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let options = read_face::parity::parse_args(args)?;
+    configure_native_access_point()?;
+    let base = match options.service.clone() {
+        Some(service) => service,
+        None => match settings_store::load() {
+            Ok(Some(settings)) => settings.model_api_url,
+            Ok(None) => model_update_api::base_url(),
+            Err(error) => {
+                eprintln!("[对拍] {error:#}；模型服务地址按环境变量 / 出厂默认");
+                model_update_api::base_url()
+            }
+        },
+    };
+    model_update_api::set_base_url(base)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("起 tokio 运行时失败")?;
+    let report = runtime.block_on(read_face::parity::run(&options))?;
+    read_face::parity::deliver(&report, options.out.as_deref())
+}
+
+/// 资产根 + 项目接入点：找到资产根，把旧版项目配置（库地址与账号）交给 `aios_core`，
+/// 没有就记下「回落到工作目录 `DbOption.toml`」这一条。界面与对拍探针共用。
+#[cfg(not(target_arch = "wasm32"))]
+fn configure_native_access_point() -> anyhow::Result<std::path::PathBuf> {
     use anyhow::Context;
 
     let development_root =
@@ -197,61 +299,7 @@ fn run_native() -> anyhow::Result<()> {
             legacy_path.display()
         ));
     }
-
-    // 设置项要在起 Bevy 之前读出来：网格资产源必须早于 `AssetPlugin` 注册，
-    // 那时候界面还一帧都没画。
-    let mut warnings = Vec::new();
-    let stored = match settings_store::load() {
-        Ok(stored) => stored,
-        Err(error) => {
-            warnings.push(format!("{error:#}；这次先用默认设置"));
-            None
-        }
-    };
-    // 没有设置文件时，服务地址仍旧走环境变量 / 出厂默认那条老路；有文件时它说了算
-    // （ADR-0008 的优先级）。
-    let settings = stored.unwrap_or_else(|| settings::Settings {
-        model_api_url: model_update_api::base_url(),
-        data_api_url: data_publish_api::base_url(),
-        ..settings::Settings::default()
-    });
-    // DirectTree 的启动查询走 `model_update_api::base_url()`，不是 `App` 保存的
-    // 请求地址。原生端既然已经采用了落盘设置，就必须在启动数据线程之前把同一份
-    // 地址交给全局 API 客户端；否则界面显示的是设置值，首个 SITE 查询却仍会连
-    // 出厂默认端口。
-    model_update_api::set_base_url(settings.model_api_url.clone())?;
-    // 供数模式（ADR-0026）：设置项那一格，开发期可由 PLANT_READ_FACE 压过。认不出的值
-    // 出声一次、按设置走——不悄悄退回出厂默认。
-    let read_face = settings_store::resolve_read_face(
-        settings.read_face,
-        std::env::var_os(settings_store::READ_FACE_ENV),
-    );
-    if let Some(warning) = read_face.warning.clone() {
-        warnings.push(warning);
-    }
-    let default_mesh_dir =
-        settings_store::resolve_mesh_dir("", std::env::var_os(PLANT_MESH_DIR), &asset_root);
-    let mesh_dir = settings_store::resolve_mesh_dir(
-        &settings.mesh_dir,
-        std::env::var_os(PLANT_MESH_DIR),
-        &asset_root,
-    );
-    if !mesh_dir.is_dir() {
-        warnings.push(format!(
-            "网格目录不存在：{}；三维会一个网格都加载不出来，去设置里改",
-            mesh_dir.display()
-        ));
-    }
-    plant_ui_view3d::mesh_source::set_mesh_dir(&mesh_dir);
-    settings_store::set_startup(settings_store::Startup {
-        settings,
-        default_mesh_dir: default_mesh_dir.to_string_lossy().into_owned(),
-        read_face,
-        warnings,
-    });
-
-    run("#plant-ui", asset_root.to_string_lossy().into_owned());
-    Ok(())
+    Ok(asset_root)
 }
 
 /// 网格目录的环境变量。夹在设置项与出厂默认之间（ADR-0008 的优先级）。

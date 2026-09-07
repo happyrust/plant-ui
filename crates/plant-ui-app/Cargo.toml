@@ -31,6 +31,9 @@ web-time.workspace = true
 bevy-wasm-tasks = { workspace = true, features = ["tokio"] }
 config.workspace = true
 rfd.workspace = true
+# 对拍探针（`--read-face-parity`）无头跑，没有 Bevy 替它起运行时，自己起一个。
+# 界面那条路仍由 bevy-wasm-tasks 驱动，这里不另开第二条数据线程。
+tokio.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 bevy-wasm-tasks = { workspace = true, features = ["wasm"] }

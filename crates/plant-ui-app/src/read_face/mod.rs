@@ -21,6 +21,10 @@ use crate::data::{Evt, RegenerateCount};
 use crate::model_update_api::ModelRecords;
 use crate::search_index::{Scope, SearchIndex, SubstringHits};
 
+/// 对拍探针（计划 §5.4 / D14）：`plant-ui-app --read-face-parity`，无头子命令，两面并存
+/// 只许在它里面。浏览器端没有命令行也没有库连接，不编进去。
+#[cfg(not(target_arch = "wasm32"))]
+pub mod parity;
 mod service;
 mod store;
 
