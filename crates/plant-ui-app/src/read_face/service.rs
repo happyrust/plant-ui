@@ -11,10 +11,10 @@ use std::sync::mpsc;
 use plant_ui::task_queue::DbnumReport;
 use plant_ui_data::{Attr, EleTreeNode, RefU64};
 
-use super::{Identity, Progress, SearchOutcome, ServiceIdentity};
+use super::{Identity, ModelInstancesReq, SearchOutcome};
 use crate::data::{Evt, RegenerateCount, SEARCH_LIMIT};
 use crate::model_update_api::{self, ModelRecords};
-use crate::search_index::{Scope, SearchIndex, SearchIndexState, SubstringHits};
+use crate::search_index::{Scope, SearchIndexState, SubstringHits};
 
 pub struct ServiceReadFace;
 
@@ -76,36 +76,30 @@ impl ServiceReadFace {
 
     /// gen-model 的快照 NAME 索引已经是子串索引，前缀那一路直接吃它；不再从库构建
     /// 第二份本地时点，子串那一路恒「不提供」。
-    pub async fn search(&self, query: &str, limit: usize, _index: &SearchIndex) -> SearchOutcome {
+    pub async fn search(&self, query: &str, limit: usize) -> SearchOutcome {
         SearchOutcome {
             prefix: model_update_api::search_names(&self.base(), query, limit).await,
             substring: SubstringHits::Unavailable,
+            index_failure: None,
         }
     }
 
     /// 这一面没有本地子串索引可开可建：搜索由服务端的 epoch 钉住的 NAME 索引供给。
-    pub async fn refresh_search_index(
-        &self,
-        _index: SearchIndex,
-        _scope: Scope,
-        _force: bool,
-        evt_tx: mpsc::Sender<Evt>,
-        ctx: egui::Context,
-    ) {
+    pub async fn refresh_search_index(&self, evt_tx: mpsc::Sender<Evt>, ctx: egui::Context) {
         let _ = evt_tx.send(Evt::SearchIndex(SearchIndexState::Off));
         ctx.request_repaint();
     }
 
-    /// 整批一次回，没有逐根进度可报。
+    /// 查 `generation_roots`（服务端在 ensure 时把每个范围解到精确的生成根，
+    /// `/model/records` 按它们分桶）。整批一次回，没有逐根进度可报。
     pub async fn model_instances(
         &self,
-        roots: &[RefU64],
-        identity: &ServiceIdentity<'_>,
-        _progress: Progress<'_>,
+        req: &ModelInstancesReq<'_>,
     ) -> anyhow::Result<ModelRecords> {
+        let identity = req.identity;
         model_update_api::model_records(
             identity.base,
-            roots,
+            req.generation_roots,
             identity.project,
             identity.mdb,
             identity.namespace,
@@ -120,11 +114,8 @@ impl ServiceReadFace {
     ///
     /// 多个根合成一份账。右键落在多选上时它们可能互相嵌套（选中一个 ZONE 连同它所在的
     /// SITE），记录按序列化后的身份去重——同一台设备数两遍，确认框上那个数字就是假的。
-    pub async fn regeneration_count(
-        &self,
-        targets: &[RefU64],
-        _delivery_units: &[String],
-    ) -> anyhow::Result<RegenerateCount> {
+    /// 交付单元名词表这一面用不上：归根由服务端在 ensure 时做。
+    pub async fn regeneration_count(&self, targets: &[RefU64]) -> anyhow::Result<RegenerateCount> {
         let base = self.base();
         let health = model_update_api::service_health(&base).await?;
         let mdb = health.mdb.as_deref().unwrap_or_default();

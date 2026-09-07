@@ -15,7 +15,10 @@
   121+2 / 104 / 18 全绿）；ADR-0026、`CONTEXT.md` 三词条与两份旧计划的追记（M5 文档半边）随本计划一并落下。
   **M1 已完成**（2026-09-07：`crates/plant-ui-app/src/read_face/{mod,service}.rs` 新建，`data.rs` 的读调用全部改经
   `ReadFace`，纯重构；三 crate 测试 121+2 / 109 / 18 全绿，`cargo check --target wasm32-unknown-unknown -p plant-ui-app` 过）。
-  M2 起代码未动。
+  **M2a 已完成**（2026-09-07：`read_face/store.rs` 从 v0.1.9 逐字接回九条、`ReadFace::Store` 接上；
+  `Settings.read_face` + `resolve_read_face` + `PLANT_READ_FACE`；`ModelInstancesReq` / `SearchOutcome.index_failure`
+  两处签名定形；测试 123+2 / 113 / 18，wasm check 过——`PLANT_READ_FACE=store` 已能整机跑库供数，只是还没有界面入口）。
+  M2b（设置窗下拉 / 接入点一行 / 热切）未动。
 
 ---
 
@@ -140,9 +143,9 @@ impl ReadFace {
     pub async fn ancestors(&self, refno: RefU64) -> anyhow::Result<Vec<RefU64>>;
     pub async fn props(&self, refno: RefU64, scope: &Scope) -> anyhow::Result<Vec<Attr>>;
     pub async fn resolve_name(&self, name: &str) -> anyhow::Result<Option<RefU64>>;
-    pub async fn search(&self, query: &str, limit: usize, index: &SearchIndex) -> SearchOutcome;   // prefix: Result<Vec<NameHit>>, substring: SubstringHits
+    pub async fn search(&self, query: &str, limit: usize, index: &SearchIndex) -> SearchOutcome;   // prefix: Result<Vec<NameHit>>, substring: SubstringHits, index_failure: Option<String>
     pub async fn refresh_search_index(&self, index: SearchIndex, scope: Scope, force: bool, evt_tx: mpsc::Sender<Evt>, ctx: egui::Context);  // 状态经 Evt::SearchIndex 出去；服务供数恒报 Off
-    pub async fn model_instances(&self, roots: &[RefU64], identity: &ServiceIdentity<'_>, progress: Progress<'_>) -> anyhow::Result<ModelRecords>;  // 只读；ensure 留在调用方
+    pub async fn model_instances(&self, req: &ModelInstancesReq<'_>, progress: Progress<'_>) -> anyhow::Result<ModelRecords>;  // 只读；ensure 留在调用方
     pub async fn regeneration_count(&self, targets: &[RefU64], delivery_units: &[String]) -> anyhow::Result<RegenerateCount>;
     pub async fn invalidate(&self);
 }
@@ -151,6 +154,18 @@ impl ReadFace {
 `ServiceIdentity<'_>` 是随 `Req` 捎下来的服务身份四格（`base` / `project` / `mdb` / `namespace`，宿主的设置项，
 数据线程不认识），库供数不看它；`Progress<'_>` = `&mut (dyn FnMut(usize, usize) + Send)`，服务供数整批一次回不报进度，
 库供数按根报。
+
+**`ModelInstancesReq { roots, generation_roots, identity }`（M2a 定形）**：两面要的根不一样，所以两份都带、各取各的。
+`roots` 是调用方自己的根（取回工作重装 = 快照里的模型 refno；eye 显示 = 点下去的树目标），**库供数只查它**
+——v0.1.9 原样，`inst_relate.anc CONTAINS $root` 一根一条，拿并集去跑会把嵌套在 `roots` 底下的生成根数两遍。
+`generation_roots` 是**服务供数要查的名单**，调用方按 `ensure` 回执算好（重装 = `roots` ∪ 回执根；eye = 回执根，
+回执空则退到目标本身），与工作树落地时 `/model/records` 的分桶口径一字不差。
+
+`SearchOutcome.index_failure`：库供数下子串索引**查询本身炸了**（不是「没就绪」）要作为 `Evt::SearchIndex(Failed)`
+说出去，v0.1.9 在 `handle_read` 里直接发；读面没有 `evt_tx`，所以放进返回值由 `data.rs` 转发。服务供数恒 `None`。
+
+各面的方法只收自己用得上的参数（`ServiceReadFace::props(refno, scope)` / `StoreReadFace::props(refno)`、
+`ServiceReadFace::search(query, limit)` / `StoreReadFace::search(query, limit, index)` …），enum 那一层是唯一的适配点。
 
 - **为什么是 enum 不是 `dyn Trait`**：恰好两个变体，穷尽匹配；`async fn` 直接写，不用 `async-trait`；
   原生端 future 要 `Send`、wasm 端不 `Send`（`data.rs:568-580` 已经为此分了两套 `InflightQuery`），
@@ -168,8 +183,13 @@ impl ReadFace {
 
 - `plant_ui::settings::Settings` 加 `read_face: ReadFaceKind`（`#[serde(default)]`，`Default` = `Service`，
   serde 字面 `"service"` / `"store"`），与 `model_api_url` 一样住 `settings_store`（exe 旁 `settings.ron`）。
-- 解析优先级（`settings_store::resolve_read_face(settings, env)`，纯函数）：`PLANT_READ_FACE` 认得出 → 用它并记
-  `overridden = true`；认不出 → 出声一次、按未设置；未设置 → 设置值。**不认 `PLANT_TREE_DATA_MODE`**。
+  **`ReadFaceKind` 本身住 `plant_ui::settings`**（绘制 crate：设置窗要画它、接入点面板要报它），
+  `plant-ui-app::read_face` 只是 `pub use`；`label()` 给「服务供数 / 库供数」两处共用。
+- 解析优先级（`settings_store::resolve_read_face(configured, env) -> ResolvedReadFace { kind, overridden, warning }`，
+  纯函数）：`PLANT_READ_FACE` 认得出 → 用它并记 `overridden = true`；认不出 → `warning` 出声一次、按设置值；
+  未设置 → 设置值。**不认 `PLANT_TREE_DATA_MODE`**。它与网格目录那条**相反**（环境变量压过设置）：这一格是开发期
+  临时切面用的，进程一起就该说了算。结果放进 `settings_store::Startup.read_face`，`App::new` 据此造读面、
+  存 `App.read_face`；浏览器端没交底 = `Service`。启动日志「已连接 …」尾巴上带当前供数模式。
 - 设置窗（`settings.rs::show`）在「模型服务地址」下面加一格下拉「供数模式：服务供数 / 库供数」；`overridden` 时
   禁用 + 一句「由 PLANT_READ_FACE 压过」。保存路径与今天三格同一条（`main.rs` 收到 `saved` → `persist_settings`）。
 - 接入点面板 `AccessPointVm` 加 `read_face: ReadFaceKind`，绘制层一行「供数：服务 / 库」。

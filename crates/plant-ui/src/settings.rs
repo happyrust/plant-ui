@@ -51,6 +51,32 @@ impl Theme {
     }
 }
 
+/// 供数模式（ADR-0026）：模型树 / 属性 / 搜索 / 三维实例从哪儿读。整个接入点只认一种，
+/// 不按读面混；命令面（补齐 / 更新 / 队列）与它无关，永远走模型服务。
+///
+/// 落盘字面是 `service` / `store`。它住在这个 crate 里是因为设置窗要画它、接入点面板要
+/// 报它；真正按它选读面的是宿主（`plant-ui-app` 的 `read_face`）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReadFaceKind {
+    /// 服务供数：经模型服务的 HTTP 接口读，底下是 e3d-io（数据）与 e3d-model（几何）。出厂默认。
+    #[default]
+    Service,
+    /// 库供数：直连 SurrealDB 的 `pe` / `pe_owner` / `ATT_*` / `inst_relate` 读。保留档：
+    /// 给已落盘的 rocksdb 部署、老版本模型服务与对拍用。
+    Store,
+}
+
+impl ReadFaceKind {
+    /// 界面上的名字。设置窗的下拉与接入点面板那一行共用，两处不各写一份。
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Service => "服务供数",
+            Self::Store => "库供数",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -58,6 +84,9 @@ pub struct Settings {
     pub density: Density,
     pub model_api_url: String,
     pub data_api_url: String,
+    /// 供数模式。老 `settings.ron` 没这一格就是服务供数（`serde(default)`）。
+    /// 它描述的是这台机器能不能碰到库，随 `model_api_url` 一起按机器落盘，不进项目 bundle。
+    pub read_face: ReadFaceKind,
     /// 网格文件所在的目录。**空串是明确的「我没指定」**，那一格让给环境变量，
     /// 再退到出厂默认 `<资产根>/meshes`；解出来的实际路径由宿主放进
     /// [`State::mesh_dir_hint`] 当占位提示显示。
@@ -74,6 +103,7 @@ impl Default for Settings {
             density: Density::Standard,
             model_api_url: DEFAULT_MODEL_API_URL.to_owned(),
             data_api_url: DEFAULT_DATA_API_URL.to_owned(),
+            read_face: ReadFaceKind::Service,
             mesh_dir: String::new(),
         }
     }
@@ -362,6 +392,34 @@ mod tests {
     #[test]
     fn mesh_dir_defaults_to_following_the_asset_root() {
         assert_eq!(Settings::default().mesh_dir, "");
+    }
+
+    /// 出厂是服务供数（ADR-0026 / 计划 D1）：库供数是保留档，得有人明确选它。
+    #[test]
+    fn the_default_read_face_is_service() {
+        assert_eq!(Settings::default().read_face, ReadFaceKind::Service);
+        assert_eq!(ReadFaceKind::default(), ReadFaceKind::Service);
+    }
+
+    /// 落盘字面是小写单词，与计划 D11 写的一致；两个方向都要对得上，
+    /// 不然手改过的 `settings.ron` 读回来就是整份解析失败。（RON 那一层的往返在
+    /// 宿主的 `settings_store` 测试里，这里只钉 serde 的改名。）
+    #[test]
+    fn read_face_kind_round_trips_as_lowercase_words() {
+        assert_eq!(
+            serde_json::to_string(&ReadFaceKind::Service).unwrap(),
+            "\"service\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReadFaceKind::Store).unwrap(),
+            "\"store\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ReadFaceKind>("\"store\"").unwrap(),
+            ReadFaceKind::Store
+        );
+        assert_eq!(ReadFaceKind::Service.label(), "服务供数");
+        assert_eq!(ReadFaceKind::Store.label(), "库供数");
     }
 
     #[test]

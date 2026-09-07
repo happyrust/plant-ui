@@ -18,7 +18,7 @@ use plant_ui::model_update::{Enqueued, Preview, ProgressEvent};
 use plant_ui::task_queue::Poll as QueuePoll;
 use plant_ui_data::{EleTreeNode, RefU64};
 
-use crate::read_face::{ReadFace, ReadFaceKind, ServiceIdentity};
+use crate::read_face::{ModelInstancesReq, ReadFace, ReadFaceKind, ServiceIdentity};
 use crate::search_index::{Scope, SearchIndex, SearchIndexState, SubstringHits};
 
 /// 搜索一次最多带回多少条。下拉本来就只列得下十几行，多取的部分只是让包含匹配
@@ -564,6 +564,10 @@ async fn handle_read(
         }
         Req::SearchElements { epoch, query } => {
             let outcome = face.search(&query, SEARCH_LIMIT, &index).await;
+            // 子串索引查炸了要说出来，否则界面只表现为「子串一条都没有」。
+            if let Some(failure) = outcome.index_failure {
+                let _ = evt_tx.send(Evt::SearchIndex(SearchIndexState::Failed(failure)));
+            }
             let _ = evt_tx.send(Evt::SearchElements {
                 epoch,
                 query,
@@ -773,6 +777,8 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>, kind: ReadF
                             // 直接算命中，只有被改到的根真重算。顺序做：一个范围可能
                             // 就是整个 ZONE，并发只会让服务端的 per-dbnum 锁互相撞。
                             // 失败不中止：空场景比旧几何更坏，重查照跑，回执里说清。
+                            // 服务供数查的是快照根 ∪ 回执里的生成根；库供数只查快照根
+                            // （两份都进 `ModelInstancesReq`，各取各的）。
                             let mut record_roots = roots.clone();
                             for target in &ensure_targets {
                                 let result = crate::model_update_api::ensure_model(
@@ -804,12 +810,15 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>, kind: ReadF
                             let progress_ctx = model_ctx.clone();
                             let result = model_face
                                 .model_instances(
-                                    &record_roots,
-                                    &ServiceIdentity {
-                                        base: &base,
-                                        project: &project,
-                                        mdb: &mdb,
-                                        namespace: &namespace,
+                                    &ModelInstancesReq {
+                                        roots: &roots,
+                                        generation_roots: &record_roots,
+                                        identity: ServiceIdentity {
+                                            base: &base,
+                                            project: &project,
+                                            mdb: &mdb,
+                                            namespace: &namespace,
+                                        },
                                     },
                                     &mut move |done, total| {
                                         let _ =
@@ -874,14 +883,19 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>, kind: ReadF
                                     model_ctx.request_repaint();
                                     let progress_tx = model_evt_tx.clone();
                                     let progress_ctx = model_ctx.clone();
+                                    // 服务供数查回执里的生成根（回执空则退到目标本身，
+                                    // 上面已经补进去）；库供数只查点下去的那个目标。
                                     let result = model_face
                                         .model_instances(
-                                            &generation_roots,
-                                            &ServiceIdentity {
-                                                base: &base,
-                                                project: &project,
-                                                mdb: &mdb,
-                                                namespace: &namespace,
+                                            &ModelInstancesReq {
+                                                roots: &[target],
+                                                generation_roots: &generation_roots,
+                                                identity: ServiceIdentity {
+                                                    base: &base,
+                                                    project: &project,
+                                                    mdb: &mdb,
+                                                    namespace: &namespace,
+                                                },
                                             },
                                             &mut move |done, total| {
                                                 let _ = progress_tx.send(Evt::ModelScopeProgress {

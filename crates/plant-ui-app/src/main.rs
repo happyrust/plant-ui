@@ -220,6 +220,15 @@ fn run_native() -> anyhow::Result<()> {
     // 地址交给全局 API 客户端；否则界面显示的是设置值，首个 SITE 查询却仍会连
     // 出厂默认端口。
     model_update_api::set_base_url(settings.model_api_url.clone())?;
+    // 供数模式（ADR-0026）：设置项那一格，开发期可由 PLANT_READ_FACE 压过。认不出的值
+    // 出声一次、按设置走——不悄悄退回出厂默认。
+    let read_face = settings_store::resolve_read_face(
+        settings.read_face,
+        std::env::var_os(settings_store::READ_FACE_ENV),
+    );
+    if let Some(warning) = read_face.warning.clone() {
+        warnings.push(warning);
+    }
     let default_mesh_dir =
         settings_store::resolve_mesh_dir("", std::env::var_os(PLANT_MESH_DIR), &asset_root);
     let mesh_dir = settings_store::resolve_mesh_dir(
@@ -237,6 +246,7 @@ fn run_native() -> anyhow::Result<()> {
     settings_store::set_startup(settings_store::Startup {
         settings,
         default_mesh_dir: default_mesh_dir.to_string_lossy().into_owned(),
+        read_face,
         warnings,
     });
 
@@ -882,6 +892,9 @@ struct App {
     settings_state: SettingsState,
     model_api_url: String,
     data_api_url: String,
+    /// 这一刻实际生效的供数模式（ADR-0026）。数据线程里的读面就是按它造的；设置项被
+    /// `PLANT_READ_FACE` 压过时它与 `settings_state.saved.read_face` 不同。
+    read_face: settings::ReadFaceKind,
     /// 当前 MDB 名（带前导 `/`），连库时取回。模型更新的预览与执行都要带上它
     /// ——本期执行范围就是照这个 MDB 解出来的 DESI 库号。
     mdb: String,
@@ -1505,6 +1518,10 @@ impl App {
         }
         let model_api_url = adopted.model_api_url.clone();
         let data_api_url = adopted.data_api_url.clone();
+        // 浏览器端没人交底：那一侧没有库可连，只有服务供数。
+        let read_face = startup
+            .map(|startup| startup.read_face.kind)
+            .unwrap_or_default();
         let mut settings_state = SettingsState::default();
         settings_state.mesh_dir_hint = startup
             .map(|startup| startup.default_mesh_dir.clone())
@@ -1528,6 +1545,7 @@ impl App {
             settings_state,
             model_api_url,
             data_api_url,
+            read_face,
             mdb: String::new(),
             namespace: String::new(),
             desi_dbs: Vec::new(),
@@ -1564,8 +1582,8 @@ impl App {
             room_panel_cache: HashMap::new(),
             pending_room_frame: None,
             room_pane_focus: None,
-            // 供数模式：M1 只有服务供数；库供数与设置那一格随 2026-09-07 计划 M2 接上。
-            bridge: data::spawn(ctx.clone(), tasks, read_face::ReadFaceKind::Service),
+            // 交互通道与模型通道都按这一个供数模式造读面（ADR-0026）。
+            bridge: data::spawn(ctx.clone(), tasks, read_face),
             tree: TreeModel::default(),
             pending_locate: None,
             logs: logs::LogBuffer::default(),
@@ -1609,11 +1627,13 @@ impl App {
         while let Ok(evt) = self.bridge.evt.try_recv() {
             match evt {
                 data::Evt::Ready(Ok(info)) => {
+                    // 供数模式跟着说一句：库供数是保留档，连上了也该看得出这次是哪条路。
                     let msg = format!(
-                        "已连接 {}（{}），根层 {} 个 SITE",
+                        "已连接 {}（{}），根层 {} 个 SITE · {}",
                         info.project,
                         db_label(&info.ns, &info.db_nums),
-                        info.sites.len()
+                        info.sites.len(),
+                        self.read_face.label()
                     );
                     self.logs.info(&mut self.vm.logs, msg);
                     self.vm.data_source_ok = true;
