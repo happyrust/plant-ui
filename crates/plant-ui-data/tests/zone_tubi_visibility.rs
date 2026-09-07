@@ -57,8 +57,9 @@ async fn zone_scope_includes_implicit_straight_tubes() {
     );
 }
 
-/// e3d-model 新直管存储回归：每段是 `inst_relate:derived_*`，不再依赖
-/// `tubi_relate` 边。24383/73948 当前应为 8 个普通构件 + 5 段直管。
+/// e3d-model 新直管存储回归：每段各占一行 `inst_relate`，id 是几何身份的摘要而不是 PE
+/// refno（2026-09-04 前那层 `derived_` 前缀已撤），不再依赖 `tubi_relate` 边。
+/// 24383/73948 当前应为 8 个普通构件 + 5 段直管。
 #[tokio::test]
 #[ignore = "需要目标运行环境的 SurrealDB、DbOption.toml 与 mesh 目录"]
 async fn branch_scope_includes_e3d_derived_tubes() {

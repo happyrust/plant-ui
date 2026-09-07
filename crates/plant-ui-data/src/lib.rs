@@ -15,7 +15,20 @@ pub mod room;
 
 /// 连接本地 SurrealDB（读取工作目录的 DbOption.toml，走 aios_core 全局句柄 SUL_DB）。
 pub async fn connect() -> Result<()> {
-    aios_core::init_surreal().await?;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static CONNECTED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+        CONNECTED.get_or_try_init(connect_once).await?;
+        Ok(())
+    }
+    #[cfg(target_arch = "wasm32")]
+    connect_once().await
+}
+
+async fn connect_once() -> Result<()> {
+    // UI reads the service-owned schema. Full initialization also installs SQL
+    // resources, which are deliberately absent from the standalone UI package.
+    aios_core::aios_db_mgr::aios_mgr::init_surreal_with_signin(aios_core::try_get_db_option()?).await?;
     // 平表读连接池后台预热（P4）：4 条连接的握手+签入约 2s，放启动期消化，
     // 首次整场重载不再吃这口冷启动（并发安全，重载若抢先会等同一次初始化）。
     #[cfg(not(target_arch = "wasm32"))]
@@ -149,9 +162,10 @@ pub async fn model_instances_anc(
     // The projection queries are noun-agnostic and simply return no rows for
     // the list that does not apply (inst vs BRAN/tubi).
     include_query_roots(roots, &mut resolved);
-    // e3d-model 的隐式直管按 `inst_relate:derived_*` 存储，同一 BRAN 的每一段
-    // 都会让 anc 解析返回一次相同的 `in`。先按 refno 去重，随后一次查询取回
-    // 该 BRAN 的全部派生行；否则分块边界会把同一批直管重复装进场景。
+    // e3d-model 的隐式直管每段各占一行 `inst_relate`（id 是几何身份摘要，不是 PE
+    // refno），同一 BRAN 的每一段都会让 anc 解析返回一次相同的 `in`。先按 refno
+    // 去重，随后一次查询取回该 BRAN 的全部派生行；否则分块边界会把同一批直管
+    // 重复装进场景。
     for (inst_refnos, _) in &mut resolved {
         inst_refnos.sort_by_key(|refno| refno.refno().0);
         inst_refnos.dedup();
@@ -239,10 +253,11 @@ fn include_query_roots(
     }
 }
 
-/// e3d-model 新路径把一根 BRAN 的每段隐式直管分别落为
-/// `inst_relate:derived_*`。这些记录的 id 不是 PE refno，旧的
-/// `query_insts_flat([bran])` 只会点查 `inst_relate:<bran>`，因此必须按 `in`
-/// 补取。旧 `tubi_relate` 仍由 [`tubi_to_geom`] 兼容读取，两条路径互不替代。
+/// e3d-model 新路径把一根 BRAN 的每段隐式直管分别落为一行 `inst_relate`，**id 是几何身份的
+/// 摘要而不是 PE refno**，旧的 `query_insts_flat([bran])` 只会点查 `inst_relate:<bran>`，
+/// 因此必须按 `in` 补取。这里刻意按 `in` 反查 + 排除 refno 键，而不是按 id 形状匹配：
+/// 摘要 id 2026-09-04 起不带 `derived_` 前缀，`string::starts_with` 那种写法也会让规划器
+/// 退回整表扫。旧 `tubi_relate` 仍由 [`tubi_to_geom`] 兼容读取，两条路径互不替代。
 async fn query_derived_insts_by_inputs(
     refnos: &[aios_core::RefnoEnum],
 ) -> Result<Vec<aios_core::GeomInstQuery>> {
@@ -264,10 +279,10 @@ async fn query_derived_insts_by_inputs(
                    IF booled_id != NONE {{
                        [{{ "geo_hash": booled_id, "is_tubi": generic = 'TUBI' }}]
                    }} ELSE {{
-                       (SELECT trans.d AS transform, record::id(out) AS geo_hash,
+                       (SELECT (transform ?? trans.d) AS transform, record::id(out) AS geo_hash,
                                generic = 'TUBI' AS is_tubi
                         FROM out->geo_relate
-                        WHERE visible && out.meshed && trans.d != NONE && geo_type = 'Pos')
+                       WHERE visible && out.meshed && (transform ?? trans.d) != NONE && geo_type = 'Pos')
                    }} AS insts,
                    generic != 'TUBI' && booled_id != NONE AS has_neg,
                    dt AS date
@@ -536,6 +551,9 @@ pub struct Attr {
     pub name: String,
     pub value: String,
     pub kind: AttrKind,
+    /// 文件侧属性接口会把 UDA 名称规范化为不带 `:` 的形式，因此不能再靠
+    /// 名称前缀判断分组。旧数据库读取仍按原始键名填充这个标志。
+    pub is_uda: bool,
 }
 
 /// 元素的 UI 属性表：走 `get_ui_named_attmap`（含 UDA、引用转全名、
@@ -574,6 +592,7 @@ pub async fn element_props(refno: RefnoEnum) -> Result<Vec<Attr>> {
                 name: k.clone(),
                 value,
                 kind,
+                is_uda: k.starts_with(':'),
             }
         })
         .collect())

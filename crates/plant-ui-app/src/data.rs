@@ -20,40 +20,34 @@ use crate::search_index::{Scope, SearchIndex, SearchIndexState, SubstringHits};
 /// 那条慢路多扫一会儿。取满这个数就等于「后面还有」，界面据此提示缩小范围。
 pub const SEARCH_LIMIT: usize = 20;
 
-/// Direct is the production default; `db` restores the previous SurrealDB tree reads.
-fn direct_tree_enabled() -> bool {
-    direct_tree_mode(std::env::var("PLANT_TREE_DATA_MODE").ok().as_deref())
-}
-
-fn direct_tree_mode(raw: Option<&str>) -> bool {
-    !matches!(
-        raw.unwrap_or("direct").trim().to_ascii_lowercase().as_str(),
-        "db" | "surreal" | "surrealdb"
-    )
-}
-
 async fn tree_sites() -> anyhow::Result<Vec<EleTreeNode>> {
-    if direct_tree_enabled() {
-        crate::model_update_api::tree_roots(&crate::model_update_api::base_url()).await
-    } else {
-        plant_ui_data::site_nodes().await
-    }
+    crate::model_update_api::tree_roots(&crate::model_update_api::base_url()).await
 }
 
 async fn tree_children(refno: RefU64) -> anyhow::Result<Vec<EleTreeNode>> {
-    if direct_tree_enabled() {
-        crate::model_update_api::tree_children(&crate::model_update_api::base_url(), refno).await
-    } else {
-        plant_ui_data::child_nodes(refno.into()).await
-    }
+    crate::model_update_api::tree_children(&crate::model_update_api::base_url(), refno).await
 }
 
 async fn tree_ancestors(refno: RefU64) -> anyhow::Result<Vec<RefU64>> {
-    if direct_tree_enabled() {
-        crate::model_update_api::tree_ancestors(&crate::model_update_api::base_url(), refno).await
-    } else {
-        plant_ui_data::ancestor_refnos(refno.into()).await
+    crate::model_update_api::tree_ancestors(&crate::model_update_api::base_url(), refno).await
+}
+
+async fn require_mirror_feature(feature: &str) -> anyhow::Result<()> {
+    let health =
+        crate::model_update_api::service_health(&crate::model_update_api::base_url()).await?;
+    if !health.mirror.status.eq_ignore_ascii_case("ready") {
+        anyhow::bail!(
+            "镜像不可用：{feature} 依赖 SurrealDB（当前状态 {}）",
+            if health.mirror.status.is_empty() {
+                "unknown"
+            } else {
+                &health.mirror.status
+            }
+        );
     }
+    // Core startup deliberately does not connect plant-ui to SurrealDB.  The
+    // compatibility pages attach lazily only after gen-model reports it ready.
+    plant_ui_data::connect().await
 }
 
 pub enum Req {
@@ -219,6 +213,8 @@ pub struct GetWork {
     pub reload_models: bool,
     /// 重查成功的分支及其新的直接子层。
     pub branches: Vec<(RefU64, Vec<EleTreeNode>)>,
+    /// 服务端明确确认不存在的分支；与暂时查询失败分开处理。
+    pub missing: Vec<RefU64>,
     /// 重查失败的分支及原因。一个分支查不动不该让整次取回作废，
     /// 它那一层就保持原样，失败单独进日志。
     pub failed: Vec<(RefU64, String)>,
@@ -231,6 +227,7 @@ pub struct ReadyInfo {
     pub mdb: String,
     pub ns: String,
     pub db_nums: Vec<u32>,
+    pub cache_versions: Vec<(u32, u64, u64)>,
     /// 开始读取根层的时刻。首次队列快照只补这之后完成的批次，避免启动期间漏刷新。
     pub observed_at: chrono::DateTime<chrono::Utc>,
     pub sites: Vec<EleTreeNode>,
@@ -254,7 +251,9 @@ pub enum Evt {
     ),
     /// 房间浏览器全表。
     RoomsOverview(anyhow::Result<Vec<plant_ui_data::room::RoomOverviewRow>>),
-    Models(bool, anyhow::Result<Vec<aios_core::GeomInstQuery>>),
+    /// 取回工作重装的整批模型记录，连同每个库认下的取数源（spec §4.12）：日志据此
+    /// 说出哪几个库此刻由 API 从内存供数。
+    Models(bool, anyhow::Result<crate::model_update_api::ModelRecords>),
     /// 取回工作重装前对一个范围目标的 ensure 回执。成败都发；失败不阻断随后的重查。
     ReloadEnsured {
         target: RefU64,
@@ -276,7 +275,11 @@ pub enum Evt {
         target: RefU64,
         result: crate::model_update_api::EnsureReply,
     },
-    ModelScope(u64, RefU64, anyhow::Result<Vec<aios_core::GeomInstQuery>>),
+    ModelScope(
+        u64,
+        RefU64,
+        anyhow::Result<crate::model_update_api::ModelRecords>,
+    ),
     ResolvedName(String, anyhow::Result<Option<RefU64>>),
     /// 一次搜索的结果。搜索框每敲一下就发一条，晚到的旧结果靠 `epoch` 认出来丢掉；
     /// `query` 原样带回，绘制层拿它确认手上这份命中是不是当前输入的。
@@ -345,6 +348,14 @@ pub enum Evt {
     /// 有任务起讫。只当醒钟用：叫轮询早一拍去取，不拿它改行状态。
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     QueueTaskChanged,
+    /// 某个库的模型取数源翻面了（WS `model_source_changed`，spec §4.12 / §5.3）：
+    /// 初始化发布收口 → 数据库；回退重建清库 → 内存。**只改库行那一格、不重载场景**
+    /// ——内存投影与刚发布的行是同一版文件算出来的，下一次范围重载自然读到 rocksdb。
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    ModelSourceChanged {
+        dbnum: u32,
+        source: plant_ui::task_queue::ModelSource,
+    },
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     QueueFeedLive,
     /// 这个构建压根不订阅逐单元明细（wasm 端）。与 `QueueFeedDown` 分开：
@@ -435,9 +446,13 @@ async fn get_work(branches: &[RefU64], reload_models: bool) -> anyhow::Result<Ge
     let sites = tree_sites().await?;
     let mut loaded = Vec::with_capacity(branches.len());
     let mut failed = Vec::new();
+    let mut missing = Vec::new();
     for refno in branches {
         match tree_children(*refno).await {
             Ok(kids) => loaded.push((*refno, kids)),
+            Err(error) if crate::model_update_api::failure_of(&error).code == "not_found" => {
+                missing.push(*refno);
+            }
             Err(error) => failed.push((*refno, crate::logs::error_chain(&error))),
         }
     }
@@ -445,6 +460,7 @@ async fn get_work(branches: &[RefU64], reload_models: bool) -> anyhow::Result<Ge
         sites,
         reload_models,
         branches: loaded,
+        missing,
         failed,
     })
 }
@@ -459,51 +475,88 @@ async fn get_work(branches: &[RefU64], reload_models: bool) -> anyhow::Result<Ge
 /// 确认框上那个数字就是假的。
 async fn count_regeneration(
     targets: &[RefU64],
-    delivery_units: &[String],
+    _delivery_units: &[String],
 ) -> anyhow::Result<RegenerateCount> {
-    let units: HashSet<String> = delivery_units.iter().cloned().collect();
-    let mut merged = plant_ui_data::GeneratedScope::default();
-    let mut seen_elements = HashSet::new();
-    let mut seen_tubing = HashSet::new();
-    for target in targets {
-        let scope = plant_ui_data::generated_scope(*target).await?;
-        for element in scope.elements {
-            if seen_elements.insert(element.refno.refno()) {
-                merged.elements.push(element);
-            }
-        }
-        for bran in scope.tubing_branches {
-            if seen_tubing.insert(bran) {
-                merged.tubing_branches.push(bran);
-            }
+    let base = crate::model_update_api::base_url();
+    let health = crate::model_update_api::service_health(&base).await?;
+    let mdb = health.mdb.as_deref().unwrap_or_default();
+    let namespace = health.namespace.as_deref().unwrap_or_default();
+    let mut records = HashSet::new();
+    for record in
+        crate::model_update_api::model_records(&base, targets, &health.project, mdb, namespace)
+            .await?
+            .records
+    {
+        if let Ok(identity) = serde_json::to_string(&record) {
+            records.insert(identity);
         }
     }
-    // 归根要问 noun 的不止元素自己，还有它们整条祖先链。先去重再问：一条链上
-    // 的祖先被同一根 BRAN 底下几十个管件共用，按元素逐个问就是几十倍的行数。
-    let mut refnos: HashSet<RefU64> = HashSet::new();
-    for element in &merged.elements {
-        refnos.insert(element.refno.refno());
-        refnos.extend(element.anc.iter().copied().map(RefU64));
-    }
-    let refnos: Vec<RefU64> = refnos.into_iter().collect();
-    let nouns = plant_ui_data::nouns_of(&refnos).await?;
+    let mut roots = targets.to_vec();
+    roots.sort_unstable();
+    roots.dedup();
     Ok(RegenerateCount {
-        elements: merged.element_count(),
-        roots: crate::regenerate::regeneration_roots(&merged, &nouns, &units),
+        elements: records.len(),
+        // The server resolves each requested scope to its exact generation
+        // roots during ensure; keeping the selected scopes here avoids a second
+        // source of owner/noun truth in the client.
+        roots,
     })
 }
 
-/// 启动序列：连库、抓工程标识、抓 SITE 根层。三步任一失败都算没连上。
+/// 启动序列只依赖 gen-model 核心 API；镜像离线不阻断树、属性与三维。
 async fn ready() -> anyhow::Result<ReadyInfo> {
-    plant_ui_data::connect().await?;
-    let (project, mdb, ns, db_nums) = plant_ui_data::project_identity().await?;
+    let base = crate::model_update_api::base_url();
+    let (health, report, sites) = futures::try_join!(
+        crate::model_update_api::service_health(&base),
+        crate::model_update_api::dbnum_report(&base),
+        tree_sites(),
+    )?;
+    let project = health.project;
+    let mdb = health.mdb.unwrap_or_else(|| "/ALL".into());
+    let ns = health.namespace.unwrap_or_default();
+    let report = Some(report);
+    let read_through = report
+        .as_ref()
+        .is_some_and(|report| report.data_face.eq_ignore_ascii_case("read-through"));
+    let db_nums: Vec<u32> = if read_through {
+        report
+            .as_ref()
+            .into_iter()
+            .flat_map(|report| report.dbnums.iter())
+            .filter(|row| {
+                (row.db_type.eq_ignore_ascii_case("DESI")
+                    || row.db_type.eq_ignore_ascii_case("ISOD"))
+                    && !row.not_in_project
+            })
+            .map(|row| row.dbnum)
+            .collect()
+    } else {
+        report
+            .as_ref()
+            .into_iter()
+            .flat_map(|report| report.dbnums.iter())
+            .filter(|row| row.db_type.eq_ignore_ascii_case("DESI") && !row.not_in_project)
+            .map(|row| row.dbnum)
+            .collect()
+    };
+    let cache_versions = if read_through {
+        report
+            .as_ref()
+            .into_iter()
+            .flat_map(|report| report.dbnums.iter())
+            .filter(|row| db_nums.contains(&row.dbnum))
+            .map(|row| (row.dbnum, row.cache_epoch, row.cached_pe_rows))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let observed_at = chrono::Utc::now();
-    let sites = tree_sites().await?;
     Ok(ReadyInfo {
         project,
         mdb,
         ns,
         db_nums,
+        cache_versions,
         observed_at,
         sites,
     })
@@ -535,7 +588,7 @@ fn boxed_query(fut: impl Future<Output = ()> + 'static) -> InflightQuery {
 /// 要独占（见 worker 循环），并发会让晚到的读把刚失效的缓存填回旧数据。
 async fn handle_read(
     req: Req,
-    index: SearchIndex,
+    _index: SearchIndex,
     scope: Scope,
     evt_tx: mpsc::Sender<Evt>,
     ctx: egui::Context,
@@ -546,49 +599,77 @@ async fn handle_read(
             let _ = evt_tx.send(Evt::Children(refno, r));
         }
         Req::Props(refno) => {
-            let r = plant_ui_data::element_props(refno.into()).await;
+            let r = crate::model_update_api::element_attributes(
+                &crate::model_update_api::base_url(),
+                refno,
+                &scope.project,
+                &scope.mdb,
+                &scope.ns,
+            )
+            .await;
             let _ = evt_tx.send(Evt::Props(refno, r));
         }
         Req::ElementRooms(refno) => {
-            let r = plant_ui_data::room::element_rooms(refno.into()).await;
+            let r = match require_mirror_feature("房间").await {
+                Ok(()) => plant_ui_data::room::element_rooms(refno.into()).await,
+                Err(error) => Err(error),
+            };
             let _ = evt_tx.send(Evt::ElementRooms(refno, r));
         }
         Req::PanelRoom(refno) => {
-            let r = plant_ui_data::room::panel_room(refno.into()).await;
+            let r = match require_mirror_feature("房间").await {
+                Ok(()) => plant_ui_data::room::panel_room(refno.into()).await,
+                Err(error) => Err(error),
+            };
             let _ = evt_tx.send(Evt::PanelRoom(refno, r));
         }
         Req::RoomPanels(refno) => {
-            let r = plant_ui_data::room::room_panels(refno.into()).await;
+            let r = match require_mirror_feature("房间").await {
+                Ok(()) => plant_ui_data::room::room_panels(refno.into()).await,
+                Err(error) => Err(error),
+            };
             let _ = evt_tx.send(Evt::RoomPanels(refno, r));
         }
         Req::RoomDetail(refno) => {
             // 成员预览条数与「房间」页签的列表容量对齐；隔离 / 取景
             // 用的是 member_refnos 全量，不受这个数约束。
-            let r = plant_ui_data::room::room_detail(refno.into(), 8).await;
+            let r = match require_mirror_feature("房间历史").await {
+                Ok(()) => plant_ui_data::room::room_detail(refno.into(), 8).await,
+                Err(error) => Err(error),
+            };
             let _ = evt_tx.send(Evt::RoomDetail(refno, r));
         }
         Req::RoomsOverview => {
-            let r = plant_ui_data::room::rooms_overview().await;
+            let r = match require_mirror_feature("房间").await {
+                Ok(()) => plant_ui_data::room::rooms_overview().await,
+                Err(error) => Err(error),
+            };
             let _ = evt_tx.send(Evt::RoomsOverview(r));
         }
         Req::ResolveName(name) => {
-            let result = plant_ui_data::resolve_name(&name).await;
+            let result = crate::model_update_api::search_names(
+                &crate::model_update_api::base_url(),
+                &name,
+                SEARCH_LIMIT,
+            )
+            .await
+            .map(|hits| {
+                hits.into_iter()
+                    .find(|hit| hit.name.eq_ignore_ascii_case(name.trim()))
+                    .map(|hit| hit.refno)
+            });
             let _ = evt_tx.send(Evt::ResolvedName(name, result));
         }
         Req::SearchElements { epoch, query } => {
-            // 前缀先打库（15.8ms），回来之后再查索引——子串是同步的亚毫秒查询，
-            // 排在后面既不多花时间，还能用上这期间可能刚换代的新索引。
-            let prefix = plant_ui_data::search_names_by_prefix(&query, SEARCH_LIMIT).await;
-            let substring = match index.search(&query, SEARCH_LIMIT) {
-                Ok(hits) => hits,
-                Err(error) => {
-                    // 查询炸了要说出来，否则界面只表现为「子串一条都没有」。
-                    let _ = evt_tx.send(Evt::SearchIndex(SearchIndexState::Failed(
-                        crate::logs::error_chain(&error),
-                    )));
-                    SubstringHits::Unavailable
-                }
-            };
+            let prefix = crate::model_update_api::search_names(
+                &crate::model_update_api::base_url(),
+                &query,
+                SEARCH_LIMIT,
+            )
+            .await;
+            // gen-model 的 snapshot NAME 索引已经是子串索引；不再从
+            // SurrealDB 构建第二份本地时点。
+            let substring = SubstringHits::Unavailable;
             let _ = evt_tx.send(Evt::SearchElements {
                 epoch,
                 query,
@@ -662,8 +743,12 @@ async fn handle_read(
                 result,
             });
         }
-        Req::CheckSearchIndex => index.refresh(scope, false, evt_tx, ctx.clone()).await,
-        Req::RebuildSearchIndex => index.refresh(scope, true, evt_tx, ctx.clone()).await,
+        Req::CheckSearchIndex | Req::RebuildSearchIndex => {
+            // Search is served by gen-model's epoch-pinned NAME index.  Do not
+            // open or rebuild the legacy SurrealDB-derived sidecar.
+            let _ = evt_tx.send(Evt::SearchIndex(SearchIndexState::Off));
+            ctx.request_repaint();
+        }
         Req::Ancestors(refno) => {
             let result = tree_ancestors(refno).await;
             let _ = evt_tx.send(Evt::Ancestors(refno, result));
@@ -780,13 +865,14 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
                         // sim 模式没有 SurrealDB 也没有网格文件：模型通道短路成
                         // 空结果，三维视口保持空场景，树与队列照常演。
                         let result = if crate::sim::enabled() {
-                            Ok(Vec::new())
+                            Ok(crate::model_update_api::ModelRecords::default())
                         } else {
                             // 先让范围目标的模型追到文件最新（ADR-0024）：与 eye 那条
                             // 路同一个 `ensure_model(force = false)`——凭证当前的根服务端
                             // 直接算命中，只有被改到的根真重算。顺序做：一个范围可能
                             // 就是整个 ZONE，并发只会让服务端的 per-dbnum 锁互相撞。
                             // 失败不中止：空场景比旧几何更坏，重查照跑，回执里说清。
+                            let mut record_roots = roots.clone();
                             for target in &ensure_targets {
                                 let result = crate::model_update_api::ensure_model(
                                     &base,
@@ -797,18 +883,35 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
                                     &namespace,
                                 )
                                 .await;
+                                if let Ok(reply) = &result {
+                                    record_roots.extend(
+                                        reply
+                                            .generation_roots
+                                            .iter()
+                                            .filter_map(|root| root.parse::<RefU64>().ok()),
+                                    );
+                                }
                                 let _ = model_evt_tx.send(Evt::ReloadEnsured {
                                     target: *target,
                                     result,
                                 });
                                 model_ctx.request_repaint();
                             }
-                            let progress_tx = model_evt_tx.clone();
-                            plant_ui_data::model_instances_with_progress(&roots, |done, total| {
-                                let _ = progress_tx.send(Evt::ReloadProgress { done, total });
-                                model_ctx.request_repaint();
-                            })
-                            .await
+                            record_roots.sort_unstable();
+                            record_roots.dedup();
+                            let result = crate::model_update_api::model_records(
+                                &base,
+                                &record_roots,
+                                &project,
+                                &mdb,
+                                &namespace,
+                            )
+                            .await;
+                            let _ = model_evt_tx.send(Evt::ReloadProgress {
+                                done: roots.len(),
+                                total: roots.len(),
+                            });
+                            result
                         };
                         let _ = model_evt_tx.send(Evt::Models(debt_reload, result));
                         model_ctx.request_repaint();
@@ -826,7 +929,7 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
                                 let _ = model_evt_tx.send(Evt::ModelScope(
                                     epoch,
                                     target,
-                                    Ok(Vec::new()),
+                                    Ok(crate::model_update_api::ModelRecords::default()),
                                 ));
                                 model_ctx.request_repaint();
                                 continue;
@@ -842,11 +945,38 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
                             .await;
                             match ensured {
                                 Ok(reply) => {
+                                    let mut generation_roots = reply
+                                        .generation_roots
+                                        .iter()
+                                        .filter_map(|root| root.parse::<RefU64>().ok())
+                                        .collect::<Vec<_>>();
+                                    if generation_roots.is_empty() {
+                                        generation_roots.push(target);
+                                    }
+                                    generation_roots.sort_unstable();
+                                    generation_roots.dedup();
                                     let _ = model_evt_tx.send(Evt::ModelScopeEnsured {
                                         epoch,
                                         target,
                                         result: reply,
                                     });
+                                    model_ctx.request_repaint();
+                                    let result = crate::model_update_api::model_records(
+                                        &base,
+                                        &generation_roots,
+                                        &project,
+                                        &mdb,
+                                        &namespace,
+                                    )
+                                    .await;
+                                    let _ = model_evt_tx.send(Evt::ModelScopeProgress {
+                                        epoch,
+                                        target,
+                                        done: generation_roots.len(),
+                                        total: generation_roots.len(),
+                                    });
+                                    let _ =
+                                        model_evt_tx.send(Evt::ModelScope(epoch, target, result));
                                     model_ctx.request_repaint();
                                 }
                                 Err(error) => {
@@ -859,22 +989,6 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
                                     continue;
                                 }
                             }
-                            let progress_tx = model_evt_tx.clone();
-                            let result = plant_ui_data::model_instances_with_progress(
-                                &[target],
-                                |done, total| {
-                                    let _ = progress_tx.send(Evt::ModelScopeProgress {
-                                        epoch,
-                                        target,
-                                        done,
-                                        total,
-                                    });
-                                    model_ctx.request_repaint();
-                                },
-                            )
-                            .await;
-                            let _ = model_evt_tx.send(Evt::ModelScope(epoch, target, result));
-                            model_ctx.request_repaint();
                         }
                     }
                 }
@@ -896,9 +1010,11 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
         };
         if let Ok(info) = started.as_ref() {
             scope = Scope {
+                project: info.project.clone(),
                 ns: info.ns.clone(),
                 mdb: info.mdb.clone(),
                 dbnums: info.db_nums.clone(),
+                cache_versions: info.cache_versions.clone(),
             };
         }
         let _ = evt_tx.send(Evt::Ready(started));
@@ -908,16 +1024,7 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
         // 不需要按请求 spawn（wasm 上也没有 tokio::spawn 可用），一条慢查询
         // 也不再把整条桥堵成串行（模型加载在此之前就已单独分道）。
         let mut inflight: FuturesUnordered<InflightQuery> = FuturesUnordered::new();
-        // 启动那一次校验：与后面的触发点走同一条路（单飞去重），只是没人替它
-        // 发 Req——界面还没起来。sim 模式下索引这一路不存在，它自己回「就绪」。
-        if sim_engine.is_none() {
-            inflight.push(boxed_query(index.clone().refresh(
-                scope.clone(),
-                false,
-                evt_tx.clone(),
-                ctx.clone(),
-            )));
-        }
+        let _ = evt_tx.send(Evt::SearchIndex(SearchIndexState::Off));
         loop {
             while let Ok(req) = req_rx.try_recv() {
                 // 模型实例冷加载在大库上可达 88 秒，且 Replace / Scopes 之间有
@@ -965,19 +1072,15 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
                         let reconnected = ready().await;
                         if let Ok(info) = reconnected.as_ref() {
                             scope = Scope {
+                                project: info.project.clone(),
                                 ns: info.ns.clone(),
                                 mdb: info.mdb.clone(),
                                 dbnums: info.db_nums.clone(),
+                                cache_versions: info.cache_versions.clone(),
                             };
                         }
                         let _ = evt_tx.send(Evt::Ready(reconnected));
                         ctx.request_repaint();
-                        inflight.push(boxed_query(index.clone().refresh(
-                            scope.clone(),
-                            false,
-                            evt_tx.clone(),
-                            ctx.clone(),
-                        )));
                     }
                     Req::GetWork {
                         branches,
@@ -987,13 +1090,6 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
                         let result = get_work(&branches, reload_models).await;
                         let _ = evt_tx.send(Evt::GetWork(result));
                         ctx.request_repaint();
-                        // 取回工作刚把数据换过一批，戳多半已经不一样了。
-                        inflight.push(boxed_query(index.clone().refresh(
-                            scope.clone(),
-                            false,
-                            evt_tx.clone(),
-                            ctx.clone(),
-                        )));
                     }
                     // 其余都是互相独立的交互读 / HTTP 往返，进并发道。树的子层
                     // 查询从此不再排在属性 / 归属 / 队列轮询后面。
@@ -1044,9 +1140,23 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
 
 #[cfg(test)]
 mod tests {
-    use super::{ModelLoad, Req, direct_tree_mode, route_model_load};
+    use super::{ModelLoad, Req, route_model_load};
     use plant_ui::RefU64;
     use std::sync::mpsc;
+
+    #[test]
+    fn property_requests_have_no_database_fallback() {
+        let source = include_str!("data.rs");
+        let branch = source
+            .split_once("Req::Props(refno) =>")
+            .expect("property request branch")
+            .1
+            .split_once("Req::ElementRooms")
+            .expect("next request branch")
+            .0;
+        assert!(branch.contains("model_update_api::element_attributes"));
+        assert!(!branch.contains("plant_ui_data::element_props"));
+    }
 
     fn reload(roots: Vec<RefU64>, ensure_targets: Vec<RefU64>, debt_reload: bool) -> Req {
         Req::Models {
@@ -1159,13 +1269,5 @@ mod tests {
                 ..
             })
         ));
-    }
-
-    #[test]
-    fn direct_tree_is_default_and_db_is_an_explicit_rollback() {
-        assert!(direct_tree_mode(None));
-        assert!(direct_tree_mode(Some("direct")));
-        assert!(!direct_tree_mode(Some("db")));
-        assert!(!direct_tree_mode(Some(" SurrealDB ")));
     }
 }

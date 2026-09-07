@@ -130,6 +130,23 @@ impl IndexStamp {
     }
 }
 
+/// Build the read-through stamp from gen-model's persistent cache epochs.
+/// `cached_pe_rows` remains part of the stamp so delete/add coverage changes
+/// are visible even when talking to an older server that leaves epoch at zero.
+pub fn stamp_from_cache(rows: &[(u32, u64, u64)]) -> IndexStamp {
+    let mut rows = rows.to_vec();
+    rows.sort_unstable_by_key(|row| row.0);
+    rows.dedup_by_key(|row| row.0);
+    IndexStamp(
+        rows.into_iter()
+            .map(|(dbnum, epoch, count)| {
+                let epoch = i32::try_from(epoch).unwrap_or(i32::MAX);
+                (dbnum, epoch, count)
+            })
+            .collect(),
+    )
+}
+
 /// 算一次戳：**一库一条** `count()`，外加一条水位，同一趟往返发出去。
 ///
 /// 一库一条不是啰嗦，是这个查询能不能用的分界线。SurrealDB 只在
@@ -304,7 +321,7 @@ pub async fn load_corpus(
         let mut response = SUL_DB
             .query(
                 "SELECT VALUE [id, name, noun ?? ''] FROM pe \
-                 WHERE dbnum = $dbnum AND name != NONE AND name != ''",
+                 WHERE dbnum = $dbnum AND !deleted AND name != NONE AND name != ''",
             )
             .bind(("dbnum", dbnum))
             .await
@@ -579,5 +596,19 @@ mod tests {
         assert!(empty.dir_name().starts_with("v1-"));
         assert_eq!(empty.dbnums(), Vec::<u32>::new());
         assert_eq!(empty.rows(), 0);
+    }
+
+    #[test]
+    fn read_through_stamp_uses_epoch_and_cached_coverage() {
+        let base = stamp_from_cache(&[(8001, 7, 10), (8000, 3, 5)]);
+        assert_eq!(base.dbnums(), vec![8000, 8001]);
+        assert_eq!(base.rows(), 15);
+        assert_eq!(
+            base,
+            stamp_from_cache(&[(8000, 3, 5), (8001, 7, 10)]),
+            "HTTP row order must not change the stamp"
+        );
+        assert_ne!(base, stamp_from_cache(&[(8000, 4, 5), (8001, 7, 10)]));
+        assert_ne!(base, stamp_from_cache(&[(8000, 3, 6), (8001, 7, 10)]));
     }
 }

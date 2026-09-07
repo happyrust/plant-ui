@@ -14,6 +14,7 @@ mod search_index;
 mod settings_store;
 mod sim;
 mod startup;
+mod source_versions;
 
 use std::collections::{HashMap, HashSet};
 use web_time::{Duration, Instant};
@@ -785,6 +786,20 @@ impl TreeModel {
         self.roots.iter().any(|n| n.refno.refno() == refno)
     }
 
+    /// 已确认删除的分支即使 OWNER 未重查，也必须从缓存子层摘掉。
+    fn detach_missing(&mut self, missing: &[RefU64]) {
+        let missing: HashSet<_> = missing.iter().copied().collect();
+        // Preserve identities until prune_unreachable collects the full unload set,
+        // including a missing SITE with no cached children or parent entry.
+        for refno in &missing {
+            self.children.entry(*refno).or_default();
+        }
+        self.roots.retain(|node| !missing.contains(&node.refno.refno()));
+        for children in self.children.values_mut() {
+            children.retain(|node| !missing.contains(&node.refno.refno()));
+        }
+    }
+
     /// 取回工作之后的清扫：把从根层已经走不到的条目摘掉。
     ///
     /// 一次重查可以让整条分支消失——元素被删了，或者挪到了别的 OWNER 底下——
@@ -899,6 +914,7 @@ struct App {
     queue_feed: Option<model_update_ws::Feed>,
     last_queue_poll: Instant,
     queue_poll_pending: bool,
+    source_versions: source_versions::SourceVersions,
     /// 已经见过终态的数据批次。轮询靠它认出「这一拍新跑完了哪几个」——
     /// 终态之后快照还会带着它们好几拍，每拍都刷一次就是反复拆装同一批几何。
     queue_finished: HashSet<String>,
@@ -1090,6 +1106,47 @@ struct ReloadSnapshot {
     targets: Vec<RefU64>,
 }
 
+fn prune_removed_reload_nodes(snapshot: &mut ReloadSnapshot, removed: &[RefU64]) {
+    // Absence from the loaded tree alone is not deletion evidence: implicit
+    // tubes and outside-tree models must remain in the reload snapshot.
+    let removed: HashSet<_> = removed.iter().copied().collect();
+    snapshot.models.retain(|(refno, _)| !removed.contains(refno));
+    snapshot.targets.retain(|refno| !removed.contains(refno));
+}
+
+#[cfg(test)]
+mod removed_reload_scope_tests {
+    use super::*;
+
+    #[test]
+    fn deleted_scope_is_not_queried_or_restored_on_later_refreshes() {
+        let deleted = RefU64(26292);
+        let kept = RefU64(26233);
+        let outside_tree = RefU64(90000);
+        let mut snapshot = ReloadSnapshot {
+            models: vec![(deleted, true), (kept, false), (outside_tree, true)],
+            targets: vec![deleted, kept, outside_tree],
+        };
+        prune_removed_reload_nodes(&mut snapshot, &[deleted]);
+        assert_eq!(snapshot.targets, vec![kept, outside_tree]);
+        assert_eq!(snapshot.models, vec![(kept, false), (outside_tree, true)]);
+        let next = snapshot.clone();
+        prune_removed_reload_nodes(&mut snapshot, &[deleted]);
+        assert_eq!(snapshot, next);
+    }
+
+    #[test]
+    fn no_removal_evidence_preserves_scope_and_hidden_models() {
+        let mut snapshot = ReloadSnapshot {
+            models: vec![(RefU64(1), false)],
+            targets: vec![RefU64(2)],
+        };
+        let before = snapshot.clone();
+        prune_removed_reload_nodes(&mut snapshot, &[]);
+        assert_eq!(snapshot, before);
+    }
+}
+
 /// 取回工作清场前的快照：场景里每个模型 refno 配上「取回前是否可见」，外加
 /// 点过眼睛的范围目标名单。
 ///
@@ -1268,7 +1325,7 @@ fn settle_refresh_generation(pending: &mut bool, generation: &mut u64, mesh_ok: 
 /// 一次队列轮询发现变化之后，界面该刷什么。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AutoRefresh {
-    /// 整场重载：树与三维一起换。只用来补人已经要过、却没给成的那一次。
+    /// 已加载范围重载：树与三维一起更新，也用于自动保存变化。
     FullReload,
     /// 整棵树重查，三维保持原样。
     TreeOnly,
@@ -1276,15 +1333,9 @@ enum AutoRefresh {
     Units,
 }
 
-/// 自动刷新只换模型树，清场重装留给人主动点的那条菜单。
-///
-/// 重装的模型查询调用前刚 `invalidate_all` 过、必定是冷的，而批次收官这一刻
-/// 人未必在看三维。数据应用因此不再排它——`owed` 只剩一个来源：模型查询本身
-/// 失败（[`restore_model_reload`]），那时场景已经清空，队列空下来必须补上，
-/// 不然点了没反应、屏幕还一直空着。
-///
-/// 代价是三维会停在旧几何上，这件事不许闷着：收尾那句日志要说出来。按单元
-/// 局部重画是下一步的事，那之前菜单那条清场重装是唯一的出路。
+/// 有新保存、应用结果或已完成的交付单元时，调用方记入重载需求。
+/// 模型屏障就绪后复用已加载范围重载，保留相机和显示方向；未就绪时先刷新树，
+/// 需求留到后续轮询。读穿模式的保存没有队列任务，由 SourceVersions 检测。
 fn auto_refresh(owed: bool, models_settled: bool, data_applied: bool) -> AutoRefresh {
     if owed && models_settled {
         AutoRefresh::FullReload
@@ -1297,6 +1348,16 @@ fn auto_refresh(owed: bool, models_settled: bool, data_applied: bool) -> AutoRef
 
 fn restore_model_reload(owed: &mut bool, failed_debt_reload: bool) {
     *owed |= failed_debt_reload;
+}
+
+fn selection_after_removed_nodes(selection: &Selection, removed: &[RefU64]) -> Selection {
+    let mut next = selection.clone();
+    for refno in removed {
+        if next.contains(*refno) {
+            next.toggle(*refno);
+        }
+    }
+    next
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1481,6 +1542,7 @@ impl App {
                 .checked_sub(QUEUE_POLL_BUSY)
                 .unwrap_or_else(Instant::now),
             queue_poll_pending: false,
+            source_versions: source_versions::SourceVersions::default(),
             queue_finished: HashSet::new(),
             refresh_anchors: HashSet::new(),
             data_observed_at: None,
@@ -1807,7 +1869,11 @@ impl App {
                         self.model_reload_in_flight = false;
                     }
                     match result {
-                        Ok(models) => {
+                        Ok(loaded) => {
+                            // 哪几个库此刻由 API 从内存供数（spec §4.12）——跟在计数后面说一句，
+                            // 常态（全部 rocksdb）不出声。
+                            let memory_note = loaded.memory_note().unwrap_or_default();
+                            let models = loaded.records;
                             self.set_get_work_busy(false);
                             self.run_deferred_get_work();
                             let mesh_count =
@@ -1853,7 +1919,7 @@ impl App {
                             self.logs.info(
                                 &mut self.vm.logs,
                                 format!(
-                                    "三维模型已就绪：{} 个元素，{} 个网格实例{replay}{ensured}",
+                                    "三维模型已就绪：{} 个元素，{} 个网格实例{replay}{ensured}{memory_note}",
                                     models.len(),
                                     mesh_count
                                 ),
@@ -1903,18 +1969,20 @@ impl App {
                                 &mut self.vm.logs,
                                 element,
                                 format!(
-                                    "取回工作·范围已追到文件最新：重算 {}/{} 个生成根，其余 {} 个命中",
+                                    "取回工作·范围已追到文件最新：重算 {}/{} 个生成根，其余 {} 个命中{}",
                                     reply.generated_root_count,
                                     reply.generation_root_count,
-                                    reply.cached_root_count
+                                    reply.cached_root_count,
+                                    reply.source_note().unwrap_or_default()
                                 ),
                             ),
                             model_update_api::EnsureStatus::AlreadyAvailable => self.logs.info_of(
                                 &mut self.vm.logs,
                                 element,
                                 format!(
-                                    "取回工作·范围模型已是最新：{} 个生成根命中",
-                                    reply.cached_root_count
+                                    "取回工作·范围模型已是最新：{} 个生成根命中{}",
+                                    reply.cached_root_count,
+                                    reply.source_note().unwrap_or_default()
                                 ),
                             ),
                             model_update_api::EnsureStatus::NoRenderableGeometry => {
@@ -1995,12 +2063,15 @@ impl App {
                     result,
                 } if epoch == self.model_scope_epoch => {
                     let element = self.tree.element(target);
+                    // 「内存」那半句只在按需生成 / 命中时说（spec §4.12）：人得知道现在看到的
+                    // 是 API 现算的、翻面后同一版会从 rocksdb 读出来。「数据库」是常态，不出声。
+                    let source_note = result.source_note().unwrap_or_default();
                     match result.status {
                         model_update_api::EnsureStatus::Generated => self.logs.info_of(
                             &mut self.vm.logs,
                             element,
                             format!(
-                                "按需生成完成：{}/{} 个生成根，本次其余 {} 个命中缓存",
+                                "按需生成完成：{}/{} 个生成根，本次其余 {} 个命中缓存{source_note}",
                                 result.generated_root_count,
                                 result.generation_root_count,
                                 result.cached_root_count
@@ -2009,7 +2080,10 @@ impl App {
                         model_update_api::EnsureStatus::AlreadyAvailable => self.logs.info_of(
                             &mut self.vm.logs,
                             element,
-                            format!("模型缓存命中：{} 个生成根", result.cached_root_count),
+                            format!(
+                                "模型缓存命中：{} 个生成根{source_note}",
+                                result.cached_root_count
+                            ),
                         ),
                         model_update_api::EnsureStatus::NoRenderableGeometry => self.logs.info_of(
                             &mut self.vm.logs,
@@ -2030,7 +2104,7 @@ impl App {
                 data::Evt::ModelScope(epoch, target, result) if epoch == self.model_scope_epoch => {
                     self.model_scope_pending.remove(&target);
                     match result {
-                        Ok(models) if models.is_empty() => {
+                        Ok(loaded) if loaded.records.is_empty() => {
                             mark_model_scope_unavailable(
                                 &mut self.tree.pending_direction,
                                 &mut self.tree.visibility_unavailable,
@@ -2046,7 +2120,9 @@ impl App {
                             self.pending_room_frame.take_if(|room| *room == target);
                             dirty = true;
                         }
-                        Ok(models) => {
+                        Ok(loaded) => {
+                            let memory_note = loaded.memory_note().unwrap_or_default();
+                            let models = loaded.records;
                             self.tree.visibility_unavailable.remove(&target);
                             let mesh_count =
                                 models.iter().map(|model| model.insts.len()).sum::<usize>();
@@ -2066,7 +2142,11 @@ impl App {
                             self.logs.info_of(
                                 &mut self.vm.logs,
                                 element,
-                                format!("查询到 {} 个元素、{} 个网格实例", refs.len(), mesh_count),
+                                format!(
+                                    "查询到 {} 个元素、{} 个网格实例{memory_note}",
+                                    refs.len(),
+                                    mesh_count
+                                ),
                             );
 
                             // 用**最新**的方向操作模型：查询期间用户可能已经反向
@@ -2454,6 +2534,49 @@ impl App {
                             }
                             let before = self.tree.element_count();
                             self.tree.roots = fresh.sites;
+                            for (refno, kids) in fresh.branches {
+                                for kid in &kids {
+                                    self.tree.parent.insert(kid.refno.refno(), refno);
+                                }
+                                self.tree.children.insert(refno, kids);
+                            }
+                            // 摘掉失败的分支之前先把话说完：`element` 要在树还
+                            // 认得这个 refno 的时候取名字。
+                            for (refno, reason) in &fresh.failed {
+                                let el = self.tree.element(*refno);
+                                self.logs.warn_of(
+                                    &mut self.vm.logs,
+                                    el,
+                                    format!("子层重查失败，这一层保持原样：{reason}"),
+                                );
+                            }
+                            self.tree.detach_missing(&fresh.missing);
+                            let removed = self.tree.prune_unreachable();
+                            if !removed.is_empty() {
+                                // Only remove nodes the refreshed tree proved unreachable.
+                                // Keep unrelated/outside-tree selections, and invalidate the
+                                // deleted primary before refetching properties or rooms below.
+                                self.set_selection(selection_after_removed_nodes(
+                                    &self.vm.selection,
+                                    &removed,
+                                ));
+                                self.view3d_commands.push(Cmd::Model(
+                                    plant_ui::ModelAction::Unload {
+                                        refnos: removed.clone(),
+                                    },
+                                ));
+                                self.logs.info(
+                                    &mut self.vm.logs,
+                                    format!("已卸载 {} 个从资料树消失的模型节点", removed.len()),
+                                );
+                            }
+                            // Prune the preserved request/replay snapshot before sending
+                            // Models, not only the scene. Otherwise deleted scopes are
+                            // ensured now and reintroduced by Evt::Models every refresh.
+                            if let Some(snapshot) = self.model_reload_restore.as_mut() {
+                                prune_removed_reload_nodes(snapshot, &removed);
+                            }
+                            self.scope_targets.retain(|refno| !removed.contains(refno));
                             if fresh.reload_models {
                                 // 重查范围 = 清场快照里的那批模型（显示 + 已隐藏），
                                 // 不再是全部 SITE 根：取回工作刷的是「已加载的三维
@@ -2494,34 +2617,6 @@ impl App {
                                     self.set_get_work_busy(false);
                                     self.run_deferred_get_work();
                                 }
-                            }
-                            for (refno, kids) in fresh.branches {
-                                for kid in &kids {
-                                    self.tree.parent.insert(kid.refno.refno(), refno);
-                                }
-                                self.tree.children.insert(refno, kids);
-                            }
-                            // 摘掉失败的分支之前先把话说完：`element` 要在树还
-                            // 认得这个 refno 的时候取名字。
-                            for (refno, reason) in &fresh.failed {
-                                let el = self.tree.element(*refno);
-                                self.logs.warn_of(
-                                    &mut self.vm.logs,
-                                    el,
-                                    format!("子层重查失败，这一层保持原样：{reason}"),
-                                );
-                            }
-                            let removed = self.tree.prune_unreachable();
-                            if !removed.is_empty() {
-                                self.view3d_commands.push(Cmd::Model(
-                                    plant_ui::ModelAction::Unload {
-                                        refnos: removed.clone(),
-                                    },
-                                ));
-                                self.logs.info(
-                                    &mut self.vm.logs,
-                                    format!("已卸载 {} 个从资料树消失的模型节点", removed.len()),
-                                );
                             }
                             // 清扫可以把待滚动路径上的某一节摘掉（元素被删或挪了
                             // OWNER）。那条路径已经通不到目标，待滚动跟着结束。
@@ -2568,6 +2663,7 @@ impl App {
                     self.queue_poll_pending = false;
                     match result {
                         Ok(poll) => {
+                            let source_changed = self.source_versions.observe(&poll.dbnums);
                             let (data_applied, mut fresh, task_ids) = self.newly_finished(&poll);
                             fresh.extend(settled_pending_roots(
                                 self.queue.loaded,
@@ -2582,6 +2678,10 @@ impl App {
                                 poll.tasks_error.is_none(),
                                 model_drains_idle(&poll.tasks, &self.vm.project),
                             );
+                            // Source saves in read-through mode have no task terminal event.
+                            // Remember reload demand until the model barrier settles; the
+                            // existing loaded-scope reload preserves visibility and camera.
+                            self.model_reload_owed |= source_changed || data_applied || !fresh.is_empty();
                             let plan =
                                 auto_refresh(self.model_reload_owed, models_settled, data_applied);
                             if !models_settled {
@@ -2679,6 +2779,25 @@ impl App {
                 data::Evt::QueueProgress(task_id, event) => self.queue.apply(&task_id, event),
                 data::Evt::QueueTaskChanged => {
                     self.poll_queue_now();
+                }
+                // 翻面通告：只改库行那一格，场景不动（plan 2026-09-06 §8 R5）。手上那份
+                // `/dbnums` 里还没有这个库（刚加进 MDB、或还没轮询到）就提前一拍去取快照，
+                // 免得那一格空到下一拍。日志说一句：人等的多半就是这件事。
+                data::Evt::ModelSourceChanged { dbnum, source } => {
+                    if !self.queue.set_model_source(dbnum, source) {
+                        self.poll_queue_now();
+                    }
+                    self.logs.info(
+                        &mut self.vm.logs,
+                        match source {
+                            task_queue::ModelSource::Database => format!(
+                                "db{dbnum} 的模型改由数据库供数：初始化发布已收口，rocksdb 为准；已显示的模型是同一版，不必重载"
+                            ),
+                            task_queue::ModelSource::Memory => format!(
+                                "db{dbnum} 的模型改由 API 从内存供数：库已清空待重建，重建收口前看到的模型活不过服务端重启"
+                            ),
+                        },
+                    );
                 }
                 data::Evt::QueueFeedLive => self.queue.feed = ModelUpdateFeed::Live,
                 data::Evt::QueueFeedDown(reason) => {
@@ -4115,7 +4234,7 @@ impl App {
     /// 与菜单点进来的那次不同：这里手上有确切线索，所以只重查真正会变的
     /// 分支——单元自己、它的原 OWNER、新 OWNER，外加树里记着的当前父节点
     /// （元素被移走时后端的 `old_owner` 未必解得出来，本端的缓存却还留着移动前
-    /// 那一头）。自动路径一律只换树，三维保持原样（见 [`auto_refresh`]）。
+    /// 那一头）。没有模型重载需求的树补查路径仍保留三维（见 [`auto_refresh`]）。
     fn refresh_for_units(&mut self, units: Vec<model_update::RefreshUnit>, task_ids: Vec<String>) {
         if units.is_empty() {
             return;
@@ -4373,6 +4492,7 @@ impl App {
         let mut common: HashMap<String, PropRowVm> = HashMap::new();
         for attr in attrs {
             let muted = attr.value == "unset";
+            let is_uda = attr.is_uda;
             let row = PropRowVm {
                 key: attr.name.clone(),
                 attr: attr.name,
@@ -4381,6 +4501,7 @@ impl App {
                 muted,
             };
             match row.attr.as_str() {
+                _ if is_uda => data.udas.push(row),
                 "TYPE" => {
                     data.noun = row.value.clone();
                     common.insert(
@@ -4649,6 +4770,37 @@ mod tests {
         assert!(!tree.pending_direction.contains_key(&equipment));
         assert!(!tree.pending_visibility.contains_key(&equipment));
         assert!(!tree.visibility_unavailable.contains(&primitive));
+    }
+
+    #[test]
+    fn get_work_missing_branch_removes_descendants_without_refreshing_parent() {
+        let site = RefU64(1);
+        let zone = RefU64(2);
+        let equipment = RefU64(3);
+        let primitive = RefU64(4);
+        let sibling = RefU64(5);
+        let mut tree = TreeModel {
+            roots: vec![node(site, "SITE", 1)],
+            ..Default::default()
+        };
+        tree.children.insert(site, vec![node(zone, "ZONE", 2)]);
+        tree.children.insert(zone, vec![node(equipment, "EQUI", 1), node(sibling, "EQUI", 0)]);
+        tree.children.insert(equipment, vec![node(primitive, "BOX", 0)]);
+        tree.parent.extend([(zone, site), (equipment, zone), (primitive, equipment), (sibling, zone)]);
+        tree.detach_missing(&[equipment]);
+        assert_eq!(tree.prune_unreachable(), vec![equipment, primitive]);
+        assert_eq!(tree.children[&zone].len(), 1);
+        assert_eq!(tree.children[&zone][0].refno.refno(), sibling);
+        assert_eq!(tree.parent.get(&sibling), Some(&zone));
+    }
+
+    #[test]
+    fn get_work_missing_site_is_included_in_unload_set() {
+        let site = RefU64(1);
+        let mut tree = TreeModel { roots: vec![node(site, "SITE", 0)], ..Default::default() };
+        tree.detach_missing(&[site]);
+        assert_eq!(tree.prune_unreachable(), vec![site]);
+        assert!(tree.roots.is_empty());
     }
 
     /// eye 那条链路的最小复现：点击 -> 查询 -> View3d 回执。
@@ -5338,10 +5490,13 @@ mod tests {
         let reply = |status, generated, cached| model_update_api::EnsureReply {
             status,
             generation_root: String::new(),
+            generation_roots: Vec::new(),
             model_available: true,
             generation_root_count: generated + cached,
             cached_root_count: cached,
             generated_root_count: generated,
+            model_source: None,
+            model_source_reason: None,
         };
         let mut tally = ReloadEnsureTally::default();
         assert_eq!(tally.summary(), None, "没有范围目标就不该多嘴");
@@ -5738,5 +5893,30 @@ impl App {
         if self.tree_reveal_row_ready() {
             ui.ctx().request_repaint();
         }
+    }
+}
+
+#[cfg(test)]
+mod deleted_selection_tests {
+    use super::*;
+    #[test]
+    fn deleting_primary_clears_selection_before_property_reload() {
+        let selected = Selection::single(RefU64(26291));
+        let next = selection_after_removed_nodes(&selected, &[RefU64(26291)]);
+        assert_eq!(next.primary(), None);
+        assert_eq!(next.len(), 0);
+    }
+    #[test]
+    fn surviving_multi_selection_becomes_primary() {
+        let mut selected = Selection::single(RefU64(1));
+        selected.toggle(RefU64(2));
+        let next = selection_after_removed_nodes(&selected, &[RefU64(2), RefU64(2)]);
+        assert_eq!(next.primary(), Some(RefU64(1)));
+        assert_eq!(next.len(), 1);
+    }
+    #[test]
+    fn outside_tree_selection_is_not_erased_without_removal_evidence() {
+        let selected = Selection::single(RefU64(99));
+        assert_eq!(selection_after_removed_nodes(&selected, &[RefU64(2)]), selected);
     }
 }

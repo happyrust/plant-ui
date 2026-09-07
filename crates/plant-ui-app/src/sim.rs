@@ -37,8 +37,8 @@ use plant_ui::model_update::{
     TransformTargetPreview, UnitPreview, UnitResult, UnitStatus, ZonePreview,
 };
 use plant_ui::task_queue::{
-    DbnumStatus, Health, KIND_DATA_BATCH, KIND_ROOM_RECALC, Poll, QueueRow, QueueSnapshot,
-    RoomCounts, TaskEntry,
+    DbnumStatus, Health, KIND_DATA_BATCH, KIND_ROOM_RECALC, ModelSource, Poll, QueueRow,
+    QueueSnapshot, RoomCounts, TaskEntry,
 };
 use plant_ui_data::{Attr, AttrKind, EleTreeNode, RefU64};
 
@@ -453,6 +453,7 @@ impl Engine {
                 .filter(|db| db.db_type == "DESI")
                 .map(|db| db.dbnum)
                 .collect(),
+            cache_versions: Vec::new(),
             observed_at: Utc::now(),
             sites: self.tree.sites.clone(),
         }
@@ -467,6 +468,7 @@ impl Engine {
             name: name.into(),
             value,
             kind,
+            is_uda: name.starts_with(':'),
         };
         let Some(node) = self.tree.nodes.get(&refno) else {
             return vec![attr("REFNO", refno.to_string(), AttrKind::Opaque)];
@@ -561,6 +563,7 @@ impl Engine {
                 .map(|refno| (*refno, self.children(*refno)))
                 .collect(),
             failed: Vec::new(),
+            missing: Vec::new(),
         }
     }
 
@@ -802,6 +805,11 @@ impl Engine {
                 mdb: Some(MDB.into()),
                 namespace: Some(NAMESPACE.into()),
                 sync_live: true,
+                data_face: "ingest".into(),
+                read_through: Default::default(),
+                core: Default::default(),
+                mirror: Default::default(),
+                features: Default::default(),
                 started_at: stamp(self.service_started_at),
                 gen_spatial_tree: true,
                 queue_paused: self.paused,
@@ -820,6 +828,8 @@ impl Engine {
                 .map(|db| DbnumStatus {
                     dbnum: db.dbnum,
                     db_type: db.db_type.into(),
+                    cache_epoch: 0,
+                    cached_pe_rows: 0,
                     // 与真服务同口径：登记过 = 有权威水位（applied > 0）。取回工作旁那行
                     // 「N 次保存未应用」从这两端算。
                     applied_sesno: db.applied,
@@ -829,6 +839,15 @@ impl Engine {
                     blocked: db.blocked,
                     excluded: db.db_type != "DESI",
                     not_in_project: db.not_in_project,
+                    // 与真服务同一条判据的剧本版（spec §4.12）：有权威水位的库 rocksdb 为准；
+                    // 从未导入的库由 API 从内存供数。剧本里没有初始化发布 run，所以只有这两档。
+                    model_source: Some(if db.applied > 0 {
+                        ModelSource::Database
+                    } else {
+                        ModelSource::Memory
+                    }),
+                    model_source_reason: (db.applied <= 0)
+                        .then(|| "data_watermark_unestablished".to_owned()),
                 })
                 .collect(),
         }

@@ -611,6 +611,41 @@ impl ModelBatch {
     }
 }
 
+fn visibility_target_matches(targets: &[RefU64], refno: RefU64, _owner: RefU64) -> bool {
+    // App resolves tree/container scopes before sending SetVisible. Expanding
+    // owner again would hide visible siblings when replaying a hidden BRAN's
+    // own TUBI record. Match exactly, as desired_visibility already does.
+    targets.contains(&refno)
+}
+
+fn initial_model_visibility(desired: &HashMap<RefU64, bool>, refno: RefU64, _owner: RefU64) -> bool {
+    // A replay only lists hidden model ids; unlisted members are visible.
+    // Their owner's own geometry can independently be hidden.
+    desired.get(&refno).copied().unwrap_or(true)
+}
+
+#[cfg(test)]
+mod exact_visibility_tests {
+    use super::*;
+    #[test]
+    fn replay_hidden_branch_before_spawn_preserves_visible_member() {
+        let branch = RefU64(26229);
+        let visible_atta = RefU64(26233);
+        let mut desired = HashMap::new();
+        record_model_visibility(&ModelAction::SetVisible { refnos: vec![branch], visible: false }, &mut desired);
+        assert!(!initial_model_visibility(&desired, branch, branch));
+        assert!(initial_model_visibility(&desired, visible_atta, branch));
+    }
+    #[test]
+    fn hiding_branch_geometry_does_not_hide_a_visible_member() {
+        let branch = RefU64(26229);
+        let visible_atta = RefU64(26233);
+        assert!(visibility_target_matches(&[branch], branch, branch));
+        assert!(!visibility_target_matches(&[branch], visible_atta, branch));
+        assert!(visibility_target_matches(&[visible_atta], visible_atta, branch));
+    }
+}
+
 fn record_model_visibility(action: &ModelAction, desired: &mut HashMap<RefU64, bool>) {
     match action {
         ModelAction::SetVisible { refnos, visible } => {
@@ -1462,11 +1497,7 @@ fn load_models(
                 .or_insert_with(|| materials.add(model_material(color)))
                 .clone();
             let state = material_state(&selected, &xray, refno, owner);
-            let visible = desired_visibility
-                .get(&refno)
-                .or_else(|| desired_visibility.get(&owner))
-                .copied()
-                .unwrap_or(true);
+            let visible = initial_model_visibility(&desired_visibility, refno, owner);
             let visibility = if visible {
                 Visibility::Visible
             } else {
@@ -1877,7 +1908,7 @@ fn apply_commands(
                 ModelAction::SetVisible { refnos, visible } => {
                     let mut applied = Vec::new();
                     for (_, root, mut visibility) in &mut roots {
-                        if refnos.contains(&root.refno) || refnos.contains(&root.owner) {
+                        if visibility_target_matches(&refnos, root.refno, root.owner) {
                             *visibility = if visible {
                                 Visibility::Visible
                             } else {

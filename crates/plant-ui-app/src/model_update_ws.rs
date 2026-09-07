@@ -68,6 +68,9 @@ impl Feed {
                         if starts_or_finishes(&text) {
                             let _ = self.tx.send(Evt::QueueTaskChanged);
                         }
+                        if let Some((dbnum, source)) = decode_model_source_changed(&text) {
+                            let _ = self.tx.send(Evt::ModelSourceChanged { dbnum, source });
+                        }
                     }
                     WsEvent::Error(error) => disconnected = Some(error),
                     WsEvent::Closed => disconnected = Some("服务端关闭了连接".into()),
@@ -164,6 +167,21 @@ fn starts_or_finishes(text: &str) -> bool {
     )
 }
 
+/// `model_source_changed` 翻面通告（spec §4.12 / §5.3）：`payload = { dbnum, model_source }`，
+/// 不带 task_id。字面值认不出（新加的第三种源）就当没收到——猜成「数据库」是在
+/// 许诺一件没发生的事，下一拍 `/dbnums` 会把真值带回来。
+#[cfg(not(target_arch = "wasm32"))]
+fn decode_model_source_changed(text: &str) -> Option<(u32, plant_ui::task_queue::ModelSource)> {
+    let envelope: serde_json::Value = serde_json::from_str(text).ok()?;
+    if envelope.get("type")?.as_str()? != "model_source_changed" {
+        return None;
+    }
+    let payload = envelope.get("payload")?;
+    let dbnum = u32::try_from(payload.get("dbnum")?.as_u64()?).ok()?;
+    let source = plant_ui::task_queue::ModelSource::parse(payload.get("model_source")?.as_str()?)?;
+    Some((dbnum, source))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +195,32 @@ mod tests {
         assert_eq!(task_id, "db-1");
         assert!(decode(r#"{"type":"task_started","task_id":"db-1"}"#).is_none());
         assert!(starts_or_finishes(r#"{"type":"task_finished"}"#));
+    }
+
+    /// 翻面通告走服务端统一信封（`payload` 里是 `{dbnum, model_source}`，`task_id` 为空）；
+    /// 它既不是进度也不是起讫，不能顺手叫醒轮询或写进哪条任务的明细。
+    #[test]
+    fn decodes_model_source_changed_and_ignores_unknown_sources() {
+        use plant_ui::task_queue::ModelSource;
+        let flipped = r#"{"type":"model_source_changed","seq":3,"ts":"2026-09-06T00:00:00+08:00",
+            "task_id":null,"payload":{"dbnum":8000,"model_source":"database"}}"#;
+        assert_eq!(
+            decode_model_source_changed(flipped),
+            Some((8000, ModelSource::Database))
+        );
+        assert!(decode(flipped).is_none());
+        assert!(!starts_or_finishes(flipped));
+
+        let wiped = r#"{"type":"model_source_changed","payload":{"dbnum":8021,"model_source":"memory"}}"#;
+        assert_eq!(
+            decode_model_source_changed(wiped),
+            Some((8021, ModelSource::Memory))
+        );
+        let unknown = r#"{"type":"model_source_changed","payload":{"dbnum":8021,"model_source":"mirror"}}"#;
+        assert_eq!(decode_model_source_changed(unknown), None);
+        assert_eq!(
+            decode_model_source_changed(r#"{"type":"task_finished","task_id":"db-1"}"#),
+            None
+        );
     }
 }

@@ -174,6 +174,18 @@ pub struct Health {
     pub namespace: Option<String>,
     #[serde(default)]
     pub sync_live: bool,
+    /// `read-through` means watermarks are intentionally not advanced and the
+    /// database is only a compatibility cache.
+    #[serde(default)]
+    pub data_face: String,
+    #[serde(default)]
+    pub read_through: ReadThroughHealth,
+    #[serde(default)]
+    pub core: ServiceSectionHealth,
+    #[serde(default)]
+    pub mirror: ServiceSectionHealth,
+    #[serde(default)]
+    pub features: FeatureHealth,
     #[serde(default)]
     pub started_at: String,
     #[serde(default)]
@@ -201,6 +213,36 @@ pub struct Health {
     pub delivery_unit_types: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ServiceSectionHealth {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct FeatureHealth {
+    #[serde(default)]
+    pub room: ServiceSectionHealth,
+    #[serde(default)]
+    pub history: ServiceSectionHealth,
+    #[serde(default)]
+    pub operations: ServiceSectionHealth,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ReadThroughHealth {
+    #[serde(default)]
+    pub queue_depth: usize,
+    #[serde(default)]
+    pub succeeded: u64,
+    #[serde(default)]
+    pub failed: u64,
+    #[serde(default)]
+    pub degraded_reason: Option<String>,
+}
+
 /// `GET /api/v1/update/pending-units`。走持久表，**不依赖任务历史**——一个库
 /// 欠着几个单元这件事，跨重启也答得出来。
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -219,6 +261,10 @@ pub struct DbnumStatus {
     pub dbnum: u32,
     #[serde(default)]
     pub db_type: String,
+    #[serde(default)]
+    pub cache_epoch: u64,
+    #[serde(default)]
+    pub cached_pe_rows: u64,
     /// 数据水位：该库已应用到的会话号（`0` = 从未导入，需初始化）。服务端一直给，
     /// 取回工作旁那行「N 次保存未应用」从这里算（原先直读 SurrealDB 水位表，
     /// 零解析库那张表是空的）。界面上一律说「保存」不说会话号（ADR-0019）。
@@ -247,10 +293,84 @@ pub struct DbnumStatus {
     /// 一句反话出现好。
     #[serde(default)]
     pub not_in_project: bool,
+    /// 这个库的模型现在该从哪儿读（gen-model spec §4.12）：`database` = rocksdb 为准；
+    /// `memory` = 初始化中 / 读透 / 水位未建立，由 API 从进程内投影供数。
+    ///
+    /// 老服务端不给这一格，认不出的字面值也归 `None`：**整格不画**，不许猜成「数据库」——
+    /// 那句话的意思是「重启后还在」，猜错了人会以为一批只活在内存里的模型已经落库。
+    #[serde(default, deserialize_with = "lenient")]
+    pub model_source: Option<ModelSource>,
+    /// `memory` 的理由（`initialization_publishing` / `data_watermark_unestablished` /
+    /// `read-through`）；`database` 时为空。只用来把「内存」那两个字说得更具体。
+    #[serde(default)]
+    pub model_source_reason: Option<String>,
+}
+
+/// 一个库的模型取数源（gen-model spec §4.12 `model_source`）。判据只在服务端一处
+/// （`model_read_route`），客户端**只消费**：不拿 `applied_sesno` / `initialized` 自己拼——
+/// 那会把「谁初始化过」的判断复制到第二处，两处一旦不一致，同一个库两页记录就混了源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelSource {
+    /// 进程内投影：初始化发布 run 还在飞、基线没落、或读透形态。活不过服务端重启。
+    Memory,
+    /// rocksdb 为准。
+    Database,
+}
+
+impl ModelSource {
+    /// `/model/records` 回执里 `source` 那一格的字面值（老字段，两个值一直没变）。
+    pub fn from_records_label(label: &str) -> Option<Self> {
+        match label {
+            "model-memory" => Some(Self::Memory),
+            "model-database" => Some(Self::Database),
+            _ => None,
+        }
+    }
+
+    /// WS `model_source_changed` 与 `/dbnums` 用的字面值。
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "memory" => Some(Self::Memory),
+            "database" => Some(Self::Database),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Database => "database",
+        }
+    }
+
+    /// 库行上并排那一格的文字。`memory` 按理由再说一层：「初始化中」是人最关心的那一种
+    /// ——它意味着现在看到的模型是 API 现算的，翻面之后同一版会从 rocksdb 读出来。
+    pub fn label(self, reason: Option<&str>) -> String {
+        match self {
+            Self::Database => "模型来源：数据库".to_owned(),
+            Self::Memory => match reason {
+                Some("initialization_publishing") => "模型来源：内存（初始化中）".to_owned(),
+                Some("data_watermark_unestablished") => "模型来源：内存（未初始化）".to_owned(),
+                Some("read-through") => "模型来源：内存（读透）".to_owned(),
+                _ => "模型来源：内存".to_owned(),
+            },
+        }
+    }
+
+    /// 行内紧凑标记用的两个字，完整句子在悬停与明细里。
+    pub fn short(self) -> &'static str {
+        match self {
+            Self::Memory => "内存",
+            Self::Database => "数据库",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DbnumReport {
+    #[serde(default)]
+    pub data_face: String,
     #[serde(default)]
     pub dbnums: Vec<DbnumStatus>,
 }
@@ -368,6 +488,31 @@ impl Vm {
 
     pub fn mark_refreshed(&mut self, task_id: &str) {
         self.refreshed.insert(task_id.to_owned());
+    }
+
+    /// WS `model_source_changed` 到了：**只改这个库那一格**，别的都不动（plan 2026-09-06
+    /// §8 R5）。不重载场景——内存投影与刚发布的行是同一版文件算出来的，下一次范围重载
+    /// 自然读到 rocksdb。理由一并清掉：翻面事件不带理由，留着旧的（「初始化中」）就是
+    /// 一句反话；下一拍 `/dbnums` 会把新理由带回来。
+    ///
+    /// 回 `false` = 这个库不在手上那份 `/dbnums` 里（还没轮询到、或不在范围内），
+    /// 调用点据此决定要不要提前一拍去取快照。
+    pub fn set_model_source(&mut self, dbnum: u32, source: ModelSource) -> bool {
+        let mut hit = false;
+        for db in self.dbnums.iter_mut().filter(|db| db.dbnum == dbnum) {
+            db.model_source = Some(source);
+            db.model_source_reason = None;
+            hit = true;
+        }
+        hit
+    }
+
+    /// 某个库此刻的模型取数源（连同理由），给行与明细并排显示用。
+    pub fn model_source_of(&self, dbnum: u32) -> Option<(ModelSource, Option<&str>)> {
+        self.dbnums
+            .iter()
+            .find(|db| db.dbnum == dbnum)
+            .and_then(|db| db.model_source.map(|source| (source, db.model_source_reason.as_deref())))
     }
 
     pub fn adopt(&mut self, poll: Poll) {
@@ -527,6 +672,13 @@ impl Vm {
     /// 把它的差额算进「待应用」等于许诺一件不会发生的事。`/dbnums` 取不到时
     /// `dbnums` 是空表，算出来两个 0，那一行整个不画，与此前「查不动就不显示」一致。
     pub fn pending_saves(&self) -> PendingSaves {
+        if self
+            .health
+            .as_ref()
+            .is_some_and(|health| health.data_face == "read-through")
+        {
+            return PendingSaves::default();
+        }
         let mut pending = PendingSaves::default();
         for db in &self.dbnums {
             if !db.db_type.trim().eq_ignore_ascii_case("DESI")
@@ -665,9 +817,20 @@ pub struct RowVm {
     pub owed: usize,
     /// 明细缺了多少条（服务端已发 − 本端已收）。
     pub behind_events: u64,
+    /// 这个库的模型此刻从哪儿读（`/dbnums` 那一行的 `model_source`，WS 翻面事件原地改）。
+    /// 服务端没给就 `None`，行上整格不画。
+    pub model_source: Option<ModelSource>,
+    /// `memory` 的理由，只用来把标签说具体。
+    pub model_source_reason: Option<String>,
 }
 
 impl RowVm {
+    /// 「模型来源：…」整句；没有来源就没有这一句。
+    fn model_source_label(&self) -> Option<String> {
+        self.model_source
+            .map(|source| source.label(self.model_source_reason.as_deref()))
+    }
+
     /// 「有变化」= 还有活没干完：运行中、排队中，以及水位虽已推进、但仍欠着
     /// 交付单元的部分完成行。纯粹已完成的收起来。
     fn has_work(&self) -> bool {
@@ -779,6 +942,16 @@ pub fn rows(vm: &Vm) -> Vec<RowVm> {
         .map(|row| row.dbnum)
         .collect();
     let owed = |dbnum: u32| owed.get(&dbnum).copied().unwrap_or_default();
+    // 模型取数源也先收成索引：`/dbnums` 在积压态有两三百行，逐行 `find` 同样是平方项。
+    let sources: HashMap<u32, (ModelSource, Option<String>)> = vm
+        .dbnums
+        .iter()
+        .filter_map(|db| {
+            db.model_source
+                .map(|source| (db.dbnum, (source, db.model_source_reason.clone())))
+        })
+        .collect();
+    let source_of = |dbnum: u32| sources.get(&dbnum).cloned();
 
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -842,6 +1015,8 @@ pub fn rows(vm: &Vm) -> Vec<RowVm> {
                 .map(|e| e.events_seen)
                 .unwrap_or_default()
                 .saturating_sub(detail.map(|d| d.received).unwrap_or_default()),
+            model_source: source_of(row.dbnum).map(|(source, _)| source),
+            model_source_reason: source_of(row.dbnum).and_then(|(_, reason)| reason),
         });
     }
 
@@ -919,6 +1094,8 @@ pub fn rows(vm: &Vm) -> Vec<RowVm> {
             behind_frozen: false,
             owed: owed(dbnum),
             behind_events: 0,
+            model_source: source_of(dbnum).map(|(source, _)| source),
+            model_source_reason: source_of(dbnum).and_then(|(_, reason)| reason),
         });
     }
 
@@ -2006,6 +2183,26 @@ fn queue_row(
             g,
             t.text_secondary,
         );
+        // 模型取数源紧挨着类型：一个字形，整句在悬停与明细里（plan 2026-09-06 §8.3 U1）。
+        // 「内存」用提醒色——这批模型活不过服务端重启，是人该知道的事；「数据库」不出声。
+        if let Some(source) = row.model_source {
+            let (icon, color) = model_source_glyph(t, source);
+            let at = pos2(tag.right() + d.px(10.0), mid);
+            glyph(ui, at, icon, d.px(12.0), color);
+            // 字形自己没有 Response，给它一块只感知悬停的热区（不吃行的点击）。
+            let hit = Rect::from_center_size(at, vec2(d.px(16.0), d.px(16.0)));
+            if let Some(label) = row.model_source_label() {
+                ui.interact(hit, row_id(&row.task_id).with("model-source"), Sense::hover())
+                    .on_hover_ui(|ui| {
+                        ui.label(label);
+                        ui.label(
+                            RichText::new(model_source_note(source))
+                                .font(Font::micro(d))
+                                .color(t.text_muted),
+                        );
+                    });
+            }
+        }
     }
     text_at(
         ui,
@@ -2062,6 +2259,19 @@ fn queue_row(
         return (resp, true);
     }
     if row.note.is_empty() {
+        // 说明列空着时把「模型来源：…」整句摆进来（U1「库行上并排显示」）。装不下就只剩
+        // 类型旁那个字形——这一句不值得为它另起一行，字形 + 悬停已经把话说全了。
+        if let Some(label) = row.model_source_label() {
+            let g = layout(ui, &label, Font::meta(d));
+            if g.size().x <= note_w {
+                let color = match row.model_source {
+                    Some(ModelSource::Memory) => t.text_secondary,
+                    _ => t.text_muted,
+                };
+                ui.painter()
+                    .galley(pos2(c.note, mid - g.size().y / 2.0), g, color);
+            }
+        }
         return (resp, true);
     }
     // 装不下就交回给调用点，让它在行下面另起一行——**宁可多占一行，也不许把
@@ -2079,6 +2289,23 @@ fn queue_row(
     ui.painter()
         .galley(pos2(c.note, mid - g.size().y / 2.0), g, color);
     (resp, true)
+}
+
+/// 模型取数源的字形与颜色。「内存」用提醒色不用危险色：它不是出事，是「这批模型此刻
+/// 活在进程里、重启后要由初始化发布落库」，值得看见、不值得惊动。
+fn model_source_glyph(t: &Tokens, source: ModelSource) -> (&'static str, Color32) {
+    match source {
+        ModelSource::Database => (ph::DATABASE, t.text_muted),
+        ModelSource::Memory => (ph::CPU, t.warn),
+    }
+}
+
+/// 悬停与明细里跟在「模型来源：…」后面的那半句：这个来源对人意味着什么。
+fn model_source_note(source: ModelSource) -> &'static str {
+    match source {
+        ModelSource::Database => "rocksdb 为准，重启后仍在",
+        ModelSource::Memory => "由 API 现算供数、活不过服务端重启；初始化发布收口后自动改读 rocksdb，同一版文件，不必重载",
+    }
 }
 
 /// 行内明细：逐单元事件、并入会话、欠着的单元、断线时缺了多少条。
@@ -2102,6 +2329,23 @@ fn row_detail(
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = d.px(2.0);
+
+            // 模型取数源整句放明细第一行：行上那个字形挤不下文字时，这里总说得全。
+            if let (Some(source), Some(label)) = (row.model_source, row.model_source_label()) {
+                let (icon, icon_color) = model_source_glyph(t, source);
+                detail_line(
+                    ui,
+                    t,
+                    d,
+                    DetailLine {
+                        icon,
+                        icon_color,
+                        label: &label,
+                        note: model_source_note(source),
+                        note_color: t.text_muted,
+                    },
+                );
+            }
 
             if row.phase.terminal() {
                 egui::Frame::new()

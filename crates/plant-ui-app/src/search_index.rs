@@ -45,9 +45,13 @@ pub enum SubstringHits {
 /// 索引取材与落脚的范围。`ns` + `mdb` 决定它住哪个目录，`dbnums` 决定收哪些库。
 #[derive(Debug, Clone, Default)]
 pub struct Scope {
+    pub project: String,
     pub ns: String,
     pub mdb: String,
     pub dbnums: Vec<u32>,
+    /// `(dbnum, cache_epoch, cached_pe_rows)` from `/dbnums`.  Present only
+    /// for the read-through data face.
+    pub cache_versions: Vec<(u32, u64, u64)>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -135,7 +139,11 @@ mod native {
             ctx: &egui::Context,
         ) -> Result<u64> {
             let root = root(scope)?;
-            let stamp = name_index::stamp(&scope.dbnums).await?;
+            let stamp = if scope.cache_versions.is_empty() {
+                name_index::stamp(&scope.dbnums).await?
+            } else {
+                name_index::stamp_from_cache(&scope.cache_versions)
+            };
             let dir = root.join(stamp.dir_name());
             if !force && dir.is_dir() {
                 // 开不动就当它不存在：目录残缺、格式对不上、被谁写坏——重建一份
