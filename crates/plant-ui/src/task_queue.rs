@@ -26,6 +26,7 @@ use crate::model_update::{
     BatchStatus, Enqueued, Feed, FileAnomaly, PendingModelUnit, Preview, ProgressEvent, RowState,
     UnitResult, UnitStatus,
 };
+use crate::settings::ReadFaceKind;
 use crate::style::group_number as group;
 use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Status, Tokens, radius};
@@ -459,6 +460,11 @@ pub struct Vm {
     pub tasks_error: Option<String>,
     /// 有没有成功取到过一次快照。没有的话画「还没连上」而不是画一个空队列。
     pub loaded: bool,
+    /// 本客户端此刻从哪一面读（宿主随 `data::spawn` 与热切填）。队列本身与它无关——命令面
+    /// 永远走模型服务；它只决定两句话怎么说：库供数下库行「模型来源」整格不画（那一格说的是
+    /// 服务端自己从哪儿取数，本客户端的实例根本不经它；ADR-0026 / 计划 §5.5），轮询失败时
+    /// 标题是「模型服务离线」而不是「读不到任务队列」——树 / 属性 / 已生成模型这时候照常。
+    pub read_face: ReadFaceKind,
     /// 只有手动向导能给出的比较基线；按 execute 回执里的 task_id 精确关联。
     preview_changes: HashMap<String, u64>,
     /// 本会话已经消费过刷新线索的终态任务。
@@ -508,11 +514,51 @@ impl Vm {
     }
 
     /// 某个库此刻的模型取数源（连同理由），给行与明细并排显示用。
+    /// 库供数下恒 `None`：见 [`Self::paints_model_source`]。
     pub fn model_source_of(&self, dbnum: u32) -> Option<(ModelSource, Option<&str>)> {
+        if !self.paints_model_source() {
+            return None;
+        }
         self.dbnums
             .iter()
             .find(|db| db.dbnum == dbnum)
             .and_then(|db| db.model_source.map(|source| (source, db.model_source_reason.as_deref())))
+    }
+
+    /// 开机就交底本客户端从哪一面读。`Default` 那一份是服务供数，库供数下拿它开机
+    /// 会先画一帧库行「模型来源」——那一帧就是句谎话（见 [`Self::paints_model_source`]）。
+    pub fn new(read_face: ReadFaceKind) -> Self {
+        Self {
+            read_face,
+            ..Self::default()
+        }
+    }
+
+    /// 一次快照都没取到时，这块面板的标题。
+    ///
+    /// 服务供数下模型服务不在场就是整个客户端读不到数据，「读不到任务队列」说的是眼前
+    /// 这块面板；库供数下它只是命令面歇了，树 / 属性 / 三维照常，所以点名说是**谁**离线
+    /// ——把这一句留成「读不到任务队列」，人会以为整个客户端断了（计划 §5.5）。
+    pub fn offline_title(&self) -> &'static str {
+        match self.read_face {
+            ReadFaceKind::Store => "模型服务离线",
+            ReadFaceKind::Service => "读不到任务队列",
+        }
+    }
+
+    /// 库供数下再补一句：什么还照常、什么得等它回来。`None` = 服务供数，那一面没什么
+    /// 照常可言。
+    pub fn offline_reassurance(&self) -> Option<&'static str> {
+        (self.read_face == ReadFaceKind::Store)
+            .then_some("库供数下树 / 属性 / 已生成模型照常；补齐、更新、房间要等它回来")
+    }
+
+    /// 库行「模型来源」这一格画不画。`/dbnums` 的 `model_source` 说的是**服务端**此刻从
+    /// 内存还是 rocksdb 取模型；服务供数下客户端的实例正是经它来的，服务端给什么画什么
+    /// （ADR-0025）。库供数下实例直读 `inst_relate`，不经服务端——这一格无论画「数据库」
+    /// 还是「内存」都是替服务端说本客户端的事，整格不画（计划 §5.5「不猜『数据库』」）。
+    pub fn paints_model_source(&self) -> bool {
+        self.read_face != ReadFaceKind::Store
     }
 
     pub fn adopt(&mut self, poll: Poll) {
@@ -943,14 +989,18 @@ pub fn rows(vm: &Vm) -> Vec<RowVm> {
         .collect();
     let owed = |dbnum: u32| owed.get(&dbnum).copied().unwrap_or_default();
     // 模型取数源也先收成索引：`/dbnums` 在积压态有两三百行，逐行 `find` 同样是平方项。
-    let sources: HashMap<u32, (ModelSource, Option<String>)> = vm
-        .dbnums
-        .iter()
-        .filter_map(|db| {
-            db.model_source
-                .map(|source| (db.dbnum, (source, db.model_source_reason.clone())))
-        })
-        .collect();
+    // 库供数下索引留空——每一行的 `model_source` 都是 `None`，三处绘制随之整格不画。
+    let sources: HashMap<u32, (ModelSource, Option<String>)> = if vm.paints_model_source() {
+        vm.dbnums
+            .iter()
+            .filter_map(|db| {
+                db.model_source
+                    .map(|source| (db.dbnum, (source, db.model_source_reason.clone())))
+            })
+            .collect()
+    } else {
+        HashMap::new()
+    };
     let source_of = |dbnum: u32| sources.get(&dbnum).cloned();
 
     let mut out = Vec::new();
@@ -1504,11 +1554,14 @@ fn not_connected(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm) {
                         .color(t.warn),
                 );
                 ui.label(
-                    RichText::new("读不到任务队列")
+                    RichText::new(vm.offline_title())
                         .font(Font::strong(d))
                         .color(t.text_secondary),
                 );
                 ui.label(RichText::new(error).font(Font::meta(d)).color(t.text_muted));
+                if let Some(line) = vm.offline_reassurance() {
+                    ui.label(RichText::new(line).font(Font::meta(d)).color(t.text_muted));
+                }
             }
             None => {
                 ui.add(egui::Spinner::new().size(d.px(22.0)).color(t.accent));
@@ -3374,6 +3427,60 @@ mod tests {
         assert!(!out[0].behind_frozen);
         assert!(out[1].behind_frozen);
         assert_eq!(out[1].note, "上一批已冻结，这是之后新存的会话");
+    }
+
+    /// 库供数下库行「模型来源」整格不画：`/dbnums` 说的是服务端自己从哪儿取模型，本客户端
+    /// 的实例直读 `inst_relate`、不经它——画「数据库」或「内存」都是替服务端说本客户端的事
+    /// （计划 §5.5）。行与明细三处绘制都只认 `RowVm.model_source`，这里钉它的来源。
+    #[test]
+    fn store_mode_never_paints_a_model_source() {
+        let mut model = vm(
+            vec![queued("db-7997", 7997, 1024, 1038)],
+            vec![entry("db-7997", 7997, "queued")],
+        );
+        model.dbnums = vec![DbnumStatus {
+            dbnum: 7997,
+            db_type: "DESI".into(),
+            model_source: Some(ModelSource::Memory),
+            model_source_reason: Some("初始化中".into()),
+            ..Default::default()
+        }];
+
+        model.read_face = ReadFaceKind::Service;
+        assert!(model.paints_model_source());
+        assert_eq!(rows(&model)[0].model_source, Some(ModelSource::Memory));
+        assert!(rows(&model)[0].model_source_label().is_some());
+        assert!(model.model_source_of(7997).is_some());
+
+        model.read_face = ReadFaceKind::Store;
+        assert!(!model.paints_model_source());
+        assert_eq!(rows(&model)[0].model_source, None);
+        assert_eq!(rows(&model)[0].model_source_label(), None);
+        assert_eq!(model.model_source_of(7997), None);
+        // 数据本身还在：切回服务供数那一格立刻回来，不用等下一拍 `/dbnums`。
+        model.read_face = ReadFaceKind::Service;
+        assert_eq!(rows(&model)[0].model_source, Some(ModelSource::Memory));
+    }
+
+    /// 模型服务不在场时，库供数点名说是**谁**离线，并交代什么还照常。
+    ///
+    /// 两面同一句「读不到任务队列」会把「命令面歇了」讲成「整个客户端断了」——
+    /// 库供数下树 / 属性 / 已生成模型这时候一切照旧（计划 §5.5，D12）。
+    #[test]
+    fn a_missing_model_service_in_store_mode_says_which_half_is_down() {
+        let mut model = Vm::new(ReadFaceKind::Service);
+        assert_eq!(model.offline_title(), "读不到任务队列");
+        assert_eq!(model.offline_reassurance(), None);
+
+        model = Vm::new(ReadFaceKind::Store);
+        assert_eq!(model.offline_title(), "模型服务离线");
+        assert_eq!(
+            model.offline_reassurance(),
+            Some("库供数下树 / 属性 / 已生成模型照常；补齐、更新、房间要等它回来")
+        );
+        // 构造函数交底的就是这一面：`Default` 那一份是服务供数，库供数拿它开机
+        // 会先画一帧库行「模型来源」。
+        assert!(!model.paints_model_source());
     }
 
     /// 「排在第几位」数的是队列里还排着几个库——运行中的行不占位置。

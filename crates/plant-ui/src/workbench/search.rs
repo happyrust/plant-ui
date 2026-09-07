@@ -18,6 +18,7 @@ use egui::{
 };
 use egui_phosphor::regular as ph;
 
+use crate::settings::ReadFaceKind;
 use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Tokens, radius};
 use crate::vm::{SearchHitVm, SubIndexVm, WorkbenchVm};
@@ -346,13 +347,7 @@ fn dropdown(
         // 子串段的段首挂一行不可选的标注：这一段的范围与上一段不一样，
         // 不说清楚人会以为搜索框把别的库漏了。
         if let (true, Some(name)) = (index == prefix_rows, name) {
-            let scope = vm.search.scope_dbs;
-            note(
-                ui,
-                d,
-                &format!("名字中间含「{name}」——{scope} 个设计库（当前 MDB）"),
-                t.text_muted,
-            );
+            note(ui, d, &substring_header(vm, name), t.text_muted);
         }
         if candidate_row(ui, t, d, row, index == cursor) {
             picked = Some(row.refno());
@@ -375,15 +370,7 @@ fn dropdown(
     } else if !settled(vm, query) {
         note(ui, d, "搜索中…", t.text_muted);
     } else if rows.is_empty() {
-        let scope = vm.search.scope_dbs;
-        let miss = match vm.search.sub_state {
-            // 子串这一路真的搜过了才敢替它说「也没有」。
-            SubIndexVm::Ready => {
-                format!("没有名字以「{name}」开头的元素；{scope} 个设计库里也没有名字含它的")
-            }
-            _ => format!("没有名字以「{name}」开头的元素"),
-        };
-        note(ui, d, &miss, t.text_secondary);
+        note(ui, d, &miss_text(vm, name), t.text_secondary);
     } else if vm.search.truncated {
         note(
             ui,
@@ -408,12 +395,53 @@ fn dropdown(
             t.danger,
         ),
         // 浏览器端没有索引。只在前缀也一无所获时说，免得每次搜索都念一遍。
-        SubIndexVm::Off if rows.is_empty() && settled(vm, query) => {
+        //
+        // 服务供数下不说：那一面本来就不建本地子串索引（`Off` 是这个意思），而前缀
+        // 那一路吃的服务端快照索引自己就含子串——把它说成「仅桌面端提供」是假话。
+        SubIndexVm::Off if store_coverage(vm) && rows.is_empty() && settled(vm, query) => {
             note(ui, d, "按中间片段搜索仅桌面端提供", t.text_muted)
         }
         SubIndexVm::Off | SubIndexVm::Ready => {}
     }
     picked
+}
+
+/// 命中来自库供数那一面吗。
+fn store_coverage(vm: &WorkbenchVm) -> bool {
+    vm.search.coverage == ReadFaceKind::Store
+}
+
+/// 命中范围的尾注。库供数的两路索引都只认已经进了 `pe` 的元素：说「没有」之前
+/// 得先交代这个范围，不然听起来像整个工程里都没有（计划 §5.5）。
+fn coverage_note(vm: &WorkbenchVm) -> &'static str {
+    if store_coverage(vm) {
+        "（只覆盖已入库元素）"
+    } else {
+        ""
+    }
+}
+
+/// 子串那一段的段首标注：这一段的范围与上一段不一样，不说清楚人会以为搜索框把
+/// 别的库漏了。
+fn substring_header(vm: &WorkbenchVm, name: &str) -> String {
+    format!(
+        "名字中间含「{name}」——{} 个设计库（当前 MDB）{}",
+        vm.search.scope_dbs,
+        coverage_note(vm)
+    )
+}
+
+/// 一行都没搜着时那句话。
+fn miss_text(vm: &WorkbenchVm, name: &str) -> String {
+    match vm.search.sub_state {
+        // 子串这一路真的搜过了才敢替它说「也没有」。
+        SubIndexVm::Ready => format!(
+            "没有名字以「{name}」开头的元素；{} 个设计库里也没有名字含它的{}",
+            vm.search.scope_dbs,
+            coverage_note(vm)
+        ),
+        _ => format!("没有名字以「{name}」开头的元素{}", coverage_note(vm)),
+    }
 }
 
 /// 一条候选。左起类型图标 + 类型 + 全名，右侧参考号；树外元素另挂一枚标。
@@ -517,10 +545,13 @@ fn elide_middle(text: &str, width: f32, d: Density) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DROPDOWN_WIDTH, Query, Row, classify, dropdown, elide_middle, moved, rows_of};
+    use super::{
+        DROPDOWN_WIDTH, Query, ReadFaceKind, Row, classify, dropdown, elide_middle, miss_text,
+        moved, rows_of, store_coverage, substring_header,
+    };
     use crate::RefU64;
     use crate::style::tokens::{Density, Tokens};
-    use crate::vm::{SearchHitVm, SearchVm, WorkbenchVm};
+    use crate::vm::{SearchHitVm, SearchVm, SubIndexVm, WorkbenchVm};
 
     fn hit(name: &str, packed: u64) -> SearchHitVm {
         SearchHitVm {
@@ -528,6 +559,7 @@ mod tests {
             name: name.to_owned(),
             noun: "EQUI".to_owned(),
             in_tree: true,
+            dbnum: 7997,
         }
     }
 
@@ -640,6 +672,67 @@ mod tests {
             assert_eq!(size.x, d.px(DROPDOWN_WIDTH), "宽度得由内容自己钉住");
             assert!(size.y > 0.0, "一行都不画的那一帧就是宽度归零的那一帧");
         }
+    }
+
+    /// 库供数那两路索引只认已经进了 `pe` 的元素，说「没有」之前先把这个范围交代
+    /// 清楚；服务供数搜的是服务端快照索引，没这回事，那句尾注一个字都不许出现
+    /// （计划 §5.5）。
+    #[test]
+    fn store_mode_search_names_its_coverage() {
+        let mut vm = vm_with("rs", &[], &[]);
+        vm.search.scope_dbs = 2;
+        vm.search.sub_state = SubIndexVm::Ready;
+
+        vm.search.coverage = ReadFaceKind::Service;
+        assert!(!store_coverage(&vm));
+        assert_eq!(
+            miss_text(&vm, "rs"),
+            "没有名字以「rs」开头的元素；2 个设计库里也没有名字含它的"
+        );
+        assert_eq!(
+            substring_header(&vm, "rs"),
+            "名字中间含「rs」——2 个设计库（当前 MDB）"
+        );
+
+        vm.search.coverage = ReadFaceKind::Store;
+        assert!(store_coverage(&vm));
+        assert_eq!(
+            miss_text(&vm, "rs"),
+            "没有名字以「rs」开头的元素；2 个设计库里也没有名字含它的（只覆盖已入库元素）"
+        );
+        assert_eq!(
+            substring_header(&vm, "rs"),
+            "名字中间含「rs」——2 个设计库（当前 MDB）（只覆盖已入库元素）"
+        );
+        // 子串那一路还没就绪时不替它说「也没有」，但范围照样得标。
+        vm.search.sub_state = SubIndexVm::Building { done: 1, total: 2 };
+        assert_eq!(
+            miss_text(&vm, "rs"),
+            "没有名字以「rs」开头的元素（只覆盖已入库元素）"
+        );
+    }
+
+    /// 「按中间片段搜索仅桌面端提供」只在库供数下说。服务供数本来就不建本地子串
+    /// 索引（`Off` 就是这个意思），而前缀那一路吃的服务端快照索引自己含子串——
+    /// 那一面说这句话是假话，跟是不是浏览器端没有关系。源码钉那一臂的门。
+    #[test]
+    fn service_mode_never_claims_substring_search_is_desktop_only() {
+        let source = include_str!("search.rs");
+        let body = source
+            .split_once("#[cfg(test)]")
+            .map(|(body, _)| body)
+            .unwrap_or(source);
+        let guard = body
+            .split_once("SubIndexVm::Off if ")
+            .expect("「不提供」那一臂")
+            .1
+            .split_once("=>")
+            .expect("臂体")
+            .0;
+        assert!(
+            guard.contains("store_coverage(vm)"),
+            "服务供数也会说这句：{guard}"
+        );
     }
 
     #[test]

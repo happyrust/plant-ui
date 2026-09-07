@@ -48,6 +48,11 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
             let mut ignored = Vec::new();
             ready(ui, t, d, data, &vm.rooms, &mut ignored);
         }
+        // 查成功、就是一条属性都没有。这不是错误：没有可重试的动作，
+        // 画成红的加一枚「重试」只会让人反复按（ADR-0026 / 计划 §5.5）。
+        PropsVm::Verdict(verdict) => {
+            note(ui, t, d, PaneState::Empty, ph::INFO, verdict);
+        }
         // 重查的是当前选中元素；选中已经挪走的话 App 侧会把这条丢掉。
         PropsVm::Failed(reason) => {
             if note(ui, t, d, PaneState::Error, ph::WARNING, reason)

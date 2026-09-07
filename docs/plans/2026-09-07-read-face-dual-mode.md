@@ -31,6 +31,9 @@
   钉着。顺带一条给 M4 / M6 的事实：开发库 8009（ns 1516）里 `SITE` 行只有 dbnum 7997（13）与 8000（3），
   库供数根层 16 个 SITE / 2 个设计库；同一接入点服务供数是 37 个 SITE / 7997、7998、8000 三库——两边数据本身不齐，
   对拍要另找一台与服务同源的库（D1 本意的已落盘 rocksdb）。
+  **M3 已完成**（2026-09-08：不说谎那几格落地——库行「模型来源」整格不画 + 翻面通告改口、CATA / 未同步 / 说不清
+  三档属性定论、搜索标「只覆盖已入库元素」、队列面板「模型服务离线」；顺带修掉服务供数那句「按中间片段搜索仅桌面端
+  提供」。三 crate 测试 128+2 / 122 / 19 全绿，wasm check 过；落地形状与三处偏离记在 §5.5 末，T5 留到 M6 前）。
 
 ---
 
@@ -267,6 +270,35 @@ plant-ui-app --read-face-parity --depth 2 --sample 200 [--roots 24381/2,…] [--
 | 队列面板 | — | gen-model 不在场 → 「模型服务离线」，树 / 属性 / 三维照常 |
 | 设置窗下拉 | 环境变量在场 → 禁用 + 标注 | 同 |
 
+**M3 落地形状**（2026-09-08，与上表的偏离都在这儿）：
+
+- **库行「模型来源」**：判据不是「`sources` 为空」而是 `task_queue::Vm.read_face`（宿主随
+  `data::spawn` 与热切填，`Vm::new(kind)` 开机就交底）。`paints_model_source()` 一处判、
+  `model_source_of()` 与 `rows()` 两处取数都过它，行与明细三处绘制照旧只认 `RowVm.model_source`。
+  只看 `sources` 空不空挡不住这一格：`/dbnums` 是队列轮询取的，库供数下它照样在轮询、照样带
+  `model_source`。顺带把 WS 翻面那一句也分了岔——库供数下改说「服务端 dbN 的模型改由…供数；
+  本客户端库供数，不受影响」（`model_source_changed_line`）。
+- **CATA 元素属性**：三档不是两档。`PropsVm` 新增 `Verdict(String)`（中性态，不带重试；
+  `PaneState::Empty` 画）。判据 `empty_props_verdict(read_face, in_tree, dbnum, dbnums)`：
+  `/dbnums` 上是 `CATA` 行 → 元件库定论；是别的行、或者元素在模型树上（树只由当前 MDB 的
+  设计库长出来）→「库里没有这个元素的属性（未同步）；切到服务供数可看」；两样都判不出来
+  → 「属性为空」。
+  **refno → dbnum 这一步与计划原文不同**：`pe.dbnum` 是库里的一列，refno 的高 32 位是
+  db ref 不是库号（同一个 dbnum 可以有几个 db ref），客户端算不出来。所以库号取自**搜索命中**
+  （`NameHit.dbnum` → `SearchHitVm.dbnum` → `App.search_hit_dbs`，随每次结果整份换掉）——
+  元件库元素只能从搜索进门，模型树上没有它那一行。命令行 / 日志定位过去的元素落在
+  `in_tree` 那一档，不需要库号。
+- **搜索下拉**：`SearchVm.coverage: ReadFaceKind`（宿主在开机、热切、关框三处填）。库供数下
+  空结果与子串段首都追「（只覆盖已入库元素）」。**顺带修了服务供数的一句谎**（不在五格里，
+  用户 2026-09-08 拍板带上）：`SubIndexVm::Off` 下那句「按中间片段搜索仅桌面端提供」只在库供数
+  下说——服务供数不建本地子串索引正是 `Off` 的意思，而前缀那一路吃的服务端快照索引自己就含
+  子串。源码钉那一臂的门。
+- **队列面板**：`Vm::offline_title()` / `offline_reassurance()` 两个纯函数，`not_connected`
+  （一次快照都没取到那一态）用它们。库供数：「模型服务离线」+「库供数下树 / 属性 / 已生成模型
+  照常；补齐、更新、房间要等它回来」。启动不阻断那一半由 `data.rs` 的源码钉守着
+  （`ready()` 只并发 `face.identity()` / `face.sites()`，正文不许出现 health / dbnum / mirror）。
+- **T5（两边身份不一致警告一句，D12 后半）留到 M6 前**：它不在五格里，也不在 M3 的测试单上。
+
 ---
 
 ## 六、里程碑
@@ -276,9 +308,9 @@ plant-ui-app --read-face-parity --depth 2 --sample 200 [--roots 24381/2,…] [--
 | ✅ **M0** | 落地工作树：13 个已改文件（`CONTEXT.md` 只取模型来源 / 翻面那一段）+ 未跟踪的 `model_record_union.rs` / `source_versions.rs` / `fixtures/` / 两条 live 测试 / `docs/adr/0025-*.md` / `docs/plans/2026-09-04-kv-mem-*.md`，一次提交「服务供数成为唯一读面」（**`f58580aff`**）；`vendor/registry/ordered-float` 与 `vendor/rs-core` + `Cargo.lock` **单独**一提（**`12a9d93e9`**，它们不是本仓的读面） | 已核：13 个文件最后写入 09-07 11:09，之后无人动 | **已过**：`cargo test -p plant-ui -p plant-ui-app -p plant-ui-data` 全绿，基线 plant-ui 121（+2 集成）/ plant-ui-app 104 / plant-ui-data 18，增量编译 23.7 s；日志 / `.codex-*` / 截图 / `web/public/assets/meshes`（667 MB）均未入库 |
 | ✅ **M1** | `read_face/{mod,service}.rs` + `ReadFace::Service` 接进 `data.rs` 五处（`ready` / `get_work` / `handle_read` / 模型通道两处）；纯重构 | M0 | **已过**（2026-09-07）：既有测试一个不少，`cargo test -p plant-ui -p plant-ui-app -p plant-ui-data` = 121+2 / 109 / 18；净增 5 条——源码钉 `data_rs_reads_only_through_read_face`（§5.1）与 `service_face_never_touches_the_store`、`desi_dbnums` 纯函数两条（读透含 ISOD 带 `cache_versions` / 摄入只 DESI）、`a_face_reports_the_kind_it_was_built_from`；`property_requests_have_no_database_fallback` 改名 `property_requests_go_through_the_read_face`，钉 `face.props(`；`cargo check --target wasm32-unknown-unknown -p plant-ui-app` 过（`Arc<ReadFace>` 与 `Progress` 的 `Send` 在 `LocalBoxFuture` 下同样成立） |
 | ✅ **M2** | `read_face/store.rs`（从 HEAD `git show 4ec446f5a:crates/plant-ui-app/src/data.rs` 接回九条）；`Settings.read_face` + `resolve_read_face` + `PLANT_READ_FACE`；设置窗下拉；`AccessPointVm` 一行；`Req::SwitchReadFace` 热切（§5.3） | M1 | **已过**（2026-09-07，两个提交：M2a 库供数 + 设置格 + 环境变量，M2b 下拉 + 接入点一行 + 热切）。`cargo test -p plant-ui -p plant-ui-data -p plant-ui-app` = **124+2 / 118 / 18**（M1 基线 121+2 / 109 / 18；净增 3 / 9 / 0）。M2a：`the_default_read_face_is_service`、`read_face_kind_round_trips_as_lowercase_words`、`store_face_never_touches_the_service`、`a_model_request_carries_both_root_sets`、`resolve_read_face_prefers_the_environment_then_the_setting`（三态）、`old_settings_without_read_face_are_service`。M2b：`an_overridden_read_face_disables_the_dropdown`（从 M3 提前：控件在这儿出生；数设置窗那一层灰掉的控件——锁上 > 0、没锁 = 0，头几帧是 egui 量尺寸那一遍要跳过）、设置窗 8 帧高度测试补「锁上」一档、`only_an_effective_override_locks_the_dropdown`、`a_switch_drains_inflight_before_swapping`、`a_switch_swaps_both_lanes`、`a_face_is_only_chosen_at_spawn_or_switch`（默认清单 ⑤：`ReadFace::new(` 在 `data.rs` 正文恰 3 处、`handle_read` 内 0 处）、`a_switch_clears_the_scene_and_reloads_the_snapshot`（`read_face_switch` 三态 + 源码钉两段顺序）。`cargo check --target wasm32-unknown-unknown -p plant-ui-app` 过。实机那一遍留 M6 |
-| **M3** | 不说谎五格（§5.5）；命令行视图切换日志 | M2 | `a_catalogue_element_in_store_mode_gets_a_verdict`、`store_mode_search_names_its_coverage`、`store_mode_never_paints_a_model_source`、`an_overridden_read_face_disables_the_dropdown`、`a_missing_model_service_in_store_mode_does_not_block_ready` |
+| ✅ **M3** | 不说谎五格（§5.5）；命令行视图切换日志 | M2 | **已过**（2026-09-08）。`cargo test -p plant-ui -p plant-ui-app -p plant-ui-data` = **128+2 / 122 / 19**（M2 实机补丁后的基线 124+2 / 119 / 19；净增 4 / 3 / 0）。五格里两格 M2b 已提前收口：设置窗下拉（`an_overridden_read_face_disables_the_dropdown`）、房间不动（D6，两面都是 `require_mirror_feature`）。本轮四格：`store_mode_never_paints_a_model_source` + `a_flip_in_store_mode_says_it_changes_nothing_here`（T1）、`a_catalogue_element_in_store_mode_gets_a_verdict`（T2，三档 + 服务供数不进这条路）、`store_mode_search_names_its_coverage` + `service_mode_never_claims_substring_search_is_desktop_only`（T3，后者源码钉那一臂的门）、`a_missing_model_service_in_store_mode_says_which_half_is_down` + `a_missing_model_service_in_store_mode_does_not_block_ready`（T4，后者源码钉 `ready()`）。落地形状与三处偏离见 §5.5 末。实机那一遍留 M6 |
 | **M4** | 对拍探针（§5.4）+ `scripts/Run-ReadFaceParity.ps1` | M2 | AvevaMarineSample `depth 2 / sample 200` 出一份报告存 `docs/evidence/2026-09-xx-read-face-parity.md`；树 roots 集合与原序零差异是硬标准，属性四档计数入档 |
-| ✅ **M5** | ADR-0026、`CONTEXT.md` 三词条、09-02 / 09-04 两份计划状态行追记（§2.3）——**这三样已随本计划落下**；`CHANGELOG.md`「未发布 · 设置」一节（供数模式下拉、换了当场清场重装、`PLANT_READ_FACE` 压过时下拉灰掉）**随 M2b 落下** | — | 文档互引核对：ADR-0026 ↔ 本计划 ↔ `CONTEXT.md` 三处名字一致；M3 不说谎五格落地时 CHANGELOG 再补一条 |
+| ✅ **M5** | ADR-0026、`CONTEXT.md` 三词条、09-02 / 09-04 两份计划状态行追记（§2.3）——**这三样已随本计划落下**；`CHANGELOG.md`「未发布 · 设置」一节（供数模式下拉、换了当场清场重装、`PLANT_READ_FACE` 压过时下拉灰掉）**随 M2b 落下**；不说谎那几格与搜索那句谎的两条**随 M3 落下**（2026-09-08） | — | 文档互引核对：ADR-0026 ↔ 本计划 ↔ `CONTEXT.md` 三处名字一致 |
 | **M6** | 实机验收（§七） | M3、M4 | 记进 `docs/2026-08-12_live-test-ledger.md` 同款格式 |
 
 **顺序**：M0 → M1 → M2 → M3；M4 / M5 与 M3 并行；M6 收尾。**首次可发布点在 M3 之后**（D15）。

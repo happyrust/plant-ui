@@ -1216,6 +1216,32 @@ mod tests {
         }
     }
 
+    /// 库供数的启动序列不等模型服务（D12 / 计划 §5.5 T4）。
+    ///
+    /// `ready()` 只并发跑当前读面的工程标识与 SITE 根层：库供数下这两条都直连库，
+    /// gen-model 不在场照样连得上、树照常展开。`/health` 与 `/dbnums` 只喂队列面板，
+    /// 它们失败只让那块面板说「模型服务离线」，不该把启动整个判死——把任何一条搬进
+    /// 这个函数，库供数就又被模型服务绑住了。
+    #[test]
+    fn a_missing_model_service_in_store_mode_does_not_block_ready() {
+        let ready = body()
+            .split_once("async fn ready(face: &ReadFace)")
+            .expect("启动序列")
+            .1
+            // 顶格的右花括号 = 函数收尾。不写 `\n}\n`：CRLF 检出时那个形状对不上。
+            .split_once("\n}")
+            .expect("函数体")
+            .0;
+        assert!(ready.contains("face.identity()"));
+        assert!(ready.contains("face.sites()"));
+        for forbidden in ["health", "dbnum", "mirror"] {
+            assert!(
+                !ready.contains(forbidden),
+                "启动序列被模型服务绑住了：{forbidden}"
+            );
+        }
+    }
+
     /// worker 循环里处理 `Req::SwitchReadFace` 的那一臂。
     fn switch_arm() -> &'static str {
         body()

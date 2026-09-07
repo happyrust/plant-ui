@@ -797,6 +797,19 @@ impl TreeModel {
         self.roots.iter().any(|n| n.refno.refno() == refno)
     }
 
+    /// 这个元素在模型树上有一行吗。树只由当前 MDB 的设计库长出来，所以「在树上」
+    /// 同时也是「它是设计库元素」的一份凭据（属性面板判空表要它，计划 §5.5）。
+    /// 只看已缓存的那部分：没展开过的分支不算，那时候本端确实还不知道。
+    fn contains(&self, refno: RefU64) -> bool {
+        self.is_root(refno)
+            || self.parent.contains_key(&refno)
+            || self
+                .children
+                .values()
+                .flatten()
+                .any(|n| n.refno.refno() == refno)
+    }
+
     /// 已确认删除的分支即使 OWNER 未重查，也必须从缓存子层摘掉。
     fn detach_missing(&mut self, missing: &[RefU64]) {
         let missing: HashSet<_> = missing.iter().copied().collect();
@@ -906,6 +919,12 @@ struct App {
     /// 搜索框每敲一下就发一次查询。晚到的旧结果靠它认出来丢掉——包含匹配要跑
     /// 几秒，那期间用户早就改了输入。
     search_epoch: u64,
+    /// 最近一次搜索命中各自所在的库号，随每次结果整份换掉（≤ `data::SEARCH_LIMIT` 条）。
+    ///
+    /// 库供数下属性表空了要判它是不是元件库元素，而元件库元素只能从搜索进门——模型树
+    /// 只长设计库元素。选中之后下拉多半已经关了、`vm.search` 也清了，所以这份库号
+    /// 单独留着，别处不用（计划 §5.5）。
+    search_hit_dbs: HashMap<RefU64, u32>,
     /// 「重新生成模型」的确认框，`None` = 没开。
     ///
     /// 这条路**只走到确认为止**：清点是只读的 deep query，按下确认之后的删除与
@@ -1037,6 +1056,7 @@ fn hit_row(hit: plant_ui_data::NameHit, desi_dbs: &[u32]) -> SearchHitVm {
         name: hit.name,
         noun: hit.noun,
         in_tree: desi_dbs.is_empty() || desi_dbs.contains(&hit.dbnum),
+        dbnum: hit.dbnum,
     }
 }
 
@@ -1228,6 +1248,67 @@ fn read_face_switch(
     overridden: bool,
 ) -> Option<settings::ReadFaceKind> {
     (!overridden && saved != current).then_some(saved)
+}
+
+/// 一张空属性表的由来（计划 §5.5「不说谎五格」）。`None` = 照旧画表。
+///
+/// 服务供数下属性来自 e3d-io 直读，元件库元素照样有值，空表是别的事，不在这儿定论。
+/// 库供数读的是 `ATT_*`，两种空法要分开说：
+///
+/// - **元件库元素**：压根不入模型本体库，切到服务供数才看得见。判据是它所在的库在
+///   `/dbnums` 上是 `CATA` 行——`db_type` 由服务端给，客户端不自己按库号猜。
+/// - **设计库元素**：`pe` 有这一行、属性没同步过来。树上长出来的元素都属这一档
+///   （模型树只由当前 MDB 的设计库长出来），所以 `in_tree` 与查得到的设计库行同解。
+///
+/// gen-model 不在场时 `/dbnums` 是空的，两档都判不出来：只说「属性为空」，不猜。
+fn empty_props_verdict(
+    read_face: settings::ReadFaceKind,
+    in_tree: bool,
+    dbnum: Option<u32>,
+    dbnums: &[task_queue::DbnumStatus],
+) -> Option<&'static str> {
+    if read_face != settings::ReadFaceKind::Store {
+        return None;
+    }
+    let row = dbnum.and_then(|dbnum| dbnums.iter().find(|row| row.dbnum == dbnum));
+    Some(match row {
+        Some(row) if row.db_type.eq_ignore_ascii_case("CATA") => {
+            "元件库元素不入模型本体库；切到服务供数可看"
+        }
+        Some(_) => "库里没有这个元素的属性（未同步）；切到服务供数可看",
+        None if in_tree => "库里没有这个元素的属性（未同步）；切到服务供数可看",
+        None => "属性为空",
+    })
+}
+
+/// 服务端翻面通告落成的那一句日志（计划 §5.5）。
+///
+/// 翻的是**服务端**这个库的模型从内存还是 rocksdb 取（ADR-0025）。服务供数下客户端的
+/// 实例正是经它来的，所以那两句说的就是本客户端下一次装载会拿到什么；库供数下实例直读
+/// `inst_relate`、压根不经服务端，同样两句话就成了替服务端说本客户端的事——那时候只报
+/// 这件事发生过，并且明说它不影响眼前这一份。
+fn model_source_changed_line(
+    dbnum: u32,
+    source: task_queue::ModelSource,
+    read_face: settings::ReadFaceKind,
+) -> String {
+    if read_face == settings::ReadFaceKind::Store {
+        return format!(
+            "服务端 db{dbnum} 的模型改由{}供数；本客户端库供数，不受影响",
+            match source {
+                task_queue::ModelSource::Database => "数据库",
+                task_queue::ModelSource::Memory => "进程内存",
+            }
+        );
+    }
+    match source {
+        task_queue::ModelSource::Database => format!(
+            "db{dbnum} 的模型改由数据库供数：初始化发布已收口，rocksdb 为准；已显示的模型是同一版，不必重载"
+        ),
+        task_queue::ModelSource::Memory => format!(
+            "db{dbnum} 的模型改由 API 从内存供数：库已清空待重建，重建收口前看到的模型活不过服务端重启"
+        ),
+    }
 }
 
 /// 取回工作重装前那一轮 ensure 的流水账，落地时汇成一句日志。
@@ -1558,6 +1639,11 @@ impl App {
             vm: WorkbenchVm {
                 user: std::env::var("USERNAME").unwrap_or_else(|_| "user".into()),
                 access_point: access_point_vm(&model_api_url, &data_api_url, read_face),
+                // 下拉靠它说清这两路命中覆盖到哪儿（计划 §5.5）。
+                search: SearchVm {
+                    coverage: read_face,
+                    ..SearchVm::default()
+                },
                 ..Default::default()
             },
             state: WorkbenchState::default(),
@@ -1575,11 +1661,13 @@ impl App {
             namespace: String::new(),
             desi_dbs: Vec::new(),
             search_epoch: 0,
+            search_hit_dbs: HashMap::new(),
             regenerate: None,
             regenerate_epoch: 0,
             regenerate_run: None,
             regenerate_show: Vec::new(),
-            queue: task_queue::Vm::default(),
+            // 队列面板按它决定库行「模型来源」画不画、轮询失败怎么说（计划 §5.5）。
+            queue: task_queue::Vm::new(read_face),
             queue_feed: None,
             // 开机就欠一拍：第一帧立刻去取第一份快照，别让面板空等一秒。
             last_queue_poll: Instant::now()
@@ -1742,6 +1830,16 @@ impl App {
                 // 晚到的旧选中结果直接丢弃，属性面板只认当前选中。
                 data::Evt::Props(refno, result) if self.vm.selection.primary() == Some(refno) => {
                     self.vm.props = match result {
+                        // 空表不画成一张只剩 refno 的表：库供数下它另有由来，替它说出来。
+                        Ok(kvs) if kvs.is_empty() => match empty_props_verdict(
+                            self.read_face,
+                            self.tree.contains(refno),
+                            self.search_hit_dbs.get(&refno).copied(),
+                            &self.queue.dbnums,
+                        ) {
+                            Some(verdict) => PropsVm::Verdict(verdict.to_owned()),
+                            None => PropsVm::Ready(self.build_props(refno, kvs)),
+                        },
                         Ok(kvs) => PropsVm::Ready(self.build_props(refno, kvs)),
                         Err(e) => {
                             let el = self.tree.element(refno);
@@ -2384,6 +2482,13 @@ impl App {
                             .map(|hit| hit_row(hit, &dbs))
                             .collect::<Vec<SearchHitVm>>()
                     });
+                    // 命中的库号整份换掉：属性面板判空表要它，而下拉那时候多半已经关了。
+                    self.search_hit_dbs = prefix
+                        .iter()
+                        .flatten()
+                        .chain(&sub_hits)
+                        .map(|hit| (hit.refno, hit.dbnum))
+                        .collect();
                     let search = &mut self.vm.search;
                     search.running = None;
                     search.query = query;
@@ -2860,14 +2965,7 @@ impl App {
                     }
                     self.logs.info(
                         &mut self.vm.logs,
-                        match source {
-                            task_queue::ModelSource::Database => format!(
-                                "db{dbnum} 的模型改由数据库供数：初始化发布已收口，rocksdb 为准；已显示的模型是同一版，不必重载"
-                            ),
-                            task_queue::ModelSource::Memory => format!(
-                                "db{dbnum} 的模型改由 API 从内存供数：库已清空待重建，重建收口前看到的模型活不过服务端重启"
-                            ),
-                        },
+                        model_source_changed_line(dbnum, source, self.read_face),
                     );
                 }
                 data::Evt::QueueFeedLive => self.queue.feed = ModelUpdateFeed::Live,
@@ -3098,6 +3196,8 @@ impl App {
                     let search = SearchVm {
                         scope_dbs: self.vm.search.scope_dbs,
                         sub_state: std::mem::take(&mut self.vm.search.sub_state),
+                        // 命中范围跟着供数模式走，关一次框不该让它退回出厂默认。
+                        coverage: self.read_face,
                         ..Default::default()
                     };
                     self.vm.search = search;
@@ -3377,6 +3477,9 @@ impl App {
             PropsVm::Uninit => return Err("当前未选中元素".into()),
             PropsVm::Loading(_) => return Err("当前元素属性仍在加载".into()),
             PropsVm::Failed(error) => return Err(format!("当前元素属性不可用：{error}")),
+            // 查成功但一条属性都没有：把面板上那句定论原样说给命令行，别报「属性不存在」
+            // ——那句听起来像打错了名字。
+            PropsVm::Verdict(verdict) => return Err(format!("当前元素没有属性：{verdict}")),
             PropsVm::Ready(data) => data,
         };
         let attr = attr.trim();
@@ -4410,10 +4513,15 @@ impl App {
         // 搜索下拉里的是旧面的结果，在途那次也隔在门外；子串索引的状态由新面的
         // `refresh_search_index` 重报（库供数开 / 建，服务供数 Off），不留旧面那份。
         self.search_epoch = self.search_epoch.wrapping_add(1);
-        self.vm.search = SearchVm::default();
+        self.vm.search = SearchVm {
+            coverage: kind,
+            ..SearchVm::default()
+        };
         self.read_face = kind;
-        // 接入点面板报的是这一刻真正在用的那一面。
+        // 接入点面板报的是这一刻真正在用的那一面；队列面板据它决定库行「模型来源」
+        // 画不画、轮询失败那句怎么说，搜索下拉据它说清命中覆盖到哪儿（计划 §5.5）。
         self.vm.access_point.read_face = kind;
+        self.queue.read_face = kind;
         let line = format!(
             "供数模式：{} → {}；已清场，重装 {} 个已加载模型 / {} 个范围目标",
             from.label(),
@@ -4433,6 +4541,8 @@ impl App {
         self.room_panel_cache.clear();
         self.model_scope_epoch = self.model_scope_epoch.wrapping_add(1);
         self.model_scopes.clear();
+        // 上一段连接的库号：换接入点后同一个号未必还是同一个库。
+        self.search_hit_dbs.clear();
         self.tree.visibility_unavailable.clear();
         self.model_scope_pending.clear();
         self.loaded_models.clear();
@@ -4665,12 +4775,13 @@ mod tests {
         RefU64, ReloadEnsureTally, ReloadSnapshot, RowVisibility, TreeModel, TreeRowVm, Window,
         auto_refresh, background_models_settled, begin_get_work, cache_model_scope,
         claim_unloaded_model_refnos, command_reply_is_current, complete_refresh_generation,
-        expand_room_model_targets, finished_after, in_mdb_path, mark_model_scope_unavailable,
-        model_drains_idle, model_progress_terminal, model_visibility_plan, needs_children_query,
-        read_face_switch, refresh_anchor, regenerate_label, regenerate_summary, reload_snapshot,
+        empty_props_verdict, expand_room_model_targets, finished_after, in_mdb_path,
+        mark_model_scope_unavailable, model_drains_idle, model_progress_terminal,
+        model_source_changed_line, model_visibility_plan, needs_children_query, read_face_switch,
+        refresh_anchor, regenerate_label, regenerate_summary, reload_snapshot,
         resolve_panel_room_reply, restore_model_reload, settle_pending_directions,
         settle_refresh_generation, settled_pending_roots, sync_ime_window, take_hidden_for_replay,
-        task_matches_project,
+        task_matches_project, task_queue,
     };
     use crate::model_update_api;
     use chrono::{TimeZone, Utc};
@@ -5636,6 +5747,88 @@ mod tests {
             .expect("移进取回工作那一格");
         let get_work = ready.find("self.get_work()").expect("按取回工作那条路重装");
         assert!(restore < hand_over && hand_over < get_work);
+    }
+
+    /// 库供数下一张空属性表要说清由来（计划 §5.5 T2）。三档：元件库元素给定论、
+    /// 设计库元素说未同步、`/dbnums` 认不出这个库就只说「属性为空」不猜。
+    /// 服务供数不进这条路——那一面属性来自 e3d-io 直读，空表是另一件事。
+    #[test]
+    fn a_catalogue_element_in_store_mode_gets_a_verdict() {
+        use plant_ui::settings::ReadFaceKind::{Service, Store};
+
+        let db = |dbnum, db_type: &str| task_queue::DbnumStatus {
+            dbnum,
+            db_type: db_type.to_owned(),
+            ..Default::default()
+        };
+        let dbnums = [db(7997, "DESI"), db(5100, "CATA")];
+
+        assert_eq!(
+            empty_props_verdict(Store, false, Some(5100), &dbnums),
+            Some("元件库元素不入模型本体库；切到服务供数可看")
+        );
+        assert_eq!(
+            empty_props_verdict(Store, false, Some(7997), &dbnums),
+            Some("库里没有这个元素的属性（未同步）；切到服务供数可看"),
+            "设计库元素：pe 有这一行，ATT_* 没同步过来"
+        );
+        assert_eq!(
+            empty_props_verdict(Store, true, None, &dbnums),
+            Some("库里没有这个元素的属性（未同步）；切到服务供数可看"),
+            "树只由当前 MDB 的设计库长出来，在树上就是设计库元素"
+        );
+        assert_eq!(
+            empty_props_verdict(Store, false, Some(9999), &dbnums),
+            Some("属性为空"),
+            "认不出这个库就不猜"
+        );
+        assert_eq!(
+            empty_props_verdict(Store, false, None, &[]),
+            Some("属性为空"),
+            "gen-model 不在场，`/dbnums` 是空的：哪一档都判不出来"
+        );
+        // 大小写按服务端给的字面照收，不自己规范化。
+        assert_eq!(
+            empty_props_verdict(Store, false, Some(5100), &[db(5100, "cata")]),
+            Some("元件库元素不入模型本体库；切到服务供数可看")
+        );
+
+        for in_tree in [true, false] {
+            assert_eq!(
+                empty_props_verdict(Service, in_tree, Some(5100), &dbnums),
+                None,
+                "服务供数照旧画表"
+            );
+        }
+    }
+
+    /// 服务端翻面通告：库供数下那两句话不能原样说（计划 §5.5 T1）。
+    ///
+    /// 「不必重载」「活不过服务端重启」说的是**本客户端下一次装载会拿到什么**，
+    /// 而库供数的实例直读 `inst_relate`、根本不经服务端——照说就是替服务端说了
+    /// 本客户端的事。那时候只报这件事发生过，并挑明它不影响眼前这一份。
+    #[test]
+    fn a_flip_in_store_mode_says_it_changes_nothing_here() {
+        use plant_ui::settings::ReadFaceKind::{Service, Store};
+        use task_queue::ModelSource::{Database, Memory};
+
+        assert_eq!(
+            model_source_changed_line(7997, Database, Store),
+            "服务端 db7997 的模型改由数据库供数；本客户端库供数，不受影响"
+        );
+        assert_eq!(
+            model_source_changed_line(7997, Memory, Store),
+            "服务端 db7997 的模型改由进程内存供数；本客户端库供数，不受影响"
+        );
+        for source in [Database, Memory] {
+            let line = model_source_changed_line(7997, source, Service);
+            assert!(line.starts_with("db7997 的模型改由"), "{line}");
+            assert!(!line.contains("不受影响"), "{line}");
+        }
+        assert!(
+            model_source_changed_line(7997, Database, Service).contains("不必重载"),
+            "服务供数照旧说本客户端下一次装载会拿到什么"
+        );
     }
 
     #[test]
