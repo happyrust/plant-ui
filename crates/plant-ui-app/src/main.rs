@@ -9,6 +9,7 @@ mod gallery;
 mod logs;
 mod model_update_api;
 mod model_update_ws;
+mod read_face;
 mod regenerate;
 mod search_index;
 mod settings_store;
@@ -1563,7 +1564,8 @@ impl App {
             room_panel_cache: HashMap::new(),
             pending_room_frame: None,
             room_pane_focus: None,
-            bridge: data::spawn(ctx.clone(), tasks),
+            // 供数模式：M1 只有服务供数；库供数与设置那一格随 2026-09-07 计划 M2 接上。
+            bridge: data::spawn(ctx.clone(), tasks, read_face::ReadFaceKind::Service),
             tree: TreeModel::default(),
             pending_locate: None,
             logs: logs::LogBuffer::default(),

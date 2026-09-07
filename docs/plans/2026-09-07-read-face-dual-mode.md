@@ -13,7 +13,9 @@
 - 状态：**已定案**（2026-09-07 grill 两轮，D1–D15 全按推荐项 + 用户追加「下拉框」；Plannotator `approved`）。
   **M0 已完成**（2026-09-07：vendor / Cargo.lock 单提 `12a9d93e9`，工作树落地 `f58580aff`，三 crate 测试
   121+2 / 104 / 18 全绿）；ADR-0026、`CONTEXT.md` 三词条与两份旧计划的追记（M5 文档半边）随本计划一并落下。
-  M1 起代码未动。
+  **M1 已完成**（2026-09-07：`crates/plant-ui-app/src/read_face/{mod,service}.rs` 新建，`data.rs` 的读调用全部改经
+  `ReadFace`，纯重构；三 crate 测试 121+2 / 109 / 18 全绿，`cargo check --target wasm32-unknown-unknown -p plant-ui-app` 过）。
+  M2 起代码未动。
 
 ---
 
@@ -130,19 +132,25 @@ pub enum ReadFace {
 }
 
 impl ReadFace {
+    pub fn new(kind: ReadFaceKind) -> Self;                               // 只在 data::spawn 与热切那一拍调
     pub fn kind(&self) -> ReadFaceKind;                                   // Service | Store
-    pub async fn identity(&self) -> anyhow::Result<ReadyInfo>;
+    pub async fn identity(&self) -> anyhow::Result<Identity>;             // project / mdb / ns / db_nums / cache_versions；ready() 拿它 + sites() 拼 ReadyInfo
     pub async fn sites(&self) -> anyhow::Result<Vec<EleTreeNode>>;
     pub async fn children(&self, refno: RefU64) -> anyhow::Result<Vec<EleTreeNode>>;
     pub async fn ancestors(&self, refno: RefU64) -> anyhow::Result<Vec<RefU64>>;
     pub async fn props(&self, refno: RefU64, scope: &Scope) -> anyhow::Result<Vec<Attr>>;
     pub async fn resolve_name(&self, name: &str) -> anyhow::Result<Option<RefU64>>;
     pub async fn search(&self, query: &str, limit: usize, index: &SearchIndex) -> SearchOutcome;   // prefix: Result<Vec<NameHit>>, substring: SubstringHits
-    pub async fn model_instances(&self, req: ModelInstancesReq<'_>, progress: impl FnMut(usize, usize)) -> anyhow::Result<ModelRecords>;
+    pub async fn refresh_search_index(&self, index: SearchIndex, scope: Scope, force: bool, evt_tx: mpsc::Sender<Evt>, ctx: egui::Context);  // 状态经 Evt::SearchIndex 出去；服务供数恒报 Off
+    pub async fn model_instances(&self, roots: &[RefU64], identity: &ServiceIdentity<'_>, progress: Progress<'_>) -> anyhow::Result<ModelRecords>;  // 只读；ensure 留在调用方
     pub async fn regeneration_count(&self, targets: &[RefU64], delivery_units: &[String]) -> anyhow::Result<RegenerateCount>;
     pub async fn invalidate(&self);
 }
 ```
+
+`ServiceIdentity<'_>` 是随 `Req` 捎下来的服务身份四格（`base` / `project` / `mdb` / `namespace`，宿主的设置项，
+数据线程不认识），库供数不看它；`Progress<'_>` = `&mut (dyn FnMut(usize, usize) + Send)`，服务供数整批一次回不报进度，
+库供数按根报。
 
 - **为什么是 enum 不是 `dyn Trait`**：恰好两个变体，穷尽匹配；`async fn` 直接写，不用 `async-trait`；
   原生端 future 要 `Send`、wasm 端不 `Send`（`data.rs:568-580` 已经为此分了两套 `InflightQuery`），
@@ -217,7 +225,7 @@ plant-ui-app --read-face-parity --depth 2 --sample 200 [--roots 24381/2,…] [--
 | 步 | 内容 | 依赖 | 验收 / 测试 |
 |---|---|---|---|
 | ✅ **M0** | 落地工作树：13 个已改文件（`CONTEXT.md` 只取模型来源 / 翻面那一段）+ 未跟踪的 `model_record_union.rs` / `source_versions.rs` / `fixtures/` / 两条 live 测试 / `docs/adr/0025-*.md` / `docs/plans/2026-09-04-kv-mem-*.md`，一次提交「服务供数成为唯一读面」（**`f58580aff`**）；`vendor/registry/ordered-float` 与 `vendor/rs-core` + `Cargo.lock` **单独**一提（**`12a9d93e9`**，它们不是本仓的读面） | 已核：13 个文件最后写入 09-07 11:09，之后无人动 | **已过**：`cargo test -p plant-ui -p plant-ui-app -p plant-ui-data` 全绿，基线 plant-ui 121（+2 集成）/ plant-ui-app 104 / plant-ui-data 18，增量编译 23.7 s；日志 / `.codex-*` / 截图 / `web/public/assets/meshes`（667 MB）均未入库 |
-| **M1** | `read_face/{mod,service}.rs` + `ReadFace::Service` 接进 `data.rs` 五处；纯重构 | M0 | 行为逐字节不变：既有测试全绿；新增源码钉 `data_rs_reads_only_through_read_face`（§5.1）；`property_requests_have_no_database_fallback` 改成钉 `ReadFace::Service` 分支 |
+| ✅ **M1** | `read_face/{mod,service}.rs` + `ReadFace::Service` 接进 `data.rs` 五处（`ready` / `get_work` / `handle_read` / 模型通道两处）；纯重构 | M0 | **已过**（2026-09-07）：既有测试一个不少，`cargo test -p plant-ui -p plant-ui-app -p plant-ui-data` = 121+2 / 109 / 18；净增 5 条——源码钉 `data_rs_reads_only_through_read_face`（§5.1）与 `service_face_never_touches_the_store`、`desi_dbnums` 纯函数两条（读透含 ISOD 带 `cache_versions` / 摄入只 DESI）、`a_face_reports_the_kind_it_was_built_from`；`property_requests_have_no_database_fallback` 改名 `property_requests_go_through_the_read_face`，钉 `face.props(`；`cargo check --target wasm32-unknown-unknown -p plant-ui-app` 过（`Arc<ReadFace>` 与 `Progress` 的 `Send` 在 `LocalBoxFuture` 下同样成立） |
 | **M2** | `read_face/store.rs`（从 HEAD `git show 4ec446f5a:crates/plant-ui-app/src/data.rs` 接回九条）；`Settings.read_face` + `resolve_read_face` + `PLANT_READ_FACE`；设置窗下拉；`AccessPointVm` 一行；`Req::SwitchReadFace` 热切（§5.3） | M1 | 单测：`resolve_read_face` 三态（设置 / 环境变量压过 / 认不出出声）；`the_default_read_face_is_service`；`old_settings_without_read_face_are_service`；`a_switch_drains_inflight_before_swapping`；`a_switch_clears_the_scene_and_reloads_the_snapshot`（沿 `data.rs` 既有的 `route_model_load` 测试形状）；设置窗 8 帧高度测试补一档（`settings.rs::window_heights` 同款） |
 | **M3** | 不说谎五格（§5.5）；命令行视图切换日志 | M2 | `a_catalogue_element_in_store_mode_gets_a_verdict`、`store_mode_search_names_its_coverage`、`store_mode_never_paints_a_model_source`、`an_overridden_read_face_disables_the_dropdown`、`a_missing_model_service_in_store_mode_does_not_block_ready` |
 | **M4** | 对拍探针（§5.4）+ `scripts/Run-ReadFaceParity.ps1` | M2 | AvevaMarineSample `depth 2 / sample 200` 出一份报告存 `docs/evidence/2026-09-xx-read-face-parity.md`；树 roots 集合与原序零差异是硬标准，属性四档计数入档 |

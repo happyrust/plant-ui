@@ -1,0 +1,196 @@
+//! 供数模式的读面（ADR-0026）：模型树 / 属性 / 搜索 / 三维实例 / 工程标识从哪儿读。
+//!
+//! 一个 enum、两个实现——**服务供数**（`Service`，经 gen-model HTTP，底下是 e3d-io 与
+//! e3d-model）今天就在；**库供数**（`Store`，直连 SurrealDB）由 2026-09-07 计划 M2 接回。
+//! 选择只在 `data::spawn` 与热切那一拍发生，`data.rs` 的读调用全部经它，数据线程内不许
+//! 根据错误自行换面。
+//!
+//! 不在这里的两样：**房间**——它只有库一条路，服务供数下经 `/health.mirror` 门控懒连
+//! （计划 D6）；**命令面**——`ensure` / 手动更新 / 队列 / 提资 / 命令查询永远走模型服务
+//! （计划 D3），所以 `model_instances` 只读、`ensure` 循环留在 `data.rs`。
+//!
+//! 为什么是 enum 不是 `dyn Trait`：恰好两个变体、穷尽匹配；`async fn` 直接写、不上
+//! `async-trait`；原生端 future 要 `Send`、wasm 端不要（`data.rs` 已为此分了两套
+//! `InflightQuery`），enum 让两端各自成立，`dyn` + `async fn` 做不到。
+
+use std::sync::mpsc;
+
+use plant_ui_data::{Attr, EleTreeNode, NameHit, RefU64};
+
+use crate::data::{Evt, RegenerateCount};
+use crate::model_update_api::ModelRecords;
+use crate::search_index::{Scope, SearchIndex, SubstringHits};
+
+mod service;
+
+pub use service::ServiceReadFace;
+
+/// 设置里那一格的值。M1 只有服务供数；库供数随 M2 加进来。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadFaceKind {
+    /// 经模型服务的 HTTP 接口读。出厂默认。
+    Service,
+}
+
+/// 工程标识：启动序列里除 SITE 根层之外的那一半。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    pub project: String,
+    /// 当前 MDB 名（带前导 `/`）。
+    pub mdb: String,
+    pub ns: String,
+    /// 本期执行范围里的设计库。
+    pub db_nums: Vec<u32>,
+    /// `(dbnum, cache_epoch, cached_pe_rows)`，只有读透形态给；其余为空。
+    pub cache_versions: Vec<(u32, u64, u64)>,
+}
+
+/// 随请求带下来的服务身份四格。它们是宿主的设置项，数据线程不认识，所以由 `Req` 捎来；
+/// 库供数不看它们。
+#[derive(Debug, Clone, Copy)]
+pub struct ServiceIdentity<'a> {
+    pub base: &'a str,
+    pub project: &'a str,
+    pub mdb: &'a str,
+    pub namespace: &'a str,
+}
+
+/// 一次搜索的两路结果。前缀那一路会失败，子串那一路只有「没就绪」——合成一个
+/// `Result` 会让前缀失败时把子串命中一起吞掉。
+pub struct SearchOutcome {
+    pub prefix: anyhow::Result<Vec<NameHit>>,
+    pub substring: SubstringHits,
+}
+
+/// 三维实例读取的进度回调 `(done, total)`。服务供数一次整批回，不报进度；库供数按根报。
+pub type Progress<'a> = &'a mut (dyn FnMut(usize, usize) + Send);
+
+pub enum ReadFace {
+    Service(ServiceReadFace),
+}
+
+impl ReadFace {
+    pub fn new(kind: ReadFaceKind) -> Self {
+        match kind {
+            ReadFaceKind::Service => Self::Service(ServiceReadFace),
+        }
+    }
+
+    /// 接入点面板那一行「供数：服务 / 库」读它；M2 接上前没有调用方。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn kind(&self) -> ReadFaceKind {
+        match self {
+            Self::Service(_) => ReadFaceKind::Service,
+        }
+    }
+
+    /// 工程标识（项目 / MDB / ns / 设计库名单）。
+    pub async fn identity(&self) -> anyhow::Result<Identity> {
+        match self {
+            Self::Service(face) => face.identity().await,
+        }
+    }
+
+    /// SITE 根层（MDB 世界的下一层）。
+    pub async fn sites(&self) -> anyhow::Result<Vec<EleTreeNode>> {
+        match self {
+            Self::Service(face) => face.sites().await,
+        }
+    }
+
+    /// 某节点的直接子层，按成员表原序。
+    pub async fn children(&self, refno: RefU64) -> anyhow::Result<Vec<EleTreeNode>> {
+        match self {
+            Self::Service(face) => face.children(refno).await,
+        }
+    }
+
+    /// 「自己 -> 上级 -> …」到库顶的祖先链。
+    pub async fn ancestors(&self, refno: RefU64) -> anyhow::Result<Vec<RefU64>> {
+        match self {
+            Self::Service(face) => face.ancestors(refno).await,
+        }
+    }
+
+    /// 选中元素的 UI 属性表。
+    pub async fn props(&self, refno: RefU64, scope: &Scope) -> anyhow::Result<Vec<Attr>> {
+        match self {
+            Self::Service(face) => face.props(refno, scope).await,
+        }
+    }
+
+    /// 命令行按名称定位：精确匹配一个元素。
+    pub async fn resolve_name(&self, name: &str) -> anyhow::Result<Option<RefU64>> {
+        match self {
+            Self::Service(face) => face.resolve_name(name).await,
+        }
+    }
+
+    /// 标题栏搜索框的一次查询。
+    pub async fn search(&self, query: &str, limit: usize, index: &SearchIndex) -> SearchOutcome {
+        match self {
+            Self::Service(face) => face.search(query, limit, index).await,
+        }
+    }
+
+    /// 校验 / 重建子串索引。状态经 `Evt::SearchIndex` 发出去；`force` = 跳过戳比对硬建。
+    pub async fn refresh_search_index(
+        &self,
+        index: SearchIndex,
+        scope: Scope,
+        force: bool,
+        evt_tx: mpsc::Sender<Evt>,
+        ctx: egui::Context,
+    ) {
+        match self {
+            Self::Service(face) => {
+                face.refresh_search_index(index, scope, force, evt_tx, ctx)
+                    .await
+            }
+        }
+    }
+
+    /// 这些模型 refno 下已经生成的几何实例。**只读**：把范围追到文件最新是 `ensure`
+    /// 的事（ADR-0024），那是命令面，留在调用方。
+    pub async fn model_instances(
+        &self,
+        roots: &[RefU64],
+        identity: &ServiceIdentity<'_>,
+        progress: Progress<'_>,
+    ) -> anyhow::Result<ModelRecords> {
+        match self {
+            Self::Service(face) => face.model_instances(roots, identity, progress).await,
+        }
+    }
+
+    /// 「重新生成模型」的清点：这些根底下已经生成过多少元素、归成多少个生成单元。
+    pub async fn regeneration_count(
+        &self,
+        targets: &[RefU64],
+        delivery_units: &[String],
+    ) -> anyhow::Result<RegenerateCount> {
+        match self {
+            Self::Service(face) => face.regeneration_count(targets, delivery_units).await,
+        }
+    }
+
+    /// 丢掉这一面自己的查询缓存（取回工作 / 重连 / 换面前）。
+    pub async fn invalidate(&self) {
+        match self {
+            Self::Service(face) => face.invalidate().await,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReadFace, ReadFaceKind};
+
+    #[test]
+    fn a_face_reports_the_kind_it_was_built_from() {
+        assert_eq!(
+            ReadFace::new(ReadFaceKind::Service).kind(),
+            ReadFaceKind::Service
+        );
+    }
+}

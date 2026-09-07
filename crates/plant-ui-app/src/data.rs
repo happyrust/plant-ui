@@ -1,11 +1,15 @@
 //! UI 线程与数据线程（tokio）之间的桥。
 //!
-//! eframe 的绘制是同步的，而 SUL_DB 全是 async：这里起一个常驻数据线程，
+//! eframe 的绘制是同步的，而读面全是 async：这里起一个常驻数据线程，
 //! 请求经 channel 进、结果经 channel 出，UI 每帧非阻塞地收。每个结果落地后
 //! `request_repaint`，免得空闲中的 UI 睡过结果。
+//!
+//! 读面（树 / 属性 / 搜索 / 三维实例 / 工程标识）一律经 [`ReadFace`]（ADR-0026）：
+//! 这个文件里不直接打 HTTP 读接口，也不直接查库——`data_rs_reads_only_through_read_face`
+//! 钉着。留在这里直接调的只有命令面（`ensure` / 更新 / 队列 / 提资）与房间的镜像门。
 
-use std::collections::HashSet;
 use std::future::Future;
+use std::sync::Arc;
 use std::sync::mpsc;
 
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -14,23 +18,12 @@ use plant_ui::model_update::{Enqueued, Preview, ProgressEvent};
 use plant_ui::task_queue::Poll as QueuePoll;
 use plant_ui_data::{EleTreeNode, RefU64};
 
+use crate::read_face::{ReadFace, ReadFaceKind, ServiceIdentity};
 use crate::search_index::{Scope, SearchIndex, SearchIndexState, SubstringHits};
 
 /// 搜索一次最多带回多少条。下拉本来就只列得下十几行，多取的部分只是让包含匹配
 /// 那条慢路多扫一会儿。取满这个数就等于「后面还有」，界面据此提示缩小范围。
 pub const SEARCH_LIMIT: usize = 20;
-
-async fn tree_sites() -> anyhow::Result<Vec<EleTreeNode>> {
-    crate::model_update_api::tree_roots(&crate::model_update_api::base_url()).await
-}
-
-async fn tree_children(refno: RefU64) -> anyhow::Result<Vec<EleTreeNode>> {
-    crate::model_update_api::tree_children(&crate::model_update_api::base_url(), refno).await
-}
-
-async fn tree_ancestors(refno: RefU64) -> anyhow::Result<Vec<RefU64>> {
-    crate::model_update_api::tree_ancestors(&crate::model_update_api::base_url(), refno).await
-}
 
 async fn require_mirror_feature(feature: &str) -> anyhow::Result<()> {
     let health =
@@ -440,15 +433,21 @@ fn route_model_load(req: Req, tx: &mpsc::Sender<ModelLoad>) -> Result<Option<Req
 /// 取回工作：先丢本进程的查询缓存，再把根层与这些分支重查一遍。
 ///
 /// 缓存必须先丢。重查 SITE 根层走的是带 memoize 的那条查询，缓存还在的话它会
-/// 原样把旧的那份还回来，界面看着刷新过了、内容一个字没变。
-async fn get_work(branches: &[RefU64], reload_models: bool) -> anyhow::Result<GetWork> {
+/// 原样把旧的那份还回来，界面看着刷新过了、内容一个字没变。房间那条镜像连接的
+/// 缓存不归读面管（D6），所以两份都丢。
+async fn get_work(
+    face: &ReadFace,
+    branches: &[RefU64],
+    reload_models: bool,
+) -> anyhow::Result<GetWork> {
     plant_ui_data::invalidate_all().await;
-    let sites = tree_sites().await?;
+    face.invalidate().await;
+    let sites = face.sites().await?;
     let mut loaded = Vec::with_capacity(branches.len());
     let mut failed = Vec::new();
     let mut missing = Vec::new();
     for refno in branches {
-        match tree_children(*refno).await {
+        match face.children(*refno).await {
             Ok(kids) => loaded.push((*refno, kids)),
             Err(error) if crate::model_update_api::failure_of(&error).code == "not_found" => {
                 missing.push(*refno);
@@ -465,98 +464,17 @@ async fn get_work(branches: &[RefU64], reload_models: bool) -> anyhow::Result<Ge
     })
 }
 
-/// 清点一批根底下已经生成过的模型。
-///
-/// **只读，且必须跑在任何删除之前**：`generated_scope` 认的是 `inst_relate`
-/// 行，删完就查不到了，那时回的空集在调用方那里长得像「这里本来就没模型」。
-///
-/// 多个根合成一份账。右键落在多选上时它们可能互相嵌套（选中一个 ZONE 连同
-/// 它所在的 SITE），元素与直管支管都按 refno 去重——同一台设备数两遍，
-/// 确认框上那个数字就是假的。
-async fn count_regeneration(
-    targets: &[RefU64],
-    _delivery_units: &[String],
-) -> anyhow::Result<RegenerateCount> {
-    let base = crate::model_update_api::base_url();
-    let health = crate::model_update_api::service_health(&base).await?;
-    let mdb = health.mdb.as_deref().unwrap_or_default();
-    let namespace = health.namespace.as_deref().unwrap_or_default();
-    let mut records = HashSet::new();
-    for record in
-        crate::model_update_api::model_records(&base, targets, &health.project, mdb, namespace)
-            .await?
-            .records
-    {
-        if let Ok(identity) = serde_json::to_string(&record) {
-            records.insert(identity);
-        }
-    }
-    let mut roots = targets.to_vec();
-    roots.sort_unstable();
-    roots.dedup();
-    Ok(RegenerateCount {
-        elements: records.len(),
-        // The server resolves each requested scope to its exact generation
-        // roots during ensure; keeping the selected scopes here avoids a second
-        // source of owner/noun truth in the client.
-        roots,
-    })
-}
-
-/// 启动序列只依赖 gen-model 核心 API；镜像离线不阻断树、属性与三维。
-async fn ready() -> anyhow::Result<ReadyInfo> {
-    let base = crate::model_update_api::base_url();
-    let (health, report, sites) = futures::try_join!(
-        crate::model_update_api::service_health(&base),
-        crate::model_update_api::dbnum_report(&base),
-        tree_sites(),
-    )?;
-    let project = health.project;
-    let mdb = health.mdb.unwrap_or_else(|| "/ALL".into());
-    let ns = health.namespace.unwrap_or_default();
-    let report = Some(report);
-    let read_through = report
-        .as_ref()
-        .is_some_and(|report| report.data_face.eq_ignore_ascii_case("read-through"));
-    let db_nums: Vec<u32> = if read_through {
-        report
-            .as_ref()
-            .into_iter()
-            .flat_map(|report| report.dbnums.iter())
-            .filter(|row| {
-                (row.db_type.eq_ignore_ascii_case("DESI")
-                    || row.db_type.eq_ignore_ascii_case("ISOD"))
-                    && !row.not_in_project
-            })
-            .map(|row| row.dbnum)
-            .collect()
-    } else {
-        report
-            .as_ref()
-            .into_iter()
-            .flat_map(|report| report.dbnums.iter())
-            .filter(|row| row.db_type.eq_ignore_ascii_case("DESI") && !row.not_in_project)
-            .map(|row| row.dbnum)
-            .collect()
-    };
-    let cache_versions = if read_through {
-        report
-            .as_ref()
-            .into_iter()
-            .flat_map(|report| report.dbnums.iter())
-            .filter(|row| db_nums.contains(&row.dbnum))
-            .map(|row| (row.dbnum, row.cache_epoch, row.cached_pe_rows))
-            .collect()
-    } else {
-        Vec::new()
-    };
+/// 启动序列只依赖当前供数模式的读面（工程标识 + SITE 根层并发取）；镜像离线不阻断
+/// 树、属性与三维。
+async fn ready(face: &ReadFace) -> anyhow::Result<ReadyInfo> {
+    let (identity, sites) = futures::try_join!(face.identity(), face.sites())?;
     let observed_at = chrono::Utc::now();
     Ok(ReadyInfo {
-        project,
-        mdb,
-        ns,
-        db_nums,
-        cache_versions,
+        project: identity.project,
+        mdb: identity.mdb,
+        ns: identity.ns,
+        db_nums: identity.db_nums,
+        cache_versions: identity.cache_versions,
         observed_at,
         sites,
     })
@@ -588,25 +506,19 @@ fn boxed_query(fut: impl Future<Output = ()> + 'static) -> InflightQuery {
 /// 要独占（见 worker 循环），并发会让晚到的读把刚失效的缓存填回旧数据。
 async fn handle_read(
     req: Req,
-    _index: SearchIndex,
+    face: Arc<ReadFace>,
+    index: SearchIndex,
     scope: Scope,
     evt_tx: mpsc::Sender<Evt>,
     ctx: egui::Context,
 ) {
     match req {
         Req::Children(refno) => {
-            let r = tree_children(refno).await;
+            let r = face.children(refno).await;
             let _ = evt_tx.send(Evt::Children(refno, r));
         }
         Req::Props(refno) => {
-            let r = crate::model_update_api::element_attributes(
-                &crate::model_update_api::base_url(),
-                refno,
-                &scope.project,
-                &scope.mdb,
-                &scope.ns,
-            )
-            .await;
+            let r = face.props(refno, &scope).await;
             let _ = evt_tx.send(Evt::Props(refno, r));
         }
         Req::ElementRooms(refno) => {
@@ -647,34 +559,16 @@ async fn handle_read(
             let _ = evt_tx.send(Evt::RoomsOverview(r));
         }
         Req::ResolveName(name) => {
-            let result = crate::model_update_api::search_names(
-                &crate::model_update_api::base_url(),
-                &name,
-                SEARCH_LIMIT,
-            )
-            .await
-            .map(|hits| {
-                hits.into_iter()
-                    .find(|hit| hit.name.eq_ignore_ascii_case(name.trim()))
-                    .map(|hit| hit.refno)
-            });
+            let result = face.resolve_name(&name).await;
             let _ = evt_tx.send(Evt::ResolvedName(name, result));
         }
         Req::SearchElements { epoch, query } => {
-            let prefix = crate::model_update_api::search_names(
-                &crate::model_update_api::base_url(),
-                &query,
-                SEARCH_LIMIT,
-            )
-            .await;
-            // gen-model 的 snapshot NAME 索引已经是子串索引；不再从
-            // SurrealDB 构建第二份本地时点。
-            let substring = SubstringHits::Unavailable;
+            let outcome = face.search(&query, SEARCH_LIMIT, &index).await;
             let _ = evt_tx.send(Evt::SearchElements {
                 epoch,
                 query,
-                prefix,
-                substring,
+                prefix: outcome.prefix,
+                substring: outcome.substring,
             });
         }
         Req::RegenerateScope {
@@ -682,7 +576,7 @@ async fn handle_read(
             targets,
             delivery_units,
         } => {
-            let result = count_regeneration(&targets, &delivery_units).await;
+            let result = face.regeneration_count(&targets, &delivery_units).await;
             let _ = evt_tx.send(Evt::RegenerateScope { epoch, result });
         }
         Req::RegenerateDelete {
@@ -743,14 +637,16 @@ async fn handle_read(
                 result,
             });
         }
-        Req::CheckSearchIndex | Req::RebuildSearchIndex => {
-            // Search is served by gen-model's epoch-pinned NAME index.  Do not
-            // open or rebuild the legacy SurrealDB-derived sidecar.
-            let _ = evt_tx.send(Evt::SearchIndex(SearchIndexState::Off));
-            ctx.request_repaint();
+        Req::CheckSearchIndex => {
+            face.refresh_search_index(index, scope, false, evt_tx.clone(), ctx.clone())
+                .await;
+        }
+        Req::RebuildSearchIndex => {
+            face.refresh_search_index(index, scope, true, evt_tx.clone(), ctx.clone())
+                .await;
         }
         Req::Ancestors(refno) => {
-            let result = tree_ancestors(refno).await;
+            let result = face.ancestors(refno).await;
             let _ = evt_tx.send(Evt::Ancestors(refno, result));
         }
         Req::ModelUpdatePreview {
@@ -841,12 +737,17 @@ async fn handle_read(
     ctx.request_repaint();
 }
 
-/// 起数据线程：连库、抓工程标识与 SITE 根层，然后循环处理懒加载请求。
-pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
+/// 起数据线程：按供数模式造读面、抓工程标识与 SITE 根层，然后循环处理懒加载请求。
+///
+/// 交互通道与模型通道各持一份读面句柄，`spawn` 里一起造——两条通道必须永远是同一面，
+/// 树是库、三维是服务就是按读面混源（ADR-0026）。
+pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>, kind: ReadFaceKind) -> Bridge {
     let (req_tx, req_rx) = mpsc::channel();
     let (model_tx, model_rx) = mpsc::channel::<ModelLoad>();
     let (evt_tx, evt_rx) = mpsc::channel();
     let evt_tx_out = evt_tx.clone();
+    let face = Arc::new(ReadFace::new(kind));
+    let model_face = Arc::clone(&face);
     let model_evt_tx = evt_tx.clone();
     let model_ctx = ctx.clone();
     let model_worker = move |mut task_ctx: bevy_wasm_tasks::TaskContext| async move {
@@ -899,14 +800,24 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
                             }
                             record_roots.sort_unstable();
                             record_roots.dedup();
-                            let result = crate::model_update_api::model_records(
-                                &base,
-                                &record_roots,
-                                &project,
-                                &mdb,
-                                &namespace,
-                            )
-                            .await;
+                            let progress_tx = model_evt_tx.clone();
+                            let progress_ctx = model_ctx.clone();
+                            let result = model_face
+                                .model_instances(
+                                    &record_roots,
+                                    &ServiceIdentity {
+                                        base: &base,
+                                        project: &project,
+                                        mdb: &mdb,
+                                        namespace: &namespace,
+                                    },
+                                    &mut move |done, total| {
+                                        let _ =
+                                            progress_tx.send(Evt::ReloadProgress { done, total });
+                                        progress_ctx.request_repaint();
+                                    },
+                                )
+                                .await;
                             let _ = model_evt_tx.send(Evt::ReloadProgress {
                                 done: roots.len(),
                                 total: roots.len(),
@@ -961,14 +872,28 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
                                         result: reply,
                                     });
                                     model_ctx.request_repaint();
-                                    let result = crate::model_update_api::model_records(
-                                        &base,
-                                        &generation_roots,
-                                        &project,
-                                        &mdb,
-                                        &namespace,
-                                    )
-                                    .await;
+                                    let progress_tx = model_evt_tx.clone();
+                                    let progress_ctx = model_ctx.clone();
+                                    let result = model_face
+                                        .model_instances(
+                                            &generation_roots,
+                                            &ServiceIdentity {
+                                                base: &base,
+                                                project: &project,
+                                                mdb: &mdb,
+                                                namespace: &namespace,
+                                            },
+                                            &mut move |done, total| {
+                                                let _ = progress_tx.send(Evt::ModelScopeProgress {
+                                                    epoch,
+                                                    target,
+                                                    done,
+                                                    total,
+                                                });
+                                                progress_ctx.request_repaint();
+                                            },
+                                        )
+                                        .await;
                                     let _ = model_evt_tx.send(Evt::ModelScopeProgress {
                                         epoch,
                                         target,
@@ -1006,7 +931,7 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
         let mut scope = Scope::default();
         let started = match sim_engine.as_ref() {
             Some(engine) => Ok(engine.ready_info()),
-            None => ready().await,
+            None => ready(&face).await,
         };
         if let Ok(info) = started.as_ref() {
             scope = Scope {
@@ -1024,7 +949,15 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
         // 不需要按请求 spawn（wasm 上也没有 tokio::spawn 可用），一条慢查询
         // 也不再把整条桥堵成串行（模型加载在此之前就已单独分道）。
         let mut inflight: FuturesUnordered<InflightQuery> = FuturesUnordered::new();
-        let _ = evt_tx.send(Evt::SearchIndex(SearchIndexState::Off));
+        // 子串索引的启动态由读面决定：服务供数没有本地索引可开，报 Off。
+        face.refresh_search_index(
+            index.clone(),
+            scope.clone(),
+            false,
+            evt_tx.clone(),
+            ctx.clone(),
+        )
+        .await;
         loop {
             while let Ok(req) = req_rx.try_recv() {
                 // 模型实例冷加载在大库上可达 88 秒，且 Replace / Scopes 之间有
@@ -1069,7 +1002,8 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
                         // 会把它们冲掉。留着它，重连就是从内存里读上一次的那份——
                         // 界面看着重连过了，这中间新增的 SITE 一个都不在。
                         plant_ui_data::invalidate_all().await;
-                        let reconnected = ready().await;
+                        face.invalidate().await;
+                        let reconnected = ready(&face).await;
                         if let Ok(info) = reconnected.as_ref() {
                             scope = Scope {
                                 project: info.project.clone(),
@@ -1087,7 +1021,7 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
                         reload_models,
                     } => {
                         while inflight.next().await.is_some() {}
-                        let result = get_work(&branches, reload_models).await;
+                        let result = get_work(&face, &branches, reload_models).await;
                         let _ = evt_tx.send(Evt::GetWork(result));
                         ctx.request_repaint();
                     }
@@ -1095,6 +1029,7 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>) -> Bridge {
                     // 查询从此不再排在属性 / 归属 / 队列轮询后面。
                     req => inflight.push(boxed_query(handle_read(
                         req,
+                        Arc::clone(&face),
                         index.clone(),
                         scope.clone(),
                         evt_tx.clone(),
@@ -1144,18 +1079,75 @@ mod tests {
     use plant_ui::RefU64;
     use std::sync::mpsc;
 
-    #[test]
-    fn property_requests_have_no_database_fallback() {
+    /// 本文件的非测试部分。源码钉都只看这一半，免得禁单里的字面值被测试自己撞上。
+    fn body() -> &'static str {
         let source = include_str!("data.rs");
-        let branch = source
+        source
+            .split_once("#[cfg(test)]")
+            .map(|(body, _)| body)
+            .unwrap_or(source)
+    }
+
+    /// 属性面板只经读面：不直接打 HTTP 读接口，也不回退到库（ADR-0026）。
+    #[test]
+    fn property_requests_go_through_the_read_face() {
+        let branch = body()
             .split_once("Req::Props(refno) =>")
             .expect("property request branch")
             .1
             .split_once("Req::ElementRooms")
             .expect("next request branch")
             .0;
-        assert!(branch.contains("model_update_api::element_attributes"));
-        assert!(!branch.contains("plant_ui_data::element_props"));
+        assert!(branch.contains("face.props("));
+        assert!(!branch.contains("model_update_api::element_attributes"));
+        assert!(!body().contains("plant_ui_data::element_props"));
+    }
+
+    /// 读面（树 / 属性 / 搜索 / 三维实例 / 工程标识）在这个文件里只有一条路：`ReadFace`。
+    /// 直接打 HTTP 读接口或直接查库都是绕过供数模式——树是服务、三维是库就是从这儿漏的。
+    /// 命令面（`ensure_model` 等）与房间的镜像门（`service_health`）不在禁单里。
+    #[test]
+    fn data_rs_reads_only_through_read_face() {
+        let body = body();
+        for forbidden in [
+            "model_update_api::tree_roots(",
+            "model_update_api::tree_children(",
+            "model_update_api::tree_ancestors(",
+            "model_update_api::search_names(",
+            "model_update_api::element_attributes(",
+            "model_update_api::model_records(",
+            "model_update_api::dbnum_report(",
+            "plant_ui_data::site_nodes(",
+            "plant_ui_data::child_nodes(",
+            "plant_ui_data::ancestor_refnos(",
+            "plant_ui_data::element_props(",
+            "plant_ui_data::resolve_name(",
+            "plant_ui_data::search_names_by_prefix(",
+            "plant_ui_data::model_instances",
+            "plant_ui_data::generated_scope(",
+            "plant_ui_data::nouns_of(",
+            "plant_ui_data::project_identity(",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "data.rs 绕过了 ReadFace：{forbidden}"
+            );
+        }
+        // 读面确实在用，不是把调用整个删了。
+        for expected in [
+            "face.identity()",
+            "face.sites()",
+            "face.children(",
+            "face.ancestors(",
+            "face.props(",
+            "face.resolve_name(",
+            "face.search(",
+            "face.regeneration_count(",
+            "face.refresh_search_index(",
+            ".model_instances(",
+        ] {
+            assert!(body.contains(expected), "data.rs 少了读面调用：{expected}");
+        }
     }
 
     fn reload(roots: Vec<RefU64>, ensure_targets: Vec<RefU64>, debt_reload: bool) -> Req {
