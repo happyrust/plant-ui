@@ -2549,7 +2549,7 @@ fn hints_block(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, totals: &
         }
         if dead > 0 {
             detail.push(format!(
-                "已放弃：{}。不再自动重试，也不并入手动更新；可在任务队列逐个重试。",
+                "已放弃：{}。不再自动重试，也不并入手动更新。",
                 listed(preview.dead_retries())
             ));
         }

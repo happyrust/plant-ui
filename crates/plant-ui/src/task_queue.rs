@@ -407,8 +407,13 @@ pub struct Poll {
     pub tasks_error: Option<String>,
     pub health: Option<Health>,
     pub pending: Vec<PendingModelUnit>,
-    /// pending 接口是否成功。失败不能冒充“欠账清零”，否则会过早替换旧三维。
+    /// 欠账那一格的答案可不可信。真取不到（超时 / 500）时为 `false`，不能冒充
+    /// “欠账清零”，否则会过早替换旧三维；端点压根不在时反而是**可信的空**，见下。
     pub pending_known: bool,
+    /// 服务端没有欠账端点（404 / 405）。这不是失败，是这一档已经不存在
+    /// （gen-model 2026-09-08 起模型工作内联进 dbnum 任务）：界面把欠账段整段不画，
+    /// 而不是把上一份快照冻在那儿当实况。
+    pub pending_unsupported: bool,
     pub dbnums: Vec<DbnumStatus>,
 }
 
@@ -447,6 +452,10 @@ pub struct Vm {
     pub tasks: Vec<TaskEntry>,
     pub health: Option<Health>,
     pub pending: Vec<PendingModelUnit>,
+    /// 服务端没有欠账端点（`Poll::pending_unsupported`）。为真时 `pending` 恒空、
+    /// 欠账那一段整段不画——不是「欠账清零」，是这一档不存在了；缺省 `false`，
+    /// 老服务端一切照旧。
+    pub pending_unsupported: bool,
     /// 已登记的库及其异常 / 阻断 / 排除标志。队列里没有这些行，它们进「本期不执行」。
     pub dbnums: Vec<DbnumStatus>,
     /// 逐单元明细，按 task_id 分桶。
@@ -570,7 +579,12 @@ impl Vm {
         }
         self.tasks_error = poll.tasks_error;
         self.health = poll.health;
-        if poll.pending_known {
+        // 端点不在 = 这一档服务端已经没有了：清空并记下来，欠账段整段不画。
+        // 真取不到才沿用上一份快照（那是「暂时看不见」，不是「没有」）。
+        self.pending_unsupported = poll.pending_unsupported;
+        if self.pending_unsupported {
+            self.pending.clear();
+        } else if poll.pending_known {
             self.pending = poll.pending;
         }
         self.dbnums = poll.dbnums;
@@ -3665,6 +3679,48 @@ mod tests {
         assert!(feed_notice(&Feed::NotSubscribed("走轮询".into()), false, 47).is_none());
         assert!(feed_notice(&Feed::Live, true, 0).is_none());
         assert!(feed_notice(&Feed::Connecting, true, 0).is_none());
+    }
+
+    /// 欠账那一格有三种答案，不是两种。真取不到（超时 / 500）沿用上一份快照——那是
+    /// 「暂时看不见」。**端点压根不在**是另一回事：gen-model 2026-09-08 起模型工作内联
+    /// 进 dbnum 任务、欠账表退役，那时候还把上一份冻在界面上，人看到的是一份越来越旧、
+    /// 而且永远不会自己消失的欠账清单。
+    #[test]
+    fn a_retired_pending_endpoint_clears_the_owed_section_instead_of_freezing_it() {
+        let unit = PendingModelUnit {
+            dbnum: 8000,
+            root_refno: "24384/1".into(),
+            source_end_sesno: 20,
+            dead: true,
+            ..Default::default()
+        };
+        let mut model = Vm::default();
+        model.adopt(Poll {
+            pending: vec![unit],
+            pending_known: true,
+            ..Default::default()
+        });
+        assert_eq!(model.pending.len(), 1);
+        assert!(!model.pending_unsupported);
+        assert_eq!(dead_letters(&model), 1);
+
+        // 真取不到：沿用上一份，不冒充「欠账清零」。
+        model.adopt(Poll {
+            pending_known: false,
+            ..Default::default()
+        });
+        assert_eq!(model.pending.len(), 1);
+        assert!(!model.pending_unsupported);
+
+        // 端点不在：整段清空并记下来，派生计数跟着归零。
+        model.adopt(Poll {
+            pending_known: true,
+            pending_unsupported: true,
+            ..Default::default()
+        });
+        assert!(model.pending.is_empty());
+        assert!(model.pending_unsupported);
+        assert_eq!(dead_letters(&model), 0);
     }
 
     /// 死信自己一格，不并进「还有活没干完」。

@@ -390,8 +390,14 @@ pub async fn poll_queue(base: &str) -> anyhow::Result<Poll> {
         Err(error) => (Vec::new(), Some(crate::logs::error_chain(&error))),
     };
     let health = get::<Health>(base, "/api/v1/health").await.ok();
+    // 欠账表有三种答案，不是两种。取到了是一种；**服务端没有这个端点**是另一种
+    // ——那不是「暂时取不到」，是这一档在服务端已经不存在（gen-model 2026-09-08 起
+    // 模型工作内联进 dbnum 任务，欠账表退役）。把它按失败处理，界面会把上一份快照
+    // 冻在那儿当成实况，越冻越旧。所以：端点不在 = 答案已知且为空，另记一格让界面
+    // 整段不画；只有真取不到（超时 / 500）才沿用上一份。
     let pending = get::<PendingUnits>(base, "/api/v1/update/pending-units").await;
-    let pending_known = pending.is_ok();
+    let pending_unsupported = pending.as_ref().err().is_some_and(pending_endpoint_retired);
+    let pending_known = pending.is_ok() || pending_unsupported;
     let pending = pending.map(|p| p.units).unwrap_or_default();
     // `/dbnums` 要重扫项目目录，是这四个里最慢的一个；取不到就少画「本期不执行」
     // 那一格，不该拖垮整次轮询。
@@ -406,8 +412,21 @@ pub async fn poll_queue(base: &str) -> anyhow::Result<Poll> {
         health,
         pending,
         pending_known,
+        pending_unsupported,
         dbnums,
     })
+}
+
+/// 这次失败是不是「服务端没有这个端点」。
+///
+/// 只认 404 / 405 与 `not_found`：那说明这一档在服务端已经不存在，答案是**可信的空**。
+/// 超时、500、连不上都不算——那些是「暂时看不见」，界面该沿用上一份快照。
+/// 判据与 `element_attributes` 那条老服务端探测同一把尺子（本文件上方）。
+fn pending_endpoint_retired(error: &anyhow::Error) -> bool {
+    let failure = failure_of(error);
+    failure.code == "not_found"
+        || failure.message.contains("HTTP 404")
+        || failure.message.contains("HTTP 405")
 }
 
 /// Current file/cache coverage.  The startup path uses this instead of the
@@ -969,6 +988,35 @@ mod tests {
         );
         // 服务端换名字不许静默当成成功的那一档：它要能在日志里被点名。
         assert_eq!(ensure_status("brand_new_state"), EnsureStatus::Unknown);
+    }
+
+    /// 欠账端点的三种答案要分得开：取到了、**服务端没有这一档**、暂时取不到。
+    ///
+    /// 只有 404 / 405 / `not_found` 算第二种——那是 gen-model 2026-09-08 起模型工作
+    /// 内联进 dbnum 任务、欠账表退役之后的常态，答案是可信的空，界面整段不画。
+    /// 超时与 500 是第三种：沿用上一份快照，不许冒充「欠账清零」。
+    #[test]
+    fn only_a_missing_endpoint_counts_as_the_owed_table_being_gone() {
+        let api =
+            |code: &str, message: &str| anyhow::Error::new(ApiError(Failure::new(code, message)));
+        assert!(pending_endpoint_retired(&api("not_found", "no such route")));
+        assert!(pending_endpoint_retired(&api(
+            "internal",
+            "HTTP 404: unknown path"
+        )));
+        assert!(pending_endpoint_retired(&api(
+            "internal",
+            "HTTP 405: method not allowed"
+        )));
+        assert!(!pending_endpoint_retired(&api(
+            "timeout",
+            "io: Connection refused"
+        )));
+        assert!(!pending_endpoint_retired(&api(
+            "internal",
+            "HTTP 500: boom"
+        )));
+        assert!(!pending_endpoint_retired(&anyhow::anyhow!("解析响应失败")));
     }
 
     /// 连不上、超时、握手不成对用的人是同一件事：服务够不着，没有任何数据被改动，

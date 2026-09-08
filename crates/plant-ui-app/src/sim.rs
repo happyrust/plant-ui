@@ -822,6 +822,7 @@ impl Engine {
             }),
             pending: self.pending.clone(),
             pending_known: true,
+            pending_unsupported: false,
             dbnums: self
                 .dbs
                 .iter()
