@@ -114,7 +114,7 @@
 | SITE 行 · 勾选框 | ☑ / ☐ | 本地 | 勾选集，默认全勾。**同库联动**（Q1 定案）：勾任何一个 SITE = 同库 SITE 全亮，只有勾/不勾两态、没有半选；折算成 execute 的 `dbnums[]`（ADR-020，2026-08-07 两侧已实现） |
 | SITE 行 · 标识 | `SITE /1WCC-PIPE` | 契约 | ADR-020 `DbnumPreview.sites[]`（`SiteSummary.site_refno` / `name`，按**最近 SITE 祖先**分桶，ZoneSummary 同款做法） |
 | SITE 行 · 增删改计数 | `+8 ~21 −2` | 契约 | `SiteSummary.added / modified / deleted`（净变化，配色 success / accent-strong / danger，等宽） |
-| SITE 详情行（展开首行） | `上次应用 07-30 18:24 → 文件最新 08-07 14:10 · 8 次保存待应用 · 与 /1WCC-EQUI 同库联动` | 契约 + 本地 | 时间对 = ADR-020 `applied_sesno_time` / `file_latest_sesno_time`（**E3D 会话写入时刻**，Q3 定案同一把尺子，相减 = 文件里没被吸收的时间跨度；从未应用为空 → 板上作 `从未应用 → 文件最新 08-05 11:02`）；保存次数 = `sessions.len()`。**sesno 区间那一段已删**（ADR-0019）：区间 `applied_sesno + 1 → file_latest_sesno` 仍是执行边界，但只活在契约与日志里，详情行上不再露面。联动名单 = 同库其余 SITE 的名字（本地折算），同库只有 1 个 SITE 时整句不画。收起的 SITE 看不到这一行——时间是展开后的信息（原始诉求原文如此） |
+| SITE 详情行（展开首行） | `数据水位 07-30 18:24 → 文件最新 08-07 14:10 · 落后 8 次保存 · 与 /1WCC-EQUI 同库联动` | 契约 + 本地 | **按两枚水位说话**（2026-09-08 用户口径：不说「待应用 / 上次应用」，CONTEXT.md「水位」）。时间对 = ADR-020 `applied_sesno_time` / `file_latest_sesno_time`（**E3D 会话写入时刻**，Q3 定案同一把尺子，相减 = 文件里没被吸收的时间跨度；数据水位尚未建立 → 板上作 `数据水位 尚未建立 → 文件最新 08-05 11:02`）；保存次数 = `sessions.len()`。**sesno 区间那一段已删**（ADR-0019）：区间 `applied_sesno + 1 → file_latest_sesno` 仍是执行边界，但只活在契约与日志里，详情行上不再露面。联动名单 = 同库其余 SITE 的名字（本地折算），同库只有 1 个 SITE 时整句不画。收起的 SITE 看不到这一行——时间是展开后的信息（原始诉求原文如此） |
 | SITE 行 · 展开 → 交付单元行 | `BRAN /100-B1 几何修改` | 契约 | `SiteSummary.units[]`——`DeliveryUnitSummary` 原形态照旧（§2 表），只是挂在 SITE 桶下 |
 | 归属未知桶 | `SITE 归属未知` | 契约 | `SiteSummary.site_refno` 为空的那一桶（解析不出 SITE 祖先的变化，ZoneSummary 同款）。本期画板场景没有，出现时行形态同 SITE 行、无勾选框、排在同库 SITE 行之后 |
 | 首次导入库行 | `ams-8009.stru · db8021 · DESI` + `需初始化 · 整库生成` | 契约 | `initialization_required = true`：有勾选框（会执行、可排除），无 SITE 行可给（从未解析，PE 里没有它的数据）——**「不看文件」的唯一例外**，文件名是它仅有的身份，行上必须同时把「首次导入 · 整库生成」说清。`applied_sesno_time` 为空 → 「从未应用」。绝不能显示成「无变化」（S2-E 铁律不变） |
@@ -128,6 +128,35 @@
 > 预览请求**不变**：预览永远全范围扫描（Q5 定案），勾选只影响 execute 的 `dbnums`。
 > 跨库级联单元（`cascaded` 来源在别的库）仍挂在**触发批次**的分组下，实现时在行上标注
 > 来源——SITE 桶是报告口径，不改变「选择的是批次」这件事。
+
+---
+
+## 2-R. 读透形态专态（2026-09-08）
+
+gen-model 出厂默认是读透形态（`data_face = read-through`，d-581）：不摄入数据、`applied_sesno`
+不动。它对 `POST /update/preview` 回 `dbnums: []`、`up_to_date: true`、`data_face`、一条
+`warnings` 与一句 `message`（`handlers.rs:1168`）；对 `POST /update/execute` 回 202
+`{ status: "model_refresh_queued", applied_sesno_changed: false }`（`:1215`），服务端排一次
+模型复核（`reconcile_model_coverage_at_startup`）与属性缓存刷新。**空表 + `up_to_date` 在这一
+形态下不是「已是最新」**，向导先看 `data_face` 再解释那两格；两步向导（勾选 → 确认）在它身上
+不成立，专态只有一个按钮。
+
+| 元素 | 示例 | 来源 | 出处 |
+|---|---|---|---|
+| 标题 | `模型更新 · 读透形态` + `… · 不摄入数据、水位不动；可复核模型与缓存` | 契约 | `Preview.data_face == "read-through"`（`Preview::read_through()`）。老服务端不给 → 空串 → 摄入形态解读，行为与此前逐字相同 |
+| 说明卡 | `模型服务以读透形态运行：这里不预览数据批次` | 界面自有 | 三句：读面直接读文件、水位不动；「复核模型与缓存」做什么、不做什么；三维要新几何走「取回工作」（ADR-0024） |
+| 范围行 | `ams7997_0001 · db7997 · DESI` `文件最新：第 289 次保存` `模型来源：内存（读透） · 模型水位不判（读透形态，数据水位不建立、没有可比的两端）` | 契约 | 来自队列轮询的 `/dbnums`（`task_queue::DbnumStatus`），口径与队列面板「本期不执行」同一套：`excluded` / 非设计库 → 排除计数，`not_in_project` → 够不着计数，`blocked` → 阻断计数，其余按 dbnum 排成行（DESI 与 ISOD 都算）。meta 取 `file_latest_sesno`（说「N 次保存」，ADR-0019）；note 取 `model_source` + `model_source_reason`（ADR-0025）与判决列 `model_verdict` / `model_verdict_reason` / `model_chasing_roots`（gen-model ADR-060 / C2）。**`not_judged` 是中性态**，说「不判」带理由、不说落后（d-594 Q4）；服务端没给的格整格不说 |
+| 范围行为空 | `范围名单尚未取到：等任务队列下一拍轮询` | 本地 | `/dbnums` 还没轮询到（忙 1 s / 闲 5 s） |
+| 另有一行 | `另有：1 个非 DESI 不在范围 · 9 个 MDB 声明了但当前项目目录里没有文件` | 契约 | 三档计数，为 0 的不画 |
+| 服务端的话 | `read-through 模式不生成数据摄入预览；执行只复核模型与缓存` | 契约 | `Preview.warnings[]` + `Preview.message` |
+| 主按钮 | `复核模型与缓存` | 契约 + 本地 | 直接发 execute（`dbnums` 不带——读透的 execute 不认它），无第二步确认：这一下不摄入、不推进水位、不删数据。灰掉条件同摄入形态（`task_queue::Vm::execution_blocked_reason`） |
+| 回执日志 | `读透形态：已排一次模型复核与缓存刷新——…不摄入数据，水位不变…` | 契约 | `Enqueued.status == "model_refresh_queued"` 或 `Enqueued.data_face == "read-through"`（`Enqueued::model_refresh_only()`）。五桶对账在它身上不成立，不许再说「扫描 0 个库」 |
+| 预览完成日志 | `模型更新预览：模型服务以读透形态运行，不摄入数据、水位不动；可「复核模型与缓存」…` | 契约 | 同上判据；摄入形态照旧「N 个设计库」 |
+
+> 读透形态的预览不查 `pending_model_retries`（服务端 `handlers.rs:1168` 直接回空表），所以专态上
+> 没有「待重试单元」卡；死信仍在队列面板。`execution_blocked_reason` 里 `(data_read_mode = direct,
+> worker_alive = null)` 那一档自 gen-model 2026-09-02 起 direct 也起 worker 后已是死路，只对老服务端
+> 成立，与读透专态正交。
 
 ---
 
@@ -161,7 +190,7 @@ S2-H 在 S2-B 形态上改五处（含删一行），其余逐格照旧。
 | 会执行 · 批次行摘要 | `同库一批（db8000）· 8 次保存 · 487 项变化` | 契约 | 「同库一批」交代联动折算；**dbnum 只在这个括号里露面**——任务队列（S12）按 dbnum 键，去那儿对账要认得出这一批是谁。保存次数 / 变化数照旧 `sessions.len()` + `net_*` 之和 |
 | 会执行 · 批次行保存窗口 | `08-01 09:12 → 08-07 14:10` | 契约 | 窗口自身两端（ADR-0019 Q3）：左端 = `DbnumPreview.first_pending_sesno_time`（**2026-08-10 已落 gen-model**，取解析器定下的窗口左端而非 `applied + 1`），右端复用 ADR-020 的 `file_latest_sesno_time`。**注意左端不是 `applied_sesno_time`**——那个是「上次应用的是哪一条」，这个是「这批的第一条」。老服务端给不出左端时**整格不画**，只留「N 次保存」 |
 | 不会执行 · 阻断 | `文件回退 · 最新保存 07-01 10:00 早于已应用 08-05 18:24` + `已阻断 · 水位不变` | 契约 + **待新增** | `blocked = true` + `anomaly`。两端时刻**已落 gen-model**（2026-08-10，ADR-0019 Q6）：挂在 `FileAnomaly::Rollback` 上，`file_latest_sesno_time`（文件端现读）+ `applied_sesno_time`（已应用端取水位表存量）。**这一格只读 `anomaly`**——阻断行的 `DbnumPreview.file_latest_sesno_time` / `applied_sesno_time` 服务端刻意留空，同一个值不摆两处。无存量时降级成 `早于已应用水位（应用时刻无记录）`，**不许拿挂钟 `applied_at` 兜底** |
-| 不会执行 · **未勾选行** | `SITE /1WCC-HVAC` `08-06 15:02 → 08-07 09:44 · 3 次保存待应用` `未勾选 · 本次跳过，水位不变` | 本地 + 契约 | 勾选集之外的可执行 SITE（标题同样用 SITE 名），窗口时间对与批次行同一个来源。**与阻断、够不着不是一回事，三类不许合成一行**：这一类是人自己选的，出路就是回上一步勾上。计入「N 项」分子 |
+| 不会执行 · **未勾选行** | `SITE /1WCC-HVAC` `08-06 15:02 → 08-07 09:44 · 落后 3 次保存` `未勾选 · 本次跳过，水位不变` | 本地 + 契约 | 勾选集之外的可执行 SITE（标题同样用 SITE 名），窗口时间对与批次行同一个来源。**与阻断、够不着不是一回事，三类不许合成一行**：这一类是人自己选的，出路就是回上一步勾上。计入「N 项」分子 |
 | 重扫提示 · 范围限定 | `预览完成于 2 分钟前；开始时对勾选范围重新扫描，期间新产生的保存自动并入本批次，结果摘要里会逐条列出；未勾选的不扫描、不入队` | 契约 + 本地 | execute 的 `dbnums` 过滤（ADR-020）作用于重扫循环——未勾选的库连扫描都不进，预览后新存的保存不会被偷偷并入。「逐条列出」是 `merged_sesnos` 的兑现，逐条带时刻（ADR-0019 Q5）走 `merged_sesno_times`（**2026-08-10 已落 gen-model**，与 `merged_sesnos` 等长的平行数组，读不到的那条是 `None`）|
 | 不可取消警告 | `数据批次一旦成功，水位立即推进且不回滚；模型生成失败的单元转入待重试，不影响已写入的数据。关闭窗口不会停任务。` | 契约 | 两阶段设计：批次 `Applied` 即推进水位，阶段二失败只落 `model_update_pending`。**「不回滚」这句不许省**——它是人按下确认前唯一能看到的不可逆声明 |
 
@@ -241,7 +270,7 @@ S2-H 在 S2-B 形态上改五处（含删一行），其余逐格照旧。
 |---|---|---|---|
 | 数据源未就绪 | 不发请求 | 本地 | `vm.data_source_ok = false`；`workbench/chrome.rs:106` 据此禁用入口按钮 |
 | 范围不一致 | 422 · `identity_mismatch` | 契约 + 本地 | 服务端 `ServiceIdentity::validate`（显式 project / mdb / namespace 与服务不符，message 点名是哪一项）；本地闸门 `task_queue::Vm::can_mutate` 拦下时同码合成、不发请求。两处一个画面 |
-| 已是最新 | 200 | 契约 | `ManualUpdatePreview.up_to_date = true` |
+| 已是最新 | 200 | 契约 | `ManualUpdatePreview.up_to_date = true`。**这一页不止一张成功卡**（2026-09-08）：`shadowed` 与 `warnings` 也画在这里——它们说的是这句「最新」是在什么范围、哪一份文件上说的，恰恰只有没有变化时才无处可去。读透形态的空表**不归这一格**，先看 `data_face`（§2-R） |
 | 连不上 / 超时 | 504 · `timeout` | 契约 | `ApiError::timeout`，或客户端 600 秒上限到点 |
 | 服务不消化执行请求 | 422 · `worker_disabled` | 契约 + 本地 | 服务以 direct 形态运行、没起数据批次 worker：预览照常，执行入队后没人出队。本地闸门（`task_queue::Vm::can_execute`，读 `/health` 的 `data_read_mode` 与 `worker_alive`）按同一 code 合成；服务端若在 direct 下直接拒绝也走这一格。`Warn` 而非 `Error`——它是形态不是故障；「没有任何数据被改动」这句不许省（2026-09-02 M1） |
 | 其余 | 500 · `internal` | 契约 | **只有这一类**才需要把原始 message 摊出来，且收进「详情」默认折起 |
@@ -255,16 +284,25 @@ S2-H 在 S2-B 形态上改五处（含删一行），其余逐格照旧。
 
 ## 7. S2-E 设计库行形态表
 
-`blocked` 不是随 `anomaly` 一起来的，是**算出来的**：`preview_dbnum` 里
-`matches!(anomaly, Rollback | TypeChanged)`，项目扫描器再把 `Duplicate` / `Missing` 直接置
-`blocked = true`。所以五种异常里 `PathMigrated` 独自落在「会执行」那一组。
+`blocked` 不是随 `anomaly` 一起来的，是**算出来的**：`preview_dbnum` 里把 `TypeChanged`
+判为阻断，项目扫描器再把 `Duplicate` / `Missing` 直接置 `blocked = true`。
+
+> **2026-09-08 追记（gen-model ADR-021，2026-08-13 起）**：**回退不再阻断。** 服务端对回退给
+> `anomaly.kind = rollback`、`blocked = false`、`initialization_required = true`；execute 照常入队，
+> 该批 `intent = "reinitialize"`，worker 出队后在冻结点复核、仍判回退才**清空该库已应用数据**并按
+> 首次导入重新解析当前文件。界面上它是一种**会执行**的行（`DbForm::Reinitialize`），与「需初始化」
+> 同段、同形、同勾选框，但 tag / note 必须说出「文件回退 · 整库重建 · 不可逆」，meta 摆回退证据
+> （两端各是哪一条保存）。此前界面按 `anomaly` 先判成阻断、再按 `blocked`/`initialization_required`
+> 判成会跑——同一库在预览树上两行、确认页两张卡。老服务端仍给 `blocked = true`，那一档照旧走下表的
+> 「文件回退 · 阻断」行。所以会执行的异常有两种：`PathMigrated` 照常跑，`Rollback` 且未阻断整库重建。
 
 | 行形态 | 关键字段 | 会否执行 | 界面必须说清的事 |
 |---|---|---|---|
 | 正常待更新 | `anomaly = None`、`applied_sesno < file_latest_sesno` | 会 | 保存窗口与成功后的水位落点，两者都说时刻：板上作 `08-01 09:12 → 08-07 14:10，8 次保存 · 487 项变化。成功后水位推进至 08-07 14:10。`（ADR-0019）|
-| 需初始化 | `initialization_required = true` | **会** | 契约不为它解保存区间，`net_*` 全是 0；**绝不能显示成「无变化」** |
-| 路径迁移 | `anomaly.kind = path_migrated`、`blocked = false` | 会 | 五种异常里唯一不阻断的；登记路径可自动跟新 |
-| 文件回退 | `anomaly.kind = rollback` | 阻断 | 判据仍是 `file_latest_sesno < applied_sesno`，**说给人听的是两个时刻**：`文件里最新的保存（07-01 10:00）早于已应用的保存（08-05 18:24）`（ADR-0019 Q6，两端来源见 §3 S2-H「不会执行 · 阻断」）；水位只前进不后退 |
+| 需初始化 | `initialization_required = true`、`anomaly = None` | **会** | 契约不为它解保存区间，`net_*` 全是 0；**绝不能显示成「无变化」** |
+| 文件回退 · 整库重建 | `anomaly.kind = rollback`、`blocked = false`、`initialization_required = true` | **会**（先清库） | 行上三件事都要说：回退证据 `文件里最新的保存（07-01 10:00）早于已应用的保存（08-05 18:24）`（ADR-0019 Q6，时刻取 `anomaly.file_latest_sesno_time` / `applied_sesno_time`，已应用端缺时刻说「应用时刻无记录」、**不拿挂钟兜底**）、后果「清空该库已应用数据后按当前文件重新解析」、**不可逆**。右栏一张 `Warn` 卡（不是阻断的 `Error`），「本次范围」多一条 `N 个库文件回退…不可逆` 提示，确认页「不可取消警告」多一句「先清空…被删掉的数据不会回来」；入队回执摘要按 `intent` 标「（文件回退 · 清库整库重建）」 |
+| 路径迁移 | `anomaly.kind = path_migrated`、`blocked = false` | 会 | 登记路径可自动跟新 |
+| 文件回退 · 阻断（老服务端） | `anomaly.kind = rollback`、`blocked = true` | 阻断 | ADR-021 之前的形状。判据仍是 `file_latest_sesno < applied_sesno`，**说给人听的是两个时刻**（同上一行的证据句）；水位只前进不后退；出路：换回正确文件 |
 | 类型变化 | `anomaly.kind = type_changed` | 阻断 | 身份永不自动覆盖，必须人工确认 |
 | 同号重复 | `anomaly.kind = duplicate` | 阻断 | 契约明写 block, do not pick —— 要把 `paths[]` 都列出来交给人挑 |
 | 文件缺失 | `anomaly.kind = missing` | 阻断 | 出路二选一：补回文件，或注销这条登记 |
@@ -283,10 +321,11 @@ S2-H 在 S2-B 形态上改五处（含删一行），其余逐格照旧。
 |---|---|
 | ~~`DbnumPreview.initialization_required`~~ | **已接进**（2026-08-05）：S2 树行与 S2-B「本次会执行」卡都有 db8021 行，形态照 S2-E |
 | `DbnumPreview.sessions[]`（`SessionPreview` 逐会话 added/modified/deleted） | 只用了 `len()`（界面上的「N 次保存」）。想做「按保存展开」得从这里取。**ADR-0019 明确不给它加逐条时刻**：Q5 的逐条时刻挂在 `DataBatchResult` 上，预览侧暂无消费者 |
-| ~~`DbnumPreview` 第一条待应用保存的时刻~~ | **已进契约**（2026-08-10，`first_pending_sesno_time`）：窗口时间对的左端（ADR-0019 Q3）。此前契约只给得出 `applied_sesno_time`（上次应用）与 `file_latest_sesno_time`（文件最新），差的就是「这批的第一条」。界面侧待接 |
+| ~~`DbnumPreview` 第一条待应用保存的时刻~~ | **已进契约**（2026-08-10，`first_pending_sesno_time`）：窗口时间对的左端（ADR-0019 Q3）。此前契约只给得出 `applied_sesno_time`（上次应用）与 `file_latest_sesno_time`（文件最新），差的就是「这批的第一条」。**界面侧已接**（2026-09-08，`DbPreview::window()`）：确认页批次行与未勾选行的保存窗口 = `first_pending_sesno_time → file_latest_sesno_time`，左端缺席整格不画、只留「N 次保存」（`saves_text()`）；向导内「sesno a → b」「N 个会话」「已应用会话号」的措辞一并收成「保存」与时刻，SITE 详情行说「数据水位 X → 文件最新 Y · 落后 N 次保存」（按水位说话，不说「待应用」） |
 | ~~`DataBatchResult` 的窗口两端时刻与并入逐条时刻~~ | **已进契约**（2026-08-10，`start_sesno_time` / `end_sesno_time` / `merged_sesno_times`）：终态行内明细的窗口时间对（Q3）与并入逐条列出（Q5）。`merged_sesno_times` 与 `merged_sesnos` **等长**，读不到的那条是 `None`——按下标取，别按长度对齐。界面侧待接 |
 | `DbnumState.applied_sesno_time`（水位表新增列） | **已进存储**（2026-08-10）：`applied_sesno` 那条保存的写入时刻，随水位同一条单调条件写入，永远指同一条保存。回退阻断卡的「已应用」端从它来（Q6）——文件被换回旧版本后那一页现读读不到了。界面不直接读这一列，读 `FileAnomaly::Rollback` 上转出来的那一份 |
-| ~~`FileAnomaly::Rollback` 的两端时刻~~ | **已进契约**（2026-08-10，`file_latest_sesno_time` / `applied_sesno_time`）：Q6 那张阻断卡的材料齐了。服务端在裁决处一次补齐（预览 / 入队 / 执行三条路径同源），文件端现读一页、已应用端取水位表存量。`reason` 原文保持不变，**界面自己组句**。界面侧待接 |
+| ~~`FileAnomaly::Rollback` 的两端时刻~~ | **已进契约**（2026-08-10，`file_latest_sesno_time` / `applied_sesno_time`）：Q6 那张阻断卡的材料齐了。服务端在裁决处一次补齐（预览 / 入队 / 执行三条路径同源），文件端现读一页、已应用端取水位表存量。`reason` 原文保持不变，**界面自己组句**。**界面侧已接**（2026-09-08，`model_update::rollback_evidence`）：整库重建行的 meta、阻断卡 / 重建卡的「原因」句、`FileAnomaly` 的 `Display` 三处同一句 |
+| `EnqueuedBatch.intent` | **已接**（2026-09-08）：`reinitialize` 在入队回执摘要里标「（文件回退 · 清库整库重建）」，并入行标「（改为整库重建）」；`apply_window` / 缺席不多说。`phase` / `epoch_id` 仍未消费 |
 | `DbnumPreview.file_name` / `file_path` | 只在 S2-A 的扫描行露过脸，预览结果页与终态页都没有 |
 | `DeliveryUnitSummary.moved_in` / `moved_out` | 元素跨交付单元迁移的计数，没画。这恰恰是最容易让人困惑的一类变化 |
 | `SitePreview.moved_in` / `moved_out`（ADR-020，2026-08-07 新增） | SITE 桶级的迁入迁出计数，没画——挪动的单元 pre/post 两侧各入一桶，SITE 行上现在只画 `+a ~m −d`。想标「挪进来的」得从这里取 |
@@ -294,7 +333,8 @@ S2-H 在 S2-B 形态上改五处（含删一行），其余逐格照旧。
 | `DbnumPreview.zones[]`（含 `ZoneSummary.model_affecting`） | 曾经画过，`docs/adr/0011` 之后整组退役。契约字段保留，反序列化仍在守（`model_update_api` 的解码用例），但界面不再用它分组 |
 | ~~`FileAnomaly` 五种只画了 `Rollback`~~ | **画齐且已接进**（2026-08-05）：行形态在 S2-E，阻断行已进 S2 树，四种阻断卡形态齐列于 **S2-F**（含 `duplicate` 的 `paths[]` 逐条列出）；S2 场景只摆真实出现的卡 |
 | ~~`PendingModelUnit.last_error`~~ | **已画**（2026-08-05）：队列面板行内明细每条欠账单元下面摆一行原因。它是「为什么失败」唯一跨得过重启的来源——WS 明细活在进程内存里、重连即失，`Outcome.units[].message` 只活在 `/tasks` 的 200 条窗口内 |
-| `PendingModelUnit.source_end_sesno` | 来源会话号只在 S2-B（历史板）「会一并处理」卡里露过脸，队列面板的欠账行没有。**ADR-0019 Q7 之后它不再直接露面**：改露 `source_end_sesno_time`（**2026-08-10 已落 gen-model**），界面说 `来源保存 08-05 18:24`。旧行、以及**不认领会话号的行**（房间任务、反向级联派生根，`source_end_sesno == 0`）都是 `None`，此时**来源段整个不摆**——不许回落成会话号 |
+| ~~`PendingModelUnit.source_end_sesno`~~ | 来源会话号只在 S2-B（历史板）「会一并处理」卡里露过脸。**ADR-0019 Q7 之后它不再直接露面**：改露 `source_end_sesno_time`（**2026-08-10 已落 gen-model**），界面说 `来源保存 08-05 18:24`。旧行、以及**不认领会话号的行**（房间任务、反向级联派生根，`source_end_sesno == 0`）都是 `None`，此时**来源段整个不摆**——不许回落成会话号。**两侧均已接**（2026-09-08）：向导 `model_update::retry_meta`（确认页「会一并处理」行）与队列面板欠账行 `task_queue::pending_line`（QUEUE-FIELD-MAP §1.5） |
 | ~~`PendingModelUnit.dead`（**新增字段**，2026-08-05）~~ | 服务端按 `attempts >= MAX_ATTEMPTS` 算出来随行带出。上限是服务端常量、不在契约里，客户端拿 `attempts` 判不出死没死。三处消费**已全部落位**：队列面板行内文案与「立刻重试」按钮、状态栏「N 个单元已放弃重试」（此前已画），S2 待重试卡与 S2-B「会一并处理」卡按 `dead` 分「将合并 / 已放弃」两行（2026-08-05 摘出） |
-| `ManualUpdatePreview.warnings[]` | 预览期的非致命告警（读不了库头、遍历目录失败等）在 S2 上没有落脚点 |
+| ~~`ManualUpdatePreview.warnings[]`~~ | 预览期的非致命告警（读不了库头、遍历目录失败、范围回落、调试 / 监控 / 模型类型限定的自报）。S2 预览页早已在右栏 `hints_block` 逐条画成「预览期告警」卡；**2026-09-08 补上另外两态**：「已是最新」与读透专态此前只有一张正文卡，服务端说的话整块看不见——而 09-07 `update_scope` 那句「库侧 MDB 表还是空的，范围改取自 SYS 库文件」正好只在没有变化时出现。两态共用 `model_update::server_says`（`warnings` + 读透的 `message`，一条都没有时整块不画） |
+| ~~`ManualUpdatePreview.shadowed[]` / `ManualEnqueueReceipt.shadowed[]`~~ | 跨项目裸 dbnum 冲突里被显式项目优先级遮蔽的候选（`{project, dbnum, file_path, selected_project}`，预览与回执同形）。**它不在回执五桶里、也不计进 `scanned`**——不单独说一句就彻底没人提，而它回答的正是「本期这些话是在哪一个项目的哪一份文件上说的」。**已接**（2026-09-08，`model_update::shadowed_card`）：S2 右栏、「已是最新」页、读透专态三处同一张 Warn 卡（不是阻断——被选中的那一份照常跑），逐条摆项目 + dbnum + 路径，出路指向服务端的 `catalogue_project_priority` / `included_projects` 顺序；`Enqueued::summary()` 末尾挂一句「另有 N 个跨项目同号文件被遮蔽未读」，一行都没排时也说 |
 | ~~`ManualUpdateStatus::Success` / `Failed`~~ | **已画**（2026-08-05）：三种终态的队列行内明细齐列于 **S12-C**（succeeded / failed 补齐，partial 对照参展）；`partial` 那张就是退役 S4-C 的行内化，重试与死信入口都在里面 |

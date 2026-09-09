@@ -27,6 +27,7 @@ use crate::style::group_number;
 use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Status, Tokens, radius};
 use crate::style::widgets;
+use crate::task_queue::DbnumStatus;
 use crate::{Cmd, RefU64};
 
 // ================================================================ 预览契约
@@ -45,7 +46,91 @@ pub struct Preview {
     pub pending_model_retries: Vec<PendingModelUnit>,
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// 跨项目裸 dbnum 冲突里被显式项目优先级遮蔽的候选（gen-model `ShadowedCandidate`）。
+    #[serde(default)]
+    pub shadowed: Vec<ShadowedCandidate>,
     pub up_to_date: bool,
+    /// 服务端的数据面形态（gen-model `data_face`）。`read-through` = 读透：不摄入数据、
+    /// 水位不动，预览回的是**空表 + `up_to_date: true`**——那不是「已是最新」，是「这一形态
+    /// 没有数据批次可预览」。老服务端不给这个键 → 空串，按摄入形态解读。
+    #[serde(default)]
+    pub data_face: String,
+    /// 读透回执里服务端附的一句说明（只有读透形态给）。
+    #[serde(default)]
+    pub message: String,
+}
+
+impl Preview {
+    /// 读透形态：向导整套「数据窗口 → 勾选 → 确认」都不成立，换专态（§A 2026-09-08）。
+    pub fn read_through(&self) -> bool {
+        self.data_face.trim().eq_ignore_ascii_case("read-through")
+    }
+}
+
+/// 同一个裸 dbnum 在多个项目目录里各有一份文件时，服务端按显式项目优先级挑一份、
+/// 把其余的记在这里（gen-model `batch_scheduler::ShadowedCandidate`，预览与执行回执都给）。
+///
+/// 被遮蔽的多半是 DICT / CATA：它们不进数据批次，所以队列里永远看不到这件事，而
+/// 「已是最新」「扫描 N 个库」这些话恰恰是在**选中的那一份**上说的。一格不解就等于
+/// 界面在替服务端隐瞒它读的是哪个项目的文件。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ShadowedCandidate {
+    /// 这份被盖住的文件所属项目。
+    #[serde(default)]
+    pub project: String,
+    pub dbnum: u32,
+    #[serde(default)]
+    pub file_path: String,
+    /// 真正被选中的那个项目。服务端说不出时为空，文案退成「另一个项目」。
+    #[serde(default)]
+    pub selected_project: String,
+}
+
+impl ShadowedCandidate {
+    /// 一行说清谁被谁盖住了。路径原样摆出来——同号不同项目时，人靠路径才认得出
+    /// 自己关心的是哪一份。
+    pub fn line(&self) -> String {
+        let mine = if self.project.trim().is_empty() {
+            "未指明项目"
+        } else {
+            self.project.trim()
+        };
+        let winner = if self.selected_project.trim().is_empty() {
+            "另一个项目"
+        } else {
+            self.selected_project.trim()
+        };
+        let path = if self.file_path.trim().is_empty() {
+            String::new()
+        } else {
+            format!("：{}", self.file_path.trim())
+        };
+        format!(
+            "db{} · {mine} 的这一份被 {winner} 的同号文件盖住{path}",
+            self.dbnum
+        )
+    }
+}
+
+/// 「N 个跨项目同号文件被遮蔽」那张卡的标题与正文；一份都没有时不画。
+fn shadowed_copy(shadowed: &[ShadowedCandidate]) -> Option<(String, String)> {
+    if shadowed.is_empty() {
+        return None;
+    }
+    let lines = shadowed
+        .iter()
+        .map(|candidate| format!("· {}", candidate.line()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some((
+        format!("{} 个跨项目同号文件被遮蔽", shadowed.len()),
+        format!(
+            "原因：同一个 dbnum 在多个项目目录里各有一份，服务端按显式项目优先级只取一份。\n\
+             影响：本期的范围、水位与判决说的都是被选中的那一份，被盖住的那些不读、不入队。\n\
+             {lines}\n\
+             出路：这不是错误；要换成另一份，改服务端的 `catalogue_project_priority` / `included_projects` 顺序。"
+        ),
+    ))
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -65,6 +150,12 @@ pub struct DbPreview {
     /// 同一把尺子，相减 = 文件里还有多大时间跨度的设计改动没被吸收。
     #[serde(default)]
     pub file_latest_sesno_time: Option<String>,
+    /// **第一条待应用保存**（窗口左端，`applied_sesno + 1`）的写入时刻（RFC3339，ADR-0019 Q3）。
+    /// 与 `applied_sesno_time` 不是同一个时刻：那个是「上次应用的是哪一条」，这个是「这批要
+    /// 应用的第一条」。阻断 / 需初始化 / 无待应用窗口、以及老服务端 → `None`，保存窗口那一格
+    /// 整格不画，只留「N 次保存」。
+    #[serde(default)]
+    pub first_pending_sesno_time: Option<String>,
     pub sessions: Vec<SessionPreview>,
     pub net_added: u32,
     pub net_modified: u32,
@@ -220,6 +311,10 @@ pub struct PendingModelUnit {
     #[serde(default)]
     pub noun: String,
     pub source_end_sesno: i32,
+    /// 来源保存的 E3D 写入时刻（ADR-0019 Q7）。界面说「来源保存 08-05 18:24」；旧行与不认领
+    /// 会话号的行（房间任务、反向级联派生根）是 `None`——此时来源段整个不摆，不回落成会话号。
+    #[serde(default)]
+    pub source_end_sesno_time: Option<String>,
     #[serde(default)]
     pub attempts: u32,
     #[serde(default)]
@@ -239,6 +334,14 @@ pub enum FileAnomaly {
     Rollback {
         file_latest_sesno: i32,
         applied_sesno: i32,
+        /// 文件里最新那条保存的 E3D 写入时刻（RFC3339，ADR-0019 Q6）。服务端在裁决处
+        /// 现读一页补上；读不到、或老服务端 → `None`，界面退回会话号。
+        #[serde(default)]
+        file_latest_sesno_time: Option<String>,
+        /// 已应用那条保存的写入时刻，取水位表存量（文件被换回旧版本后那一页现读读不到了）。
+        /// **不许拿挂钟 `applied_at` 兜底**——缺席就说「应用时刻无记录」。
+        #[serde(default)]
+        applied_sesno_time: Option<String>,
     },
     PathMigrated {
         old_path: String,
@@ -259,12 +362,12 @@ pub enum FileAnomaly {
 impl std::fmt::Display for FileAnomaly {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Rollback {
-                file_latest_sesno,
-                applied_sesno,
-            } => write!(
+            // 回退是阻断还是整库重建由服务端的 `blocked` 定（ADR-021），这里只说事实：
+            // 两端各是哪一条保存。后果那半句由知道 `blocked` 的调用方补。
+            Self::Rollback { .. } => write!(
                 f,
-                "文件最新会话号 {file_latest_sesno} 低于已应用 {applied_sesno}。水位只前进不后退，其他批次不受影响。出路：换回正确文件。"
+                "{}。水位只前进不后退，其他批次不受影响。出路：若文件是被误换回旧版本，先换回正确文件。",
+                rollback_evidence(self)
             ),
             Self::PathMigrated { old_path, new_path } => write!(
                 f,
@@ -291,11 +394,15 @@ impl std::fmt::Display for FileAnomaly {
     }
 }
 
-/// S2-E 的七种设计库行形态，外加两种「不在范围内」与「无变化」。
+/// S2-E 的设计库行形态，外加两种「不在范围内」与「无变化」。
 ///
-/// `blocked` 不是随 `anomaly` 一起来的，是算出来的：`preview_dbnum` 里只把
-/// `Rollback | TypeChanged` 判为阻断，项目扫描器再把 `Duplicate` / `Missing`
-/// 直接置 `blocked = true`。**五种异常里只有 `PathMigrated` 照常执行。**
+/// `blocked` 不是随 `anomaly` 一起来的，是算出来的：`preview_dbnum` 里把
+/// `TypeChanged` 判为阻断，项目扫描器再把 `Duplicate` / `Missing` 直接置
+/// `blocked = true`。**回退自 gen-model ADR-021（2026-08-13）起不再阻断**：服务端给
+/// `blocked = false` + `initialization_required = true`，worker 在冻结点清空该库、
+/// 按首次导入重新解析当前文件——那是 [`Self::Reinitialize`]；老服务端仍给
+/// `blocked = true`，那一档照旧是 [`Self::Rollback`]。所以会执行的异常有两种：
+/// `PathMigrated` 照常跑，`Rollback` 且未阻断整库重建。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbForm {
     /// 非 DESI：压根不进本期扫描，与「阻断」来自契约的不同位置，不许合成一行。
@@ -308,9 +415,15 @@ pub enum DbForm {
     /// 从未导入过，还没有权威水位。契约不为它解会话区间，`net_*` 全是 0，
     /// **但它确实会跑**，绝不能显示成「无变化」。
     Initialize,
+    /// 文件回退且服务端**不阻断**（gen-model ADR-021）：确认后 worker 清空该库已应用的
+    /// 数据、按当前文件从头重新解析。它会跑、会产生批次，但与「需初始化」不是一回事——
+    /// 那个是从没导入过，这个是把导入过的删掉重来，**不可逆**，行上必须把两个时刻与
+    /// 这层后果一起说出来。
+    Reinitialize,
     PathMigrated,
     Pending,
     UpToDate,
+    /// 文件回退且服务端阻断（`blocked = true`，ADR-021 之前的老服务端形状）。
     Rollback,
     TypeChanged,
     Duplicate,
@@ -331,6 +444,7 @@ impl DbForm {
             Self::Excluded => "",
             Self::NotInProject => "MDB 声明",
             Self::Initialize => "需初始化",
+            Self::Reinitialize => "文件回退 · 整库重建",
             Self::PathMigrated => "路径迁移",
             Self::Pending => "正常待更新",
             Self::UpToDate => "",
@@ -348,6 +462,7 @@ impl DbForm {
             Self::Excluded => "非 DESI · 不在本期执行范围",
             Self::NotInProject => "不在当前项目目录 · 本期够不着",
             Self::Initialize => "首次导入 · 会执行",
+            Self::Reinitialize => "清空该库后按当前文件重新解析 · 会执行 · 不可逆",
             Self::PathMigrated => "登记路径自动跟新 · 会执行",
             Self::Pending => "",
             Self::UpToDate => "无变化",
@@ -358,7 +473,7 @@ impl DbForm {
     pub fn tone(self) -> Status {
         match self {
             Self::Excluded | Self::NotInProject | Self::UpToDate => Status::Neutral,
-            Self::Initialize | Self::PathMigrated => Status::Warn,
+            Self::Initialize | Self::Reinitialize | Self::PathMigrated => Status::Warn,
             Self::Pending => Status::Success,
             _ => Status::Error,
         }
@@ -369,6 +484,7 @@ impl DbForm {
             Self::Excluded => ph::PROHIBIT,
             Self::NotInProject => ph::FILE_DASHED,
             Self::Initialize => ph::SEAL_WARNING,
+            Self::Reinitialize => ph::CLOCK_COUNTER_CLOCKWISE,
             Self::PathMigrated => ph::GIT_MERGE,
             Self::Pending | Self::UpToDate => ph::FILE,
             Self::Rollback => ph::CLOCK_COUNTER_CLOCKWISE,
@@ -409,6 +525,10 @@ impl DbPreview {
             return DbForm::NotInProject;
         }
         match &self.anomaly {
+            // 回退不再阻断（gen-model ADR-021）：`blocked = false` 的回退是整库重建，
+            // 会跑；`blocked = true` 是老服务端的阻断形状。先看 `blocked` 再定形态，
+            // 否则同一库会同时落进「会执行」与「本期不执行」两段。
+            Some(FileAnomaly::Rollback { .. }) if !self.blocked => DbForm::Reinitialize,
             Some(FileAnomaly::Rollback { .. }) => DbForm::Rollback,
             Some(FileAnomaly::TypeChanged { .. }) => DbForm::TypeChanged,
             Some(FileAnomaly::Duplicate { .. }) => DbForm::Duplicate,
@@ -420,16 +540,34 @@ impl DbPreview {
         }
     }
 
-    /// 会话区间。需初始化的库契约不为它解区间，那一行不摆区间而摆一句实话。
+    /// 保存窗口那一格（ADR-0019 Q3）：窗口**自身两端**的写入时刻——第一条待应用保存
+    /// （`first_pending_sesno_time`，不是上次应用的那条）→ 文件最新那条。老服务端给不出左端
+    /// 就整格不画（空串），只留别处的「N 次保存」；会话号只活在契约与日志里，不回落。
+    /// 需初始化的库契约不为它解区间，摆一句实话；回退的库（重建或阻断）摆回退证据——
+    /// 两端各是哪一条保存，那正是它为什么要重来 / 为什么不跑。
     pub fn window(&self) -> String {
-        if self.initialization_required {
-            return "首次导入 · 尚无权威水位".into();
+        match self.form() {
+            DbForm::Reinitialize | DbForm::Rollback => self
+                .anomaly
+                .as_ref()
+                .map(rollback_evidence)
+                .unwrap_or_default(),
+            DbForm::Initialize => "首次导入 · 尚无权威水位".into(),
+            _ => match (
+                self.first_pending_sesno_time.as_deref(),
+                self.file_latest_sesno_time.as_deref(),
+            ) {
+                (Some(first), Some(latest)) => {
+                    format!("{} → {}", e3d_time(first), e3d_time(latest))
+                }
+                _ => String::new(),
+            },
         }
-        format!(
-            "sesno {} → {}",
-            self.applied_sesno + 1,
-            self.file_latest_sesno
-        )
+    }
+
+    /// 「N 次保存」那半句：待应用的保存次数（`sessions.len()`），界面上一律这么说（ADR-0019）。
+    pub fn saves_text(&self) -> String {
+        format!("{} 次保存", self.sessions.len())
     }
 
     /// 有名有姓的 SITE 桶（归属未知桶不算）。空 = 老服务端没给 `sites[]`，或
@@ -453,23 +591,20 @@ impl DbPreview {
     /// 同库只有 1 个 SITE 时整句不画。
     pub fn site_detail_line(&self, exclude: &str) -> String {
         let mut parts = Vec::new();
+        // 按水位说话（2026-09-08）：数据水位在哪一次保存、文件最新在哪一次、落后几次。
         if let Some(latest) = self.file_latest_sesno_time.as_deref() {
             let applied = self
                 .applied_sesno_time
                 .as_deref()
                 .map(e3d_time)
-                .unwrap_or_else(|| "从未应用".into());
+                .unwrap_or_else(|| "尚未建立".into());
             parts.push(format!(
-                "上次应用 {applied} → 文件最新 {}",
+                "数据水位 {applied} → 文件最新 {}",
                 e3d_time(latest)
             ));
         }
-        parts.push(format!(
-            "待应用 sesno {} → {}（{} 个会话）",
-            group_number((self.applied_sesno + 1).into()),
-            group_number(self.file_latest_sesno.into()),
-            self.sessions.len()
-        ));
+        // sesno 区间那一段已删（ADR-0019）：区间仍是执行边界，但只活在契约与日志里。
+        parts.push(format!("落后 {}", self.saves_text()));
         let linked: Vec<&str> = self
             .named_sites()
             .map(SitePreview::display_name)
@@ -482,6 +617,40 @@ impl DbPreview {
             parts.push("文件已迁移 · 登记路径自动跟新".into());
         }
         parts.join(" · ")
+    }
+}
+
+/// 回退的证据，一句话说两端（ADR-0019 Q6）：有时刻说时刻，没有就退回会话号——
+/// 已应用那端缺时刻时说「应用时刻无记录」，**不拿挂钟兜底**。非回退异常给空串。
+fn rollback_evidence(anomaly: &FileAnomaly) -> String {
+    let FileAnomaly::Rollback {
+        file_latest_sesno,
+        applied_sesno,
+        file_latest_sesno_time,
+        applied_sesno_time,
+    } = anomaly
+    else {
+        return String::new();
+    };
+    match (
+        file_latest_sesno_time.as_deref(),
+        applied_sesno_time.as_deref(),
+    ) {
+        (Some(latest), Some(applied)) => format!(
+            "文件里最新的保存（{}）早于已应用的保存（{}）",
+            e3d_time(latest),
+            e3d_time(applied)
+        ),
+        (Some(latest), None) => format!(
+            "文件里最新的保存（{}）早于已应用水位（应用时刻无记录，会话号 {}）",
+            e3d_time(latest),
+            group_number((*applied_sesno).into())
+        ),
+        _ => format!(
+            "文件最新会话号 {} 低于已应用 {}",
+            group_number((*file_latest_sesno).into()),
+            group_number((*applied_sesno).into())
+        ),
     }
 }
 
@@ -515,6 +684,9 @@ pub struct Totals {
     pub transform_targets: usize,
     /// 会产生数据批次的 dbnum 数。
     pub batches: usize,
+    /// 其中因文件回退要**清库整库重建**的库数（`DbForm::Reinitialize`）。它们算在
+    /// `batches` 里，但要单独说——那是这一页上唯一会删掉已应用数据的动作。
+    pub reinitialize: usize,
     /// 在本期执行范围之内的 DESI 库数（当前 MDB 声明、且当前项目目录里有文件）。
     pub desi: usize,
     /// 非 DESI 而被排除的库数。
@@ -538,6 +710,7 @@ impl Preview {
             t.generating += db.units.iter().filter(|u| u.will_generate).count();
             t.transform_targets += db.transform_targets.len();
             t.batches += usize::from(db.will_run());
+            t.reinitialize += usize::from(db.will_run() && db.form() == DbForm::Reinitialize);
             if !db.is_desi() {
                 t.excluded += 1;
             } else if db.not_in_project {
@@ -607,6 +780,29 @@ pub struct Enqueued {
     pub unselected: Vec<u32>,
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// 跨项目裸 dbnum 冲突里被遮蔽的候选。它们不在上面那五桶里——回执的
+    /// `scanned` 也不数它们，所以不单独说一句就彻底没人提。
+    #[serde(default)]
+    pub shadowed: Vec<ShadowedCandidate>,
+    /// 服务端数据面形态（与 [`Preview::data_face`] 同源）。读透形态的 execute 回执没有
+    /// 上面那五桶，只有一句 `status`。
+    #[serde(default)]
+    pub data_face: String,
+    /// 读透形态的回执状态：`model_refresh_queued` = 服务端排了一次模型复核与缓存刷新，
+    /// 不摄入数据、`applied_sesno` 不变。摄入形态的回执没有这个键。
+    #[serde(default)]
+    pub status: String,
+}
+
+impl Enqueued {
+    /// 这份回执说的是「排了模型复核」而不是「排了数据批次」（读透形态）。五桶对账在
+    /// 它身上不成立——`scanned` 恒 0，照旧算会得出「扫描 0 个库、回执没交代去向」这种反话。
+    pub fn model_refresh_only(&self) -> bool {
+        self.status
+            .trim()
+            .eq_ignore_ascii_case("model_refresh_queued")
+            || self.data_face.trim().eq_ignore_ascii_case("read-through")
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -622,6 +818,17 @@ pub struct EnqueuedBatch {
     pub start_sesno: i32,
     #[serde(default)]
     pub end_sesno: i32,
+    /// 调度意图（gen-model ADR-021）：`apply_window` = 普通窗口；`reinitialize` = 已裁决
+    /// 回退，worker 出队后清空该库、按首次导入重新解析。老服务端不给 → 空串，按普通窗口说。
+    #[serde(default)]
+    pub intent: String,
+}
+
+impl EnqueuedBatch {
+    /// 这一批会不会先清库。回执里唯一说得出「按下去会删东西」的地方，日志不许吞掉它。
+    pub fn rebuilds(&self) -> bool {
+        self.intent.trim().eq_ignore_ascii_case("reinitialize")
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -642,12 +849,29 @@ impl Enqueued {
     /// 剩下 27 个去哪了说不出来。那与本仓自己坚持的「排除有两个理由，界面上必须
     /// 分开数」「过滤不许无声」正好相反。
     pub fn summary(&self) -> String {
+        if self.model_refresh_only() {
+            return "读透形态：已排一次模型复核与缓存刷新——文件已前进的库重算过期的生成根、\
+                    刷新已读入的属性缓存；不摄入数据，水位不变。模型工作在任务队列的 model_drain \
+                    行里跑；三维要看到新几何仍走「取回工作」"
+                .to_owned();
+        }
         let mut parts = Vec::new();
         if !self.enqueued.is_empty() {
             let list = self
                 .enqueued
                 .iter()
-                .map(|b| format!("db{} 排第 {} 位", b.dbnum, b.position))
+                .map(|b| {
+                    format!(
+                        "db{} 排第 {} 位{}",
+                        b.dbnum,
+                        b.position,
+                        if b.rebuilds() {
+                            "（文件回退 · 清库整库重建）"
+                        } else {
+                            ""
+                        }
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("、");
             parts.push(format!(
@@ -659,7 +883,17 @@ impl Enqueued {
             let list = self
                 .merged
                 .iter()
-                .map(|b| format!("db{}", b.dbnum))
+                .map(|b| {
+                    format!(
+                        "db{}{}",
+                        b.dbnum,
+                        if b.rebuilds() {
+                            "（改为整库重建）"
+                        } else {
+                            ""
+                        }
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("、");
             parts.push(format!(
@@ -703,11 +937,29 @@ impl Enqueued {
                 .join("；");
             parts.push(format!("{} 个阻断未入队（{list}）", self.blocked.len()));
         }
+        // 遮蔽不在五桶里、也不计进 `scanned`：它说的是「同号的另一份没被读」，
+        // 与「这个库去哪了」是两件事，所以单挂一句，而且没排上任何批次时也要说。
+        let shadowed = (!self.shadowed.is_empty()).then(|| {
+            format!(
+                "另有 {} 个跨项目同号文件被遮蔽未读（{}）",
+                self.shadowed.len(),
+                self.shadowed
+                    .iter()
+                    .map(ShadowedCandidate::line)
+                    .collect::<Vec<_>>()
+                    .join("；")
+            )
+        });
         if parts.is_empty() {
-            return format!(
+            let mut line = format!(
                 "扫描 {} 个库，没有需要入队的批次，回执也没说这些库各自是什么去向",
                 self.scanned
             );
+            if let Some(shadowed) = shadowed {
+                line.push_str("；");
+                line.push_str(&shadowed);
+            }
+            return line;
         }
         // 加不到 `scanned` 就把差额摆出来。契约上这五桶应当是它的一个划分，
         // 但那是服务端的性质，不是本端能保证的事——差额说不出来的时候，
@@ -716,6 +968,7 @@ impl Enqueued {
         if unaccounted > 0 {
             parts.push(format!("另有 {unaccounted} 个库回执没交代去向"));
         }
+        parts.extend(shadowed);
         format!("扫描 {} 个库；{}", self.scanned, parts.join("；"))
     }
 
@@ -767,6 +1020,18 @@ pub struct RefreshUnit {
 }
 
 impl Outcome {
+    /// 这一轮走**刚体前移便宜路**（gen-model ADR-066：只动方位、网格未重算）交付的根数。
+    ///
+    /// 只数成功交付的（`status == Generated && kind == Transform`）。旧回执没有 `kind`
+    /// 列、整组缺省成 `Regen`，于是恒为 0——终态明细那句「刚体前移 N 根」也就整格不画
+    /// （计划 §五 V2：字段缺席前不画；元数据门那半句同理，等 §3 的结构化字段）。
+    pub fn transform_roots(&self) -> usize {
+        self.units
+            .iter()
+            .filter(|unit| unit.status == UnitStatus::Generated && unit.kind == UnitKind::Transform)
+            .count()
+    }
+
     pub fn data_applied(&self) -> bool {
         self.batch
             .as_ref()
@@ -853,9 +1118,54 @@ pub struct BatchResult {
     pub merged_sesno_times: Vec<Option<String>>,
     #[serde(default)]
     pub changed_elements: u64,
+    /// 增 / 删 / 改三数分解（gen-model `manual_update.rs` 的 `set_change_counts`，
+    /// 从冻结后净窗口的操作集里算，与 `changed_elements` 同源）。
+    ///
+    /// 三个都是 `#[serde(default)]`：**老服务端根本不发这一组**，缺省全成 0。缺席与
+    /// 真零靠 [`Self::change_breakdown`] 分开——**别直接读这三个数画界面**，否则老回执
+    /// 的 0 / 0 / 0 会被画成「无变化」（计划 `2026-09-09-task-finished-detail-plan.md` §2）。
+    #[serde(default)]
+    pub added_elements: u64,
+    #[serde(default)]
+    pub modified_elements: u64,
+    #[serde(default)]
+    pub deleted_elements: u64,
+}
+
+/// 终态数据段的增 / 删 / 改三数（见 [`BatchResult::change_breakdown`]）。
+///
+/// 只在分解拿得到时才构造得出来，所以拿到一个 `ChangeBreakdown` 就意味着「这三数是
+/// 真的、可以画」——缺席的判定已经在 `change_breakdown` 里做完了。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChangeBreakdown {
+    pub added: u64,
+    pub modified: u64,
+    pub deleted: u64,
+}
+
+impl ChangeBreakdown {
+    /// 三数之和。契约保证它等于 `changed_elements`（同源计算），界面拿它兜「共 N 项变化」。
+    pub fn total(self) -> u64 {
+        self.added + self.modified + self.deleted
+    }
 }
 
 impl BatchResult {
+    /// 增 / 删 / 改三数分解——**缺席时返回 `None`，调用点只报总数**（纯函数，计划 §2）。
+    ///
+    /// 三个字段是 `#[serde(default)]`，老服务端整组缺省成 0。三数全 0 有两种来路，
+    /// **都不该画三数**：老服务端缺字段（此时 `changed_elements > 0`，只画总数一句），
+    /// 或本批真的零变化（`changed_elements == 0`，整个变化区本来就不画）。所以判据只有
+    /// 一句——三数之和为 0 即缺席——两种情形一并落到 `None`，绝不把 0 / 0 / 0 画成「无变化」。
+    pub fn change_breakdown(&self) -> Option<ChangeBreakdown> {
+        let breakdown = ChangeBreakdown {
+            added: self.added_elements,
+            modified: self.modified_elements,
+            deleted: self.deleted_elements,
+        };
+        (breakdown.total() > 0).then_some(breakdown)
+    }
+
     /// 并入的那几条保存，逐条配上时刻（ADR-0019 Q5）。
     ///
     /// **只有每一条都拿得到时刻才给**：漏掉几条却仍标着「并入 3 次」会让人以为
@@ -896,6 +1206,11 @@ pub struct UnitResult {
     pub old_owner: Option<String>,
     #[serde(default)]
     pub new_owner: Option<String>,
+    /// 本单元这一轮的发布方式（gen-model ADR-066）：整根重算还是刚体前移便宜路。
+    /// **旧回执没有这一列 → `Regen`**（`#[serde(default)]`），刚体前移计数随之为 0、
+    /// 终态明细那一句整格不画（计划 §五 V2）。
+    #[serde(default)]
+    pub kind: UnitKind,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -904,6 +1219,16 @@ pub enum UnitStatus {
     #[default]
     Generated,
     Failed,
+}
+
+/// 一个交付单元这一轮的发布方式（gen-model ADR-066 `UnitKind`）：整根重算（默认）或
+/// 刚体前移便宜路（只动方位、网格未重算）。旧回执没有这一列，反序列化成 `Regen`。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnitKind {
+    #[default]
+    Regen,
+    Transform,
 }
 
 /// 执行期的两阶段进度事件，与 gen-model 的 `ManualUpdateEvent` 同形。
@@ -1216,9 +1541,12 @@ struct Selection {
     /// 有变化的 SITE 总数（有名有姓的桶；归属未知桶与首次导入库不算 SITE）。
     site_total: usize,
     site_checked: usize,
-    /// 勾中折算出的数据批次数（含勾中的首次导入库）。
+    /// 勾中折算出的数据批次数（含勾中的首次导入库与整库重建库）。
     batches: usize,
     batches_total: usize,
+    /// 勾中的批次里要先清库整库重建的（`DbForm::Reinitialize`）。确认页那句不可逆
+    /// 声明按它决定要不要多说一句。
+    reinitialize: usize,
     /// 勾中批次的交付单元数（按 `db.units` 去重口径，不用 SITE 桶——挪动的
     /// 单元在两个桶里各出现一次，按桶相加会虚高）。
     units: usize,
@@ -1237,6 +1565,7 @@ fn selection(preview: &Preview, state: &State) -> Selection {
         s.site_total += named;
         if state.db_checked(db.dbnum) {
             s.batches += 1;
+            s.reinitialize += usize::from(db.form() == DbForm::Reinitialize);
             s.site_checked += named;
             s.units += db.units.len();
             s.generating += db.units.iter().filter(|u| u.will_generate).count();
@@ -1265,6 +1594,7 @@ pub fn show(
     scope_mdb: &str,
     sync_live: Option<bool>,
     execution_blocked: Option<&str>,
+    dbnums: &[DbnumStatus],
     vm: &Vm,
     state: &mut State,
 ) -> Vec<Cmd> {
@@ -1309,7 +1639,14 @@ pub fn show(
                         "服务端接下任务后，本窗会关闭并切到任务队列。",
                     ),
                     Vm::Failed(failure) => failure_body(ui, t, d, failure, state),
-                    Vm::Ready(preview) if preview.up_to_date => up_to_date_body(ui, t, d, state),
+                    // 读透形态回的是空表 + `up_to_date: true`，必须排在「已是最新」之前判：
+                    // 那不是没有变化，是这一形态没有数据批次可预览。
+                    Vm::Ready(preview) if preview.read_through() => {
+                        read_through_body(ui, t, d, preview, dbnums)
+                    }
+                    Vm::Ready(preview) if preview.up_to_date => {
+                        up_to_date_body(ui, t, d, preview, state)
+                    }
                     Vm::Ready(preview) => match state.step {
                         Step::Confirm => confirm_body(ui, t, d, preview, state),
                         _ => preview_body(ui, t, d, applying, preview, state),
@@ -1424,6 +1761,15 @@ fn header_text(
             format!("{} · {}", identity(scope_mdb), failure.code),
             failure.form().tone(),
             failure.form().icon(),
+        ),
+        Vm::Ready(preview) if preview.read_through() => (
+            "模型更新 · 读透形态".into(),
+            format!(
+                "{} · 不摄入数据、水位不动；可复核模型与缓存",
+                identity(&preview.mdb)
+            ),
+            Status::Info,
+            ph::LIGHTNING,
         ),
         Vm::Ready(preview) if preview.up_to_date => (
             "模型更新 · 已是最新".into(),
@@ -1563,7 +1909,21 @@ fn footer_hint(
     match vm {
         Vm::Loading => (
             ph::LOCK_SIMPLE,
-            "预览为只读：不修改元素数据、模型或已应用会话号；关闭窗口不影响后台扫描".into(),
+            "预览为只读：不修改元素数据、模型或数据水位；关闭窗口不影响后台扫描".into(),
+            Status::Neutral,
+        ),
+        // 读透形态：脚注说清那一键做什么、不做什么；服务不消化时同样先说为什么。
+        Vm::Ready(preview) if preview.read_through() && execution_blocked.is_some() => (
+            ph::PAUSE_CIRCLE,
+            format!(
+                "{}。范围照常可看，复核要等服务端",
+                execution_blocked.unwrap_or_default()
+            ),
+            Status::Warn,
+        ),
+        Vm::Ready(preview) if preview.read_through() => (
+            ph::LIGHTNING,
+            "读透形态：「复核模型与缓存」不摄入数据、不推进水位、不删数据".into(),
             Status::Neutral,
         ),
         // 服务此刻不消化执行请求：这句要顶掉「预览为只读」——人对着一份预览、
@@ -1583,7 +1943,7 @@ fn footer_hint(
         ),
         Vm::Ready(preview) if !preview.up_to_date => (
             ph::LOCK_SIMPLE,
-            "预览为只读：不修改元素数据、模型或已应用会话号".into(),
+            "预览为只读：不修改元素数据、模型或数据水位".into(),
             Status::Neutral,
         ),
         _ => (ph::PLUGS, format!("服务 {api_url}"), Status::Neutral),
@@ -1618,6 +1978,34 @@ fn footer_actions(
             }
         }
         Vm::Starting(_) => {}
+        // 读透形态：没有勾选集、没有确认页——这一下不摄入数据、不推进水位、不删东西，
+        // 两步确认在它身上是摆设。范围交给服务端（读透的 execute 不认 `dbnums`）。
+        Vm::Ready(preview) if preview.read_through() => {
+            if ui
+                .add_enabled(
+                    execution_blocked.is_none(),
+                    widgets::button(t, d, "复核模型与缓存")
+                        .icon(ph::LIGHTNING)
+                        .primary(),
+                )
+                .on_disabled_hover_text(execution_blocked.unwrap_or_default())
+                .on_hover_text(
+                    "让服务端对文件已前进的库重算过期的生成根、刷新已读入的属性缓存；不摄入数据，水位不变",
+                )
+                .clicked()
+            {
+                cmds.push(Cmd::ExecuteModelUpdate { dbnums: None });
+            }
+            if ui
+                .add(widgets::button(t, d, "重新预览").icon(ph::ARROWS_CLOCKWISE))
+                .clicked()
+            {
+                cmds.push(Cmd::RefreshModelUpdate);
+            }
+            if ui.add(widgets::button(t, d, "关闭")).clicked() {
+                state.open = false;
+            }
+        }
         Vm::Ready(preview) if preview.up_to_date => {
             if ui
                 .add(widgets::button(t, d, "重新预览").icon(ph::ARROWS_CLOCKWISE))
@@ -1720,7 +2108,7 @@ fn previewing_body(ui: &mut Ui, t: &Tokens, d: Density, state: &State) {
             ui.add_space(d.px(6.0));
             ui.label(
                 RichText::new(
-                    "逐库比对会话号，单库可达数分钟。扫描期间不写入任何东西，超时重试即可。",
+                    "逐库比对保存记录，单库可达数分钟。扫描期间不写入任何东西，超时重试即可。",
                 )
                 .font(Font::meta(d))
                 .color(t.text_secondary),
@@ -1765,13 +2153,18 @@ fn previewing_body(ui: &mut Ui, t: &Tokens, d: Density, state: &State) {
     });
 }
 
-fn up_to_date_body(ui: &mut Ui, t: &Tokens, d: Density, state: &State) {
+/// 「已是最新」不等于「没有话要说」。这一态此前只画一张成功卡，于是三类交代全被吞掉：
+/// 范围回落（09-07 `update_scope` 那句「库侧 MDB 表是空的，范围改取自 SYS 库文件」）、
+/// 调试 / 监控 / 模型类型限定的自报、跨项目同号文件的遮蔽。它们说的都是
+/// **这句「最新」是在什么范围、哪一份文件上说的**——恰恰在没有变化时最该出声。
+fn up_to_date_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &State) {
     let since = state
         .cache
         .as_ref()
         .map(|c| format!("上次扫描于 {}", ago(c.at.elapsed())))
         .unwrap_or_default();
-    pad(ui, d, |ui| {
+    scroll_pad(ui, d, "model-update-up-to-date", |ui| {
+        ui.spacing_mut().item_spacing.y = d.px(12.0);
         note_card(
             ui,
             t,
@@ -1779,8 +2172,179 @@ fn up_to_date_body(ui: &mut Ui, t: &Tokens, d: Density, state: &State) {
             Status::Success,
             ph::CHECK_CIRCLE,
             "已是最新，没有可更新的内容",
-            &format!("没有待应用的会话，也没有待重试的交付单元。这是正常结果，不是错误。{since}"),
+            &format!("数据水位已追平文件，也没有待重试的交付单元。这是正常结果，不是错误。{since}"),
         );
+        shadowed_card(ui, t, d, &preview.shadowed);
+        server_says(ui, t, d, preview);
+    });
+}
+
+/// 服务端在这次预览里说的话（`warnings` + 读透形态的 `message`）。一份都没有时整块不画。
+///
+/// 「已是最新」与读透专态共用：两处的正文都是本端拼的，服务端唯一能插话的地方就是这里。
+fn server_says(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview) {
+    let mut said = preview.warnings.clone();
+    if !preview.message.trim().is_empty() {
+        said.push(preview.message.clone());
+    }
+    if said.is_empty() {
+        return;
+    }
+    section(ui, t, d, "服务端的话");
+    for line in &said {
+        ui.label(RichText::new(line).font(Font::meta(d)).color(t.text_muted));
+    }
+}
+
+/// 遮蔽卡。不是阻断（Warn 不是 Error）：被选中的那一份照常跑，这里说的是**另一份没被读**。
+fn shadowed_card(ui: &mut Ui, t: &Tokens, d: Density, shadowed: &[ShadowedCandidate]) {
+    let Some((title, body)) = shadowed_copy(shadowed) else {
+        return;
+    };
+    note_card(ui, t, d, Status::Warn, ph::FILES, &title, &body);
+}
+
+/// 读透形态下向导能说的范围：`/dbnums` 里本期执行范围之内的设计库，以及被挡在外面的三档
+/// 各有几个。读透的预览回执是空表，范围名单只能从队列轮询的那份 `/dbnums` 来。
+#[derive(Debug, Default)]
+struct ReadThroughScope<'a> {
+    rows: Vec<&'a DbnumStatus>,
+    excluded: usize,
+    not_in_project: usize,
+    blocked: usize,
+}
+
+fn read_through_scope(dbnums: &[DbnumStatus]) -> ReadThroughScope<'_> {
+    let mut scope = ReadThroughScope::default();
+    for db in dbnums {
+        let design = ["DESI", "ISOD"]
+            .iter()
+            .any(|kind| db.db_type.trim().eq_ignore_ascii_case(kind));
+        if db.excluded || !design {
+            scope.excluded += 1;
+        } else if db.not_in_project {
+            scope.not_in_project += 1;
+        } else if db.blocked {
+            scope.blocked += 1;
+        } else {
+            scope.rows.push(db);
+        }
+    }
+    scope.rows.sort_by_key(|db| db.dbnum);
+    scope
+}
+
+/// 读透形态下每行 note 的那一句：模型来源 + 判决，都是服务端给的，缺哪格就不说哪格。
+fn read_through_row_note(db: &DbnumStatus) -> String {
+    let mut parts = Vec::new();
+    if let Some(source) = db.model_source {
+        parts.push(source.label(db.model_source_reason.as_deref()));
+    }
+    if let Some(verdict) = db.verdict_label() {
+        parts.push(verdict);
+    }
+    parts.join(" · ")
+}
+
+/// 读透形态专态：没有数据批次可预览，也没有保存窗口可确认——`applied_sesno` 不动。
+/// 这里能做的是让服务端复核模型与缓存；范围名单从 `/dbnums` 说，一行一库，只说服务端
+/// 给得出的格（文件最新保存次数、模型来源、一致性判决）。
+fn read_through_body(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    preview: &Preview,
+    dbnums: &[DbnumStatus],
+) {
+    let scope = read_through_scope(dbnums);
+    scroll_pad(ui, d, "model-update-read-through", |ui| {
+        ui.spacing_mut().item_spacing.y = d.px(12.0);
+        note_card(
+            ui,
+            t,
+            d,
+            Status::Info,
+            ph::LIGHTNING,
+            "模型服务以读透形态运行：这里不预览数据批次",
+            "模型树、属性、搜索与三维直接从库文件读，没有数据要摄入，也没有保存窗口可确认——数据水位不动。\n\
+             「复核模型与缓存」让服务端对文件已前进的库重算过期的生成根、刷新已读入的属性缓存：不推进任何水位、不删任何数据。\n\
+             三维要看到新几何仍走菜单「取回工作」（它按需把模型追到文件最新）。",
+        );
+
+        let title = if scope.rows.is_empty() {
+            "本期执行范围".to_owned()
+        } else {
+            format!("本期执行范围 · {} 个设计库", scope.rows.len())
+        };
+        section(ui, t, d, &title);
+        if dbnums.is_empty() {
+            ui.label(
+                RichText::new("范围名单尚未取到：等任务队列下一拍轮询（忙 1 s / 闲 5 s）")
+                    .font(Font::meta(d))
+                    .color(t.text_muted),
+            );
+        } else if scope.rows.is_empty() {
+            ui.label(
+                RichText::new("当前 MDB 声明的设计库一个都没在范围里")
+                    .font(Font::meta(d))
+                    .color(t.text_muted),
+            );
+        }
+        for db in &scope.rows {
+            let label = if db.file_name.is_empty() {
+                format!("db{} · {}", db.dbnum, db.db_type)
+            } else {
+                format!("{} · db{} · {}", db.file_name, db.dbnum, db.db_type)
+            };
+            let note = read_through_row_note(db);
+            let _ = row(
+                ui,
+                t,
+                d,
+                Row {
+                    icon: ph::FILE,
+                    icon_color: t.text_muted,
+                    label: &label,
+                    label_color: t.text_primary,
+                    strong: true,
+                    // 文件最新是两枚水位共同的基准；读透下数据水位按设计不建立，只说文件在哪。
+                    meta: if db.file_latest_sesno > 0 {
+                        format!(
+                            "文件最新：第 {} 次保存",
+                            group_number(db.file_latest_sesno.into())
+                        )
+                    } else {
+                        String::new()
+                    },
+                    note: &note,
+                    note_color: t.text_secondary,
+                    ..Row::default()
+                },
+            );
+        }
+        let mut parked = Vec::new();
+        if scope.excluded > 0 {
+            parked.push(format!("{} 个非 DESI 不在范围", scope.excluded));
+        }
+        if scope.not_in_project > 0 {
+            parked.push(format!(
+                "{} 个 MDB 声明了但当前项目目录里没有文件",
+                scope.not_in_project
+            ));
+        }
+        if scope.blocked > 0 {
+            parked.push(format!("{} 个阻断", scope.blocked));
+        }
+        if !parked.is_empty() {
+            ui.label(
+                RichText::new(format!("另有：{}", parked.join(" · ")))
+                    .font(Font::meta(d))
+                    .color(t.text_muted),
+            );
+        }
+
+        shadowed_card(ui, t, d, &preview.shadowed);
+        server_says(ui, t, d, preview);
     });
 }
 
@@ -2107,8 +2671,14 @@ fn legacy_db_rows(ui: &mut Ui, t: &Tokens, d: Density, db: &DbPreview, state: &m
 
 /// 首次导入库行（§2-G）：有勾选框（会执行、可排除），无 SITE 行可给——
 /// 「不看文件」的唯一例外。绝不能显示成「无变化」（S2-E 铁律不变）。
+/// 首次导入行与整库重建行共用：两者都没有 SITE 可说、都以文件名为身份、都会跑。
+/// 分别在 tag / meta / note：前者「需初始化 · 尚无数据水位」，后者「文件回退 · 整库重建」
+/// 加回退证据（两端各是哪一条保存）与「不可逆」——那是这一行与首次导入唯一的差别，
+/// 也是最不能省的一句。
 fn init_row(ui: &mut Ui, t: &Tokens, d: Density, db: &DbPreview, state: &mut State) {
     let checked = state.db_checked(db.dbnum);
+    let form = db.form();
+    let rebuild = form == DbForm::Reinitialize;
     let (tone_fg, _) = t.status(Status::Warn);
     let label = if db.file_name.is_empty() {
         format!("db{} · {}", db.dbnum, db.db_type)
@@ -2121,7 +2691,11 @@ fn init_row(ui: &mut Ui, t: &Tokens, d: Density, db: &DbPreview, state: &mut Sta
         d,
         Row {
             check: Some(checked),
-            icon: ph::SEAL_WARNING,
+            icon: if rebuild {
+                form.icon()
+            } else {
+                ph::SEAL_WARNING
+            },
             icon_color: tone_fg,
             label: &label,
             label_color: if checked {
@@ -2130,10 +2704,22 @@ fn init_row(ui: &mut Ui, t: &Tokens, d: Density, db: &DbPreview, state: &mut Sta
                 t.text_muted
             },
             strong: true,
-            tag: "需初始化",
+            tag: if rebuild {
+                form.label()
+            } else {
+                "需初始化"
+            },
             tag_color: tone_fg,
-            meta: "从未应用".into(),
-            note: "首次导入 · 整库生成 · 会执行",
+            meta: if rebuild {
+                db.window()
+            } else {
+                "尚无数据水位".into()
+            },
+            note: if rebuild {
+                form.note()
+            } else {
+                "首次导入 · 整库生成 · 会执行"
+            },
             note_color: tone_fg,
             fill: t.bg_header,
             ..Row::default()
@@ -2395,6 +2981,21 @@ fn summary_block(ui: &mut Ui, t: &Tokens, d: Density, applying: usize, totals: &
             false,
         );
     }
+    // 整库重建是这一页上唯一会删已应用数据的动作，不能只藏在行里。为 0 时不画。
+    if totals.reinitialize > 0 {
+        ui.add_space(d.px(10.0));
+        strip(
+            ui,
+            t,
+            d,
+            Status::Warn,
+            ph::CLOCK_COUNTER_CLOCKWISE,
+            &format!(
+                "{} 个库文件回退：确认后清空该库已应用数据、按当前文件整库重建，不可逆",
+                totals.reinitialize
+            ),
+        );
+    }
     // 预览与数据批次并发（合流后没有单飞预检）：正在被应用的会话也会被算进
     // 「待应用」。数字说不清来路就把来路说出来——为 0 时整条不画，不摆空话。
     if applying > 0 {
@@ -2410,17 +3011,22 @@ fn summary_block(ui: &mut Ui, t: &Tokens, d: Density, applying: usize, totals: &
     }
 }
 
-fn anomaly_copy(anomaly: &FileAnomaly) -> (&'static str, String) {
+/// 阻断卡 / 提示卡的「原因 · 影响 · 出路」三句。`blocked` 只对回退有意义：同一个
+/// 回退证据，服务端阻断（老形状）与整库重建（ADR-021）的影响和出路是两回事。
+fn anomaly_copy(anomaly: &FileAnomaly, blocked: bool) -> (&'static str, String) {
     match anomaly {
-        FileAnomaly::Rollback {
-            file_latest_sesno,
-            applied_sesno,
-        } => (
-            "会话号回退，本次跳过",
+        FileAnomaly::Rollback { .. } if !blocked => (
+            "文件回退，将整库重建",
             format!(
-                "原因：文件最新会话号 {} 低于已应用 {}。\n影响：水位不回退，其他库照常执行。\n出路：换回正确文件。",
-                group_number((*file_latest_sesno).into()),
-                group_number((*applied_sesno).into())
+                "原因：{}。\n影响：确认后 worker 清空该库已应用的数据，按当前文件从头重新解析；这一步不可逆，其他库照常执行。\n出路：若文件是被误换回旧版本，先换回正确文件再更新；确认是要退回旧版本才按下去。",
+                rollback_evidence(anomaly)
+            ),
+        ),
+        FileAnomaly::Rollback { .. } => (
+            "文件回退，本次跳过",
+            format!(
+                "原因：{}。\n影响：水位不回退，其他库照常执行。\n出路：换回正确文件。",
+                rollback_evidence(anomaly)
             ),
         ),
         FileAnomaly::PathMigrated { old_path, new_path } => (
@@ -2462,16 +3068,47 @@ fn hints_block(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, totals: &
 
     for db in preview.dbnums.iter().filter(|db| db.form().blocks()) {
         any = true;
-        let (title, body) = db.anomaly.as_ref().map(anomaly_copy).unwrap_or((
-            "文件异常，本次跳过",
-            "影响：水位不变。\n出路：检查项目文件。".into(),
-        ));
+        let (title, body) = db
+            .anomaly
+            .as_ref()
+            .map(|anomaly| anomaly_copy(anomaly, db.blocked))
+            .unwrap_or((
+                "文件异常，本次跳过",
+                "影响：水位不变。\n出路：检查项目文件。".into(),
+            ));
         note_card(
             ui,
             t,
             d,
             Status::Error,
             ph::WARNING_CIRCLE,
+            &format!("db{} · {title}", db.dbnum),
+            &body,
+        );
+        ui.add_space(d.px(10.0));
+    }
+
+    // 整库重建卡：它会跑，所以不是阻断卡的红；但它会删东西，所以也不是普通提示。
+    for db in preview
+        .dbnums
+        .iter()
+        .filter(|db| db.form() == DbForm::Reinitialize)
+    {
+        any = true;
+        let (title, body) = db
+            .anomaly
+            .as_ref()
+            .map(|anomaly| anomaly_copy(anomaly, db.blocked))
+            .unwrap_or((
+                "文件回退，将整库重建",
+                "影响：清空该库已应用数据后按当前文件重新解析，不可逆。".into(),
+            ));
+        note_card(
+            ui,
+            t,
+            d,
+            Status::Warn,
+            ph::CLOCK_COUNTER_CLOCKWISE,
             &format!("db{} · {title}", db.dbnum),
             &body,
         );
@@ -2487,7 +3124,7 @@ fn hints_block(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, totals: &
         let (title, body) = db
             .anomaly
             .as_ref()
-            .map(anomaly_copy)
+            .map(|anomaly| anomaly_copy(anomaly, db.blocked))
             .unwrap_or(("路径迁移，照常执行", String::new()));
         note_card(
             ui,
@@ -2565,6 +3202,12 @@ fn hints_block(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, totals: &
         ui.add_space(d.px(10.0));
     }
 
+    if !preview.shadowed.is_empty() {
+        any = true;
+        shadowed_card(ui, t, d, &preview.shadowed);
+        ui.add_space(d.px(10.0));
+    }
+
     for warning in &preview.warnings {
         any = true;
         note_card(ui, t, d, Status::Warn, ph::WARNING, "预览期告警", warning);
@@ -2612,6 +3255,21 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
                     .iter()
                     .filter(|db| db.will_run() && state.db_checked(db.dbnum))
                 {
+                    // 整库重建与首次导入同为文件级身份、同样整库生成，但前者会先
+                    // 删掉已应用的数据——行上分开说，色也分开（warn 不是 accent）。
+                    if db.form() == DbForm::Reinitialize {
+                        line(
+                            ui,
+                            t,
+                            d,
+                            Dot::Tone(t.warn),
+                            &format!("db{} · {}", db.dbnum, db.db_type),
+                            &db.window(),
+                            "文件回退 · 清空该库后整库重建 · 不可逆",
+                            t.warn,
+                        );
+                        continue;
+                    }
                     if db.initialization_required {
                         line(
                             ui,
@@ -2620,24 +3278,26 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
                             Dot::Tone(t.accent),
                             &format!("db{} · {}", db.dbnum, db.db_type),
                             &db.window(),
-                            "需初始化 · 整库生成 · 建立水位",
+                            "需初始化 · 整库生成 · 建立数据水位",
                             t.text_secondary,
                         );
                         continue;
                     }
+                    // S2-H 批次行摘要：「同库一批」交代联动折算；dbnum 只在这个括号里露面；
+                    // 保存次数照 ADR-0019 说「N 次保存」。
                     let sites = db.named_sites().count();
                     let note = if sites > 1 {
                         format!(
-                            "同库一批（db{}）· {} 个会话 · {} 项变化",
+                            "同库一批（db{}）· {} · {} 项变化",
                             db.dbnum,
-                            db.sessions.len(),
+                            db.saves_text(),
                             db.changes()
                         )
                     } else {
                         format!(
-                            "db{} · {} 个会话 · {} 项变化",
+                            "db{} · {} · {} 项变化",
                             db.dbnum,
-                            db.sessions.len(),
+                            db.saves_text(),
                             db.changes()
                         )
                     };
@@ -2683,7 +3343,7 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
                     Status::Info,
                     ph::GIT_MERGE,
                     &format!(
-                        "{previewed_at}开始时对勾选范围重新扫描，新会话自动并入本批次并逐条列出；未勾选的不扫描、不入队"
+                        "{previewed_at}开始时对勾选范围重新扫描，期间新产生的保存自动并入本批次并逐条列出；未勾选的不扫描、不入队"
                     ),
                 );
             },
@@ -2712,13 +3372,20 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
                 // 未勾选行：人自己选的，出路就是回上一步勾上。与阻断、够不着
                 // 不是一回事，三类不许合成一行。
                 for db in &unselected {
+                    // 窗口时间对与批次行同一个来源；老服务端给不出左端就只剩「N 次保存」。
+                    let window = db.window();
+                    let meta = if window.is_empty() {
+                        format!("数据水位落后 {}", db.saves_text())
+                    } else {
+                        format!("{window} · 落后 {}", db.saves_text())
+                    };
                     line(
                         ui,
                         t,
                         d,
                         Dot::Glyph(ph::SQUARE, t.text_muted),
                         &db.batch_title(),
-                        &format!("{} · {} 个会话待应用", db.window(), db.sessions.len()),
+                        &meta,
                         "未勾选 · 本次跳过，水位不变",
                         t.text_muted,
                     );
@@ -2791,10 +3458,7 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
                             d,
                             Dot::Tone(t.accent),
                             &format!("{} {}", unit.noun, unit.root_refno),
-                            &format!(
-                                "上次生成失败 · 已尝试 {} 次 · 来源会话 {}",
-                                unit.attempts, unit.source_end_sesno
-                            ),
+                            &retry_meta(unit),
                             "按最新状态只生成一次",
                             t.text_secondary,
                         );
@@ -2822,9 +3486,38 @@ fn confirm_body(ui: &mut Ui, t: &Tokens, d: Density, preview: &Preview, state: &
             Status::Warn,
             ph::WARNING,
             "开始后不能中途取消",
-            "数据批次一旦成功，已应用会话号立即推进且不回滚；模型生成失败的单元转入待重试，不影响已写入的数据。关闭窗口不会停任务。",
+            &irreversible_notice(&sel),
         );
     });
+}
+
+/// 「会一并处理」里待重试单元那一格：已尝试几次、来源是哪次保存（ADR-0019 Q7）。
+/// 来源时刻缺席（旧行、房间任务、反向级联派生根）时来源段整个不摆，不回落成会话号。
+fn retry_meta(unit: &PendingModelUnit) -> String {
+    let mut parts = vec![
+        "上次生成失败".to_owned(),
+        format!("已尝试 {} 次", unit.attempts),
+    ];
+    if let Some(at) = unit.source_end_sesno_time.as_deref() {
+        parts.push(format!("来源保存 {}", e3d_time(at)));
+    }
+    parts.join(" · ")
+}
+
+/// 确认页底下那句不可逆声明——它是人按下确认前唯一能看到的不可逆声明，「不回滚」
+/// 不许省；勾中了整库重建的库时再加一句：那一步会**先删**已应用的数据，与「只前进」
+/// 是相反方向的不可逆，得单独点名。
+fn irreversible_notice(sel: &Selection) -> String {
+    let mut text = String::from(
+        "数据批次一旦成功，水位立即推进且不回滚；模型生成失败的单元转入待重试，不影响已写入的数据。关闭窗口不会停任务。",
+    );
+    if sel.reinitialize > 0 {
+        text.push_str(&format!(
+            "\n本次勾中 {} 个文件回退的库：确认后先清空该库已应用的数据，再按当前文件整库重新解析——被删掉的数据不会回来。",
+            sel.reinitialize
+        ));
+    }
+    text
 }
 
 // ================================================================ 失败态
@@ -3145,7 +3838,9 @@ fn stat_row(
 }
 
 /// 按比例铺开的横条。分布条与进度条是同一个零件：都只是「几段各占多少」。
-fn ratio_bar(ui: &mut Ui, t: &Tokens, d: Density, segments: &[(u32, Color32)]) {
+///
+/// 终态行内明细的增删改分布条也用它（`task_queue`），两处认得出是同一组视觉。
+pub(crate) fn ratio_bar(ui: &mut Ui, t: &Tokens, d: Density, segments: &[(u32, Color32)]) {
     let h = d.px(8.0);
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
     let cr = CornerRadius::same((h / 2.0) as u8);
@@ -3546,6 +4241,8 @@ mod tests {
                 FileAnomaly::Rollback {
                     file_latest_sesno: 812,
                     applied_sesno: 1005,
+                    file_latest_sesno_time: None,
+                    applied_sesno_time: None,
                 },
                 DbForm::Rollback,
             ),
@@ -3581,6 +4278,347 @@ mod tests {
         let excluded = db(8191, "CATA");
         assert_eq!(excluded.form(), DbForm::Excluded);
         assert!(!excluded.will_run());
+    }
+
+    /// gen-model ADR-021（2026-08-13）：回退不再阻断——服务端给 `blocked: false` +
+    /// `initialization_required: true`，worker 出队后清空该库、按当前文件重新解析。
+    /// 这一形状此前同时命中 `form().blocks()`（进「本期不执行」段与阻断卡）和
+    /// `will_run()`（进批次数与勾选集）：同一库在预览树上两行、确认页两张卡、
+    /// 主按钮数它一次而阻断计数不数它。上面那条用例只造了 `blocked: true` 的老形状，
+    /// 所以一直是绿的。
+    #[test]
+    fn a_rolled_back_file_the_server_will_rebuild_is_one_batch_not_a_block() {
+        let mut rebuild = db(8003, "DESI");
+        rebuild.initialization_required = true;
+        rebuild.anomaly = Some(FileAnomaly::Rollback {
+            file_latest_sesno: 812,
+            applied_sesno: 1005,
+            file_latest_sesno_time: Some("2026-07-01T10:00:00+08:00".into()),
+            applied_sesno_time: Some("2026-08-05T18:24:00+08:00".into()),
+        });
+        assert_eq!(rebuild.form(), DbForm::Reinitialize);
+        assert!(!rebuild.form().blocks(), "整库重建会跑，不是阻断");
+        assert!(rebuild.will_run());
+        assert!(
+            rebuild.window().contains("早于已应用的保存"),
+            "行上摆的是回退证据：{}",
+            rebuild.window()
+        );
+
+        let preview = Preview {
+            dbnums: vec![rebuild.clone()],
+            ..Default::default()
+        };
+        let totals = preview.totals();
+        assert_eq!(
+            (totals.batches, totals.reinitialize, totals.blocked),
+            (1, 1, 0)
+        );
+        // 预览树段一（首次导入 / 整库重建行）与段二（本期不执行）的过滤条件必须互斥。
+        let in_first = preview
+            .dbnums
+            .iter()
+            .filter(|db| db.will_run() && db.initialization_required)
+            .count();
+        let in_parked = preview
+            .dbnums
+            .iter()
+            .filter(|db| db.form().blocks() || db.form() == DbForm::NotInProject)
+            .count();
+        assert_eq!((in_first, in_parked), (1, 0), "同一库不许两行");
+        // 确认页那句不可逆声明要把「先清库」点出来——那是与「只前进」相反方向的不可逆。
+        let state = State::default();
+        let sel = selection(&preview, &state);
+        assert_eq!(sel.reinitialize, 1);
+        assert!(irreversible_notice(&sel).contains("先清空该库已应用的数据"));
+        assert!(!irreversible_notice(&Selection::default()).contains("清空"));
+
+        // 老服务端仍给 `blocked: true`——那一档照旧是阻断，一个字不变。
+        let mut blocked = rebuild;
+        blocked.blocked = true;
+        assert_eq!(blocked.form(), DbForm::Rollback);
+        assert!(blocked.form().blocks());
+        assert!(!blocked.will_run());
+    }
+
+    /// 回退证据按 ADR-0019 Q6 说两个时刻；服务端给不出时退回会话号；已应用端缺
+    /// 时刻时说「应用时刻无记录」，不拿挂钟兜底。两枚时刻字段是 `serde(default)`，
+    /// 老服务端的 payload 照旧解得动。
+    #[test]
+    fn rollback_evidence_speaks_times_when_the_server_gives_them() {
+        let latest = "2026-07-01T10:00:00+08:00";
+        let applied = "2026-08-05T18:24:00+08:00";
+        let both = FileAnomaly::Rollback {
+            file_latest_sesno: 812,
+            applied_sesno: 1005,
+            file_latest_sesno_time: Some(latest.into()),
+            applied_sesno_time: Some(applied.into()),
+        };
+        assert_eq!(
+            rollback_evidence(&both),
+            format!(
+                "文件里最新的保存（{}）早于已应用的保存（{}）",
+                e3d_time(latest),
+                e3d_time(applied)
+            )
+        );
+        let half = FileAnomaly::Rollback {
+            file_latest_sesno: 812,
+            applied_sesno: 1005,
+            file_latest_sesno_time: Some(latest.into()),
+            applied_sesno_time: None,
+        };
+        let text = rollback_evidence(&half);
+        assert!(
+            text.contains("应用时刻无记录") && !text.contains("早于已应用的保存（"),
+            "{text}"
+        );
+        let none = FileAnomaly::Rollback {
+            file_latest_sesno: 812,
+            applied_sesno: 1005,
+            file_latest_sesno_time: None,
+            applied_sesno_time: None,
+        };
+        assert!(rollback_evidence(&none).starts_with("文件最新会话号"));
+
+        let decoded: FileAnomaly = serde_json::from_str(
+            r#"{"kind":"rollback","file_latest_sesno":812,"applied_sesno":1005,
+                "file_latest_sesno_time":"2026-07-01T10:00:00+08:00","applied_sesno_time":null}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            decoded,
+            FileAnomaly::Rollback {
+                file_latest_sesno_time: Some(_),
+                applied_sesno_time: None,
+                ..
+            }
+        ));
+        let legacy: FileAnomaly = serde_json::from_str(
+            r#"{"kind":"rollback","file_latest_sesno":812,"applied_sesno":1005}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            FileAnomaly::Rollback {
+                file_latest_sesno_time: None,
+                applied_sesno_time: None,
+                ..
+            }
+        ));
+    }
+
+    /// 回执里 `intent = "reinitialize"` 是「按下去会先删东西」在服务端回执上唯一的
+    /// 出处，日志那句摘要不许吞掉它；老服务端不给这个键，按普通窗口说。
+    #[test]
+    fn the_enqueue_receipt_names_the_batches_that_rebuild_a_database() {
+        let receipt: Enqueued = serde_json::from_str(
+            r#"{"scanned":2,"enqueued":[
+                {"task_id":"a","dbnum":8003,"position":1,"intent":"reinitialize"},
+                {"task_id":"b","dbnum":8000,"position":2,"intent":"apply_window"}]}"#,
+        )
+        .unwrap();
+        assert!(receipt.enqueued[0].rebuilds());
+        assert!(!receipt.enqueued[1].rebuilds());
+        let summary = receipt.summary();
+        assert!(
+            summary.contains("db8003 排第 1 位（文件回退 · 清库整库重建）"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("db8000 排第 2 位") && !summary.contains("db8000 排第 2 位（"),
+            "{summary}"
+        );
+
+        let legacy: Enqueued =
+            serde_json::from_str(r#"{"enqueued":[{"task_id":"a","dbnum":8003}]}"#).unwrap();
+        assert!(!legacy.enqueued[0].rebuilds());
+    }
+
+    /// gen-model 读透形态（出厂默认，d-581）的预览回执与 `handlers.rs:1168` 逐字同形：
+    /// 空表 + `up_to_date: true` + `data_face: "read-through"`。此前向导拿它当「已是最新」
+    /// ——文件里有一百次新保存也这么说。现在靠 `data_face` 分岔，标题不许再说「已是最新」。
+    #[test]
+    fn a_read_through_preview_is_a_model_refresh_not_up_to_date() {
+        let preview: Preview = serde_json::from_str(
+            r#"{"project":"AMS","mdb":"/ALL","namespace":"ams","data_face":"read-through",
+                "dbnums":[],"pending_model_retries":[],
+                "warnings":["read-through 模式不生成数据摄入预览；执行只复核模型与缓存"],
+                "up_to_date":true,"data_batches":[],
+                "message":"read-through preview only schedules model/cache refresh; applied_sesno is unchanged"}"#,
+        )
+        .unwrap();
+        assert!(preview.read_through());
+        assert!(
+            preview.up_to_date,
+            "契约就是这么给的，分岔靠 data_face 不靠它"
+        );
+        let (title, sub, tone, _) =
+            header_text(&Vm::Ready(preview), &State::default(), "/ALL", None);
+        assert!(title.contains("读透"), "{title}");
+        assert!(!title.contains("已是最新"), "{title}");
+        assert!(sub.contains("水位不动"), "{sub}");
+        assert_eq!(tone, Status::Info);
+
+        // 摄入形态的空表才是「已是最新」，老服务端不给 data_face 也归这一档。
+        let ingest: Preview = serde_json::from_str(
+            r#"{"project":"AMS","dbnums":[],"warnings":[],"up_to_date":true}"#,
+        )
+        .unwrap();
+        assert!(!ingest.read_through());
+        let (title, ..) = header_text(&Vm::Ready(ingest), &State::default(), "/ALL", None);
+        assert!(title.contains("已是最新"), "{title}");
+    }
+
+    /// 读透形态的范围名单来自 `/dbnums`，分档口径与队列面板「本期不执行」同一套：
+    /// 排除（非 DESI / 不在 MDB 名单）、够不着、阻断各自数，剩下的按 dbnum 排成范围行。
+    /// 行上的判决句：`not_judged` 说「不判」带理由，**不说落后**（d-594 Q4）。
+    #[test]
+    fn read_through_scope_splits_rows_like_the_queue_panel_and_keeps_not_judged_neutral() {
+        let mk = |dbnum, db_type: &str| DbnumStatus {
+            dbnum,
+            db_type: db_type.into(),
+            file_latest_sesno: 289,
+            model_source: Some(crate::task_queue::ModelSource::Memory),
+            model_source_reason: Some("read-through".into()),
+            model_verdict: Some("not_judged".into()),
+            model_verdict_reason: Some("read-through".into()),
+            ..Default::default()
+        };
+        let rows = vec![
+            mk(8000, "DESI"),
+            DbnumStatus {
+                excluded: true,
+                ..mk(8191, "CATA")
+            },
+            DbnumStatus {
+                not_in_project: true,
+                ..mk(7015, "DESI")
+            },
+            DbnumStatus {
+                blocked: true,
+                ..mk(8003, "DESI")
+            },
+            mk(7997, "DESI"),
+            mk(7999, "ISOD"),
+        ];
+        let scope = read_through_scope(&rows);
+        assert_eq!(
+            scope.rows.iter().map(|db| db.dbnum).collect::<Vec<_>>(),
+            vec![7997, 7999, 8000],
+            "范围行按 dbnum 排，ISOD 也算设计库"
+        );
+        assert_eq!(
+            (scope.excluded, scope.not_in_project, scope.blocked),
+            (1, 1, 1)
+        );
+        let note = read_through_row_note(scope.rows[0]);
+        assert!(note.contains("读透"), "{note}");
+        assert!(note.contains("不判"), "{note}");
+        assert!(!note.contains("落后"), "不判是中性态：{note}");
+        // 服务端没给判决与来源（老服务端）→ 整句空，不编。
+        assert_eq!(read_through_row_note(&DbnumStatus::default()), "");
+    }
+
+    /// 读透形态的 execute 回执只有一句 `status`（`handlers.rs:1215`）。五桶对账在它身上
+    /// 不成立——此前日志会说「扫描 0 个库，没有需要入队的批次，回执也没说这些库各自是
+    /// 什么去向」，把一次成功的模型复核讲成一句反话。
+    #[test]
+    fn a_read_through_execute_receipt_says_model_refresh_not_zero_scans() {
+        let receipt: Enqueued = serde_json::from_str(
+            r#"{"project":"AMS","mdb":"/ALL","namespace":"ams","data_face":"read-through",
+                "data_batches":[],"status":"model_refresh_queued","applied_sesno_changed":false}"#,
+        )
+        .unwrap();
+        assert!(receipt.model_refresh_only());
+        let summary = receipt.summary();
+        assert!(summary.contains("不摄入数据"), "{summary}");
+        assert!(summary.contains("水位不变"), "{summary}");
+        assert!(!summary.contains("扫描 0 个库"), "{summary}");
+
+        // 摄入形态的空回执照旧走五桶对账那条兜底句。
+        let idle: Enqueued = serde_json::from_str(r#"{"scanned":3}"#).unwrap();
+        assert!(!idle.model_refresh_only());
+        assert!(idle.summary().contains("扫描 3 个库"));
+    }
+
+    /// 跨项目同号文件被遮蔽：预览与执行回执都给这一格，界面此前一格未解。它不在
+    /// 五桶里、也不计进 `scanned`，所以只要不单独说一句就彻底没人提——而它说的正是
+    /// 「本期这些话是在哪一个项目的哪一份文件上说的」。
+    #[test]
+    fn a_shadowed_cross_project_file_is_named_wherever_the_scope_is_stated() {
+        let preview: Preview = serde_json::from_str(
+            r#"{"project":"AMS","dbnums":[],"up_to_date":true,
+                "warnings":["库侧 MDB 表还是空的，范围改取自 SYS 库文件"],
+                "shadowed":[{"project":"AvevaMarineSample","dbnum":7355,
+                             "file_path":"D:/proj/marine/cata/ams7355_0001",
+                             "selected_project":"AMS"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(preview.shadowed.len(), 1);
+        let line = preview.shadowed[0].line();
+        assert!(
+            line.contains("db7355") && line.contains("AvevaMarineSample") && line.contains("AMS"),
+            "{line}"
+        );
+        assert!(
+            line.contains("ams7355_0001"),
+            "同号不同项目时，路径是人认出这一份的唯一凭据：{line}"
+        );
+
+        let (title, body) = shadowed_copy(&preview.shadowed).expect("有遮蔽就要说");
+        assert!(title.contains("1 个"), "{title}");
+        assert!(
+            body.contains("catalogue_project_priority"),
+            "要说得出换成另一份怎么做：{body}"
+        );
+        assert!(shadowed_copy(&[]).is_none(), "一份都没有时整张卡不画");
+
+        // 回执那一半：一行都没排时也要说，排上了就挂在末尾。
+        let shadowed = r#""shadowed":[{"project":"AvevaMarineSample","dbnum":7355,
+                          "file_path":"D:/proj/marine/cata/ams7355_0001",
+                          "selected_project":"AMS"}]"#;
+        let idle: Enqueued =
+            serde_json::from_str(&format!(r#"{{"scanned":3,{shadowed}}}"#)).unwrap();
+        let summary = idle.summary();
+        assert!(summary.contains("扫描 3 个库"), "{summary}");
+        assert!(
+            summary.contains("遮蔽未读") && summary.contains("db7355"),
+            "{summary}"
+        );
+
+        let busy: Enqueued = serde_json::from_str(&format!(
+            r#"{{"scanned":4,"up_to_date":3,
+                 "enqueued":[{{"task_id":"db-8000-9","dbnum":8000,"position":1}}],{shadowed}}}"#
+        ))
+        .unwrap();
+        let summary = busy.summary();
+        assert!(summary.contains("已入队 1 个数据批次"), "{summary}");
+        assert!(
+            summary.contains("遮蔽未读"),
+            "五桶非空时也不许吞掉它：{summary}"
+        );
+
+        // 老服务端不给这一格：解成空表，谁也不说。
+        let old: Enqueued = serde_json::from_str(r#"{"scanned":1,"up_to_date":1}"#).unwrap();
+        assert!(old.shadowed.is_empty());
+        assert!(!old.summary().contains("遮蔽"), "{}", old.summary());
+    }
+
+    /// 「已是最新」此前只画一张成功卡，于是服务端在这次预览里说的话整块看不见——
+    /// 09-07 那句「库侧 MDB 表还是空的，范围改取自 SYS 库文件」正好落在这一态。
+    /// 没有变化的时候，恰恰最该说清这句「最新」是在什么范围、哪一份文件上说的。
+    #[test]
+    fn the_up_to_date_page_still_repeats_what_the_server_said() {
+        // 这棵树 CRLF / LF 混用，`include_str!` 原样带回来；探针按 LF 写，先归一。
+        let source = include_str!("model_update.rs").replace("\r\n", "\n");
+        let body = source
+            .split_once("fn up_to_date_body(")
+            .expect("「已是最新」那一页存在")
+            .1;
+        let body = &body[..body.find("\n}\n").expect("函数体收尾")];
+        assert!(body.contains("server_says("), "服务端的话要画出来：{body}");
+        assert!(body.contains("shadowed_card("), "遮蔽要画出来：{body}");
     }
 
     /// 「够不着」与「文件缺失」是两回事，最要紧的是**它不阻断**：MDB 声明了
@@ -3694,6 +4732,8 @@ mod tests {
         blocked.anomaly = Some(FileAnomaly::Rollback {
             file_latest_sesno: 812,
             applied_sesno: 1005,
+            file_latest_sesno_time: None,
+            applied_sesno_time: None,
         });
 
         let preview = Preview {
@@ -3818,6 +4858,98 @@ mod tests {
         assert_eq!(outcome.units[0].attempts, 3);
     }
 
+    /// 增删改三数齐备：拆得出分解，且三数之和等于总数（同源计算）——界面照它画三数 + 分布条。
+    #[test]
+    fn change_breakdown_reads_the_three_counts_when_present() {
+        let outcome: Outcome = serde_json::from_str(
+            r#"{
+                "batch":{"dbnum":7997,"start_sesno":41,"end_sesno":48,
+                    "status":"applied","changed_elements":85,
+                    "added_elements":18,"modified_elements":64,"deleted_elements":3}
+            }"#,
+        )
+        .unwrap();
+        let batch = outcome.batch.expect("批次摘要应当能解出来");
+        let breakdown = batch.change_breakdown().expect("三数齐备时必须拆得出分解");
+        assert_eq!(
+            (breakdown.added, breakdown.modified, breakdown.deleted),
+            (18, 64, 3)
+        );
+        assert_eq!(
+            breakdown.total(),
+            batch.changed_elements,
+            "三数之和必须等于总数"
+        );
+    }
+
+    /// 老回执缺这一组字段：三数缺省成 0 而总数仍在——**只报总数，绝不画 0 / 0 / 0**。
+    #[test]
+    fn change_breakdown_is_absent_on_legacy_receipts() {
+        let outcome: Outcome = serde_json::from_str(
+            r#"{
+                "batch":{"dbnum":7997,"start_sesno":41,"end_sesno":48,
+                    "status":"applied","changed_elements":85}
+            }"#,
+        )
+        .unwrap();
+        let batch = outcome.batch.unwrap();
+        assert!(
+            batch.change_breakdown().is_none(),
+            "缺字段（全 0）不得当作分解，交给调用点只报总数"
+        );
+        assert_eq!(batch.changed_elements, 85, "总数照旧读得到");
+    }
+
+    /// 真零：一个字段都没变、总数也是 0——分解为无，整个变化区本来就不画。
+    #[test]
+    fn change_breakdown_is_absent_on_a_true_zero_batch() {
+        let outcome: Outcome = serde_json::from_str(
+            r#"{
+                "batch":{"dbnum":7997,"start_sesno":41,"end_sesno":41,
+                    "status":"applied","changed_elements":0}
+            }"#,
+        )
+        .unwrap();
+        let batch = outcome.batch.unwrap();
+        assert!(batch.change_breakdown().is_none());
+        assert_eq!(batch.changed_elements, 0);
+    }
+
+    /// 刚体前移根数只数成功走便宜路的单元（`kind == transform && status == generated`）：
+    /// 整根重算的 regen 根不算，前移失败的也不算。
+    #[test]
+    fn transform_roots_counts_only_generated_transform_units() {
+        let outcome: Outcome = serde_json::from_str(
+            r#"{
+                "units":[
+                    {"dbnum":7997,"root_refno":"24384/2","noun":"EQUI",
+                        "status":"generated","kind":"transform"},
+                    {"dbnum":7997,"root_refno":"24384/9","noun":"BRAN",
+                        "status":"generated","kind":"regen"},
+                    {"dbnum":7997,"root_refno":"24384/7","noun":"EQUI",
+                        "status":"failed","kind":"transform"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(outcome.transform_roots(), 1, "只数成功前移的那一根");
+    }
+
+    /// 老回执没有 `kind` 列 → 整组缺省 `Regen` → 刚体前移计数为 0 → 那一句整格不画。
+    #[test]
+    fn transform_roots_is_zero_on_legacy_receipts() {
+        let outcome: Outcome = serde_json::from_str(
+            r#"{
+                "units":[
+                    {"dbnum":7997,"root_refno":"24384/2","noun":"EQUI","status":"generated"},
+                    {"dbnum":7997,"root_refno":"24384/9","noun":"BRAN","status":"generated"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(outcome.transform_roots(), 0);
+    }
+
     /// 入队回执是数组不是单个 task_id：一次扫描可能排下好几个库，也可能一行都没排。
     /// 解成旧的 `{task_id, kind, state}` 会**直接反序列化失败**，界面落到一个
     /// 看不懂的 internal 错误页——这正是合流之后向导那枚按钮坏掉的形态。
@@ -3888,21 +5020,78 @@ mod tests {
         assert!(short.contains("另有 5 个库回执没交代去向"), "{short}");
     }
 
-    /// 会话区间从**水位的下一号**起算。需初始化的库契约不为它解区间，
-    /// 那一行不许摆一个假的 `sesno 1 → 0`——那看起来像「有一条会话待应用」。
+    /// 保存窗口那一格说的是窗口**自身两端**的写入时刻（ADR-0019 Q3）：左端是第一条待应用
+    /// 保存 `first_pending_sesno_time`（不是上次应用的那条 `applied_sesno_time`），右端是文件
+    /// 最新。老服务端给不出左端就整格不画、**不回落成会话号**；需初始化的库契约不为它解
+    /// 区间，那一行不许摆一个假的 `1 → 0`——那看起来像「有一条保存待应用」。
     #[test]
-    fn the_session_window_starts_one_past_the_watermark() {
+    fn the_save_window_speaks_its_own_two_ends_or_nothing() {
         let mut pending = db(8000, "DESI");
         pending.applied_sesno = 1023;
         pending.file_latest_sesno = 1031;
-        assert_eq!(pending.window(), "sesno 1024 → 1031");
+        pending.sessions = vec![SessionPreview::default(); 8];
+        let applied = "2026-07-30T18:24:00+08:00";
+        let first = "2026-08-01T09:12:00+08:00";
+        let latest = "2026-08-07T14:10:00+08:00";
+        pending.applied_sesno_time = Some(applied.into());
+        pending.file_latest_sesno_time = Some(latest.into());
+        // 老服务端：有上次应用与文件最新，没有窗口左端 → 整格不画。
+        assert_eq!(pending.window(), "");
+        assert!(!pending.window().contains("sesno"));
+        assert_eq!(pending.saves_text(), "8 次保存");
 
-        pending.initialization_required = true;
+        pending.first_pending_sesno_time = Some(first.into());
+        assert_eq!(
+            pending.window(),
+            format!("{} → {}", e3d_time(first), e3d_time(latest))
+        );
         assert!(
-            !pending.window().contains("sesno"),
-            "首次导入尚无权威水位，不许摆区间：{}",
+            !pending.window().contains(&e3d_time(applied)),
+            "左端是这批的第一条，不是上次应用的那条：{}",
             pending.window()
         );
+        // SITE 详情行同样不再露 sesno 区间，按水位说话：「数据水位 X → 文件最新 Y · 落后 8 次保存」。
+        let detail = pending.site_detail_line("");
+        assert!(
+            detail.contains("数据水位") && detail.contains("落后 8 次保存"),
+            "{detail}"
+        );
+        assert!(
+            !detail.contains("sesno") && !detail.contains("待应用"),
+            "{detail}"
+        );
+
+        pending.initialization_required = true;
+        assert_eq!(pending.window(), "首次导入 · 尚无权威水位");
+    }
+
+    /// 待重试单元的来源段说「来源保存 时刻」（ADR-0019 Q7）；时刻缺席时来源段整个不摆，
+    /// 不回落成会话号。
+    #[test]
+    fn a_retry_names_its_source_save_by_time_or_not_at_all() {
+        let at = "2026-08-05T18:24:00+08:00";
+        let unit = PendingModelUnit {
+            dbnum: 8000,
+            root_refno: "24381/1".into(),
+            noun: "BRAN".into(),
+            source_end_sesno: 1029,
+            source_end_sesno_time: Some(at.into()),
+            attempts: 2,
+            ..Default::default()
+        };
+        let meta = retry_meta(&unit);
+        assert!(
+            meta.contains(&format!("来源保存 {}", e3d_time(at))),
+            "{meta}"
+        );
+        assert!(!meta.contains("1029") && !meta.contains("会话"), "{meta}");
+
+        let legacy = PendingModelUnit {
+            source_end_sesno_time: None,
+            ..unit
+        };
+        let meta = retry_meta(&legacy);
+        assert_eq!(meta, "上次生成失败 · 已尝试 2 次");
     }
 
     /// `footer_hint` 是 `match vm` 带 guard，而**臂的先后是有意义的**：确认页那一臂

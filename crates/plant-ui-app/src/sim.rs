@@ -19,7 +19,7 @@
 //! - db8001：CATA，非 DESI 不进本期执行范围；
 //! - 数据批次跑空后收一轮房间归属重算（泳道 Converging → Converged）。
 //!
-//! 另有一档服务形态开关 `PLANT_UI_SIM_SERVICE=direct-no-worker`（见 [`ServiceMode`]）：
+//! 另有一档服务形态开关 `PLANT_UI_SIM_SERVICE=direct-no-worker | read-through`（见 [`ServiceMode`]）：
 //! 演 gen-model 以 direct 形态运行、没起 worker——预览照常、执行入口该灰、入了队的
 //! 批次永远排队。
 //!
@@ -33,12 +33,13 @@ use chrono::{DateTime, Duration, SecondsFormat, Utc};
 
 use plant_ui::model_update::{
     BatchResult, BatchStatus, BlockedDbnum, DbPreview, Enqueued, EnqueuedBatch, FileAnomaly,
-    Outcome, PendingModelUnit, Preview, ProgressEvent, RunStatus, SessionPreview, SitePreview,
-    TransformTargetPreview, UnitPreview, UnitResult, UnitStatus, ZonePreview,
+    Outcome, PendingModelUnit, Preview, ProgressEvent, RunStatus, SessionPreview,
+    ShadowedCandidate, SitePreview, TransformTargetPreview, UnitKind, UnitPreview, UnitResult,
+    UnitStatus, ZonePreview,
 };
 use plant_ui::task_queue::{
-    DbnumStatus, Health, KIND_DATA_BATCH, KIND_ROOM_RECALC, ModelSource, Poll, QueueRow,
-    QueueSnapshot, RoomCounts, TaskEntry,
+    CatalogueReconcile, DbnumStatus, Health, KIND_DATA_BATCH, KIND_ROOM_RECALC, ModelSource, Poll,
+    QueueRow, QueueSnapshot, RoomCounts, TaskEntry,
 };
 use plant_ui_data::{Attr, AttrKind, EleTreeNode, RefU64};
 
@@ -76,6 +77,12 @@ pub fn enabled() -> bool {
 enum ServiceMode {
     Legacy,
     DirectNoWorker,
+    /// `PLANT_UI_SIM_SERVICE=read-through`：gen-model 的出厂默认形态（d-581）。`/health`
+    /// 报 `data_face = "read-through"`、worker 在；`/update/preview` 回空表 + `up_to_date`
+    /// + `data_face`（与 `handlers.rs:1168` 同形），`/update/execute` 回
+    /// `status = "model_refresh_queued"`、不排任何数据批次；`/dbnums` 每行 `applied_sesno = 0`、
+    /// 模型来源「内存（读透）」、判决 `not_judged / read-through`。
+    ReadThrough,
 }
 
 impl ServiceMode {
@@ -86,6 +93,7 @@ impl ServiceMode {
     fn parse(raw: Option<&str>) -> Self {
         match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
             Some("direct-no-worker") | Some("direct_no_worker") => Self::DirectNoWorker,
+            Some("read-through") | Some("read_through") => Self::ReadThrough,
             _ => Self::Legacy,
         }
     }
@@ -93,15 +101,26 @@ impl ServiceMode {
     fn data_read_mode(self) -> &'static str {
         match self {
             Self::Legacy => "db",
-            Self::DirectNoWorker => "direct",
+            Self::DirectNoWorker | Self::ReadThrough => "direct",
+        }
+    }
+
+    fn data_face(self) -> &'static str {
+        match self {
+            Self::Legacy | Self::DirectNoWorker => "ingest",
+            Self::ReadThrough => "read-through",
         }
     }
 
     fn worker_alive(self) -> Option<bool> {
         match self {
-            Self::Legacy => Some(true),
+            Self::Legacy | Self::ReadThrough => Some(true),
             Self::DirectNoWorker => None,
         }
+    }
+
+    fn read_through(self) -> bool {
+        self == Self::ReadThrough
     }
 }
 
@@ -139,6 +158,9 @@ struct SimUnit {
     /// pre 状态下它归哪个 SITE——只有跨 SITE 挪过的单元才有。
     moved_from: Option<SimSite>,
     fail: Option<&'static str>,
+    /// 这一根走刚体前移便宜路（ADR-066：只动方位、网格未重算）。映射到回执的
+    /// `UnitResult.kind = Transform`；`false` = 整根重算（默认 `Regen`）。
+    transform: bool,
 }
 
 /// 一个库的脚本状态。`applied` 会随批次完成推进，是引擎里唯一的「水位」。
@@ -279,6 +301,12 @@ struct SimBatch {
     /// 界面按下标配对，所以这里也只能一起 push。
     merged_at_ago_h: Vec<Option<i64>>,
     changed_elements: u64,
+    /// 增 / 删 / 改三数（`BatchResult` 的分解字段）。取自 SimDb 的 `net`——与
+    /// `changed_elements` 同源、三数之和等于它；`net` 全 0 的库（需初始化 / 无分解）
+    /// 天然落进「分解缺席」分支，终态明细只报总数、不画 0 / 0 / 0。
+    added: u64,
+    modified: u64,
+    deleted: u64,
     stage: Stage,
     state: &'static str, // 终态串："succeeded" | "partial"
     units_done: u32,
@@ -407,6 +435,14 @@ pub struct Engine {
     retries_due: Vec<(String, DateTime<Utc>)>,
     /// db7002 排队期间「新到会话并入」的一次性剧本还没演过。
     absorb_pending: bool,
+    /// 第一轮房间收敛后「db7001 / db7002 又各存了一次盘」的一次性剧本还没演过。
+    /// 它是库行「立即执行」Ready 态在剧本里唯一的入口（09-08 计划 §七.1 的起点）：
+    /// 不演这一幕，跑空之后每一行都追平，可点的按钮与粗版气泡就永远摆不出来。
+    late_save_pending: bool,
+    /// 晚到保存那一刻「服务端判出模型落后」的线：(dbnum, 根数)。`/dbnums` 的
+    /// `model_chasing_roots` 只在这里有值——粗版气泡的模型段「落后约 N 根（服务端判）」
+    /// 吃它；那个库的任务一跑完就清（模型追上了）。
+    late_chasing: Option<(u32, u32)>,
     announced_feed: bool,
     last_activity: DateTime<Utc>,
     seq: u32,
@@ -433,6 +469,8 @@ impl Engine {
             pending: Vec::new(),
             retries_due: Vec::new(),
             absorb_pending: true,
+            late_save_pending: true,
+            late_chasing: None,
             announced_feed: false,
             last_activity: now,
             seq: 0,
@@ -575,6 +613,22 @@ impl Engine {
     }
 
     pub fn preview(&self) -> Preview {
+        // 读透形态的预览与真服务同形（`handlers.rs:1168`）：空表 + `up_to_date`——向导
+        // 靠 `data_face` 把它与「已是最新」分开，这里要演的正是那一格。
+        if self.service.read_through() {
+            return Preview {
+                project: PROJECT.into(),
+                mdb: MDB.into(),
+                data_face: "read-through".into(),
+                warnings: vec![
+                    "模拟模式（PLANT_UI_SIM=1）：以下数据由内置剧本生成，仅用于界面演示".into(),
+                    "read-through 模式不生成数据摄入预览；执行只复核模型与缓存".into(),
+                ],
+                message: "read-through preview only schedules model/cache refresh; applied_sesno is unchanged".into(),
+                up_to_date: true,
+                ..Default::default()
+            };
+        }
         let dbnums = self
             .dbs
             .iter()
@@ -622,6 +676,13 @@ impl Engine {
                     file_latest_sesno: db.latest,
                     applied_sesno_time: self.e3d_stamp(db.applied_at_ago_h),
                     file_latest_sesno_time: self.e3d_stamp(db.latest_at_ago_h),
+                    // 窗口左端 = 这批的第一条保存：剧本里取「上次应用」之后一小时那一存，
+                    // 与右端同一把尺子；没有待应用窗口的库给不出左端（与真服务同口径）。
+                    first_pending_sesno_time: if pending_units {
+                        self.e3d_stamp(db.applied_at_ago_h.map(|h| (h - 1).max(0)))
+                    } else {
+                        None
+                    },
                     sites: if pending_units {
                         db.site_buckets(&units)
                     } else {
@@ -663,7 +724,17 @@ impl Engine {
             warnings: vec![
                 "模拟模式（PLANT_UI_SIM=1）：以下数据由内置剧本生成，仅用于界面演示".into(),
             ],
+            // 剧本里 db8191（CATA）在另一个项目目录下还有一份同号文件，被显式项目
+            // 优先级盖住。它不进五桶、也不计进 `scanned`——演的就是「不单独说就没人提」。
+            shadowed: vec![ShadowedCandidate {
+                project: "AvevaMarineSample".into(),
+                dbnum: 8191,
+                file_path: "D:/proj/marine/cata/ams8191_0001".into(),
+                selected_project: PROJECT.into(),
+            }],
             up_to_date: !self.dbs.iter().any(SimDb::runnable),
+            data_face: self.service.data_face().into(),
+            message: String::new(),
         }
     }
 
@@ -671,6 +742,16 @@ impl Engine {
     /// `Some` 时未勾选的库不扫描、不入队、水位不动，只进回执的 `unselected`。
     /// **`Some(&[])` 是「一个都不勾」而不是「没选择」**，两者在这里也不许混。
     pub fn execute(&mut self, dbnums: Option<&[u32]>) -> Enqueued {
+        // 读透形态：不排数据批次，回执只有一句 `status`（`handlers.rs:1215`）。
+        if self.service.read_through() {
+            self.last_activity = Utc::now();
+            return Enqueued {
+                project: PROJECT.into(),
+                data_face: "read-through".into(),
+                status: "model_refresh_queued".into(),
+                ..Default::default()
+            };
+        }
         let now = Utc::now();
         let mut receipt = Enqueued {
             project: PROJECT.into(),
@@ -718,6 +799,9 @@ impl Engine {
                 merged_sesnos: Vec::new(),
                 merged_at_ago_h: Vec::new(),
                 changed_elements: db.changed_elements,
+                added: db.net.0 as u64,
+                modified: db.net.1 as u64,
+                deleted: db.net.2 as u64,
                 stage: Stage::Queued,
                 state: "succeeded",
                 units_done: 0,
@@ -739,6 +823,8 @@ impl Engine {
                 position,
                 start_sesno,
                 end_sesno: db.latest,
+                // sim 里的回退库是阻断形状（`blocked: true`），不入队，所以这里永远是普通窗口。
+                intent: "apply_window".into(),
             });
             self.batches.push(batch);
         }
@@ -805,7 +891,7 @@ impl Engine {
                 mdb: Some(MDB.into()),
                 namespace: Some(NAMESPACE.into()),
                 sync_live: true,
-                data_face: "ingest".into(),
+                data_face: self.service.data_face().into(),
                 read_through: Default::default(),
                 core: Default::default(),
                 mirror: Default::default(),
@@ -819,6 +905,14 @@ impl Engine {
                 delivery_unit_types: ["BRAN", "HANG", "SUPPO", "EQUI"]
                     .map(str::to_owned)
                     .to_vec(),
+                // 剧本里 db8191（CATA）前移过、且反查退化——那条横幅只有在这一档才画得出来。
+                catalogue_reconcile: Some(CatalogueReconcile {
+                    trigger: "periodic".into(),
+                    at: stamp(self.service_started_at),
+                    catalogue_cascade_degraded: true,
+                    stale_catalogue_dbnums: vec![8191],
+                    unreadable_catalogue_dbnums: 0,
+                }),
             }),
             pending: self.pending.clone(),
             pending_known: true,
@@ -826,29 +920,51 @@ impl Engine {
             dbnums: self
                 .dbs
                 .iter()
-                .map(|db| DbnumStatus {
-                    dbnum: db.dbnum,
-                    db_type: db.db_type.into(),
-                    cache_epoch: 0,
-                    cached_pe_rows: 0,
-                    // 与真服务同口径：登记过 = 有权威水位（applied > 0）。取回工作旁那行
-                    // 「N 次保存未应用」从这两端算。
-                    applied_sesno: db.applied,
-                    file_latest_sesno: db.latest,
-                    initialized: db.applied > 0,
-                    anomaly: db.anomaly.clone(),
-                    blocked: db.blocked,
-                    excluded: db.db_type != "DESI",
-                    not_in_project: db.not_in_project,
-                    // 与真服务同一条判据的剧本版（spec §4.12）：有权威水位的库 rocksdb 为准；
-                    // 从未导入的库由 API 从内存供数。剧本里没有初始化发布 run，所以只有这两档。
-                    model_source: Some(if db.applied > 0 {
-                        ModelSource::Database
-                    } else {
-                        ModelSource::Memory
-                    }),
-                    model_source_reason: (db.applied <= 0)
-                        .then(|| "data_watermark_unestablished".to_owned()),
+                .map(|db| {
+                    let read_through = self.service.read_through();
+                    // 读透形态每行 `applied_sesno` 恒 0、不算「已登记」，模型来源恒内存（读透），
+                    // 判决恒「不判」（`handlers.rs::append_cold_read_through_dbnums`）。
+                    let applied = if read_through { 0 } else { db.applied };
+                    DbnumStatus {
+                        dbnum: db.dbnum,
+                        db_type: db.db_type.into(),
+                        file_name: db.file_name.into(),
+                        cache_epoch: 0,
+                        cached_pe_rows: 0,
+                        // 与真服务同口径：登记过 = 有权威水位（applied > 0）。取回工作旁那行
+                        // 「数据水位落后 N 次保存」从这两端算。
+                        applied_sesno: applied,
+                        file_latest_sesno: db.latest,
+                        initialized: applied > 0,
+                        anomaly: if read_through {
+                            None
+                        } else {
+                            db.anomaly.clone()
+                        },
+                        blocked: !read_through && db.blocked,
+                        excluded: db.db_type != "DESI",
+                        not_in_project: db.not_in_project,
+                        // 与真服务同一条判据的剧本版（spec §4.12）：有权威水位的库 rocksdb 为准；
+                        // 从未导入的库由 API 从内存供数。剧本里没有初始化发布 run，所以只有这两档。
+                        model_source: Some(if applied > 0 {
+                            ModelSource::Database
+                        } else {
+                            ModelSource::Memory
+                        }),
+                        model_source_reason: if read_through {
+                            Some("read-through".to_owned())
+                        } else {
+                            (applied <= 0).then(|| "data_watermark_unestablished".to_owned())
+                        },
+                        model_sesno: None,
+                        model_sesno_time: None,
+                        model_verdict: read_through.then(|| "not_judged".to_owned()),
+                        model_verdict_reason: read_through.then(|| "read-through".to_owned()),
+                        model_chasing_roots: self
+                            .late_chasing
+                            .and_then(|(n, roots)| (n == db.dbnum).then_some(roots)),
+                        model_dead_roots: None,
+                    }
                 })
                 .collect(),
         }
@@ -892,6 +1008,9 @@ impl Engine {
                     .map(|ago| self.e3d_stamp(*ago))
                     .collect(),
                 changed_elements: batch.changed_elements,
+                added_elements: batch.added,
+                modified_elements: batch.modified,
+                deleted_elements: batch.deleted,
             }),
             units: batch
                 .units
@@ -909,6 +1028,11 @@ impl Engine {
                     message: unit.fail.map(Into::into),
                     old_owner: None,
                     new_owner: None,
+                    kind: if unit.transform {
+                        UnitKind::Transform
+                    } else {
+                        UnitKind::Regen
+                    },
                 })
                 .collect(),
             warnings: Vec::new(),
@@ -1078,6 +1202,7 @@ impl Engine {
                                 root_refno: sim_unit.root_refno.into(),
                                 noun: sim_unit.noun.into(),
                                 source_end_sesno: batch.end_sesno,
+                                source_end_sesno_time: Some(stamp(now)),
                                 attempts: 3,
                                 last_error: Some(error.into()),
                                 dead: true,
@@ -1170,6 +1295,10 @@ impl Engine {
         if had_units {
             self.room_owed = true;
         }
+        // 晚到保存排的那一次任务跑完 = 模型追上了：那根「落后约 N 根」的线随之收掉。
+        if self.late_chasing.is_some_and(|(n, _)| n == dbnum) {
+            self.late_chasing = None;
+        }
         self.last_activity = now;
     }
 
@@ -1202,7 +1331,30 @@ impl Engine {
         out.push(Evt::QueueTaskChanged);
     }
 
+    /// 一次性剧本：跑空之后 db7001 / db7002 又各存了一次盘。db7001 还让服务端判出
+    /// 12 根模型落后——它的「立即执行」气泡数据段 / 模型段两行都有得看；db7002 那枚
+    /// 只有数据段（`model_chasing_roots` 没给就整行不画），两种形状正好都摆出来。
+    fn late_saves(&mut self, out: &mut Vec<Evt>) {
+        for dbnum in [7001u32, 7002] {
+            if let Some(db) = self.dbs.iter_mut().find(|db| db.dbnum == dbnum) {
+                db.latest += 1;
+                // 刚写进文件的保存：右端与窗口左端都是此刻（ADR-0019 按写入时刻说话）。
+                db.latest_at_ago_h = Some(0);
+                db.first_pending_at_ago_h = Some(0);
+                db.sessions.push(SessionPreview {
+                    sesno: db.latest as u32,
+                    added: 1,
+                    modified: 2,
+                    deleted: 0,
+                });
+            }
+        }
+        self.late_chasing = Some((7001, 12));
+        out.push(Evt::QueueTaskChanged);
+    }
+
     fn step_room(&mut self, now: DateTime<Utc>, out: &mut Vec<Evt>) {
+        let mut converged_now = false;
         if let Some(room) = &mut self.room {
             if room.finished_at.is_none() {
                 while now >= room.next_at && room.done < room.total {
@@ -1213,9 +1365,21 @@ impl Engine {
                     room.finished_at = Some(now);
                     self.last_activity = now;
                     out.push(Evt::QueueTaskChanged);
+                    converged_now = true;
                 }
-                return;
+                if !converged_now {
+                    return;
+                }
             }
+        }
+        // 一次性剧本：第一轮房间收敛的同一拍，db7001 / db7002 又各来一次新保存
+        // ——跑空刚追平的两条历史行，「立即执行」这才有亮起来（Ready）的那一刻。
+        if converged_now {
+            if self.late_save_pending {
+                self.late_save_pending = false;
+                self.late_saves(out);
+            }
+            return;
         }
         // 队列收空、且这一轮欠着房间账 → 开一轮房间归属重算。
         if self.room_owed && !self.batches.iter().any(SimBatch::active) {
@@ -1267,6 +1431,7 @@ fn script() -> Vec<SimDb> {
                     site: Some(SITE_A),
                     moved_from: None,
                     fail: None,
+                    transform: false,
                 },
                 SimUnit {
                     root_refno: "24384/201",
@@ -1275,6 +1440,8 @@ fn script() -> Vec<SimDb> {
                     site: Some(SITE_B),
                     moved_from: None,
                     fail: None,
+                    // 只挪了方位：走刚体前移便宜路，网格未重算（ADR-066）。
+                    transform: true,
                 },
             ],
             unknown_site: (0, 0, 0),
@@ -1315,6 +1482,7 @@ fn script() -> Vec<SimDb> {
                     site: Some(SITE_A),
                     moved_from: None,
                     fail: None,
+                    transform: false,
                 },
                 SimUnit {
                     root_refno: "24385/77",
@@ -1323,6 +1491,7 @@ fn script() -> Vec<SimDb> {
                     site: Some(SITE_A),
                     moved_from: None,
                     fail: Some("OCC 布尔运算失败：负体面片退化（剧本注入的失败）"),
+                    transform: false,
                 },
                 SimUnit {
                     root_refno: "24385/305",
@@ -1331,6 +1500,7 @@ fn script() -> Vec<SimDb> {
                     site: Some(SITE_B),
                     moved_from: Some(SITE_A),
                     fail: None,
+                    transform: false,
                 },
             ],
             unknown_site: (0, 1, 0),
@@ -1387,6 +1557,8 @@ fn script() -> Vec<SimDb> {
             anomaly: Some(FileAnomaly::Rollback {
                 file_latest_sesno: 66,
                 applied_sesno: 70,
+                file_latest_sesno_time: None,
+                applied_sesno_time: None,
             }),
             blocked: true,
             not_in_project: false,
@@ -1441,6 +1613,7 @@ fn script() -> Vec<SimDb> {
                     site: None,
                     moved_from: None,
                     fail: None,
+                    transform: false,
                 },
                 SimUnit {
                     root_refno: "24390/2",
@@ -1449,6 +1622,7 @@ fn script() -> Vec<SimDb> {
                     site: None,
                     moved_from: None,
                     fail: None,
+                    transform: false,
                 },
             ],
             unknown_site: (0, 0, 0),
@@ -1569,6 +1743,16 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
         Req::Reconnect | Req::SwitchReadFace(_) => Evt::Ready(Ok(engine.ready_info())),
         Req::Children(refno) => Evt::Children(refno, Ok(engine.children(refno))),
         Req::Props(refno) => Evt::Props(refno, Ok(engine.props(refno))),
+        Req::SubtreeBounds { epoch, target } => Evt::SubtreeBounds {
+            epoch,
+            target,
+            result: Err(anyhow::anyhow!("NO_RENDERABLE_GEOMETRY: {}", target)),
+        },
+        Req::EnsureForFocus { epoch, target } => Evt::EnsureForFocus {
+            epoch,
+            target,
+            result: Err(anyhow::anyhow!("模型服务不可用: {}", target)),
+        },
         // 剧本里没有房间数据：空归属即「无所属房间」，界面照常走 Ready 空态。
         Req::ElementRooms(refno) => Evt::ElementRooms(refno, Ok(Vec::new())),
         Req::PanelRoom(refno) => Evt::PanelRoom(refno, Ok(None)),

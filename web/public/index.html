@@ -43,7 +43,15 @@
         if (!currentResponse.ok) {
           throw new Error(`config.json: HTTP ${currentResponse.status}`);
         }
-        return currentResponse.json();
+        const current = await currentResponse.json();
+        const configuredModelUrl = current.model_api_url?.trim();
+        current.model_api_url =
+          configuredModelUrl && configuredModelUrl !== "http://127.0.0.1:8022"
+            ? configuredModelUrl
+            : window.location.origin;
+        const configuredDataUrl = current.data_api_url?.trim();
+        current.data_api_url = configuredDataUrl || window.location.origin;
+        return current;
       }
 
       const [config] = await Promise.all([

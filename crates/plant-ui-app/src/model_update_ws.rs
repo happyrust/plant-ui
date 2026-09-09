@@ -211,12 +211,14 @@ mod tests {
         assert!(decode(flipped).is_none());
         assert!(!starts_or_finishes(flipped));
 
-        let wiped = r#"{"type":"model_source_changed","payload":{"dbnum":8021,"model_source":"memory"}}"#;
+        let wiped =
+            r#"{"type":"model_source_changed","payload":{"dbnum":8021,"model_source":"memory"}}"#;
         assert_eq!(
             decode_model_source_changed(wiped),
             Some((8021, ModelSource::Memory))
         );
-        let unknown = r#"{"type":"model_source_changed","payload":{"dbnum":8021,"model_source":"mirror"}}"#;
+        let unknown =
+            r#"{"type":"model_source_changed","payload":{"dbnum":8021,"model_source":"mirror"}}"#;
         assert_eq!(decode_model_source_changed(unknown), None);
         assert_eq!(
             decode_model_source_changed(r#"{"type":"task_finished","task_id":"db-1"}"#),

@@ -21,6 +21,26 @@ use crate::data::{Evt, RegenerateCount};
 use crate::model_update_api::ModelRecords;
 use crate::search_index::{Scope, SearchIndex, SubstringHits};
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubtreeBounds {
+    pub min_mm: [f32; 3],
+    pub max_mm: [f32; 3],
+    pub model_count: usize,
+}
+
+#[derive(Debug)]
+pub struct NoRenderableGeometry;
+impl std::fmt::Display for NoRenderableGeometry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NO_RENDERABLE_GEOMETRY")
+    }
+}
+impl std::error::Error for NoRenderableGeometry {}
+pub fn is_no_renderable_geometry(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<NoRenderableGeometry>().is_some()
+        || crate::model_update_api::failure_of(error).code == "no_renderable_geometry"
+}
+
 /// 对拍探针（计划 §5.4 / D14）：`plant-ui-app --read-face-parity`，无头子命令，两面并存
 /// 只许在它里面。浏览器端没有命令行也没有库连接，不编进去。
 #[cfg(not(target_arch = "wasm32"))]
@@ -191,6 +211,17 @@ impl ReadFace {
         match self {
             Self::Service(face) => face.model_instances(req).await,
             Self::Store(face) => face.model_instances(req.roots, progress).await,
+        }
+    }
+
+    pub async fn subtree_bounds(
+        &self,
+        root: RefU64,
+        scope: &Scope,
+    ) -> anyhow::Result<SubtreeBounds> {
+        match self {
+            Self::Service(face) => face.subtree_bounds(root, scope).await,
+            Self::Store(face) => face.subtree_bounds(root).await,
         }
     }
 

@@ -11,7 +11,7 @@ use std::sync::mpsc;
 use plant_ui::task_queue::DbnumReport;
 use plant_ui_data::{Attr, EleTreeNode, RefU64};
 
-use super::{Identity, ModelInstancesReq, SearchOutcome};
+use super::{Identity, ModelInstancesReq, SearchOutcome, SubtreeBounds};
 use crate::data::{Evt, RegenerateCount, SEARCH_LIMIT};
 use crate::model_update_api::{self, ModelRecords};
 use crate::search_index::{Scope, SearchIndexState, SubstringHits};
@@ -19,6 +19,58 @@ use crate::search_index::{Scope, SearchIndexState, SubstringHits};
 pub struct ServiceReadFace;
 
 impl ServiceReadFace {
+    pub async fn subtree_bounds(
+        &self,
+        root: RefU64,
+        scope: &Scope,
+    ) -> anyhow::Result<SubtreeBounds> {
+        let reply = model_update_api::query(
+            &self.base(),
+            &scope.project,
+            &scope.mdb,
+            &scope.ns,
+            "model.spatial.bounds",
+            serde_json::json!({"refno": root.to_string().replace('_', "/"), "scope": "subtree"}),
+        )
+        .await?;
+        let value = reply.result;
+        let min_mm = serde_json::from_value(
+            value
+                .get("min_mm")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing min_mm"))?,
+        )?;
+        let max_mm = serde_json::from_value(
+            value
+                .get("max_mm")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing max_mm"))?,
+        )?;
+        anyhow::ensure!(
+            value.get("scope").and_then(|v| v.as_str()) == Some("subtree"),
+            "服务未返回子树范围，请更新模型服务"
+        );
+        let model_count = value
+            .get("model_count")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| anyhow::anyhow!("missing model_count"))?
+            as usize;
+        if model_count == 0 {
+            return Err(super::NoRenderableGeometry.into());
+        }
+        let min_mm: [f32; 3] = min_mm;
+        let max_mm: [f32; 3] = max_mm;
+        anyhow::ensure!(
+            (0..3)
+                .all(|i| min_mm[i].is_finite() && max_mm[i].is_finite() && min_mm[i] <= max_mm[i]),
+            "invalid subtree bounds"
+        );
+        Ok(SubtreeBounds {
+            min_mm,
+            max_mm,
+            model_count,
+        })
+    }
     fn base(&self) -> String {
         model_update_api::base_url()
     }

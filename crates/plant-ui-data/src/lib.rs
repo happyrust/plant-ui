@@ -413,7 +413,7 @@ pub async fn nouns_of(refnos: &[RefU64]) -> Result<std::collections::HashMap<Ref
 
 // 「设计库里还没应用的保存数」不再从这里直读 gen-model 的 `dbnum_watermark` 表：
 // 那张表在零解析（direct）部署里是空的，而且它让本 crate 认得后端的表名与字段名。
-// 提示现在从队列轮询的 `GET /api/v1/dbnums` 回包算（`task_queue::Vm::pending_saves`），
+// 提示现在从队列轮询的 `GET /api/v1/dbnums` 回包算（`task_queue::Vm::watermark_lag`），
 // 那份本来就每拍都取、每行都带 `applied_sesno` / `file_latest_sesno`。
 
 /// 取回工作前先把本进程的查询缓存丢干净。

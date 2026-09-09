@@ -51,6 +51,8 @@
 | 尝试次数 | `第 3 次尝试` | 契约 | `ModelUnitResult.attempts` / `PendingModelUnit.attempts`（跨重试累计）|
 | 「立刻重试」按钮 | | 契约 | `POST /api/v1/update/pending-units/retry`（2026-08-05 起改走此端点，不再直接打 `/model/ensure`）：只复活已存在的行——`attempts` 清零、`revision + 1`、清 `last_error`——再叫醒调度器，不排新批次；死信从同一入口复活。空单元 500 是 `/model/ensure` 通道的问题（见表下那段），与此按钮已无关 |
 | 上次结果 | `上次 partial · 10:04` | 契约 | 该 dbnum 最近一条终态 `TaskEntry` 的 `state` + `finished_at`。分层保留策略保证它一定还在（ADR-011 §11）|
+| 模型水位判决（2026-09-08） | 类型 · 模型来源字形右边一枚字形；悬停 `模型水位落后于数据水位 · 追赶中 4 根` + `模型水位在 08-07 14:10 那次保存 · 1 根已放弃（死信，队列面板可立刻重试）`；说明列空着时整句 `模型来源：数据库 · 模型水位落后于数据水位 · 追赶中 4 根` | 契约 | `/dbnums` 每行的 `model_verdict`（`in_sync` / `lagging` / `not_judged`）+ `model_verdict_reason` + `model_chasing_roots` / `model_dead_roots` + `model_sesno_time`（gen-model ADR-060 / C2，d-594）。判据只在服务端一处，客户端**不拿 `model_sesno` / `applied_sesno` 自己比**。三态三枚字形：追平 `check-circle` 灰、落后 `hourglass` 提醒色、**不判 `minus-circle` 灰**——不判是中性态（读透形态 / 数据水位未建立 / 没有生成根），文案「一致性不判（理由）」，不许画成落后。**两种供数模式都画**（与「模型来源」那格不同：判决说的是服务端模型水位对数据水位，库供数读的 `inst_relate` 正是那份模型）。老服务端不给 → 整格不画。行内明细第二行是同一句（`task_queue::RowVm.verdict*`） |
+| 「立即执行」（2026-09-09，09-08 计划 U2） | 行尾「操作」列一枚按钮。灰时悬停给判据句：`已在队列第 3 位，提前执行不会插队` / `正在执行中` / `文件没有新保存，无可执行` / 阻断原因原文（与 S2-E 同一段文案）；可点时悬停粗版气泡：`提前执行 db7321：现在排上这个库的任务` + `数据 · 已应用 412 → 文件最新 415（3 次保存）` + `模型 · 落后约 12 根（服务端判）` + `不插队、不改本期执行范围；与自动发现排出的是同一种任务` | 契约 + 本地 | 判据 `task_queue::early_run`（09-08 计划 D1 A / 5.1，六档互斥）：范围与阻断看 `/dbnums` 的 `excluded / not_in_project / blocked / anomaly`——排除与够不着**不画这一格**；队列占用看行表（同库有排队 / 运行行即灰，断线 `Unknown` 当占着队列，不放行重复入队）；两枚水位看 `applied_sesno / file_latest_sesno`，**需初始化 = 首次导入照样可点**，气泡说「首次导入，整库建立基线」、不说「落后 N 次保存」；模型段 `model_chasing_roots`，没给整行不画；房间段粗版说不出，**整格不画**（等单库预览或 S9 字段再谈精确版）。按下推 `Cmd::RunDbnumNow` → 既有 `POST /update/execute` + 单库 `dbnums[]`，与「立刻扫一遍」同一守卫（`can_execute` / direct 形态置灰同一句）。`/dbnums` 空表 → **操作列整列不画**（D7：老服务端不给判据就没有这列）。「本期不执行」的阻断行同格永灰、悬停同一段原因原文 |
 
 > 注（2026-08-05）：行内「立刻重试」已改走 `pending-units/retry`，下面这段是
 > `/model/ensure` 通道的已知问题——按需生成、生成回放仍会踩到，保留备查。
@@ -97,9 +99,20 @@
 | 计时 | `开跑 10:07 · 结束 10:12 · 用时 04:38` | 契约 + 本地 | `TaskEntry.started_at / finished_at`；用时是两者之差 |
 | 失败 · 不产生欠账 | `模型生成未开始——数据未落库，不产生待重试单元` | 契约 | 两阶段设计：批次失败则阶段二不开始，`units` 为空 |
 | 失败 · 自动回队 | `不用手动重排：队列按水位派生，下一轮扫描会照原区间重新入队` | 契约 | ADR-011 §6（30s 轮询）+ §9（派生态，不做取消） |
-| 欠账单元行 | `EQUI /P-1201B · 来源保存 08-05 18:24 · 第 3 次尝试 · 写入生成结果失败：目标分支被占用` | 契约 | `PendingModelUnit.noun / root_refno / attempts / last_error`；来源段走 `source_end_sesno_time`（ADR-0019 Q7，**2026-08-10 已落 gen-model**）。旧行、以及不认领会话号的行（房间任务、反向级联派生根）是 `None`，此时**来源段整个不摆**——不许回落成会话号 |
+| 欠账单元行 | `EQUI /P-1201B · 来源保存 08-05 18:24 · 第 3 次尝试 · 写入生成结果失败：目标分支被占用` | 契约 | `PendingModelUnit.noun / root_refno / attempts / last_error`；来源段走 `source_end_sesno_time`（ADR-0019 Q7，**2026-08-10 已落 gen-model**）。旧行、以及不认领会话号的行（房间任务、反向级联派生根）是 `None`，此时**来源段整个不摆**——不许回落成会话号。**已接**（2026-09-08，`task_queue::pending_line`）：此前这一行只说「第 N 次尝试失败」，分不清欠的是刚才那一窗还是几天前那一窗一直没补上的 |
 | 死信行 | `BRAN /100-B7 · 已尝试 5 次 · 已放弃重试：不再自动重试，也不并入手动更新` | 契约 | `PendingModelUnit.dead`（判死上限是服务端常量，客户端只认这个布尔） |
 | 「立刻重试」 | 欠账行与死信行行尾各一枚 | 契约 | 见 §1「立刻重试」按钮：`pending-units/retry`，死信同一入口复活 |
+
+> **2026-09-09 追记（更新任务详情，计划 `docs/plans/2026-09-09-task-finished-detail-plan.md`，
+> 画板见 `ui/手动增量更新.pen`「更新任务详情 · 终态行内明细 / 段形态表」）**：终态明细补下面四格
+> （前三格 V1 / V2 已落地 2026-09-09；房间段待新增）。
+
+| 元素 | 示例 | 来源 | 出处 |
+|---|---|---|---|
+| 增删改三数 + 分布条 | `+18 新增 ~64 修改 −3 删除 · 共 85 项变化 · 预览时 82` + 三段分布条 | 契约 | `DataBatchResult.added_elements / modified_elements / deleted_elements`（gen-model `manual_update.rs`，`set_change_counts` 与 `changed_elements` 同源，`#[serde(default)]`）。三数之和必须等于 `changed_elements`；视觉与预览页 S2「三个大数 + 分布条」同款 |
+| 分解缺席降级 | `85 项变化`（只此一句） | 契约 + 本地 | 判据：三数全 0 且 `changed_elements > 0` = 老服务端缺分解字段 → 三数与分布条**整组不画**，不许画成 0 / 0 / 0；真零时整个变化区本来就不画 |
+| 刚体前移 | `刚体前移 2 根（只动方位，网格未重算）`（模型段，单元计数句之下） | 契约 | `ModelUnitResult.kind`（gen-model ADR-066 `UnitKind`：`regen` / `transform`，`#[serde(default)]` 缺省 `regen`）。只数成功交付的（`Outcome::transform_roots`：`status == generated && kind == transform`），计数 > 0 才画——旧回执没这一列、缺省全 `regen` 恒 0，整句自动缺席。元数据门省下的根数那半句**等计划 §3 的 `metadata_only_roots`**，落地前整格不画：不解析 `warnings[]` 文本反拼数字（ADR-0019 先例） |
+| 房间段 | `重算 2 块面板 + 27 个构件 · 受影响 3 间 · 搬间 2 件` + 房间行组 / 搬间明细 / 失败框（G2） | **待新增** | 无契约。字段清单见计划 §3（`rooms.touched[] / moves[] / failed[]` 等），等 gen-model S8/T4 房间内联随 Task 回执带出；缺席 → 整段不画、行上四段退三段。失败不给队列重试（N-C），两个命令面入口同 09-08 计划 D4 |
 
 ---
 
@@ -127,8 +140,8 @@
 
 | 元素 | 示例 | 来源 | 出处 |
 |---|---|---|---|
-| 阻断行 | `db8003 · 文件回退 · 最新保存 07-01 10:00 早于已应用 08-05 18:24` | **待新增** | `GET /dbnums` 补上 `anomaly` / `blocked`。`blocked` 是**算出来的**不是随 `anomaly` 一起来的：`preview_dbnum` 只把 `Rollback \| TypeChanged` 判为阻断，项目扫描器另外把 `Duplicate` / `Missing` 直接置真——这段逻辑要从预览里提出来复用。**两端时刻已落 gen-model（2026-08-10，ADR-0019 Q6）**：就挂在 `FileAnomaly::Rollback` 上，`file_latest_sesno_time`（文件端，现读一页）+ `applied_sesno_time`（已应用端，取水位表存量）。**这一格只读 `anomaly`，不要去读 `DbnumPreview` 的同名字段**——阻断行那两个字段服务端刻意留空，同一个值不摆两处。无存量时降级成 `早于已应用水位（应用时刻无记录）`，**不许拿挂钟 `applied_at` 兜底**。服务端的 `reason` 原文保持不变（诊断串，进日志与规格样例），**界面不再当它的传声筒**，自己拿这两个时刻组句 |
-| 五种文件异常 | 文件回退 / 路径迁移 / 类型变化 / 同号重复 / 文件缺失 | **待新增** | 同上。五种里**只有路径迁移不阻断**，它照常入队。第一种界面上叫「文件回退」（最新保存早于已应用），不叫「会话号回退」——判据仍是 sesno 比较（ADR-0019）|
+| 阻断行 | `db8003 · 文件回退 · 最新保存 07-01 10:00 早于已应用 08-05 18:24` | 契约（**已落**，2026-09-09 复核：`DbnumStatus.anomaly / blocked` 已随 `/dbnums` 给出并在本格与「立即执行」判据消费） | 原登记：`GET /dbnums` 补上 `anomaly` / `blocked`。`blocked` 是**算出来的**不是随 `anomaly` 一起来的：`preview_dbnum` 只把 `Rollback \| TypeChanged` 判为阻断，项目扫描器另外把 `Duplicate` / `Missing` 直接置真——这段逻辑要从预览里提出来复用。**两端时刻已落 gen-model（2026-08-10，ADR-0019 Q6）**：就挂在 `FileAnomaly::Rollback` 上，`file_latest_sesno_time`（文件端，现读一页）+ `applied_sesno_time`（已应用端，取水位表存量）。**这一格只读 `anomaly`，不要去读 `DbnumPreview` 的同名字段**——阻断行那两个字段服务端刻意留空，同一个值不摆两处。无存量时降级成 `早于已应用水位（应用时刻无记录）`，**不许拿挂钟 `applied_at` 兜底**。服务端的 `reason` 原文保持不变（诊断串，进日志与规格样例），**界面不再当它的传声筒**，自己拿这两个时刻组句 |
+| 五种文件异常 | 文件回退 / 路径迁移 / 类型变化 / 同号重复 / 文件缺失 | 契约（**已落**，同上行） | 同上。五种里**只有路径迁移不阻断**，它照常入队。第一种界面上叫「文件回退」（最新保存早于已应用），不叫「会话号回退」——判据仍是 sesno 比较（ADR-0019）|
 | 排除行 | `db7999 · 非 DESI，不在本期范围` | 契约 | 排除发生在扫描之前，与阻断不是一回事，**界面上不许合成一行** |
 | 出路 | 同号重复要列出 `paths[]` 交给人挑；文件缺失是补回文件或注销登记 | 契约 | 与 `MODEL-UPDATE-FIELD-MAP.md` §7 的 S2-E 同一套说法，两处文案要一致 |
 
@@ -144,7 +157,8 @@
 | 「恢复队列」 | 按钮，落在暂停横幅右端 | **待新增** | 同上的 `resume` |
 | 「立刻扫一遍」 | 按钮 | 契约 | `POST /update/execute`。ADR-011 §6：它不插队，作用只是别等下一个 30s 轮询 |
 | 服务不消化执行请求 | 横幅 `模型服务以 direct 形态运行、未启动数据批次 worker：预览可用，执行不可用（入队的批次不会被处理）。`；同时「立刻扫一遍」「立刻重试」、向导「开始更新 / 确认并开始」灰掉，悬停给同一句 | 契约 | `GET /health` 的 `data_read_mode == "direct"` 且 `worker_alive` 为 `null`（gen-model direct 形态就是这么报的：不起 watcher / worker，执行请求 202 入队后没人出队）。判定在 `task_queue::Vm::execution_blocked_reason`；`worker_alive == false` 那条既有的红横幅优先。**暂停 / 恢复不受它管**——它们只改调度器旗标。老服务端两个键都不给 → 不出声（2026-09-02，`docs/plans/manual-update-and-get-work-on-direct-mode.md` M1） |
-| 取回工作旁的提示（命令栏菜单，不在队列面板上） | `设计库还有 8 次保存未应用 · 2 个库需初始化 · 去「模型更新」` | 契约 + 本地 | 从 `/dbnums` 每行的 `applied_sesno` / `file_latest_sesno` / `initialized` 算（`task_queue::Vm::pending_saves`）：只数会执行的 DESI（排除 / 阻断 / 够不着不算），登记过的累计 `max(file_latest − applied, 0)`，`applied == 0` 的单独数成「需初始化」——它没有「待应用的保存」可数，契约不为它解区间，但绝不能显示成无变化。说「保存」不说「会话」（ADR-0019）。两个数都是 0 整行不画；此前直读 SurrealDB `dbnum_watermark`，零解析库那张表是空的（2026-09-02 M3a） |
+| 取回工作旁的提示（命令栏菜单，不在队列面板上） | `数据水位落后 8 次保存 · 2 个库尚无数据水位（需初始化） · 模型水位：1 个库落后 · 去「模型更新」` | 契约 + 本地 | **按两枚水位说话，不说「待应用 / 未应用 / pending」**（2026-09-08 用户口径，CONTEXT.md「水位」）。从 `/dbnums` 每行的 `applied_sesno` / `file_latest_sesno` / `initialized` 算（`task_queue::Vm::watermark_lag`）：只数会执行的 DESI（排除 / 阻断 / 够不着不算），已建立数据水位的累计 `max(file_latest − applied, 0)`，`applied == 0` 的单独数成「尚无数据水位（需初始化）」——它没有「落后几次」可数，契约不为它解区间，但绝不能显示成无变化。说「保存」不说「会话」（ADR-0019）。**第三句是模型水位**（2026-09-08，09-02 计划 M3b 改靶后的落法）：同一批会执行的 DESI 里服务端判 `model_verdict = lagging` 的库数（`WatermarkLag.model_lagging`），只数 `lagging`——`not_judged` 中性、`in_sync` 无事、老服务端不给恒 0；与前两句不相加，它解释的是「属性是新的、三维是旧的」这种分叉。三个数都是 0 整行不画；读透形态整行不画（数据水位按设计不建立，不是落后）；此前直读 SurrealDB `dbnum_watermark`，零解析库那张表是空的（2026-09-02 M3a） |
+| 目录反查退化 | 横幅 `目录库已前移，但反查没能点名受影响的根（db7355、db7356）：服务端按「宁多算不漏算」把这些目录库的全部依赖根判过期重算。不是错误——这一轮的模型工作会比精确命中时多。` | 契约 | `GET /health` 的 `catalogue_reconcile.catalogue_cascade_degraded`（gen-model d-635 / d-665：目录库没有引用表 / 表读不了 / 超安全阈时的退路 ii），库名单取同一格的 `stale_catalogue_dbnums`。判定在 `task_queue::CatalogueReconcile::degraded_line`。**目录库不进数据批次，队列里永远没有它们的行**——目录改了之后模型凭什么在重算、又为什么算得比预期多，这是界面上唯一说得出的地方。`Warn` 不是 `Error`：宁多算不漏算是设计裁决。**精确命中时一个字不说**（目录前移是常态，出声就是刷屏）；老服务端不给这个键 → 整条不画（2026-09-08） |
 | 队列已重建 | `服务 18:02 重启过，这条队列是按水位重建的；排队时长从重启起算，重启前排了多久已无从得知。` | **待新增** | ADR-011 §4 要求界面说出这句话，但要说得出得先知道进程重启过——`GET /health` 增加进程启动时刻。**后半句不许省**：省了就等于把重建的队列装成一直在那儿 |
 | ~~「取消」~~ | | | **不做**。队列是派生态，移掉一行下一轮就回来了，那是个会自己撤销的按钮（ADR-011 §9）|
 

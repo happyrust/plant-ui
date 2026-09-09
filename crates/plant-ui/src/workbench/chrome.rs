@@ -135,11 +135,11 @@ pub fn command_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: 
                         cmds.push(Cmd::GetWork);
                         ui.close();
                     }
-                    // 取回工作只取界面。设计库里还躺着没应用的保存时，
+                    // 取回工作只取界面。哪一枚水位落后于文件时，
                     // 这一行是唯一告诉人「该去的是另一个入口」的地方。
-                    if let Some(pending) = vm.pending_saves.filter(|p| !p.is_empty()) {
+                    if let Some(lag) = vm.watermark_lag.filter(|l| !l.is_empty()) {
                         ui.label(
-                            RichText::new(pending_saves_hint(pending))
+                            RichText::new(watermark_hint(lag))
                                 .font(Font::micro(d))
                                 .color(t.text_muted),
                         );
@@ -544,15 +544,23 @@ fn open_menu_marker(ui: &mut Ui, t: &Tokens, d: Density, response: &egui::Respon
     }
 }
 
-/// 取回工作旁那行提示。说「保存」不说「会话」（ADR-0019）；「需初始化」单独一句，
-/// 它不是「N 次保存」的一部分（那些库契约不为它解保存区间，CONTEXT.md「需初始化」）。
-fn pending_saves_hint(pending: crate::task_queue::PendingSaves) -> String {
+/// 取回工作旁那行提示，按**两枚水位**说话（CONTEXT.md「水位」；2026-09-08 用户口径：
+/// 不说「待应用 / pending」）。说「保存」不说「会话」（ADR-0019）。三句各说一件事、不相加：
+/// 数据水位落后文件几次保存；几个库尚无数据水位（需初始化——它们没有「落后几次」可数）；
+/// 模型水位落后于数据水位的库数（服务端判 `lagging`，「不判」或没给判决时这一句不出现）。
+fn watermark_hint(lag: crate::task_queue::WatermarkLag) -> String {
     let mut parts = Vec::new();
-    if pending.saves > 0 {
-        parts.push(format!("设计库还有 {} 次保存未应用", pending.saves));
+    if lag.data_behind > 0 {
+        parts.push(format!("数据水位落后 {} 次保存", lag.data_behind));
     }
-    if pending.uninitialized > 0 {
-        parts.push(format!("{} 个库需初始化", pending.uninitialized));
+    if lag.data_unestablished > 0 {
+        parts.push(format!(
+            "{} 个库尚无数据水位（需初始化）",
+            lag.data_unestablished
+        ));
+    }
+    if lag.model_lagging > 0 {
+        parts.push(format!("模型水位：{} 个库落后", lag.model_lagging));
     }
     parts.push("去「模型更新」".to_owned());
     parts.join(" · ")
@@ -560,31 +568,70 @@ fn pending_saves_hint(pending: crate::task_queue::PendingSaves) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::pending_saves_hint;
-    use crate::task_queue::PendingSaves;
+    use super::watermark_hint;
+    use crate::task_queue::WatermarkLag;
 
-    /// 文案按 ADR-0019 说「保存」；需初始化的库单独一句，不并进保存次数。
+    /// 文案按水位说话、按 ADR-0019 说「保存」；尚无数据水位的库单独一句，不并进保存次数。
     #[test]
-    fn the_pending_saves_hint_speaks_saves_and_keeps_uninitialized_apart() {
+    fn the_watermark_hint_speaks_watermarks_and_saves_and_keeps_unestablished_apart() {
         assert_eq!(
-            pending_saves_hint(PendingSaves {
-                saves: 8,
-                uninitialized: 0,
+            watermark_hint(WatermarkLag {
+                data_behind: 8,
+                data_unestablished: 0,
+                model_lagging: 0,
             }),
-            "设计库还有 8 次保存未应用 · 去「模型更新」"
+            "数据水位落后 8 次保存 · 去「模型更新」"
         );
         assert_eq!(
-            pending_saves_hint(PendingSaves {
-                saves: 8,
-                uninitialized: 2,
+            watermark_hint(WatermarkLag {
+                data_behind: 8,
+                data_unestablished: 2,
+                model_lagging: 0,
             }),
-            "设计库还有 8 次保存未应用 · 2 个库需初始化 · 去「模型更新」"
+            "数据水位落后 8 次保存 · 2 个库尚无数据水位（需初始化） · 去「模型更新」"
         );
-        let only_init = pending_saves_hint(PendingSaves {
-            saves: 0,
-            uninitialized: 1,
+        let only_init = watermark_hint(WatermarkLag {
+            data_behind: 0,
+            data_unestablished: 1,
+            model_lagging: 0,
         });
-        assert_eq!(only_init, "1 个库需初始化 · 去「模型更新」");
-        assert!(!only_init.contains("会话"), "界面上不说会话号：{only_init}");
+        assert_eq!(only_init, "1 个库尚无数据水位（需初始化） · 去「模型更新」");
+        for text in [&only_init] {
+            assert!(!text.contains("会话"), "界面上不说会话号：{text}");
+            assert!(
+                !text.contains("待应用") && !text.contains("未应用"),
+                "按水位说话，不说 pending：{text}"
+            );
+        }
+    }
+
+    /// 模型水位单独一句，且只在服务端判 `lagging` 时出现；数据水位已追平而模型水位落后
+    /// 也要说——那正是「属性是新的、三维是旧的」这种分叉的解释（09-02 计划 §七）。
+    #[test]
+    fn the_hint_names_a_lagging_model_watermark_separately() {
+        let both = watermark_hint(WatermarkLag {
+            data_behind: 8,
+            data_unestablished: 0,
+            model_lagging: 2,
+        });
+        assert_eq!(
+            both,
+            "数据水位落后 8 次保存 · 模型水位：2 个库落后 · 去「模型更新」"
+        );
+        let model_only = watermark_hint(WatermarkLag {
+            data_behind: 0,
+            data_unestablished: 0,
+            model_lagging: 1,
+        });
+        assert_eq!(model_only, "模型水位：1 个库落后 · 去「模型更新」");
+        assert!(
+            !WatermarkLag {
+                data_behind: 0,
+                data_unestablished: 0,
+                model_lagging: 1,
+            }
+            .is_empty(),
+            "只有模型水位落后也值得画那一行"
+        );
     }
 }

@@ -342,6 +342,14 @@ plant-ui-app --read-face-parity --depth 2 --sample 200 [--roots 24381/2,…] [--
   照常；补齐、更新、房间要等它回来」。启动不阻断那一半由 `data.rs` 的源码钉守着
   （`ready()` 只并发 `face.identity()` / `face.sites()`，正文不许出现 health / dbnum / mirror）。
 - **T5（两边身份不一致警告一句，D12 后半）留到 M6 前**：它不在五格里，也不在 M3 的测试单上。
+  **T5 已落地**（2026-09-08，单独一提）：`task_queue::Vm::identity_mismatch_line()` 三前提缺一不说——这一面是库供数、
+  `/health` 在场（一边缺身份是 `Legacy`，不算对不上）、`identity_status() == Mismatch`；服务供数不进这条路（那一面的身份与
+  `/health` 同源，对不上是服务端自己前后矛盾）。`main.rs` 的 `QueuePoll` 臂在 `adopt(poll)` **之后**判，`identity_mismatch_said`
+  一次撞上只说一次（轮询忙时 1 秒一拍），命令行与日志各一句，对上了就复位。测试
+  `only_store_mode_says_the_two_sides_are_different_projects` / `a_mismatched_identity_in_store_mode_is_said_once_per_encounter`；
+  三 crate 129+2 / 134 / 19。同日工作树里另一份「出厂默认翻成库供数、与 gen-model `external` 对齐」的未提交改动**已按用户意见回退**
+  （它没动 ADR-0026 / `CONTEXT.md` / `CHANGELOG`，还顺带把浏览器端 `unwrap_or_default()` 那一档翻成了库供数）——D1 / D11 维持服务供数，
+  翻不翻等 ADR 定案。
 
 ---
 

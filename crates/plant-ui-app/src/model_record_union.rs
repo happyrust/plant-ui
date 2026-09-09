@@ -71,7 +71,10 @@ impl ModelRecordUnion {
             // BRAN and member queries return different owners for the same mesh.
             // Keep the first record's owner but do not use this scope label as identity.
             let mut identity = serde_json::to_value(&record)?;
-            identity.as_object_mut().expect("GeomInstQuery serializes as an object").remove("owner");
+            identity
+                .as_object_mut()
+                .expect("GeomInstQuery serializes as an object")
+                .remove("owner");
             let key = serde_json::to_string(&identity)?;
             let count = scope_counts.entry(key.clone()).or_default();
             *count += 1;
@@ -102,9 +105,8 @@ mod tests {
     use super::*;
 
     fn fixture() -> Vec<GeomInstQuery> {
-        let page: serde_json::Value = serde_json::from_str(include_str!(
-            "fixtures/pipe26229-deleted-records.json"
-        )).unwrap();
+        let page: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/pipe26229-deleted-records.json")).unwrap();
         serde_json::from_value(page["items"].clone()).unwrap()
     }
 
@@ -119,13 +121,14 @@ mod tests {
     fn overlapping_branch_and_members_keep_fourteen_not_twenty_five() {
         let records = fixture();
         assert_eq!(records.len(), 14);
-        let members: Vec<Vec<GeomInstQuery>> = serde_json::from_str(include_str!(
-            "fixtures/pipe26229-member-records.json"
-        )).unwrap();
+        let members: Vec<Vec<GeomInstQuery>> =
+            serde_json::from_str(include_str!("fixtures/pipe26229-member-records.json")).unwrap();
         assert_eq!(members.len(), 11);
         let mut union = ModelRecordUnion::default();
         union.extend_scope(RecordScope::legacy(), records).unwrap();
-        for scope in members { union.extend_scope(RecordScope::legacy(), scope).unwrap(); }
+        for scope in members {
+            union.extend_scope(RecordScope::legacy(), scope).unwrap();
+        }
         let result = union.finish();
         assert_eq!(result.len(), 14);
         assert_eq!(result.iter().filter(|r| r.generic == "TUBI").count(), 3);
@@ -137,7 +140,12 @@ mod tests {
         records.push(fixture().remove(0));
         let expected = serde_json::to_value(&records).unwrap();
         let mut union = ModelRecordUnion::default();
-        union.extend_scope(RecordScope::legacy(), serde_json::from_value(expected.clone()).unwrap()).unwrap();
+        union
+            .extend_scope(
+                RecordScope::legacy(),
+                serde_json::from_value(expected.clone()).unwrap(),
+            )
+            .unwrap();
         union.extend_scope(RecordScope::legacy(), records).unwrap();
         assert_eq!(serde_json::to_value(union.finish()).unwrap(), expected);
     }
@@ -146,12 +154,21 @@ mod tests {
     #[test]
     fn buckets_by_dbnum_and_refuses_two_sources_inside_one_dbnum() {
         let mut union = ModelRecordUnion::default();
-        union.extend_scope(scope(8000, ModelSource::Database), fixture()).unwrap();
-        union.extend_scope(scope(8021, ModelSource::Memory), Vec::new()).unwrap();
-        union.extend_scope(scope(8000, ModelSource::Database), Vec::new()).unwrap();
+        union
+            .extend_scope(scope(8000, ModelSource::Database), fixture())
+            .unwrap();
+        union
+            .extend_scope(scope(8021, ModelSource::Memory), Vec::new())
+            .unwrap();
+        union
+            .extend_scope(scope(8000, ModelSource::Database), Vec::new())
+            .unwrap();
         assert_eq!(
             union.sources(),
-            vec![(Some(8000), ModelSource::Database), (Some(8021), ModelSource::Memory)]
+            vec![
+                (Some(8000), ModelSource::Database),
+                (Some(8021), ModelSource::Memory)
+            ]
         );
 
         let error = union
@@ -159,20 +176,31 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("db8000"), "{error}");
-        assert!(error.contains("database") && error.contains("memory"), "{error}");
+        assert!(
+            error.contains("database") && error.contains("memory"),
+            "{error}"
+        );
     }
 
     /// 老服务端没有 `dbnum`：整次装载算一个桶，两个源照样拒绝——这正是此前「不混纪元」的口径。
     #[test]
     fn without_dbnum_the_whole_load_is_one_bucket() {
         let mut union = ModelRecordUnion::default();
-        let memory = RecordScope { dbnum: None, source: Some(ModelSource::Memory) };
-        let database = RecordScope { dbnum: None, source: Some(ModelSource::Database) };
+        let memory = RecordScope {
+            dbnum: None,
+            source: Some(ModelSource::Memory),
+        };
+        let database = RecordScope {
+            dbnum: None,
+            source: Some(ModelSource::Database),
+        };
         union.extend_scope(memory, Vec::new()).unwrap();
         union.extend_scope(memory, Vec::new()).unwrap();
         assert!(union.extend_scope(database, Vec::new()).is_err());
         // 认不出的源不参与判定：老服务端连 `source` 都没有的响应不能因此整趟失败。
-        union.extend_scope(RecordScope::legacy(), fixture()).unwrap();
+        union
+            .extend_scope(RecordScope::legacy(), fixture())
+            .unwrap();
         assert_eq!(union.finish().len(), 14);
     }
 }

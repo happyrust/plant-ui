@@ -660,7 +660,9 @@ impl ModelRecords {
     pub fn memory_dbnums(&self) -> Vec<u32> {
         self.sources
             .iter()
-            .filter_map(|(dbnum, source)| (*source == ModelSource::Memory).then_some(*dbnum).flatten())
+            .filter_map(|(dbnum, source)| {
+                (*source == ModelSource::Memory).then_some(*dbnum).flatten()
+            })
             .collect()
     }
 
@@ -674,7 +676,9 @@ impl ModelRecords {
                 .sources
                 .iter()
                 .any(|(dbnum, source)| dbnum.is_none() && *source == ModelSource::Memory)
-                .then(|| "；由 API 从内存供数（初始化收口后自动改读 rocksdb，不必重载）".to_owned());
+                .then(|| {
+                    "；由 API 从内存供数（初始化收口后自动改读 rocksdb，不必重载）".to_owned()
+                });
         }
         Some(format!(
             "；其中 {} 由 API 从内存供数（初始化收口后自动改读 rocksdb，不必重载）",

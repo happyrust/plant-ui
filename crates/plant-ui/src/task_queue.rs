@@ -23,8 +23,8 @@ use serde::Deserialize;
 
 use crate::Cmd;
 use crate::model_update::{
-    BatchStatus, Enqueued, Feed, FileAnomaly, PendingModelUnit, Preview, ProgressEvent, RowState,
-    UnitResult, UnitStatus,
+    BatchStatus, ChangeBreakdown, Enqueued, Feed, FileAnomaly, PendingModelUnit, Preview,
+    ProgressEvent, RowState, UnitResult, UnitStatus,
 };
 use crate::settings::ReadFaceKind;
 use crate::style::group_number as group;
@@ -212,6 +212,60 @@ pub struct Health {
     /// 「没有交付单元」，见 `model_regenerate::DeliveryUnits`。
     #[serde(default)]
     pub delivery_unit_types: Vec<String>,
+    /// 目录版本核对的最近一次结果（gen-model `/health.catalogue_reconcile`）。老服务端
+    /// 不给这个键 → `None`，整条横幅不画。
+    #[serde(default)]
+    pub catalogue_reconcile: Option<CatalogueReconcile>,
+}
+
+/// `/health.catalogue_reconcile`：CATA 库文件前移之后，哪些已发布的根还落在旧目录上。
+///
+/// 目录库不进数据批次，队列里永远没有它们的行——目录改了之后模型为什么在重算，
+/// 这一格是界面上唯一说得出来的地方。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CatalogueReconcile {
+    /// `startup` / `periodic` / `sweep` / `requested`。
+    #[serde(default)]
+    pub trigger: String,
+    #[serde(default)]
+    pub at: String,
+    /// 目录确实前移了，但反查没跑成（该目录库没有引用表、表读不了、或超了安全阈）：
+    /// 服务端按「宁多算不漏算」把该库的**全部**依赖根判过期（gen-model d-635 / d-665）。
+    #[serde(default)]
+    pub catalogue_cascade_degraded: bool,
+    /// 已前移、且有已发布的根还落在旧目录上的 CATA 库。与上一格是两件事：
+    /// 精确反查成功的库也在这里。
+    #[serde(default)]
+    pub stale_catalogue_dbnums: Vec<u32>,
+    /// 记在案、却在当前 MDB 里读不到最新会话的 CATA 库数。这是**不知道**，不是「已确认过期」。
+    #[serde(default)]
+    pub unreadable_catalogue_dbnums: usize,
+}
+
+impl CatalogueReconcile {
+    /// 退化那一句。只在 `catalogue_cascade_degraded` 为真时说得出口——精确命中时
+    /// 目录前移是常态，不值得占一条横幅。
+    pub fn degraded_line(&self) -> Option<String> {
+        if !self.catalogue_cascade_degraded {
+            return None;
+        }
+        let which = if self.stale_catalogue_dbnums.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "（{}）",
+                self.stale_catalogue_dbnums
+                    .iter()
+                    .map(|dbnum| format!("db{dbnum}"))
+                    .collect::<Vec<_>>()
+                    .join("、")
+            )
+        };
+        Some(format!(
+            "目录库已前移，但反查没能点名受影响的根{which}：服务端按「宁多算不漏算」\
+             把这些目录库的全部依赖根判过期重算。不是错误——这一轮的模型工作会比精确命中时多。"
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -262,16 +316,19 @@ pub struct DbnumStatus {
     pub dbnum: u32,
     #[serde(default)]
     pub db_type: String,
+    /// 库文件名（`ams7997_0001`）。没有 SITE 可说的行（读透形态的范围行）用它当身份。
+    #[serde(default)]
+    pub file_name: String,
     #[serde(default)]
     pub cache_epoch: u64,
     #[serde(default)]
     pub cached_pe_rows: u64,
     /// 数据水位：该库已应用到的会话号（`0` = 从未导入，需初始化）。服务端一直给，
-    /// 取回工作旁那行「N 次保存未应用」从这里算（原先直读 SurrealDB 水位表，
+    /// 取回工作旁那行「数据水位落后 N 次保存」从这里算（原先直读 SurrealDB 水位表，
     /// 零解析库那张表是空的）。界面上一律说「保存」不说会话号（ADR-0019）。
     #[serde(default)]
     pub applied_sesno: i32,
-    /// 文件此刻自报的最新会话号。与 `applied_sesno` 的差就是待应用的保存次数。
+    /// 文件此刻自报的最新会话号。与 `applied_sesno` 的差就是数据水位落后文件的保存次数。
     #[serde(default)]
     pub file_latest_sesno: i32,
     /// 服务端的登记判定：登记过且有权威水位。与 `applied_sesno > 0` 同义，取这一份。
@@ -305,6 +362,214 @@ pub struct DbnumStatus {
     /// `read-through`）；`database` 时为空。只用来把「内存」那两个字说得更具体。
     #[serde(default)]
     pub model_source_reason: Option<String>,
+    /// 模型水位（gen-model ADR-060 / C2 判决列）：该库模型已算到的会话号。老服务端不给 → `None`。
+    #[serde(default)]
+    pub model_sesno: Option<i32>,
+    #[serde(default)]
+    pub model_sesno_time: Option<String>,
+    /// 三态判决 `in_sync | lagging | not_judged`（gen-model `dbnum_consistency`）。判据只在
+    /// 服务端一处，客户端只消费；`not_judged` 是**中性态**（读透形态 / 水位未建立 / 没有生成根），
+    /// 不许画成落后（d-594 Q4）。老服务端不给 → `None`，整格不画。
+    #[serde(default)]
+    pub model_verdict: Option<String>,
+    #[serde(default)]
+    pub model_verdict_reason: Option<String>,
+    #[serde(default)]
+    pub model_chasing_roots: Option<u32>,
+    #[serde(default)]
+    pub model_dead_roots: Option<u32>,
+}
+
+/// 库一致性判决三态（gen-model ADR-060 / C2 `dbnum_consistency`）：模型水位对数据水位。
+/// 判据只在服务端一处，客户端只认字面、不拿 `model_sesno` / `applied_sesno` 自己比。
+/// `NotJudged` 是**中性态**（读透形态 / 数据水位未建立 / 没有生成根），不是落后、不是告警
+/// （d-594 Q4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    InSync,
+    Lagging,
+    NotJudged,
+}
+
+impl Verdict {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "in_sync" => Some(Self::InSync),
+            "lagging" => Some(Self::Lagging),
+            "not_judged" => Some(Self::NotJudged),
+            _ => None,
+        }
+    }
+}
+
+impl DbnumStatus {
+    /// 服务端给的判决；认不出的字面值与缺席都是 `None`，整格不画。
+    pub fn verdict(&self) -> Option<Verdict> {
+        self.model_verdict.as_deref().and_then(Verdict::parse)
+    }
+
+    /// 判决那一格给人看的一句，按两枚水位说话（CONTEXT.md「水位」）：模型水位对数据水位。
+    /// `None` = 服务端没给，整格不画。`not_judged` 说「不判」并带理由，不说「落后」。
+    pub fn verdict_label(&self) -> Option<String> {
+        let verdict = self.model_verdict.as_deref()?.trim();
+        Some(match verdict {
+            "in_sync" => "模型水位已追平数据水位".to_owned(),
+            "lagging" => match self.model_chasing_roots {
+                Some(n) if n > 0 => format!("模型水位落后于数据水位 · 追赶中 {n} 根"),
+                _ => "模型水位落后于数据水位".to_owned(),
+            },
+            "not_judged" => format!(
+                "模型水位不判（{}）",
+                match self.model_verdict_reason.as_deref() {
+                    Some("read-through") => "读透形态，数据水位不建立、没有可比的两端",
+                    Some("data_watermark_unestablished") => "数据水位尚未建立",
+                    Some("no_generation_roots") => "没有生成根",
+                    Some(other) if !other.is_empty() => other,
+                    _ => "原因未给",
+                }
+            ),
+            other => format!("模型水位：{other}"),
+        })
+    }
+
+    /// 明细里跟在判决后面的那半句：模型水位停在哪一次保存（E3D 写入时刻，ADR-0019），
+    /// 已放弃几根。说得出哪格就说哪格，都说不出就 `None`。
+    pub fn verdict_note(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(at) = self.model_sesno_time.as_deref().map(e3d_time) {
+            parts.push(format!("模型水位在 {at} 那次保存"));
+        }
+        // 只说事实，不指路：重试这件事将来不再由队列面板提供（gen-model 2026-09-08
+        // 起失败根只留痕、不排队），而「模型水位越不过它们」在两种服务端上都成立。
+        if let Some(dead) = self.model_dead_roots.filter(|n| *n > 0) {
+            parts.push(format!("{dead} 根已放弃，模型水位不会越过它们"));
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+}
+
+/// 库行「立即执行」此刻该长什么样（09-08 计划 D1 A / 5.1，2026-09-09 D2–D8 拍板后 U2）。
+///
+/// 判据与文案在**按下之前**就说完——今天这几句都要等回执才知道。六档互斥，
+/// 顺序即优先级：范围（排除 / 够不着）→ 阻断 → 队列里已有它的活 → 两枚水位。
+#[derive(Debug, Clone, PartialEq)]
+pub enum EarlyRun {
+    /// 排除 / 够不着：它本来就不在本期执行范围里，这一格不画（D1 表末行）。
+    Hidden,
+    /// 阻断：按钮灰，悬停给阻断原因原文（含出路，与 S2-E 同一段文案）。
+    Blocked(String),
+    /// 该库已有任务排着：按钮灰，「已在队列第 N 位，提前执行不会插队」。
+    InQueue(Option<usize>),
+    /// 该库的任务正在跑：按钮灰，「正在执行中」。
+    Running,
+    /// `applied == file_latest`：按钮灰，「文件没有新保存，无可执行」。
+    UpToDate,
+    /// 其余：可点。粗版气泡的材料随判据一起备好（5.1：粗版说得出的每一格
+    /// 都有出处，说不出的整格不画——房间段就属于说不出的）。
+    Ready(EarlyRunPlan),
+}
+
+/// 粗版气泡的材料：只用 `/dbnums` 已有的字段，不走全范围预览那条重查询。
+#[derive(Debug, Clone, PartialEq)]
+pub struct EarlyRunPlan {
+    pub dbnum: u32,
+    pub applied: i32,
+    pub latest: i32,
+    /// 落后的保存次数（`latest − applied`）。首次导入时没有「落后几次」可数，恒 0。
+    pub saves: i32,
+    /// 尚无数据水位（`initialized == false`）：这一下排的是首次导入，整库建立基线。
+    /// 「落后 N 次保存」在它身上是整库会话数，不许那么说（CONTEXT.md「需初始化」）。
+    pub first_import: bool,
+    /// 模型段那一行「落后约 M 根」的 M（服务端判的 `model_chasing_roots`）。
+    /// 没有或为 0 就整行不画——粗版不猜。
+    pub chasing_roots: Option<u32>,
+}
+
+impl EarlyRunPlan {
+    /// 气泡数据段那一行。首次导入不说「落后 N 次保存」，说它真正要干的事。
+    pub fn data_line(&self) -> String {
+        if self.first_import {
+            "数据 · 尚无数据水位——首次导入，整库建立基线".to_owned()
+        } else {
+            format!(
+                "数据 · 已应用 {} → 文件最新 {}（{} 次保存）",
+                group(self.applied as i64),
+                group(self.latest as i64),
+                self.saves
+            )
+        }
+    }
+
+    /// 气泡模型段那一行；说不出就 `None`，整行不画。
+    pub fn model_line(&self) -> Option<String> {
+        self.chasing_roots
+            .map(|n| format!("模型 · 落后约 {n} 根（服务端判）"))
+    }
+}
+
+/// 这个库此刻在队列里的活。由绘制层从行表收一份索引传进来——判据只看
+/// 「这个库有没有活」，不看「这一行是什么」：终态历史行旁边那枚按钮也要
+/// 认得出同库还排着一条新的。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ActiveTask {
+    Running,
+    /// 排队中（含断线的 `Unknown`：不知道它开没开始，就当它还占着队列，
+    /// 绝不能因为断线就把「再排一次」放行成重复入队）。
+    Queued(Option<usize>),
+}
+
+/// 「立即执行」的判据（09-08 计划 5.1 那张表，逐行对应）。
+pub fn early_run(db: &DbnumStatus, active: Option<ActiveTask>) -> EarlyRun {
+    if db.excluded || db.not_in_project {
+        return EarlyRun::Hidden;
+    }
+    if db.blocked {
+        return EarlyRun::Blocked(
+            db.anomaly
+                .as_ref()
+                .map(|anomaly| anomaly.to_string())
+                .unwrap_or_else(|| "阻断，原因未随契约给出".to_owned()),
+        );
+    }
+    match active {
+        Some(ActiveTask::Running) => return EarlyRun::Running,
+        Some(ActiveTask::Queued(position)) => return EarlyRun::InQueue(position),
+        None => {}
+    }
+    if !db.initialized {
+        return EarlyRun::Ready(EarlyRunPlan {
+            dbnum: db.dbnum,
+            applied: db.applied_sesno,
+            latest: db.file_latest_sesno,
+            saves: 0,
+            first_import: true,
+            chasing_roots: db.model_chasing_roots.filter(|n| *n > 0),
+        });
+    }
+    let saves = db.file_latest_sesno - db.applied_sesno;
+    if saves <= 0 {
+        return EarlyRun::UpToDate;
+    }
+    EarlyRun::Ready(EarlyRunPlan {
+        dbnum: db.dbnum,
+        applied: db.applied_sesno,
+        latest: db.file_latest_sesno,
+        saves,
+        first_import: false,
+        chasing_roots: db.model_chasing_roots.filter(|n| *n > 0),
+    })
+}
+
+/// RFC3339 → 「MM-DD HH:MM」（本地时区），与 `model_update::e3d_time` 同一口径：
+/// 语义是 E3D 会话写入时刻，解不动就原样返回。
+fn e3d_time(rfc3339: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(rfc3339)
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|_| rfc3339.to_owned())
 }
 
 /// 一个库的模型取数源（gen-model spec §4.12 `model_source`）。判据只在服务端一处
@@ -376,23 +641,29 @@ pub struct DbnumReport {
     pub dbnums: Vec<DbnumStatus>,
 }
 
-/// 取回工作旁那行提示的材料：本期执行范围内还没应用进模型的东西有多少。
+/// 取回工作旁那行提示的材料：本期执行范围内**两枚水位**各落后文件多少（CONTEXT.md「水位」：
+/// 数据水位 = `applied_sesno`，模型水位 = gen-model ADR-060 的 `model_sesno`，都以文件最新那次
+/// 保存为基准；界面按水位说话，不说「待应用 / pending」——2026-09-08 用户口径）。
 ///
-/// 两个数分开给，不许相加：「需初始化」的库契约不为它解保存区间，`file_latest − applied`
-/// 在它身上是整库的会话数而不是「待应用的保存」，加进去数字就是假的；而它又确实会跑，
-/// 绝不能显示成「无变化」（CONTEXT.md「需初始化」）。
+/// 三个数分开给，不许相加：「需初始化」的库尚无数据水位，`file_latest − applied` 在它身上是
+/// 整库的会话数而不是「落后的保存」，加进去数字就是假的；而它又确实会跑，绝不能显示成
+/// 「无变化」（CONTEXT.md「需初始化」）。模型水位那一枚由服务端判，不拿两个会话号自己比。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PendingSaves {
-    /// 已登记的 DESI 库里，文件比水位新的那部分保存次数之和。
-    pub saves: u32,
-    /// 范围内从未导入过的 DESI 库数。
-    pub uninitialized: usize,
+pub struct WatermarkLag {
+    /// 已建立数据水位的 DESI 库里，文件比数据水位多出来的保存次数之和。
+    pub data_behind: u32,
+    /// 范围内尚无数据水位（从未导入）的 DESI 库数。
+    pub data_unestablished: usize,
+    /// 范围内服务端判「模型水位落后于数据水位」（`model_verdict = lagging`）的库数
+    /// （gen-model ADR-060 / C2）。**只数 `lagging`**：`not_judged` 是中性态、`in_sync` 无事，
+    /// 老服务端不给判决时恒 0。
+    pub model_lagging: usize,
 }
 
-impl PendingSaves {
-    /// 有没有值得提示的东西。两个数都是 0 那一行整个不画。
+impl WatermarkLag {
+    /// 有没有值得提示的东西。三个数都是 0 那一行整个不画。
     pub fn is_empty(self) -> bool {
-        self.saves == 0 && self.uninitialized == 0
+        self.data_behind == 0 && self.data_unestablished == 0 && self.model_lagging == 0
     }
 }
 
@@ -531,7 +802,10 @@ impl Vm {
         self.dbnums
             .iter()
             .find(|db| db.dbnum == dbnum)
-            .and_then(|db| db.model_source.map(|source| (source, db.model_source_reason.as_deref())))
+            .and_then(|db| {
+                db.model_source
+                    .map(|source| (source, db.model_source_reason.as_deref()))
+            })
     }
 
     /// 开机就交底本客户端从哪一面读。`Default` 那一份是服务供数，库供数下拿它开机
@@ -700,6 +974,36 @@ impl Vm {
             && self.identity_status() != IdentityStatus::Mismatch
     }
 
+    /// 库供数下两边身份对不上的那一句（计划 D12 后半）。`None` = 不说。
+    ///
+    /// 库供数的工程标识来自库（`project_identity()` 读 `MDB` / `CURD` / `WORL`），命令面
+    /// 照旧发往模型服务（计划 D3）——两边接的不是同一个项目 / MDB / ns 时，眼前的树与
+    /// 属性来自这边，点下去的补齐与更新落到那边。上面那条红横幅只在队列页说得出来，
+    /// 撞上这件事的人多半正对着树，所以再说一句到命令行与日志。
+    ///
+    /// 服务供数不进这条路：那一面的身份与 `/health` 同源（`ServiceReadFace::identity()`
+    /// 读的就是它），对不上是服务端自己前后矛盾，不是两套数据源撞在一起。一边缺身份
+    /// （老服务端、或还没连上）是 [`IdentityStatus::Legacy`]，同样不说——「两边都在场」
+    /// 是 D12 给这句话定的前提。
+    pub fn identity_mismatch_line(&self) -> Option<String> {
+        if self.read_face != ReadFaceKind::Store
+            || self.identity_status() != IdentityStatus::Mismatch
+        {
+            return None;
+        }
+        let service = self.health.as_ref()?;
+        Some(format!(
+            "库与模型服务不是同一套身份——库：{} {} {}；模型服务：{} {} {}。\
+             树 / 属性 / 三维读的是库，补齐、更新与队列发往服务；写操作已禁用",
+            self.project,
+            normalize_mdb(&self.mdb),
+            self.namespace,
+            service.project,
+            normalize_mdb(service.mdb.as_deref().unwrap_or_default()),
+            service.namespace.as_deref().unwrap_or_default()
+        ))
+    }
+
     /// 执行类写操作（开始更新 / 立刻扫一遍 / 立刻重试）此刻为什么会白点；
     /// `None` = 服务会消化。
     ///
@@ -726,20 +1030,21 @@ impl Vm {
         self.can_mutate() && self.execution_blocked_reason().is_none()
     }
 
-    /// 本期执行范围内还没应用进模型的保存有多少（取回工作旁那行提示的材料）。
+    /// 本期执行范围内两枚水位各落后文件多少（取回工作旁那行提示的材料）。
     ///
     /// 只数**会执行**的 DESI 库：排除、阻断、够不着的都不算——阻断的库水位本来就不会动，
-    /// 把它的差额算进「待应用」等于许诺一件不会发生的事。`/dbnums` 取不到时
-    /// `dbnums` 是空表，算出来两个 0，那一行整个不画，与此前「查不动就不显示」一致。
-    pub fn pending_saves(&self) -> PendingSaves {
+    /// 把它的差额算进「落后」等于许诺一件不会发生的事。`/dbnums` 取不到时
+    /// `dbnums` 是空表，算出来三个 0，那一行整个不画，与此前「查不动就不显示」一致。
+    /// 读透形态整个不算：那一形态数据水位**按设计**不建立（`applied_sesno` 恒 0），不是落后。
+    pub fn watermark_lag(&self) -> WatermarkLag {
         if self
             .health
             .as_ref()
             .is_some_and(|health| health.data_face == "read-through")
         {
-            return PendingSaves::default();
+            return WatermarkLag::default();
         }
-        let mut pending = PendingSaves::default();
+        let mut lag = WatermarkLag::default();
         for db in &self.dbnums {
             if !db.db_type.trim().eq_ignore_ascii_case("DESI")
                 || db.excluded
@@ -749,12 +1054,14 @@ impl Vm {
                 continue;
             }
             if !db.initialized || db.applied_sesno <= 0 {
-                pending.uninitialized += 1;
+                lag.data_unestablished += 1;
                 continue;
             }
-            pending.saves += (db.file_latest_sesno - db.applied_sesno).max(0) as u32;
+            lag.data_behind += (db.file_latest_sesno - db.applied_sesno).max(0) as u32;
+            // 模型水位那一枚由服务端判（三态）；这里只数 `lagging`，不拿两个会话号自己比。
+            lag.model_lagging += usize::from(db.verdict() == Some(Verdict::Lagging));
         }
-        pending
+        lag
     }
 
     /// 此刻正在应用的数据批次数（本项目、`state == "running"` 的队列行）。
@@ -882,6 +1189,12 @@ pub struct RowVm {
     pub model_source: Option<ModelSource>,
     /// `memory` 的理由，只用来把标签说具体。
     pub model_source_reason: Option<String>,
+    /// 这个库的一致性判决（`/dbnums` 那一行的 `model_verdict`，gen-model ADR-060 / C2）：
+    /// 模型那一枚凭证对数据那一枚。服务端没给就 `None`，行上整格不画。
+    pub verdict: Option<Verdict>,
+    /// 判决整句（`DbnumStatus::verdict_label`）与明细里的那半句（`verdict_note`）。
+    pub verdict_label: Option<String>,
+    pub verdict_note: Option<String>,
 }
 
 impl RowVm {
@@ -889,6 +1202,16 @@ impl RowVm {
     fn model_source_label(&self) -> Option<String> {
         self.model_source
             .map(|source| source.label(self.model_source_reason.as_deref()))
+    }
+
+    /// 说明列空着时摆的那一句：模型来源 + 判决，有哪句摆哪句。都没有就 `None`。
+    fn status_line(&self) -> Option<String> {
+        let parts: Vec<String> = self
+            .model_source_label()
+            .into_iter()
+            .chain(self.verdict_label.clone())
+            .collect();
+        (!parts.is_empty()).then(|| parts.join(" · "))
     }
 
     /// 「有变化」= 还有活没干完：运行中、排队中，以及水位虽已推进、但仍欠着
@@ -1016,6 +1339,18 @@ pub fn rows(vm: &Vm) -> Vec<RowVm> {
         HashMap::new()
     };
     let source_of = |dbnum: u32| sources.get(&dbnum).cloned();
+    // 判决同样先收成索引。它与模型来源不同，**两种供数模式都画**：说的是服务端模型水位
+    // 对数据水位，库供数读的 `inst_relate` 正是那份模型，判决对它同样成立。
+    let verdicts: HashMap<u32, (Verdict, String, Option<String>)> = vm
+        .dbnums
+        .iter()
+        .filter_map(|db| {
+            let verdict = db.verdict()?;
+            let label = db.verdict_label()?;
+            Some((db.dbnum, (verdict, label, db.verdict_note())))
+        })
+        .collect();
+    let verdict_of = |dbnum: u32| verdicts.get(&dbnum).cloned();
 
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -1081,6 +1416,9 @@ pub fn rows(vm: &Vm) -> Vec<RowVm> {
                 .saturating_sub(detail.map(|d| d.received).unwrap_or_default()),
             model_source: source_of(row.dbnum).map(|(source, _)| source),
             model_source_reason: source_of(row.dbnum).and_then(|(_, reason)| reason),
+            verdict: verdict_of(row.dbnum).map(|(verdict, _, _)| verdict),
+            verdict_label: verdict_of(row.dbnum).map(|(_, label, _)| label),
+            verdict_note: verdict_of(row.dbnum).and_then(|(_, _, note)| note),
         });
     }
 
@@ -1160,6 +1498,9 @@ pub fn rows(vm: &Vm) -> Vec<RowVm> {
             behind_events: 0,
             model_source: source_of(dbnum).map(|(source, _)| source),
             model_source_reason: source_of(dbnum).and_then(|(_, reason)| reason),
+            verdict: verdict_of(dbnum).map(|(verdict, _, _)| verdict),
+            verdict_label: verdict_of(dbnum).map(|(_, label, _)| label),
+            verdict_note: verdict_of(dbnum).and_then(|(_, _, note)| note),
         });
     }
 
@@ -1457,7 +1798,21 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, state: &mut State, cmd
         // 泳道与「本期不执行」贴底：它们与 dbnum 列表平级，不该跟着列表一起滚走
         // ——一个库默默阻断好几周的时候，滚出视野就等于没说。
         footer(ui, t, d, vm);
-        header(ui, t, d);
+        // 「立即执行」的判据材料（09-08 计划 D1 A）：`/dbnums` 按库、行表按「这个库
+        // 有没有活」各收一份索引。空表 = 老服务端没给判据，操作列整列不画（D7）。
+        let actions = !vm.dbnums.is_empty();
+        let dbs: HashMap<u32, &DbnumStatus> =
+            vm.dbnums.iter().map(|db| (db.dbnum, db)).collect();
+        let mut active: HashMap<u32, ActiveTask> = HashMap::new();
+        for r in &all {
+            if r.phase.running() {
+                active.insert(r.dbnum, ActiveTask::Running);
+            } else if matches!(r.phase, Phase::Queued | Phase::Unknown) {
+                // 断线的 Unknown 也算占着队列：不知道它开没开始，就不许放行「再排一次」。
+                active.entry(r.dbnum).or_insert(ActiveTask::Queued(r.position));
+            }
+        }
+        header(ui, t, d, actions);
 
         let hits = visible(&all, state.filter, &state.search);
         ScrollArea::vertical()
@@ -1470,7 +1825,12 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, state: &mut State, cmd
                 for i in hits {
                     let row = &all[i];
                     let open = state.open(row);
-                    let (resp, note_fits) = queue_row(ui, t, d, row, vm.paused(), open);
+                    let gate = dbs
+                        .get(&row.dbnum)
+                        .map(|db| early_run(db, active.get(&row.dbnum).copied()))
+                        .unwrap_or(EarlyRun::Hidden);
+                    let (resp, note_fits) =
+                        queue_row(ui, t, d, row, vm.paused(), open, actions, &gate, vm, cmds);
                     if resp.clicked() {
                         state.toggle(&row.task_id);
                     }
@@ -1552,6 +1912,16 @@ fn service_status_banners(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm) {
             ph::WARNING,
             "模型服务以 direct 形态运行、未启动数据批次 worker：预览可用，执行不可用（入队的批次不会被处理）。",
         );
+    }
+    // 目录库不进数据批次，队列里没有它们的行：目录改了之后模型凭什么在重算、
+    // 又为什么重算得比预期多，只有这一句说得出来。
+    if let Some(line) = vm
+        .health
+        .as_ref()
+        .and_then(|health| health.catalogue_reconcile.as_ref())
+        .and_then(CatalogueReconcile::degraded_line)
+    {
+        hint_banner(ui, t, d, Status::Warn, ph::WARNING, &line);
     }
 }
 
@@ -2058,6 +2428,24 @@ fn excluded_row(ui: &mut Ui, t: &Tokens, d: Density, db: &DbnumStatus) {
         .rect_filled(box_rect, CornerRadius::same(radius::SM), bg);
     ui.painter()
         .galley(pos2(box_rect.left() + pad, mid - g.size().y / 2.0), g, fg);
+    // 阻断行也有「立即执行」那一格，但它永远灰着、悬停给阻断原因原文（09-08 计划
+    // 5.1：判据在按下之前就说完）；排除 / 够不着的行不画这一格——它们本来就不在
+    // 本期执行范围里。
+    if let EarlyRun::Blocked(reason) = early_run(db, None) {
+        let zone = Rect::from_min_max(
+            pos2(box_rect.left() - d.px(84.0), mid - d.px(10.0)),
+            pos2(box_rect.left() - d.px(10.0), mid + d.px(10.0)),
+        );
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(zone)
+                .id(egui::Id::new(("early-run-blocked", db.dbnum))),
+            |ui| {
+                ui.add_enabled(false, widgets::button(t, d, "立即执行"))
+                    .on_disabled_hover_text(reason);
+            },
+        );
+    }
     // 出路（同号重复要列出 paths[] 交给人挑、文件缺失是补回文件或注销登记）
     // 与预览那边 S2-E 用的是同一段文案，两处不许各说各话。
     if let Some(anomaly) = &db.anomaly {
@@ -2088,6 +2476,7 @@ fn anomaly_brief(anomaly: &FileAnomaly) -> String {
         FileAnomaly::Rollback {
             file_latest_sesno,
             applied_sesno,
+            ..
         } => format!(
             "文件回退 {} < 已应用 {}",
             group(*file_latest_sesno as i64),
@@ -2104,13 +2493,13 @@ fn anomaly_brief(anomaly: &FileAnomaly) -> String {
     }
 }
 
-/// 表头。七个列位与 [`queue_row`] 共用 [`cols`] 算出来的那一组 x，两处不许各排各的。
-fn header(ui: &mut Ui, t: &Tokens, d: Density) {
+/// 表头。列位与 [`queue_row`] 共用 [`cols`] 算出来的那一组 x，两处不许各排各的。
+fn header(ui: &mut Ui, t: &Tokens, d: Density, actions: bool) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), d.px(26.0)), Sense::hover());
     ui.painter()
         .rect_filled(rect, CornerRadius::ZERO, t.bg_panel);
     hairline(ui.painter(), rect, t.border);
-    let c = cols(rect, d);
+    let c = cols(rect, d, actions);
     for (x, name) in [
         (c.db, "设计库"),
         (c.ty, "类型"),
@@ -2124,10 +2513,21 @@ fn header(ui: &mut Ui, t: &Tokens, d: Density) {
     }
     let g = layout(ui, "计时 / 结果", Font::micro(d));
     ui.painter().galley(
-        pos2(c.right - g.size().x, rect.center().y - g.size().y / 2.0),
+        pos2(
+            c.timer_right - g.size().x,
+            rect.center().y - g.size().y / 2.0,
+        ),
         g,
         t.text_muted,
     );
+    if actions {
+        let g = layout(ui, "操作", Font::micro(d));
+        ui.painter().galley(
+            pos2(c.action, rect.center().y - g.size().y / 2.0),
+            g,
+            t.text_muted,
+        );
+    }
 }
 
 struct Cols {
@@ -2139,6 +2539,11 @@ struct Cols {
     note: f32,
     /// 「进度 / 说明」写到哪为止；再往右是计时那一列的保留位。
     note_end: f32,
+    /// 计时那一列右对齐到这里。没有操作列时它就是 `right`。
+    timer_right: f32,
+    /// 「操作」列（库行「立即执行」，09-08 计划 D1 A）的左缘；`right` 是它的右缘。
+    /// `/dbnums` 一行都没有时不留这一列（老服务端不给就整列不画，D7）。
+    action: f32,
     right: f32,
 }
 
@@ -2151,14 +2556,18 @@ struct Cols {
 ///
 /// 窄到连状态列都摆不下时，说明列让位给状态：一行先要说清它在干什么。
 /// 挤掉的说明由调用点在行下面另起一行补上，不会丢。
-fn cols(rect: Rect, d: Density) -> Cols {
+fn cols(rect: Rect, d: Density, actions: bool) -> Cols {
     let pad = d.px(14.0);
     let right = rect.right() - pad;
     let window = rect.left() + d.px(168.0);
+    // 操作列只在 `/dbnums` 给了行的时候存在：判据全部来自那张表，没有它
+    // 按钮一颗都画不出来，留一列空白只会让人以为坏了。
+    let action = if actions { right - d.px(74.0) } else { right };
+    let timer_right = if actions { action - d.px(10.0) } else { right };
     // 时间对比会话号长（`08-01 09:12 → 08-07 14:33` vs `sesno 1 024 → 1 038`），
     // 这一列随 ADR-0019 从 150 加宽到 180。
     let after_window = window + d.px(180.0);
-    let note_end = right - d.px(80.0);
+    let note_end = timer_right - d.px(80.0);
     let room = (note_end - after_window).max(0.0);
     let state_w = d.px(168.0).min(room);
     Cols {
@@ -2169,6 +2578,8 @@ fn cols(rect: Rect, d: Density) -> Cols {
         state: after_window,
         note: after_window + state_w,
         note_end,
+        timer_right,
+        action,
         right,
     }
 }
@@ -2187,9 +2598,14 @@ fn row_id(task_id: &str) -> egui::Id {
     egui::Id::new(("task-queue-row", task_id))
 }
 
-/// 组件 `C/QueueRow`：状态点 / 设计库 / 类型 / 保存窗口 / 状态 / 进度与说明 / 计时。
+/// 组件 `C/QueueRow`：状态点 / 设计库 / 类型 / 保存窗口 / 状态 / 进度与说明 / 计时 / 操作。
 /// 返回行的响应，以及「进度 / 说明」那一格有没有装下——装不下的由调用点
 /// 在行下面补一行，不许截没。
+///
+/// `actions` = 面板这一帧画不画操作列（`/dbnums` 空表就整列不画，D7）；`gate` 是这个库
+/// 「立即执行」的判据（[`early_run`]），`Hidden` 与「没这一行」都不画按钮。
+/// 按下推 [`Cmd::RunDbnumNow`]。
+#[allow(clippy::too_many_arguments)]
 fn queue_row(
     ui: &mut Ui,
     t: &Tokens,
@@ -2197,6 +2613,10 @@ fn queue_row(
     row: &RowVm,
     paused: bool,
     open: bool,
+    actions: bool,
+    gate: &EarlyRun,
+    vm: &Vm,
+    cmds: &mut Vec<Cmd>,
 ) -> (egui::Response, bool) {
     let (_, rect) = ui.allocate_space(vec2(ui.available_width(), d.px(34.0)));
     let resp = ui.interact(rect, row_id(&row.task_id), Sense::click());
@@ -2211,8 +2631,11 @@ fn queue_row(
         ui.painter()
             .rect_filled(rect, CornerRadius::ZERO, t.bg_hover);
     }
-    let c = cols(rect, d);
+    let c = cols(rect, d, actions);
     let mid = rect.center().y;
+    if actions && *gate != EarlyRun::Hidden {
+        early_run_button(ui, t, d, rect, &c, row.task_id.as_str(), gate, vm, cmds);
+    }
 
     ui.painter()
         .circle_filled(pos2(c.dot, mid), d.px(4.0), tone);
@@ -2252,23 +2675,44 @@ fn queue_row(
         );
         // 模型取数源紧挨着类型：一个字形，整句在悬停与明细里（plan 2026-09-06 §8.3 U1）。
         // 「内存」用提醒色——这批模型活不过服务端重启，是人该知道的事；「数据库」不出声。
+        let mut next_x = tag.right() + d.px(10.0);
         if let Some(source) = row.model_source {
             let (icon, color) = model_source_glyph(t, source);
-            let at = pos2(tag.right() + d.px(10.0), mid);
+            let at = pos2(next_x, mid);
             glyph(ui, at, icon, d.px(12.0), color);
             // 字形自己没有 Response，给它一块只感知悬停的热区（不吃行的点击）。
             let hit = Rect::from_center_size(at, vec2(d.px(16.0), d.px(16.0)));
             if let Some(label) = row.model_source_label() {
-                ui.interact(hit, row_id(&row.task_id).with("model-source"), Sense::hover())
-                    .on_hover_ui(|ui| {
-                        ui.label(label);
-                        ui.label(
-                            RichText::new(model_source_note(source))
-                                .font(Font::micro(d))
-                                .color(t.text_muted),
-                        );
-                    });
+                ui.interact(
+                    hit,
+                    row_id(&row.task_id).with("model-source"),
+                    Sense::hover(),
+                )
+                .on_hover_ui(|ui| {
+                    ui.label(label);
+                    ui.label(
+                        RichText::new(model_source_note(source))
+                            .font(Font::micro(d))
+                            .color(t.text_muted),
+                    );
+                });
             }
+            next_x += d.px(18.0);
+        }
+        // 判决字形再靠右一格：模型那一枚凭证对数据那一枚（ADR-060 / C2）。「落后」用提醒色，
+        // 「追平」与「不判」都是灰的——不判是中性态，不许画成落后（d-594 Q4）。
+        if let (Some(verdict), Some(label)) = (row.verdict, row.verdict_label.as_deref()) {
+            let (icon, color) = verdict_glyph(t, verdict);
+            let at = pos2(next_x, mid);
+            glyph(ui, at, icon, d.px(12.0), color);
+            let hit = Rect::from_center_size(at, vec2(d.px(16.0), d.px(16.0)));
+            ui.interact(hit, row_id(&row.task_id).with("verdict"), Sense::hover())
+                .on_hover_ui(|ui| {
+                    ui.label(label);
+                    if let Some(note) = row.verdict_note.as_deref() {
+                        ui.label(RichText::new(note).font(Font::micro(d)).color(t.text_muted));
+                    }
+                });
         }
     }
     text_at(
@@ -2301,8 +2745,11 @@ fn queue_row(
             _ => t.text_muted,
         };
         let g = layout(ui, &timer_text, Font::mono_meta(d));
-        ui.painter()
-            .galley(pos2(c.right - g.size().x, mid - g.size().y / 2.0), g, color);
+        ui.painter().galley(
+            pos2(c.timer_right - g.size().x, mid - g.size().y / 2.0),
+            g,
+            color,
+        );
     }
 
     let note_w = (c.note_end - c.note).max(0.0);
@@ -2326,17 +2773,22 @@ fn queue_row(
         return (resp, true);
     }
     if row.note.is_empty() {
-        // 说明列空着时把「模型来源：…」整句摆进来（U1「库行上并排显示」）。装不下就只剩
-        // 类型旁那个字形——这一句不值得为它另起一行，字形 + 悬停已经把话说全了。
-        if let Some(label) = row.model_source_label() {
+        // 说明列空着时把「模型来源：… · 判决」整句摆进来（U1「库行上并排显示」）。整句装不下
+        // 就退到只摆来源那半句；还装不下就只剩类型旁那两个字形——这些话不值得为它另起
+        // 一行，字形 + 悬停已经把话说全了。
+        let candidates = [row.status_line(), row.model_source_label()];
+        for label in candidates.into_iter().flatten() {
             let g = layout(ui, &label, Font::meta(d));
             if g.size().x <= note_w {
-                let color = match row.model_source {
-                    Some(ModelSource::Memory) => t.text_secondary,
+                let color = match (row.model_source, row.verdict) {
+                    (Some(ModelSource::Memory), _) | (_, Some(Verdict::Lagging)) => {
+                        t.text_secondary
+                    }
                     _ => t.text_muted,
                 };
                 ui.painter()
                     .galley(pos2(c.note, mid - g.size().y / 2.0), g, color);
+                break;
             }
         }
         return (resp, true);
@@ -2358,6 +2810,91 @@ fn queue_row(
     (resp, true)
 }
 
+/// 库行上的「立即执行」（09-08 计划 D1 A / 5.1；D2–D8 2026-09-09 拍板后 U2）。
+///
+/// 六档判据在 [`early_run`]；这里只管把它画出来：可点的带粗版气泡，灰的把
+/// 「为什么按不下去」放在悬停里——判据与文案在**按下之前**就说完，不等回执。
+/// 服务不消化执行请求时（direct 形态 / 身份不一致）与「立刻扫一遍」同样置灰。
+#[allow(clippy::too_many_arguments)]
+fn early_run_button(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    row_rect: Rect,
+    c: &Cols,
+    task_id: &str,
+    gate: &EarlyRun,
+    vm: &Vm,
+    cmds: &mut Vec<Cmd>,
+) {
+    let zone = Rect::from_min_max(
+        pos2(c.action, row_rect.center().y - d.px(12.0)),
+        pos2(c.right, row_rect.center().y + d.px(12.0)),
+    );
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(zone)
+            .id(egui::Id::new(("early-run", task_id))),
+        |ui| match gate {
+            EarlyRun::Hidden => {}
+            EarlyRun::Blocked(reason) => {
+                ui.add_enabled(false, widgets::button(t, d, "立即执行"))
+                    .on_disabled_hover_text(reason);
+            }
+            EarlyRun::InQueue(position) => {
+                let hint = match position {
+                    Some(n) => format!("已在队列第 {n} 位，提前执行不会插队"),
+                    None => "已在队列，提前执行不会插队".to_owned(),
+                };
+                ui.add_enabled(false, widgets::button(t, d, "立即执行"))
+                    .on_disabled_hover_text(hint);
+            }
+            EarlyRun::Running => {
+                ui.add_enabled(false, widgets::button(t, d, "立即执行"))
+                    .on_disabled_hover_text("正在执行中");
+            }
+            EarlyRun::UpToDate => {
+                ui.add_enabled(false, widgets::button(t, d, "立即执行"))
+                    .on_disabled_hover_text("文件没有新保存，无可执行");
+            }
+            EarlyRun::Ready(plan) => {
+                let resp = ui
+                    .add_enabled(vm.can_execute(), widgets::button(t, d, "立即执行"))
+                    .on_disabled_hover_text(execution_disabled_hint(vm));
+                let resp = resp.on_hover_ui(|ui| {
+                    ui.set_max_width(d.px(340.0));
+                    ui.label(
+                        RichText::new(format!("提前执行 db{}：现在排上这个库的任务", plan.dbnum))
+                            .font(Font::strong(d))
+                            .color(t.text_primary),
+                    );
+                    ui.label(
+                        RichText::new(plan.data_line())
+                            .font(Font::meta(d))
+                            .color(t.text_secondary),
+                    );
+                    if let Some(model) = plan.model_line() {
+                        ui.label(
+                            RichText::new(model)
+                                .font(Font::meta(d))
+                                .color(t.text_secondary),
+                        );
+                    }
+                    // 房间段整格不画：粗版只有 `/dbnums` 的字段，房间没有出处（5.1）。
+                    ui.label(
+                        RichText::new("不插队、不改本期执行范围；与自动发现排出的是同一种任务")
+                            .font(Font::micro(d))
+                            .color(t.text_muted),
+                    );
+                });
+                if resp.clicked() {
+                    cmds.push(Cmd::RunDbnumNow { dbnum: plan.dbnum });
+                }
+            }
+        },
+    );
+}
+
 /// 模型取数源的字形与颜色。「内存」用提醒色不用危险色：它不是出事，是「这批模型此刻
 /// 活在进程里、重启后要由初始化发布落库」，值得看见、不值得惊动。
 fn model_source_glyph(t: &Tokens, source: ModelSource) -> (&'static str, Color32) {
@@ -2367,11 +2904,23 @@ fn model_source_glyph(t: &Tokens, source: ModelSource) -> (&'static str, Color32
     }
 }
 
+/// 判决的字形与颜色。「落后」用提醒色（模型还没追上数据，看到的几何可能是旧的）；
+/// 「追平」不出声；「不判」是中性态，同样不出声——它不是告警。
+fn verdict_glyph(t: &Tokens, verdict: Verdict) -> (&'static str, Color32) {
+    match verdict {
+        Verdict::InSync => (ph::CHECK_CIRCLE, t.text_muted),
+        Verdict::Lagging => (ph::HOURGLASS_MEDIUM, t.warn),
+        Verdict::NotJudged => (ph::MINUS_CIRCLE, t.text_muted),
+    }
+}
+
 /// 悬停与明细里跟在「模型来源：…」后面的那半句：这个来源对人意味着什么。
 fn model_source_note(source: ModelSource) -> &'static str {
     match source {
         ModelSource::Database => "rocksdb 为准，重启后仍在",
-        ModelSource::Memory => "由 API 现算供数、活不过服务端重启；初始化发布收口后自动改读 rocksdb，同一版文件，不必重载",
+        ModelSource::Memory => {
+            "由 API 现算供数、活不过服务端重启；初始化发布收口后自动改读 rocksdb，同一版文件，不必重载"
+        }
     }
 }
 
@@ -2409,6 +2958,22 @@ fn row_detail(
                         icon_color,
                         label: &label,
                         note: model_source_note(source),
+                        note_color: t.text_muted,
+                    },
+                );
+            }
+            // 判决整句第二行：模型水位停在哪次保存、几根在追、几根已放弃。
+            if let (Some(verdict), Some(label)) = (row.verdict, row.verdict_label.as_deref()) {
+                let (icon, icon_color) = verdict_glyph(t, verdict);
+                detail_line(
+                    ui,
+                    t,
+                    d,
+                    DetailLine {
+                        icon,
+                        icon_color,
+                        label,
+                        note: row.verdict_note.as_deref().unwrap_or_default(),
                         note_color: t.text_muted,
                     },
                 );
@@ -2607,16 +3172,20 @@ fn terminal_detail(
             }
         }
 
-        let changed = match vm.preview_changes.get(&row.task_id) {
-            Some(previewed) => format!(
-                "{} 项变化（预览时 {}）",
-                group(batch.changed_elements as i64),
-                group(*previewed as i64)
-            ),
-            None => format!("{} 项变化", group(batch.changed_elements as i64)),
-        };
-        if batch.changed_elements > 0 {
-            sub_line(ui, t, d, &changed, false);
+        // 增删改三数 + 分布条（计划 §2 / QUEUE-FIELD-MAP §1.5）：拆得出分解就画三数与条，
+        // 拆不出（老服务端缺字段）退回一句总数——绝不把缺省的 0/0/0 画成「无变化」。真零时
+        // 总数也是 0，`change_breakdown` 同样给 None，整个变化区本来就不画。
+        let previewed = vm.preview_changes.get(&row.task_id).copied();
+        match batch.change_breakdown() {
+            Some(breakdown) => {
+                let total = change_total(batch.changed_elements, previewed, true);
+                change_block(ui, t, d, breakdown, &total)
+            }
+            None if batch.changed_elements > 0 => {
+                let fallback = change_total(batch.changed_elements, previewed, false);
+                sub_line(ui, t, d, &fallback, false)
+            }
+            None => {}
         }
 
         if batch.status == BatchStatus::Failed {
@@ -2664,6 +3233,22 @@ fn terminal_detail(
                 format!("{generated} 成功 · {} 失败 · 共 {total}", failed.len())
             };
             sub_line(ui, t, d, &label, false);
+        }
+
+        // 刚体前移便宜路交付的根（gen-model ADR-066，计划 §五 V2）：只动方位、网格未重算。
+        // 契约已有 `kind`，旧回执缺省 Regen → 计数 0 → 整句不画（元数据门那半句等 §3 字段）。
+        let transformed = outcome.map_or(0, |o| o.transform_roots());
+        if transformed > 0 {
+            sub_line(
+                ui,
+                t,
+                d,
+                &format!(
+                    "刚体前移 {} 根（只动方位，网格未重算）",
+                    group(transformed as i64)
+                ),
+                false,
+            );
         }
 
         for unit in failed {
@@ -2811,11 +3396,17 @@ fn pending_line(
             .font(Font::mono_meta(d))
             .color(t.text_secondary),
     );
-    let state = if unit.dead {
+    let mut state = if unit.dead {
         format!("已尝试 {} 次 · 已放弃重试", unit.attempts)
     } else {
         format!("第 {} 次尝试失败", unit.attempts)
     };
+    // 这一根欠的是**哪一次保存**的模型（QUEUE-FIELD-MAP §1.5）。不说来源，一条欠账行
+    // 就分不清是刚才那一窗留下的、还是几天前那一窗一直没补上的。老服务端给不出
+    // 时刻就整段不摆——不回落成会话号（ADR-0019）。
+    if let Some(at) = unit.source_end_sesno_time.as_deref() {
+        state.push_str(&format!(" · 来源保存 {}", e3d_time(at)));
+    }
     line.label(RichText::new(state).font(Font::micro(d)).color(tone));
 
     let submitted = in_flight.contains_key(&unit.root_refno);
@@ -2860,6 +3451,79 @@ fn pending_line(
     // 持久表这一份跨重启仍在，不画就等于没有。
     if let Some(error) = unit.last_error.as_deref() {
         sub_line(ui, t, d, error, unit.dead);
+    }
+}
+
+/// 终态数据段的增删改三数 + 分布条（计划 §2 / QUEUE-FIELD-MAP §1.5）。
+///
+/// 只在 [`crate::model_update::BatchResult::change_breakdown`] 拆得出分解时才调——缺席
+/// 由调用点退回一句总数。三数配色与预览页 S2「三个大数 + 分布条」对齐：新增 `success`、
+/// 修改 `warn`、删除 `danger`，两处认得出是同一组数；分布条与进度条共用 `ratio_bar`
+/// 那一个零件。总数句原样接在三数后面（`· 共 N 项变化 · 预览时 M`）。
+fn change_block(ui: &mut Ui, t: &Tokens, d: Density, breakdown: ChangeBreakdown, total: &str) {
+    ui.horizontal(|ui| {
+        ui.add_space(d.px(21.0));
+        ui.spacing_mut().item_spacing.x = d.px(4.0);
+        for (i, (value, sign, label, color)) in [
+            (breakdown.added, "+", "新增", t.success),
+            (breakdown.modified, "~", "修改", t.warn),
+            (breakdown.deleted, "−", "删除", t.danger),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if i > 0 {
+                ui.add_space(d.px(12.0));
+            }
+            ui.label(
+                RichText::new(format!("{sign}{}", group(value as i64)))
+                    .font(Font::mono(d))
+                    .color(color),
+            );
+            ui.label(
+                RichText::new(label)
+                    .font(Font::micro(d))
+                    .color(t.text_muted),
+            );
+        }
+        ui.add_space(d.px(8.0));
+        ui.label(
+            RichText::new(format!("· {total}"))
+                .font(Font::micro(d))
+                .color(t.text_muted),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.add_space(d.px(21.0));
+        ui.allocate_ui(vec2(d.px(300.0), d.px(8.0)), |ui| {
+            crate::model_update::ratio_bar(
+                ui,
+                t,
+                d,
+                &[
+                    (breakdown.added as u32, t.success),
+                    (breakdown.modified as u32, t.warn),
+                    (breakdown.deleted as u32, t.danger),
+                ],
+            );
+        });
+    });
+    ui.add_space(d.px(2.0));
+}
+
+/// 终态数据段的总数句（QUEUE-FIELD-MAP §1.5，两种形态一字不差）。
+///
+/// 三数在场（`after_breakdown`）时它挂在三数尾巴上：带「共」、用 `·` 接预览值
+/// （`共 85 项变化 · 预览时 82`）。分解缺席的降级句独立成行，回到 V1 之前的原句：
+/// 不带「共」、预览值进括号（`85 项变化（预览时 82）`）——段形态表拿这一字之差当
+/// 「降级 = 退回旧观感」的记号，别顺手抹平。
+fn change_total(changed_elements: u64, previewed: Option<u64>, after_breakdown: bool) -> String {
+    let total = group(changed_elements as i64);
+    match (after_breakdown, previewed) {
+        (true, Some(p)) => format!("共 {total} 项变化 · 预览时 {}", group(p as i64)),
+        (true, None) => format!("共 {total} 项变化"),
+        (false, Some(p)) => format!("{total} 项变化（预览时 {}）", group(p as i64)),
+        (false, None) => format!("{total} 项变化"),
     }
 }
 
@@ -3123,6 +3787,55 @@ mod tests {
         }
     }
 
+    /// 库供数下两边身份对不上要另说一句（计划 D12 后半）。三个前提缺一不说：这一面是
+    /// 库供数、两边身份都在场、且真的对不上。服务供数不进这条路——那一面的身份与
+    /// `/health` 同源，比的是服务端和它自己。
+    #[test]
+    fn only_store_mode_says_the_two_sides_are_different_projects() {
+        let mut model = vm(Vec::new(), Vec::new());
+        model.read_face = ReadFaceKind::Store;
+        model.health = Some(Health {
+            project: "Other".into(),
+            mdb: Some("/OTHER".into()),
+            namespace: Some("other".into()),
+            ..Default::default()
+        });
+
+        let line = model
+            .identity_mismatch_line()
+            .expect("库供数 + 两边都在场 + 对不上 = 要说");
+        // 两边各自的三格都要写出来，人才知道该改哪一头。
+        for expected in ["ProjAMS", "/ALL", "plant", "Other", "/OTHER", "other"] {
+            assert!(line.contains(expected), "{line}");
+        }
+
+        model.read_face = ReadFaceKind::Service;
+        assert_eq!(
+            model.identity_mismatch_line(),
+            None,
+            "服务供数下身份与 /health 同源，不是两套数据源撞了"
+        );
+
+        model.read_face = ReadFaceKind::Store;
+        model.health.as_mut().unwrap().namespace = None;
+        assert_eq!(
+            model.identity_mismatch_line(),
+            None,
+            "老服务端不给身份字段是 Legacy，不许当成对不上"
+        );
+
+        model.health = None;
+        assert_eq!(model.identity_mismatch_line(), None, "还没取到 /health");
+
+        model.health = Some(Health {
+            project: "ProjAMS".into(),
+            mdb: Some("ALL".into()),
+            namespace: Some("plant".into()),
+            ..Default::default()
+        });
+        assert_eq!(model.identity_mismatch_line(), None, "对得上就不说");
+    }
+
     /// direct 形态下 gen-model 不起 worker，`/health` 把 `worker_alive` 报成 `null`、
     /// 另给 `data_read_mode: "direct"`。执行请求会入队却没人出队——这一档必须把
     /// 执行类按钮灰掉，但暂停 / 恢复（只改调度器旗标）与预览不受影响。
@@ -3205,10 +3918,10 @@ mod tests {
         );
     }
 
-    /// 取回工作旁那行提示只数会执行的 DESI：排除 / 阻断 / 够不着的不算，需初始化的
-    /// 单独数——它的 `file_latest − applied` 是整库会话数，不是「待应用的保存」。
+    /// 取回工作旁那行提示只数会执行的 DESI：排除 / 阻断 / 够不着的不算，尚无数据水位的
+    /// 单独数——它的 `file_latest − applied` 是整库会话数，不是「落后的保存」。
     #[test]
-    fn pending_saves_counts_only_in_scope_desi_and_splits_uninitialized() {
+    fn watermark_lag_counts_only_in_scope_desi_and_splits_unestablished() {
         let db = |dbnum, db_type: &str, applied, latest| DbnumStatus {
             dbnum,
             db_type: db_type.into(),
@@ -3239,16 +3952,43 @@ mod tests {
             db(8007, "DESI", 50, 40),
         ];
         assert_eq!(
-            model.pending_saves(),
-            PendingSaves {
-                saves: 8,
-                uninitialized: 1,
+            model.watermark_lag(),
+            WatermarkLag {
+                data_behind: 8,
+                data_unestablished: 1,
+                model_lagging: 0,
             }
         );
 
+        // 模型水位那一枚只认服务端的三态判决：`lagging` 数进去；`not_judged` 是中性态、
+        // `in_sync` 无事、认不出的字面值与缺席都不算；范围之外的库（阻断 / 排除 / 够不着）
+        // 即便 lagging 也不数——它们本来就不在「会执行」那一边。
+        let judged = |dbnum, verdict: &str| DbnumStatus {
+            model_verdict: Some(verdict.into()),
+            ..db(dbnum, "DESI", 10, 12)
+        };
+        model.dbnums = vec![
+            judged(7997, "lagging"),
+            judged(8000, "in_sync"),
+            judged(8001, "not_judged"),
+            judged(8002, "brand_new_word"),
+            DbnumStatus {
+                blocked: true,
+                ..judged(8004, "lagging")
+            },
+            DbnumStatus {
+                model_verdict: Some("lagging".into()),
+                ..db(8021, "DESI", 0, 66)
+            },
+        ];
+        let lag = model.watermark_lag();
+        assert_eq!(lag.model_lagging, 1, "{lag:?}");
+        assert_eq!(lag.data_unestablished, 1);
+        assert!(!lag.is_empty());
+
         model.dbnums.clear();
         assert!(
-            model.pending_saves().is_empty(),
+            model.watermark_lag().is_empty(),
             "取不到 /dbnums 时那一行不画"
         );
     }
@@ -3269,6 +4009,52 @@ mod tests {
         let legacy: DbnumStatus = serde_json::from_str(r#"{"dbnum":1,"db_type":"DESI"}"#).unwrap();
         assert_eq!((legacy.applied_sesno, legacy.file_latest_sesno), (0, 0));
         assert!(!legacy.initialized);
+    }
+
+    /// `/dbnums` 的判决列（gen-model ADR-060 / C2）要真解出来；三态里 `not_judged` 是
+    /// 中性态，文案说「不判」带理由、不说「落后」（d-594 Q4）；老服务端不给整格 `None`。
+    #[test]
+    fn dbnum_status_decodes_the_verdict_columns_and_keeps_not_judged_neutral() {
+        let report: DbnumReport = serde_json::from_str(
+            r#"{"data_face":"read-through","dbnums":[
+                {"dbnum":7997,"db_type":"DESI","applied_sesno":0,"initialized":false,
+                 "model_sesno":0,"model_sesno_time":null,"model_verdict":"not_judged",
+                 "model_verdict_reason":"read-through","model_caught_up_roots":0,
+                 "model_chasing_roots":0,"model_dead_roots":0,"model_lazy_roots":null,
+                 "model_source":"memory","model_source_reason":"read-through"},
+                {"dbnum":8000,"db_type":"DESI","applied_sesno":49,"initialized":true,
+                 "model_sesno":47,"model_verdict":"lagging","model_chasing_roots":3},
+                {"dbnum":8021,"db_type":"DESI","applied_sesno":66,"initialized":true,
+                 "model_sesno":66,"model_verdict":"in_sync"},
+                {"dbnum":8003,"db_type":"DESI","applied_sesno":41,"initialized":true}]}"#,
+        )
+        .unwrap();
+        let [cold, lagging, in_sync, legacy] = report.dbnums.as_slice() else {
+            panic!("四行");
+        };
+        let cold_label = cold.verdict_label().unwrap();
+        assert!(
+            cold_label.contains("不判") && cold_label.contains("读透"),
+            "{cold_label}"
+        );
+        assert!(!cold_label.contains("落后"), "{cold_label}");
+        assert_eq!(cold.model_sesno, Some(0));
+
+        let lagging_label = lagging.verdict_label().unwrap();
+        assert!(
+            lagging_label.contains("落后") && lagging_label.contains("3 根"),
+            "{lagging_label}"
+        );
+        assert_eq!(lagging.model_sesno, Some(47));
+
+        assert_eq!(
+            in_sync.verdict_label().as_deref(),
+            Some("模型水位已追平数据水位")
+        );
+
+        assert_eq!(legacy.model_verdict, None);
+        assert_eq!(legacy.verdict_label(), None, "老服务端不给判决，整格不画");
+        assert_eq!(legacy.model_sesno, None);
     }
 
     /// `/health` 多出来的 `data_read_mode` 键要真解出来，而不是被 `serde(default)`
@@ -3347,6 +4133,104 @@ mod tests {
             model.preview_changes.len(),
             2,
             "没有 task_id 的覆盖项不许猜"
+        );
+    }
+
+    /// 目录库不进数据批次，队列里永远没有它们的行——目录改了之后模型为什么在重算、
+    /// 又为什么算得比预期多，`/health.catalogue_reconcile` 是界面上唯一说得出的地方。
+    /// 精确命中时不出声（目录前移是常态，出声就是刷屏），只有退化那一档占横幅。
+    #[test]
+    fn a_degraded_catalogue_cascade_gets_a_banner_and_a_precise_one_stays_quiet() {
+        let health: Health = serde_json::from_str(
+            r#"{"catalogue_reconcile":{"origin":"startup","trigger":"requested",
+                 "at":"2026-09-08T13:20:00+08:00","catalogue_cascade_degraded":true,
+                 "stale_catalogue_dbnums":[7355,7356],"unreadable_catalogue_dbnums":1}}"#,
+        )
+        .unwrap();
+        let reconcile = health.catalogue_reconcile.as_ref().expect("这一格解得出");
+        assert_eq!(reconcile.stale_catalogue_dbnums, vec![7355, 7356]);
+        assert_eq!(reconcile.unreadable_catalogue_dbnums, 1);
+        let line = reconcile.degraded_line().expect("退化要出声");
+        assert!(line.contains("db7355") && line.contains("db7356"), "{line}");
+        assert!(
+            line.contains("不是错误"),
+            "宁多算不漏算是设计裁决，不是故障：{line}"
+        );
+
+        // 前移了、但反查精确命中：这一档不画横幅。
+        let precise: Health = serde_json::from_str(
+            r#"{"catalogue_reconcile":{"catalogue_cascade_degraded":false,
+                 "stale_catalogue_dbnums":[7355]}}"#,
+        )
+        .unwrap();
+        assert!(
+            precise
+                .catalogue_reconcile
+                .expect("解得出")
+                .degraded_line()
+                .is_none()
+        );
+
+        // 老服务端不给这个键：整块不画，不是「没退化」。
+        let old: Health = serde_json::from_str("{}").unwrap();
+        assert!(old.catalogue_reconcile.is_none());
+    }
+
+    /// 欠账那一格有三种答案，不是两种。真取不到（超时 / 500）沿用上一份快照——那是
+    /// 「暂时看不见」。**端点压根不在**是另一回事：gen-model 2026-09-08 起模型工作内联
+    /// 进 dbnum 任务、欠账表退役，那时候还把上一份冻在界面上，人看到的是一份越来越旧、
+    /// 而且永远不会自己消失的欠账清单。
+    #[test]
+    fn a_retired_pending_endpoint_clears_the_owed_section_instead_of_freezing_it() {
+        let unit = PendingModelUnit {
+            dbnum: 8000,
+            root_refno: "24384/1".into(),
+            source_end_sesno: 20,
+            dead: true,
+            ..Default::default()
+        };
+        let mut model = Vm::default();
+        model.adopt(Poll {
+            pending: vec![unit],
+            pending_known: true,
+            ..Default::default()
+        });
+        assert_eq!(model.pending.len(), 1);
+        assert!(!model.pending_unsupported);
+        assert_eq!(dead_letters(&model), 1);
+
+        // 真取不到：沿用上一份，不冒充「欠账清零」。
+        model.adopt(Poll {
+            pending_known: false,
+            ..Default::default()
+        });
+        assert_eq!(model.pending.len(), 1);
+        assert!(!model.pending_unsupported);
+
+        // 端点不在：整段清空并记下来，派生计数跟着归零。
+        model.adopt(Poll {
+            pending_known: true,
+            pending_unsupported: true,
+            ..Default::default()
+        });
+        assert!(model.pending.is_empty());
+        assert!(model.pending_unsupported);
+        assert_eq!(dead_letters(&model), 0);
+    }
+
+    /// 欠账行说得出自己欠的是**哪一次保存**的模型（QUEUE-FIELD-MAP §1.5）。不说来源，
+    /// 一条欠账分不清是刚才那一窗留下的、还是几天前那一窗一直没补上的。
+    /// 时刻缺席就整段不摆——不回落成会话号（ADR-0019）。
+    #[test]
+    fn an_owed_unit_names_the_save_it_owes() {
+        // 这棵树 CRLF / LF 混用，`include_str!` 原样带回来；探针按 LF 写，先归一。
+        let source = include_str!("task_queue.rs").replace("\r\n", "\n");
+        let body = source.split_once("fn pending_line(").expect("欠账行存在").1;
+        let body = &body[..body.find("\n}\n").expect("函数体收尾")];
+        assert!(body.contains("unit.source_end_sesno_time"), "{body}");
+        assert!(
+            body.contains("来源保存") && body.contains("e3d_time(at)"),
+            "时刻走 e3d_time，不摆 RFC3339 原文：{body}"
         );
     }
 
@@ -3474,6 +4358,52 @@ mod tests {
         // 数据本身还在：切回服务供数那一格立刻回来，不用等下一拍 `/dbnums`。
         model.read_face = ReadFaceKind::Service;
         assert_eq!(rows(&model)[0].model_source, Some(ModelSource::Memory));
+    }
+
+    /// 库行的判决那一格来自 `/dbnums` 的 `model_verdict`（gen-model ADR-060 / C2），
+    /// **两种供数模式都画**——它说的是服务端模型水位对数据水位，库供数读的 `inst_relate`
+    /// 正是那份模型。`not_judged` 照画，但字面是「不判」不是落后；服务端没给整格 `None`。
+    #[test]
+    fn a_row_carries_the_servers_verdict_in_both_read_faces() {
+        let mut model = vm(
+            vec![queued("db-7997", 7997, 1024, 1038)],
+            vec![entry("db-7997", 7997, "queued")],
+        );
+        model.dbnums = vec![DbnumStatus {
+            dbnum: 7997,
+            db_type: "DESI".into(),
+            model_verdict: Some("lagging".into()),
+            model_chasing_roots: Some(4),
+            model_dead_roots: Some(1),
+            model_sesno_time: Some("2026-08-07T14:10:00+08:00".into()),
+            ..Default::default()
+        }];
+        for face in [ReadFaceKind::Service, ReadFaceKind::Store] {
+            model.read_face = face;
+            let row = &rows(&model)[0];
+            assert_eq!(row.verdict, Some(Verdict::Lagging));
+            let label = row.verdict_label.as_deref().unwrap();
+            assert!(label.contains("落后") && label.contains("4 根"), "{label}");
+            let note = row.verdict_note.as_deref().unwrap();
+            assert!(
+                note.contains("模型水位在") && note.contains("1 根已放弃"),
+                "{note}"
+            );
+            assert!(row.status_line().unwrap().contains("落后"));
+        }
+
+        model.dbnums[0].model_verdict = Some("not_judged".into());
+        model.dbnums[0].model_verdict_reason = Some("data_watermark_unestablished".into());
+        let row = &rows(&model)[0];
+        assert_eq!(row.verdict, Some(Verdict::NotJudged));
+        let label = row.verdict_label.as_deref().unwrap();
+        assert!(label.contains("不判") && !label.contains("落后"), "{label}");
+
+        model.dbnums[0].model_verdict = None;
+        let row = &rows(&model)[0];
+        assert_eq!(row.verdict, None);
+        assert_eq!(row.verdict_label, None);
+        assert_eq!(row.status_line(), None, "来源与判决都没有就没有这一句");
     }
 
     /// 模型服务不在场时，库供数点名说是**谁**离线，并交代什么还照常。
@@ -3679,48 +4609,6 @@ mod tests {
         assert!(feed_notice(&Feed::NotSubscribed("走轮询".into()), false, 47).is_none());
         assert!(feed_notice(&Feed::Live, true, 0).is_none());
         assert!(feed_notice(&Feed::Connecting, true, 0).is_none());
-    }
-
-    /// 欠账那一格有三种答案，不是两种。真取不到（超时 / 500）沿用上一份快照——那是
-    /// 「暂时看不见」。**端点压根不在**是另一回事：gen-model 2026-09-08 起模型工作内联
-    /// 进 dbnum 任务、欠账表退役，那时候还把上一份冻在界面上，人看到的是一份越来越旧、
-    /// 而且永远不会自己消失的欠账清单。
-    #[test]
-    fn a_retired_pending_endpoint_clears_the_owed_section_instead_of_freezing_it() {
-        let unit = PendingModelUnit {
-            dbnum: 8000,
-            root_refno: "24384/1".into(),
-            source_end_sesno: 20,
-            dead: true,
-            ..Default::default()
-        };
-        let mut model = Vm::default();
-        model.adopt(Poll {
-            pending: vec![unit],
-            pending_known: true,
-            ..Default::default()
-        });
-        assert_eq!(model.pending.len(), 1);
-        assert!(!model.pending_unsupported);
-        assert_eq!(dead_letters(&model), 1);
-
-        // 真取不到：沿用上一份，不冒充「欠账清零」。
-        model.adopt(Poll {
-            pending_known: false,
-            ..Default::default()
-        });
-        assert_eq!(model.pending.len(), 1);
-        assert!(!model.pending_unsupported);
-
-        // 端点不在：整段清空并记下来，派生计数跟着归零。
-        model.adopt(Poll {
-            pending_known: true,
-            pending_unsupported: true,
-            ..Default::default()
-        });
-        assert!(model.pending.is_empty());
-        assert!(model.pending_unsupported);
-        assert_eq!(dead_letters(&model), 0);
     }
 
     /// 死信自己一格，不并进「还有活没干完」。
@@ -3946,6 +4834,8 @@ mod tests {
                 anomaly: Some(FileAnomaly::Rollback {
                     file_latest_sesno: 812,
                     applied_sesno: 1005,
+                    file_latest_sesno_time: None,
+                    applied_sesno_time: None,
                 }),
                 ..Default::default()
             },
@@ -4096,6 +4986,160 @@ mod tests {
             segments(&["", "批次失败", "水位不变"]),
             "批次失败 · 水位不变"
         );
+    }
+
+    /// 总数句两种形态一字不差（QUEUE-FIELD-MAP §1.5）：三数在场时带「共」、用 `·` 接
+    /// 预览值；分解缺席的降级句不带「共」、预览值进括号——正是 V1 之前的原句，段形态表
+    /// 拿这一字之差当「降级 = 退回旧观感」的记号。
+    #[test]
+    fn the_total_sentence_has_two_exact_forms() {
+        assert_eq!(change_total(85, Some(82), true), "共 85 项变化 · 预览时 82");
+        assert_eq!(change_total(85, None, true), "共 85 项变化");
+        assert_eq!(change_total(85, Some(82), false), "85 项变化（预览时 82）");
+        assert_eq!(change_total(85, None, false), "85 项变化");
+    }
+
+    /// 「立即执行」的判据（09-08 计划 5.1 那张表）：排除与够不着**不画这一格**
+    /// ——它们本来就不在本期执行范围里，画个灰按钮等于暗示「哪天能点」。
+    #[test]
+    fn early_run_is_hidden_for_excluded_and_unreachable_dbs() {
+        let excluded = DbnumStatus {
+            dbnum: 7999,
+            excluded: true,
+            ..Default::default()
+        };
+        let unreachable = DbnumStatus {
+            dbnum: 1112,
+            not_in_project: true,
+            ..Default::default()
+        };
+        assert_eq!(early_run(&excluded, None), EarlyRun::Hidden);
+        assert_eq!(early_run(&unreachable, None), EarlyRun::Hidden);
+    }
+
+    /// 阻断：按钮灰，悬停给阻断原因**原文**（含出路，与 S2-E 同一段文案）；
+    /// 契约没给 anomaly 时也要有一句，不许空着。
+    #[test]
+    fn early_run_is_blocked_with_the_anomaly_text() {
+        let db = DbnumStatus {
+            dbnum: 6003,
+            blocked: true,
+            anomaly: Some(FileAnomaly::Rollback {
+                file_latest_sesno: 44,
+                applied_sesno: 46,
+                file_latest_sesno_time: None,
+                applied_sesno_time: None,
+            }),
+            initialized: true,
+            ..Default::default()
+        };
+        match early_run(&db, None) {
+            // 原因原文 = FileAnomaly 的整句：证据 + 后果 + 出路（与 S2-E 同一段文案）。
+            EarlyRun::Blocked(reason) => assert!(
+                reason.contains("已应用") && reason.contains("出路"),
+                "{reason}"
+            ),
+            other => panic!("阻断库该是 Blocked，得到 {other:?}"),
+        }
+        let bare = DbnumStatus {
+            dbnum: 6004,
+            blocked: true,
+            initialized: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            early_run(&bare, None),
+            EarlyRun::Blocked("阻断，原因未随契约给出".to_owned())
+        );
+    }
+
+    /// 已在队列：灰 + 第几位。位置数的是队列里还排着几个库（RowVm.position 的口径）。
+    #[test]
+    fn early_run_yields_to_a_queued_task() {
+        let db = lagging_db(7999, 88, 90);
+        assert_eq!(
+            early_run(&db, Some(ActiveTask::Queued(Some(2)))),
+            EarlyRun::InQueue(Some(2))
+        );
+    }
+
+    /// 正在执行：灰。「再排一次」是 U4 失败留痕那两个按钮的事，不归这一格。
+    #[test]
+    fn early_run_yields_to_a_running_task() {
+        let db = lagging_db(8000, 379, 379);
+        assert_eq!(early_run(&db, Some(ActiveTask::Running)), EarlyRun::Running);
+    }
+
+    /// 文件没有新保存：灰。**按不下去**，而不是按下去回一句「已是最新」（验收 §7.2）。
+    #[test]
+    fn early_run_is_grey_when_the_file_has_no_new_saves() {
+        let db = lagging_db(7998, 300, 300);
+        assert_eq!(early_run(&db, None), EarlyRun::UpToDate);
+    }
+
+    /// 其余：可点，粗版气泡的材料随判据备好——数据段准（两枚水位差 = N 次保存），
+    /// 模型段只在服务端判了追赶根数时才有，房间段压根不在材料里（粗版不猜）。
+    #[test]
+    fn early_run_is_ready_with_the_coarse_bubble_material() {
+        let mut db = lagging_db(7321, 412, 415);
+        db.model_chasing_roots = Some(12);
+        match early_run(&db, None) {
+            EarlyRun::Ready(plan) => {
+                assert_eq!(plan.saves, 3);
+                assert_eq!(
+                    plan.data_line(),
+                    "数据 · 已应用 412 → 文件最新 415（3 次保存）"
+                );
+                assert_eq!(
+                    plan.model_line().as_deref(),
+                    Some("模型 · 落后约 12 根（服务端判）")
+                );
+            }
+            other => panic!("落后库该可点，得到 {other:?}"),
+        }
+        // 服务端没判追赶根数（老服务端 / 追平后未再判）：模型段整行不画。
+        let plain = lagging_db(7321, 412, 415);
+        match early_run(&plain, None) {
+            EarlyRun::Ready(plan) => assert_eq!(plan.model_line(), None),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// 尚无数据水位（需初始化）的库也可点——这一下排的是首次导入。数据段不许说
+    /// 「落后 N 次保存」：那个差在它身上是整库会话数（CONTEXT.md「需初始化」）。
+    #[test]
+    fn early_run_on_an_uninitialized_db_is_a_first_import() {
+        let db = DbnumStatus {
+            dbnum: 7355,
+            db_type: "DESI".to_owned(),
+            applied_sesno: 0,
+            file_latest_sesno: 812,
+            initialized: false,
+            ..Default::default()
+        };
+        match early_run(&db, None) {
+            EarlyRun::Ready(plan) => {
+                assert!(plan.first_import);
+                assert_eq!(
+                    plan.data_line(),
+                    "数据 · 尚无数据水位——首次导入，整库建立基线"
+                );
+                assert!(!plan.data_line().contains("次保存"));
+            }
+            other => panic!("需初始化的库该可点（首次导入），得到 {other:?}"),
+        }
+    }
+
+    /// `early_run` 测试用的落后库底座。
+    fn lagging_db(dbnum: u32, applied: i32, latest: i32) -> DbnumStatus {
+        DbnumStatus {
+            dbnum,
+            db_type: "DESI".to_owned(),
+            applied_sesno: applied,
+            file_latest_sesno: latest,
+            initialized: true,
+            ..Default::default()
+        }
     }
 
     /// 跨天靠日期本身说清，同一天也照样带日期——两端各自完整，不做「省略同一天」

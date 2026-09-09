@@ -313,7 +313,10 @@ pub(super) fn element_menu(
             ),
         ] {
             if ui.button(format!("{icon}  {label}")).clicked() {
-                cmds.push(Cmd::Model(action));
+                cmds.push(match action {
+                    ModelAction::Focus(target) => Cmd::FocusTreeScope(target),
+                    action => Cmd::Model(action),
+                });
                 ui.close();
             }
         }

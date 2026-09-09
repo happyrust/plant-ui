@@ -13,7 +13,7 @@ use std::sync::mpsc;
 
 use plant_ui_data::{Attr, EleTreeNode, RefU64};
 
-use super::{Identity, Progress, SearchOutcome};
+use super::{Identity, Progress, SearchOutcome, SubtreeBounds};
 use crate::data::{Evt, RegenerateCount};
 use crate::model_update_api::ModelRecords;
 use crate::search_index::{Scope, SearchIndex, SubstringHits};
@@ -21,6 +21,35 @@ use crate::search_index::{Scope, SearchIndex, SubstringHits};
 pub struct StoreReadFace;
 
 impl StoreReadFace {
+    pub async fn subtree_bounds(&self, root: RefU64) -> anyhow::Result<SubtreeBounds> {
+        let records = plant_ui_data::model_instances_with_progress(&[root], |_, _| {}).await?;
+        let mut min_mm = [f32::INFINITY; 3];
+        let mut max_mm = [f32::NEG_INFINITY; 3];
+        let mut count = 0;
+        for record in records {
+            let aabb = record.world_aabb;
+            let mins = [aabb.mins.coords.x, aabb.mins.coords.y, aabb.mins.coords.z];
+            let maxs = [aabb.maxs.coords.x, aabb.maxs.coords.y, aabb.maxs.coords.z];
+            if record.insts.is_empty()
+                || (0..3).any(|i| !mins[i].is_finite() || !maxs[i].is_finite() || mins[i] > maxs[i])
+            {
+                continue;
+            }
+            for axis in 0..3 {
+                min_mm[axis] = min_mm[axis].min(mins[axis]);
+                max_mm[axis] = max_mm[axis].max(maxs[axis]);
+            }
+            count += 1;
+        }
+        if count == 0 {
+            return Err(super::NoRenderableGeometry.into());
+        }
+        Ok(SubtreeBounds {
+            min_mm,
+            max_mm,
+            model_count: count,
+        })
+    }
     /// 启动序列：连库、抓工程标识（`MDB` / `CURD` / `WORL` 表）。两步任一失败都算没连上。
     /// 模型服务在不在场与这一步无关（计划 D12）：树、属性、三维照常，队列面板自己报离线。
     pub async fn identity(&self) -> anyhow::Result<Identity> {

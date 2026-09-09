@@ -1423,23 +1423,12 @@ fn load_models(
     }
     let scene_transform = Transform::from_scale(Vec3::splat(MODEL_SCALE))
         * Transform::from_rotation(Quat::from_rotation_x(-FRAC_PI_2));
-    let scene_matrix = scene_transform.compute_matrix();
     for model in &models {
-        let center = model.world_aabb.center();
-        let center = Vec3::new(center.x, center.y, center.z);
-        let half = model.world_aabb.half_extents();
-        let half = Vec3::new(half.x, half.y, half.z);
-        let mut min = Vec3::splat(f32::INFINITY);
-        let mut max = Vec3::splat(f32::NEG_INFINITY);
-        for x in [-half.x, half.x] {
-            for y in [-half.y, half.y] {
-                for z in [-half.z, half.z] {
-                    let point = scene_matrix.transform_point3(center + Vec3::new(x, y, z));
-                    min = min.min(point);
-                    max = max.max(point);
-                }
-            }
-        }
+        let aabb = &model.world_aabb;
+        let Some((min, max)) = scene_bounds_from_mm(
+            [aabb.mins.x, aabb.mins.y, aabb.mins.z],
+            [aabb.maxs.x, aabb.maxs.y, aabb.maxs.z],
+        ) else { continue; };
         extend_bounds(&mut view.bounds, model.refno.refno(), min, max);
         extend_bounds(&mut view.bounds, model.owner.refno(), min, max);
     }
@@ -1941,6 +1930,12 @@ fn apply_commands(
                         frame_bounds(min, max, &mut orbit, &mut camera_transform, &mut projection);
                     }
                 }
+                ModelAction::FocusBounds { min_mm, max_mm } => {
+                    if let Some((min, max)) = scene_bounds_from_mm(min_mm, max_mm) {
+                        orbit.anim = None;
+                        frame_bounds(min, max, &mut orbit, &mut camera_transform, &mut projection);
+                    }
+                }
                 ModelAction::FocusGroup { refnos } => {
                     let mut min = Vec3::splat(f32::INFINITY);
                     let mut max = Vec3::splat(f32::NEG_INFINITY);
@@ -2195,6 +2190,32 @@ fn extend_bounds(bounds: &mut HashMap<RefU64, (Vec3, Vec3)>, refno: RefU64, min:
         .or_insert((min, max));
 }
 
+/// Convert a world-space millimetre AABB using the same transform as loaded
+/// model geometry. Rotating only the two extrema is incorrect for this
+/// transform, so all eight corners are evaluated and re-bounded.
+fn scene_bounds_from_mm(min_mm: [f32; 3], max_mm: [f32; 3]) -> Option<(Vec3, Vec3)> {
+    let min = Vec3::from_array(min_mm);
+    let max = Vec3::from_array(max_mm);
+    if !min.is_finite() || !max.is_finite() || (min.cmpgt(max)).any() {
+        return None;
+    }
+    let transform = Transform::from_scale(Vec3::splat(MODEL_SCALE))
+        * Transform::from_rotation(Quat::from_rotation_x(-FRAC_PI_2));
+    let matrix = transform.compute_matrix();
+    let mut out_min = Vec3::splat(f32::INFINITY);
+    let mut out_max = Vec3::splat(f32::NEG_INFINITY);
+    for x in [min.x, max.x] {
+        for y in [min.y, max.y] {
+            for z in [min.z, max.z] {
+                let point = matrix.transform_point3(Vec3::new(x, y, z));
+                out_min = out_min.min(point);
+                out_max = out_max.max(point);
+            }
+        }
+    }
+    out_min.is_finite().then_some((out_min, out_max))
+}
+
 fn frame_bounds(
     min: Vec3,
     max: Vec3,
@@ -2253,6 +2274,16 @@ fn surface_hit(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn focus_bounds_rotates_all_corners_and_rejects_invalid_input() {
+        let (min, max) = super::scene_bounds_from_mm([1000., 2000., 3000.], [4000., 6000., 8000.]).unwrap();
+        let scale = super::MODEL_SCALE;
+        assert!(min.abs_diff_eq(bevy::prelude::Vec3::new(1000., 3000., -6000.) * scale, 0.001));
+        assert!(max.abs_diff_eq(bevy::prelude::Vec3::new(4000., 8000., -2000.) * scale, 0.001));
+        assert!(super::scene_bounds_from_mm([f32::NAN; 3], [1.; 3]).is_none());
+        assert!(super::scene_bounds_from_mm([2.; 3], [1.; 3]).is_none());
+    }
+
     use super::*;
     use bevy::asset::AssetPlugin;
     use bevy::render::mesh::VertexAttributeValues;

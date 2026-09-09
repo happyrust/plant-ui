@@ -15,6 +15,17 @@
   单测全绿，新增 12 条；ADR-0024、CHANGELOG、CONTEXT.md、两份 FIELD-MAP 已补）；M3b（等 G3）、M4（等 G4）、M5 未动。
   **2026-09-07 追记**：M4（属性面板走 gen-model 直读端点 `POST /api/v1/element/attributes`）已随提交 `f58580aff` 落地，
   整条读面同时换到服务供数；双轨见 `docs/plans/2026-09-07-read-face-dual-mode.md`。
+  **2026-09-08 追记**：两处契约漂移已修，见 `design/MODEL-UPDATE-FIELD-MAP.md` §2-R 与 §7 追记：
+  ① gen-model 读透形态（出厂默认，d-581）下 `/update/preview` 回空表 + `up_to_date`、`/update/execute` 回
+  `model_refresh_queued`，向导按 `Preview.data_face` 换「读透形态」专态（只有「复核模型与缓存」一键），M1 那档
+  `(direct, worker_alive = null)` 判据自 G1 起只对老服务端成立；② gen-model ADR-021 回退不再阻断
+  （`blocked = false` + `initialization_required = true`），向导加 `DbForm::Reinitialize`。
+  **G3 / M3b 改靶**：gen-model 未做 `model_source_end_sesno` / `credential_advance`，改由 ADR-060 / C2 的
+  `/dbnums` 判决列（`model_sesno` / `model_verdict` 三态 / `model_chasing_roots` …）与 `DbnumPreview.model_verdict`
+  给；plant-ui `DbnumStatus` 已解码这几列（`verdict_label()` / `verdict_note()`），**M3b 按新靶落地**（2026-09-08）：
+  队列库行一枚判决字形 + 明细一行（`RowVm.verdict*`，两种供数模式都画），`PendingSaves.model_lagging` 只数
+  `lagging`，提示行第三句「模型：N 个库落后于文件」；`not_judged` 中性不画成落后。`credential_advance` 那一行
+  （队列终态明细「凭证前移 K 根」）没有对应契约，不做。
 
 ---
 

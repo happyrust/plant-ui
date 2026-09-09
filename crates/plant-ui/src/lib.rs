@@ -20,7 +20,7 @@ pub use aios_core::RefU64;
 ///
 /// 动作自带 `refno`：右键菜单打开后选中还可能被别处改掉，回头读 `vm.selection`
 /// 就会作用到另一个元素上。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ModelAction {
     /// 可见性作用于一整批：「隐藏这几个」是选中之后最常做的一件事，
     /// 拆成 N 条命令会在宿主侧变成 N 次深度展开与 N 次事件写入。
@@ -53,6 +53,9 @@ pub enum ModelAction {
     /// refno。塞一组进去的结果是定位到其中某一个、还说不清是哪一个。定位本来
     /// 就是「带我到它跟前」，作用于主选中是说得清的语义。
     Focus(aios_core::RefU64),
+    /// 相机对准一个由数据面返回的树范围包围盒。该动作只改变相机，
+    /// 不加载模型、不改变可见性，也不写入模型 bounds 索引。
+    FocusBounds { min_mm: [f32; 3], max_mm: [f32; 3] },
     /// 相机覆盖一组元素的合并包围盒（房间取景用）。与 `Focus` 分开：房间 FRMW
     /// 自身没有几何实体，能取景的只有它的面板与成员；合并**已加载**那部分的
     /// 包围盒，没加载的不参与，一个都没加载时不动相机。
@@ -201,6 +204,12 @@ pub enum Cmd {
     },
     /// 任务队列上的「立刻扫一遍」。它**不插队**，作用只是别等服务端下一个 30 秒轮询。
     ScanNow,
+    /// 库行上的「立即执行」（09-08 计划 D1 A）：对一个 dbnum 提前排一次它的任务，
+    /// 打的还是既有 execute、带单库名单。它不插队、不改本期执行范围；与自动发现
+    /// 排出的是同一种任务。
+    RunDbnumNow {
+        dbnum: u32,
+    },
     /// 暂停 / 恢复队列出队。暂停**只挡出队**，正在跑的那一批会跑完为止——
     /// 服务端没有中止接口，所以这条命令也不该被当成「停下来」。
     SetQueuePaused(bool),
@@ -233,6 +242,8 @@ pub enum Cmd {
     ResizeViewport([u32; 2]),
     /// 对模型的显示 / 定位类动作。
     Model(ModelAction),
+    /// Query all published descendants, ensuring missing geometry once.
+    FocusTreeScope(RefU64),
     /// 主题下发的三维视口配色：渐变背景上下两色与地面网格线色。
     ///
     /// 背景渐变画在宿主的全屏背景面片上（拷问定案第 2 题，用户点名 Bevy 内画），
