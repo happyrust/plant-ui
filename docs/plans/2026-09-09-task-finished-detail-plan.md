@@ -73,6 +73,10 @@
 
 ## 三、待新增字段（给 gen-model S8 / S9 的消费者侧清单）
 
+> 2026-09-09 已按用户指示提到 gen-model 侧作 S8 回执定形的设计输入：gen-model
+> `docs/plans/2026-09-09-s8-task-receipt-room-fields-consumer-input.md`（其 09-08 计划 §7.1
+> 「交接补入」有指针）。仍是输入不是要求；那边裁完有差异照裁定改本节与 V3。
+
 房间段随 dbnum Task 收尾产出（U5 / N-D），建议挂在 Task 终态 `result` 里与批次结果平级：
 
 | 建议字段 | 语义 | 界面消费点 |
