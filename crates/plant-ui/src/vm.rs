@@ -54,6 +54,13 @@ pub struct WorkbenchVm {
     pub rooms: RoomVm,
     /// 「房间」页签聚焦房间的详情，`Cmd::FocusRoom` 后由宿主填。
     pub room_detail: RoomDetailVm,
+    /// 尺寸标注层（计划 B2–B4）：视口此刻挂着哪条 BRAN 的尺寸标注、到了哪一步。
+    /// 不跟选中走——右键「查看尺寸标注」才换，之后换选中它照样挂着。
+    pub dimensions: DimensionsVm,
+    /// 主选中能挂尺寸标注的 BRAN（自己是 BRAN，或所在 BRAN；计划 B2 / D3）。视口右键
+    /// 菜单作用于主选中，而「它是不是管道元素」只有宿主对着已加载的树才答得出，所以随
+    /// 选中与树的变化由宿主填。`None` = 主选中不是管道元素，或者它还不在已加载的树里。
+    pub selection_branch: Option<RefU64>,
     /// 命令交互视图。
     pub command: CommandVm,
     /// 标题栏搜索框的查询结果。
@@ -532,6 +539,10 @@ pub struct TreeRowVm {
     /// 画面变过来之间隔着查询与网格装载。那段时间里图标停在原样，再点一下要的是
     /// **反转上一次指令**，不是反转图标。
     pub next_visible: bool,
+    /// 这一行能挂尺寸标注的 BRAN（计划 B2 / D3）：自己是 BRAN 就是自己，是 BRAN 的成员
+    /// （ELBO / ATTA / TUBI…）就是所在 BRAN；PIPE / ZONE / EQUI 这些为 `None`，右键菜单里
+    /// 不出「查看尺寸标注」。宿主展平时顺着父链算好，绘制层不必回头找父行。
+    pub dimension_branch: Option<RefU64>,
 }
 
 /// 属性视图数据状态（跟随 `WorkbenchVm::selected`）。
@@ -762,12 +773,87 @@ pub struct RoomMemberVm {
     pub inside_count: u8,
 }
 
+/// 尺寸标注层的状态（计划 B2）。同时只挂一条 BRAN：再看另一条就把前一条换掉，
+/// 「隐藏尺寸标注」回到 [`Self::Off`]。
+///
+/// 三个非空态都带 refno：右键菜单要认得出「落点这条 BRAN 就是挂着的那条」，才好把
+/// 「查看」翻成「隐藏」。失败态**不算挂着**（[`Self::shows`]）——画面上什么都没有，
+/// 菜单上那一项仍是「查看」，再点一次就是重试；错误本身由 B4 的状态入口呈现。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum DimensionsVm {
+    /// 没挂任何尺寸标注。
+    #[default]
+    Off,
+    /// 取数在途（服务端每次请求新开 `DbSet` 跑求解，大 BRAN 要几秒）。
+    Loading(RefU64),
+    /// 取到了。B3 之前只有这份摘要；视口层接上后几何走 View3d 命令，不进 Vm。
+    Ready(DimensionsDataVm),
+    /// 取数失败。`message` 是分好型的 `MbdError` 的人话（宿主拼好，绘制层不解析）。
+    Failed { refno: RefU64, message: String },
+}
+
+impl DimensionsVm {
+    /// 此刻占着这一层的那条 BRAN（在途 / 已上屏 / 失败），`Off` 时为 None。
+    pub fn refno(&self) -> Option<RefU64> {
+        match self {
+            Self::Off => None,
+            Self::Loading(refno) | Self::Failed { refno, .. } => Some(*refno),
+            Self::Ready(data) => Some(data.refno),
+        }
+    }
+
+    /// 这条 BRAN 的尺寸标注此刻算不算「显示着」——在途或已上屏都算，失败不算。
+    /// 右键菜单据此在「查看」与「隐藏」之间切换。
+    pub fn shows(&self, refno: RefU64) -> bool {
+        match self {
+            Self::Loading(shown) => *shown == refno,
+            Self::Ready(data) => data.refno == refno,
+            Self::Off | Self::Failed { .. } => false,
+        }
+    }
+}
+
+/// 一条 BRAN 尺寸标注的摘要（B4 状态条 / tooltip 的数据源）。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DimensionsDataVm {
+    pub refno: RefU64,
+    /// 图元数（尺寸线 / 引线 / 标记 / 弧…）。
+    pub primitives: usize,
+    /// 求解器给的提示数（抑制、降级、定位问题）。
+    pub issues: usize,
+    /// 求解器的布局模式（契约 `meta.layout_mode`，如 `isodim_main`）。
+    pub layout_mode: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn r(n: u64) -> RefU64 {
         RefU64(n)
+    }
+
+    /// 菜单上「查看 / 隐藏」的切换只认在途与已上屏：失败了画面上什么都没有，
+    /// 那一项得还是「查看」（= 重试），不能摆一个「隐藏」让人去藏一幅不存在的图。
+    #[test]
+    fn a_failed_dimension_layer_does_not_count_as_shown() {
+        assert!(!DimensionsVm::Off.shows(r(7)));
+        assert!(DimensionsVm::Loading(r(7)).shows(r(7)));
+        assert!(!DimensionsVm::Loading(r(7)).shows(r(8)));
+        let ready = DimensionsVm::Ready(DimensionsDataVm {
+            refno: r(7),
+            ..Default::default()
+        });
+        assert!(ready.shows(r(7)));
+        assert!(!ready.shows(r(8)));
+        let failed = DimensionsVm::Failed {
+            refno: r(7),
+            message: "x".into(),
+        };
+        assert!(!failed.shows(r(7)));
+        // 但它仍占着这一层：宿主认帧、B4 报错都要知道失败的是哪一条。
+        assert_eq!(failed.refno(), Some(r(7)));
+        assert_eq!(DimensionsVm::Off.refno(), None);
     }
 
     #[test]

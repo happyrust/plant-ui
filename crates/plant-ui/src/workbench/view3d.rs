@@ -193,6 +193,11 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                 primary,
                 &vm.selection.to_vec(),
                 &vm.rooms,
+                // 主选中能挂尺寸标注的 BRAN 由宿主对着已加载的树算好（计划 B2）。
+                super::tree::ElementDimensions {
+                    branch: vm.selection_branch,
+                    layer: &vm.dimensions,
+                },
                 true,
                 vm.regen_busy,
                 cmds,

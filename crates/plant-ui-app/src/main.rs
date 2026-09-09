@@ -57,10 +57,10 @@ use plant_ui::style::theme_tokens::{self, set_weight_families_ready};
 use plant_ui::style::tokens::{Density, Tokens};
 use plant_ui::task_queue;
 use plant_ui::vm::{
-    AccessPointVm, CommandLineKind, CommandLineVm, LogElement, ModelLoadVm, PropKind, PropRowVm,
-    PropsDataVm, PropsVm, RoomDetailDataVm, RoomDetailVm, RoomMemberVm, RoomRelationVm, RoomViewVm,
-    RoomVm, RoomsDataVm, RowVisibility, SearchHitVm, SearchRunVm, SearchVm, Selection, SubIndexVm,
-    TreeRowVm, TreeVm, View3dVm, WorkbenchVm,
+    AccessPointVm, CommandLineKind, CommandLineVm, DimensionsDataVm, DimensionsVm, LogElement,
+    ModelLoadVm, PropKind, PropRowVm, PropsDataVm, PropsVm, RoomDetailDataVm, RoomDetailVm,
+    RoomMemberVm, RoomRelationVm, RoomViewVm, RoomVm, RoomsDataVm, RowVisibility, SearchHitVm,
+    SearchRunVm, SearchVm, Selection, SubIndexVm, TreeRowVm, TreeVm, View3dVm, WorkbenchVm,
 };
 use plant_ui::workbench::{self, Pane, WorkbenchState};
 use plant_ui_data::{EleTreeNode, RefU64};
@@ -755,6 +755,13 @@ fn settle_pending_directions(
     previous.retain(|target, _| pending.contains_key(target));
 }
 
+/// 尺寸标注的靶子只认 BRAN（计划 B2 / D3：PIPE 级批量首版不做）。HVAC 的 BRAN 同名
+/// 也放行——它解不出尺寸是服务端 422 说的事（`MbdError::NotDimensionable`），
+/// 客户端不替它预判。
+fn is_bran_noun(noun: &str) -> bool {
+    noun.eq_ignore_ascii_case("BRAN")
+}
+
 impl TreeModel {
     /// 当前行的 eye。没有独立模型范围的树行继承最近祖先的实际状态；
     /// 一旦自己查过范围（含明确查空 / 失败），就以自己的结果为准。
@@ -784,17 +791,25 @@ impl TreeModel {
 
     /// 按展开状态 DFS 展平可见行。只在结构变化时调用，绘制层逐帧只读。
     fn flatten(&self, scopes: &HashMap<RefU64, Vec<RefU64>>) -> Vec<TreeRowVm> {
+        /// `branch` 是走到这一层时头上最近的 BRAN（右键「查看尺寸标注」的靶子，计划 B2）：
+        /// 顺着 DFS 往下带，比每行回头爬一遍父链便宜，也不用绘制层自己找父行。
         fn walk(
             model: &TreeModel,
             scopes: &HashMap<RefU64, Vec<RefU64>>,
             nodes: &[EleTreeNode],
             depth: u16,
+            branch: Option<RefU64>,
             rows: &mut Vec<TreeRowVm>,
         ) {
             for n in nodes {
                 let refno = n.refno.refno();
                 let expandable = (n.children_count > 0).then(|| model.expanded.contains(&refno));
                 let visibility = model.visibility_for(refno, scopes);
+                let dimension_branch = if is_bran_noun(&n.noun) {
+                    Some(refno)
+                } else {
+                    branch
+                };
                 rows.push(TreeRowVm {
                     refno,
                     depth,
@@ -807,16 +822,17 @@ impl TreeModel {
                         model.pending_direction.get(&refno).copied(),
                         visibility,
                     ),
+                    dimension_branch,
                 });
                 if expandable == Some(true)
                     && let Some(kids) = model.children.get(&refno)
                 {
-                    walk(model, scopes, kids, depth + 1, rows);
+                    walk(model, scopes, kids, depth + 1, dimension_branch, rows);
                 }
             }
         }
         let mut rows = Vec::new();
-        walk(self, scopes, &self.roots, 0, &mut rows);
+        walk(self, scopes, &self.roots, 0, None, &mut rows);
         rows
     }
 
@@ -938,6 +954,29 @@ impl TreeModel {
                 return Some(chain);
             }
             cur = p;
+        }
+        None
+    }
+
+    /// 这个元素能挂尺寸标注的 BRAN（计划 B2 / D3）：自己是 BRAN 就是自己，是 BRAN 的
+    /// 成员就顺着父链上溯到所在 BRAN；PIPE / ZONE / EQUI 这些回 None——它们头上没有
+    /// BRAN。只看已加载的树：元素不在缓存里就回 None，那时候本端确实还不知道它是什么
+    /// （视口拾取到的元素随定位把祖先一路加载回来，那之后就认得了）。
+    fn dimension_branch(&self, refno: RefU64) -> Option<RefU64> {
+        let noun_of = |refno: RefU64| {
+            self.roots
+                .iter()
+                .chain(self.children.values().flatten())
+                .find(|node| node.refno.refno() == refno)
+                .map(|node| node.noun.as_str())
+        };
+        let mut cur = refno;
+        // 与 `ancestors` 同一条封顶：数据异常造出环时不许挂住 UI 线程。
+        for _ in 0..=self.parent.len() {
+            if noun_of(cur).is_some_and(is_bran_noun) {
+                return Some(cur);
+            }
+            cur = *self.parent.get(&cur)?;
         }
         None
     }
@@ -1935,15 +1974,16 @@ impl App {
                     };
                 }
                 data::Evt::ElementRooms(..) => {}
-                // 尺寸标注回包（计划 B1）。帧号对不上 = 右键之后又换了目标或点了隐藏，丢弃。
-                // B3 接视口层之前先落日志：取数、分型、认帧这条链路到此已经通了。
+                // 尺寸标注回包（计划 B1 / B2）。帧号对不上 = 右键之后又换了目标或点了隐藏，
+                // 丢弃。对上了就落进 `vm.dimensions`：菜单据它把「查看」翻成「隐藏」，B4 的
+                // 状态入口据它报数；几何本身 B3 接视口层时从这里转发下去。
                 data::Evt::PipeDimensions {
                     epoch,
                     refno,
                     result,
                 } if epoch == self.dimensions_epoch => {
                     let el = self.tree.element(refno);
-                    match result {
+                    self.vm.dimensions = match result {
                         Ok(data) => {
                             let msg = format!(
                                 "尺寸标注：BRAN {}，{} 个图元，{} 条提示，布局 {}",
@@ -1953,8 +1993,15 @@ impl App {
                                 data.meta.layout_mode.as_deref().unwrap_or("-")
                             );
                             self.logs.info_of(&mut self.vm.logs, el, msg);
+                            DimensionsVm::Ready(DimensionsDataVm {
+                                refno,
+                                primitives: data.primitives.len(),
+                                issues: data.issues.len(),
+                                layout_mode: data.meta.layout_mode.clone(),
+                            })
                         }
                         Err(error) => {
+                            let message = error.to_string();
                             self.logs.error_of(
                                 &mut self.vm.logs,
                                 el,
@@ -1962,9 +2009,9 @@ impl App {
                                 &anyhow::Error::new(error),
                                 None,
                             );
+                            DimensionsVm::Failed { refno, message }
                         }
-                    }
-                    dirty = true;
+                    };
                 }
                 data::Evt::PipeDimensions { .. } => {}
                 data::Evt::PanelRoom(refno, result) => match result {
@@ -3583,6 +3630,10 @@ impl App {
                     }
                     self.state.focus(Pane::Room);
                 }
+                // 右键「查看 / 隐藏尺寸标注」（计划 B2）。带过来的已经是 BRAN——成员上溯
+                // 在绘制层的靶子字段里做完了，这里不再判 noun。
+                Cmd::ShowPipeDimensions(refno) => self.show_pipe_dimensions(refno),
+                Cmd::ClearPipeDimensions => self.clear_pipe_dimensions(),
                 Cmd::FocusPane(pane) => self.state.focus(pane),
                 Cmd::ToggleDock(side) => self.state.toggle_dock(side),
                 Cmd::OpenRoomBrowser => {
@@ -4292,6 +4343,8 @@ impl App {
         }
         let before = self.vm.selection.primary();
         self.vm.selection = selection;
+        // 视口右键菜单的尺寸标注靶子跟着主选中走（计划 B2）。
+        self.sync_selection_branch();
         if before != self.vm.selection.primary() {
             self.clear_room_xray();
         }
@@ -4313,6 +4366,40 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// 主选中能挂尺寸标注的 BRAN 随选中与树同步（视口右键菜单的靶子，计划 B2）。
+    /// 树也是触发点：视口拾取到的成员要等定位把祖先加载回来，才认得出它头上的 BRAN。
+    fn sync_selection_branch(&mut self) {
+        self.vm.selection_branch = self
+            .vm
+            .selection
+            .primary()
+            .and_then(|refno| self.tree.dimension_branch(refno));
+    }
+
+    /// 取这条 BRAN 的尺寸标注并挂到视口上（计划 B2）。一层只挂一条，换目标就是换帧：
+    /// 在途的旧取数回来时帧号对不上，宿主直接丢——与搜索 / 清点同一套取消口径。
+    fn show_pipe_dimensions(&mut self, refno: RefU64) {
+        self.dimensions_epoch = self.dimensions_epoch.wrapping_add(1);
+        self.vm.dimensions = DimensionsVm::Loading(refno);
+        let sent = self.bridge.req.send(data::Req::PipeDimensions {
+            epoch: self.dimensions_epoch,
+            refno,
+        });
+        if sent.is_err() {
+            let message = "模型服务通道已断开".to_owned();
+            self.logs.warn(&mut self.vm.logs, message.clone());
+            self.vm.dimensions = DimensionsVm::Failed { refno, message };
+        }
+    }
+
+    /// 清掉尺寸标注层。也进一帧：在途的取数回来不再上屏。重连 / 换项目走的也是它——
+    /// 旧库的 refno 挂在层上，菜单会对着新库里同号的元素说「隐藏」。B3 接上视口后在
+    /// 这里一并下 `ClearDimensions`。
+    fn clear_pipe_dimensions(&mut self) {
+        self.dimensions_epoch = self.dimensions_epoch.wrapping_add(1);
+        self.vm.dimensions = DimensionsVm::Off;
     }
 
     fn refetch_props(&mut self, refno: RefU64) {
@@ -4890,6 +4977,9 @@ impl App {
         self.focus_room_pending = None;
         self.pending_room_frame = None;
         self.room_pane_focus = None;
+        // 尺寸标注层挂的是旧库的 BRAN：清掉，在途的取数回来也不再上屏。
+        self.clear_pipe_dimensions();
+        self.vm.selection_branch = None;
         // 换库了，旧库的房间总览不作数。窗口开着就顺手重拉，关着就等下次打开。
         if self.room_browser_state.open {
             self.rooms_overview.begin_query();
@@ -5002,6 +5092,8 @@ impl App {
         );
         self.vm.tree = TreeVm::Ready(self.tree.flatten(&self.model_scopes));
         self.vm.element_count = self.tree.element_count();
+        // 树变了，主选中头上的 BRAN 可能这才加载到（视口拾取 -> 定位 -> 祖先落地）。
+        self.sync_selection_branch();
     }
 
     /// 数据层属性 -> 面板分组。通用组固定 类型/名称/OWNER 顺序，
@@ -5337,6 +5429,86 @@ mod tests {
         tree.detach_missing(&[site]);
         assert_eq!(tree.prune_unreachable(), vec![site]);
         assert!(tree.roots.is_empty());
+    }
+
+    /// SITE > ZONE > PIPE > BRAN > { ELBO, ATTA }，旁边一台 EQUI；整棵展开。
+    /// 右键「查看尺寸标注」的靶子（计划 B2 / D3）就在这棵树上算。
+    fn pipe_tree() -> TreeModel {
+        let (site, zone, pipe, bran, elbo, atta, equi) = (
+            RefU64(1),
+            RefU64(2),
+            RefU64(3),
+            RefU64(4),
+            RefU64(5),
+            RefU64(6),
+            RefU64(7),
+        );
+        let mut tree = TreeModel {
+            roots: vec![node(site, "SITE", 1)],
+            ..Default::default()
+        };
+        tree.children.insert(site, vec![node(zone, "ZONE", 2)]);
+        tree.children
+            .insert(zone, vec![node(pipe, "PIPE", 1), node(equi, "EQUI", 0)]);
+        tree.children.insert(pipe, vec![node(bran, "BRAN", 2)]);
+        tree.children
+            .insert(bran, vec![node(elbo, "ELBO", 0), node(atta, "ATTA", 0)]);
+        tree.parent.extend([
+            (zone, site),
+            (pipe, zone),
+            (equi, zone),
+            (bran, pipe),
+            (elbo, bran),
+            (atta, bran),
+        ]);
+        tree.expanded.extend([site, zone, pipe, bran]);
+        tree
+    }
+
+    /// BRAN 归自己，成员上溯到所在 BRAN，PIPE / ZONE / EQUI 与不在树里的元素都没有靶子
+    /// ——其余元素不出现该项（计划 D3），而且不许把 PIPE 当成「一整根管」去问服务。
+    #[test]
+    fn dimension_target_is_the_branch_itself_or_the_owning_branch() {
+        let tree = pipe_tree();
+        let bran = RefU64(4);
+        assert_eq!(tree.dimension_branch(bran), Some(bran));
+        assert_eq!(tree.dimension_branch(RefU64(5)), Some(bran));
+        assert_eq!(tree.dimension_branch(RefU64(6)), Some(bran));
+        for outsider in [RefU64(1), RefU64(2), RefU64(3), RefU64(7), RefU64(99)] {
+            assert_eq!(tree.dimension_branch(outsider), None, "{outsider}");
+        }
+        assert!(super::is_bran_noun("bran"));
+        assert!(!super::is_bran_noun("PIPE"));
+    }
+
+    /// 展平时每一行都带着自己的靶子，与逐个上溯算出来的一致——模型树的行菜单读的是
+    /// 行上这一格，视口菜单读的是主选中那一格，两个入口不许答出两个数。
+    #[test]
+    fn flattened_rows_carry_the_same_dimension_target_as_the_lookup() {
+        let tree = pipe_tree();
+        let rows = tree.flatten(&HashMap::new());
+        assert_eq!(rows.len(), 7, "整棵都展开了");
+        for row in &rows {
+            assert_eq!(
+                row.dimension_branch,
+                tree.dimension_branch(row.refno),
+                "{} {}",
+                row.noun,
+                row.refno
+            );
+        }
+        let targets: Vec<_> = rows
+            .iter()
+            .filter_map(|row| row.dimension_branch.map(|b| (row.noun.as_str(), b)))
+            .collect();
+        assert_eq!(
+            targets,
+            vec![
+                ("BRAN", RefU64(4)),
+                ("ELBO", RefU64(4)),
+                ("ATTA", RefU64(4))
+            ]
+        );
     }
 
     /// eye 那条链路的最小复现：点击 -> 查询 -> View3d 回执。

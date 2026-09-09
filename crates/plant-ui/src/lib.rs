@@ -151,6 +151,16 @@ pub enum Cmd {
     /// 打开房间浏览器浮窗并（重新）拉取全表。全表是全库扫描级的重查询，
     /// 所以由这条命令按需触发，不进启动路径；查询在途时再按只开窗不重发。
     OpenRoomBrowser,
+    /// 右键「查看尺寸标注」（计划 B2）：取这条 BRAN 的 MBD 尺寸标注并挂到视口上。
+    ///
+    /// 带的是**BRAN** 的 refno，不是右键落点：落点是 ELBO / ATTA 这类成员时，归属到
+    /// 所在 BRAN 的那一步在绘制层就做完了（`TreeRowVm::dimension_branch` /
+    /// `WorkbenchVm::selection_branch`，两者都由宿主对着已加载的树算好），宿主拿到的
+    /// 一律是可以直接去问服务的目标。同时只挂一条：再看另一条就把前一条换掉。
+    ShowPipeDimensions(aios_core::RefU64),
+    /// 右键「隐藏尺寸标注」：清掉视口上挂着的尺寸标注层。不带 refno——这一层同时只有
+    /// 一条 BRAN，清的就是它；在途的取数回来也不再上屏（宿主按帧号丢弃）。
+    ClearPipeDimensions,
     /// 把某个常驻视图切到前台（如待重算横幅 -> 任务队列）。找不到该页签时
     /// 宿主是无操作——用户可以把页签拖走，那是他的布局。
     FocusPane(workbench::Pane),
