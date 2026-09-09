@@ -8,6 +8,7 @@ plant-ui.workspace = true
 plant-ui-data.workspace = true
 plant-ui-view3d.workspace = true
 aios_core.workspace = true
+plant-mbd.workspace = true
 egui.workspace = true
 eframe.workspace = true
 egui-phosphor.workspace = true

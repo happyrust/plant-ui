@@ -1833,6 +1833,16 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
             label,
             result: Ok(query_fixture(&tool, &arguments)),
         },
+        // 剧本里没有模型服务，尺寸标注无从求解。说清楚是演示模式，不归「够不着、
+        // 可重试」那一型——重试多少次都不会有。
+        Req::PipeDimensions { epoch, refno } => Evt::PipeDimensions {
+            epoch,
+            refno,
+            result: Err(crate::mbd_api::MbdError::Service {
+                code: "sim".to_owned(),
+                message: "演示模式没有模型服务，取不到尺寸标注".to_owned(),
+            }),
+        },
         Req::Models { .. } | Req::ModelScopes { .. } => {
             unreachable!("模型请求已在桥上路由到专用通道")
         }

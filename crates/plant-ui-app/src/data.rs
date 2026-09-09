@@ -6,7 +6,8 @@
 //!
 //! 读面（树 / 属性 / 搜索 / 三维实例 / 工程标识）一律经 [`ReadFace`]（ADR-0026）：
 //! 这个文件里不直接打 HTTP 读接口，也不直接查库——`data_rs_reads_only_through_read_face`
-//! 钉着。留在这里直接调的只有命令面（`ensure` / 更新 / 队列 / 提资）与房间的镜像门。
+//! 钉着。留在这里直接调的只有命令面（`ensure` / 更新 / 队列 / 提资）、房间的镜像门，
+//! 与 MBD 尺寸标注（只有模型服务这一条路，`pipe_dimensions_go_straight_to_the_model_service`）。
 
 use std::future::Future;
 use std::sync::Arc;
@@ -208,6 +209,18 @@ pub enum Req {
         tool: String,
         arguments: serde_json::Value,
     },
+    /// 一条 BRAN 的 MBD 尺寸标注（`GET /api/mbd/v2/pipe/{refno}`，
+    /// `gen-model/.planning/2026-09-09-plant-ui-mbd-dimensions` B1）。
+    ///
+    /// 不走读面：尺寸标注只有模型服务这一条路（计划边界「MBD 永远走模型服务，与命令面
+    /// 同口径」）——求解器要的成员结点视图只有服务端会拼，库供数下也一样。
+    /// `epoch` 认帧：右键换了别的 BRAN、或者已经点了隐藏，晚到的旧结果不许再贴回来。
+    // B2（菜单与动作）接上第一个发送点后删掉这行。
+    #[allow(dead_code)]
+    PipeDimensions {
+        epoch: u64,
+        refno: RefU64,
+    },
 }
 
 /// 一次清点的结果：确认框要摆的那两个数字，外加确认之后要逐个重做的那份名单。
@@ -364,6 +377,13 @@ pub enum Evt {
         epoch: u64,
         label: String,
         result: anyhow::Result<crate::model_update_api::QueryReply>,
+    },
+    /// 一条 BRAN 的尺寸标注回包。`epoch` / `refno` 原样带回：帧号对不上的旧结果丢弃。
+    /// 错误是分好型的 [`crate::mbd_api::MbdError`]，界面按型给出路，不解析字符串。
+    PipeDimensions {
+        epoch: u64,
+        refno: RefU64,
+        result: Result<plant_mbd::MbdV2PipeData, crate::mbd_api::MbdError>,
     },
     /// 队列视图的逐单元明细，带发生在哪个任务上。
     ///
@@ -789,6 +809,17 @@ async fn handle_read(
             let _ = evt_tx.send(Evt::CommandQuery {
                 epoch,
                 label,
+                result,
+            });
+        }
+        Req::PipeDimensions { epoch, refno } => {
+            // 服务地址与 `EnsureForFocus` 同源：设置窗那一格「模型服务」，MBD 端点就在
+            // 同一进程同一端口上（服务端 `web_service/mbd.rs`），不另起一格配置。
+            let result =
+                crate::mbd_api::pipe_dimensions(&crate::model_update_api::base_url(), refno).await;
+            let _ = evt_tx.send(Evt::PipeDimensions {
+                epoch,
+                refno,
                 result,
             });
         }
@@ -1264,6 +1295,24 @@ mod tests {
         ] {
             assert!(body.contains(expected), "data.rs 少了读面调用：{expected}");
         }
+    }
+
+    /// 尺寸标注不进读面（计划边界：MBD 永远走模型服务，与命令面同口径）：求解器要的
+    /// 成员结点视图只有服务端会拼，库供数下也没有第二条路。这一臂直接打 `mbd_api`，
+    /// 地址与 `EnsureForFocus` 同源；哪天有人把它「顺手」搬进 `ReadFace`，这里先红。
+    #[test]
+    fn pipe_dimensions_go_straight_to_the_model_service() {
+        let arm = body()
+            .split_once("Req::PipeDimensions { epoch, refno } =>")
+            .expect("尺寸标注那一臂")
+            .1
+            .split_once("Req::Reconnect")
+            .expect("下一臂")
+            .0;
+        assert!(arm.contains("crate::mbd_api::pipe_dimensions("));
+        assert!(arm.contains("crate::model_update_api::base_url()"));
+        assert!(!arm.contains("face."), "尺寸标注不该经读面：{arm}");
+        assert!(arm.contains("Evt::PipeDimensions"));
     }
 
     /// 库供数的启动序列不等模型服务（D12 / 计划 §5.5 T4）。

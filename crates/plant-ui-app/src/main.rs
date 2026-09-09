@@ -8,6 +8,7 @@ mod focus_bounds;
 #[cfg(not(target_arch = "wasm32"))]
 mod gallery;
 mod logs;
+mod mbd_api;
 mod model_update_api;
 mod model_update_ws;
 mod read_face;
@@ -1058,6 +1059,10 @@ struct App {
     /// 「房间」页签当前聚焦的房间。与上面那个分开：视口那半回包即清（一次性
     /// 动作），页签这半要一直立着——切换选中或重连才归零。
     room_pane_focus: Option<RefU64>,
+    /// 尺寸标注取数的帧号（`Req::PipeDimensions`，计划 B1）。每次右键「查看尺寸标注」
+    /// 或清层都进一帧：大 BRAN 的求解要跑几秒，那期间人早就右键了别的 BRAN 或点了隐藏，
+    /// 晚到的旧结果靠它认出来丢掉——与搜索 / 清点同一套取消口径。
+    dimensions_epoch: u64,
     bridge: data::Bridge,
     tree: TreeModel,
     /// 还没落地的那一次树定位。同时只留一个：连续定位只完成最后一次。
@@ -1754,6 +1759,7 @@ impl App {
             room_panel_cache: HashMap::new(),
             pending_room_frame: None,
             room_pane_focus: None,
+            dimensions_epoch: 0,
             // 交互通道与模型通道都按这一个供数模式造读面（ADR-0026）。
             bridge: data::spawn(ctx.clone(), tasks, read_face),
             tree: TreeModel::default(),
@@ -1929,6 +1935,38 @@ impl App {
                     };
                 }
                 data::Evt::ElementRooms(..) => {}
+                // 尺寸标注回包（计划 B1）。帧号对不上 = 右键之后又换了目标或点了隐藏，丢弃。
+                // B3 接视口层之前先落日志：取数、分型、认帧这条链路到此已经通了。
+                data::Evt::PipeDimensions {
+                    epoch,
+                    refno,
+                    result,
+                } if epoch == self.dimensions_epoch => {
+                    let el = self.tree.element(refno);
+                    match result {
+                        Ok(data) => {
+                            let msg = format!(
+                                "尺寸标注：BRAN {}，{} 个图元，{} 条提示，布局 {}",
+                                data.branch_refno,
+                                data.primitives.len(),
+                                data.issues.len(),
+                                data.meta.layout_mode.as_deref().unwrap_or("-")
+                            );
+                            self.logs.info_of(&mut self.vm.logs, el, msg);
+                        }
+                        Err(error) => {
+                            self.logs.error_of(
+                                &mut self.vm.logs,
+                                el,
+                                "尺寸标注取数失败",
+                                &anyhow::Error::new(error),
+                                None,
+                            );
+                        }
+                    }
+                    dirty = true;
+                }
+                data::Evt::PipeDimensions { .. } => {}
                 data::Evt::PanelRoom(refno, result) => match result {
                     Ok(room) => {
                         match resolve_panel_room_reply(self.vm.selection.primary(), refno, room) {

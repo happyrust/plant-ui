@@ -20,6 +20,10 @@ plant-ui-view3d = { path = "crates/plant-ui-view3d" }
 # vendored from rs-core-pin (= git rev 5667b70 + get_world fallthrough fix), editable
 # `render` 开着 bevy_render：三维搬进来之后几何侧要它（view3d-migration.md 决定 1）
 aios_core = { path = "vendor/rs-core", default-features = false, features = ["render"] }
+# MBD 尺寸标注的冻结契约（gen-model/.planning/2026-09-09-plant-ui-mbd-dimensions，D1：单一契约源）。
+# 纯求解器库（glam 0.29 / serde，无 DB、HTTP、e3d 依赖，wasm 编得动），与 gen-model 服务端
+# 消费的是同一棵树；这里只用 contract 类型解 /api/mbd/v2/pipe 的响应体，不在客户端跑求解。
+plant-mbd = { path = "../vendor/plant-mbd/crates/plant-mbd" }
 
 # 三维那一半的地基。特性列表照抄 rs-plant3-d，换列表要连带核对 e3d_plugin 的用法。
 bevy = { git = "https://gitee.com/happydpc/bevy", default-features = false, features = [
