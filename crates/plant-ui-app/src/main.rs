@@ -2169,12 +2169,11 @@ impl App {
                             dirty = true;
                         }
                         Err(error) => {
-                            restore_model_reload(&mut self.model_reload_owed, debt_reload);
                             self.set_get_work_busy(false);
                             self.run_deferred_get_work();
                             self.logs.error(
                                 &mut self.vm.logs,
-                                "三维模型查询失败：场景已清空，队列空闲时自动重试，也可再点「取回工作」",
+                                "三维模型查询失败：场景已清空；错误已记录，不会自动重试，可再点「取回工作」",
                                 &error,
                                 None,
                             );
@@ -5909,7 +5908,27 @@ mod tests {
     }
 
     #[test]
-    fn failed_model_load_restores_the_reload_debt() {
+    fn failed_model_result_is_logged_without_restoring_reload_debt() {
+        let source = include_str!("main.rs");
+        let failure = source
+            .split_once("data::Evt::Models(debt_reload, result) =>")
+            .expect("model result arm")
+            .1
+            .split_once("data::Evt::ReloadEnsured")
+            .expect("next event arm")
+            .0
+            .split_once("Err(error) =>")
+            .expect("model failure arm")
+            .1;
+        assert!(failure.contains("三维模型查询失败"));
+        assert!(
+            !failure.contains("restore_model_reload"),
+            "模型查询已经返回失败时只记录，不把同一笔欠账交给队列轮询自动重试"
+        );
+    }
+
+    #[test]
+    fn failed_reload_before_model_result_restores_the_reload_debt() {
         let mut owed = false;
         restore_model_reload(&mut owed, true);
         assert_eq!(auto_refresh(owed, true, false), AutoRefresh::FullReload);
