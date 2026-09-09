@@ -114,6 +114,9 @@ const INVALID_TUBI_AA_PX: f32 = 0.75;
 /// GPU 屏幕带在离屏视口上不可用时采用的真实长度虚线节距（模型数据单位为毫米）。
 const INVALID_TUBI_DASH_MM: f32 = 100.0;
 const INVALID_TUBI_GAP_MM: f32 = 80.0;
+/// 尺寸标注层的线色（计划 B3）。不参与光照（`fallback_line_material`），免得随视角变暗；
+/// 取近白而不取管道黄 / 结构蓝那几档类型色，标注得一眼分得出不是构件。
+const DIMENSION_COLOR: Color = Color::srgb_u8(240, 240, 240);
 /// 开机默认配色（深色主题的 viewport tokens：#232F3A / #0E1318 / #46586A）。
 /// 首帧 App 就会按当前主题发 `SetViewportBackground` 盖掉，这里只求
 /// 「主题命令到达前别闪白」。
@@ -437,6 +440,18 @@ impl View3d {
         self.picked.take()
     }
 
+    /// 挂一批尺寸标注线（计划 B3）。**整层替换**：上一批（不论哪条 BRAN 的）先撤，
+    /// 同时只挂一条 BRAN 的标注是宿主那边定的口径，这里不留叠加的口子。
+    pub fn set_dimensions(&mut self, batch: DimensionBatch) {
+        self.commands
+            .push_back(ViewCommand::Dimensions(Some(batch)));
+    }
+
+    /// 撤掉尺寸标注层。没挂着时是无操作。
+    pub fn clear_dimensions(&mut self) {
+        self.commands.push_back(ViewCommand::Dimensions(None));
+    }
+
     /// 加载失败、还没重试成功的网格数。
     pub fn failed_mesh_count(&self) -> usize {
         self.failed_meshes.len()
@@ -560,6 +575,24 @@ impl MeshLoadProgress {
     }
 }
 
+/// 尺寸标注层的一批线段（计划 B3）。
+///
+/// 坐标是 **PDMS 毫米（契约 `source_mm`）**，与模型几何过同一个装载变换（[`scene_transform`]：
+/// 0.01 缩放 + Z-up → Y-up 旋转），宿主不必自己换系、也不许吃契约里的 `source_to_design`
+/// ——那是网页设计系的事。契约到线段的翻译（尺寸线 + 延长线 + 箭头、弧按框架采样、虚线
+/// 切段）在宿主侧做完，这里只把线画出来；非有限的端点在建网格时丢弃。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DimensionBatch {
+    pub lines: Vec<DimensionLine>,
+}
+
+/// 尺寸标注层里的一条线段，两端毫米。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DimensionLine {
+    pub from: [f32; 3],
+    pub to: [f32; 3],
+}
+
 struct LoadingMesh {
     /// 这个网格属于哪个模型。逐模型的成功 / 失败计数靠它归堆。
     refno: RefU64,
@@ -618,7 +651,11 @@ fn visibility_target_matches(targets: &[RefU64], refno: RefU64, _owner: RefU64) 
     targets.contains(&refno)
 }
 
-fn initial_model_visibility(desired: &HashMap<RefU64, bool>, refno: RefU64, _owner: RefU64) -> bool {
+fn initial_model_visibility(
+    desired: &HashMap<RefU64, bool>,
+    refno: RefU64,
+    _owner: RefU64,
+) -> bool {
     // A replay only lists hidden model ids; unlisted members are visible.
     // Their owner's own geometry can independently be hidden.
     desired.get(&refno).copied().unwrap_or(true)
@@ -632,7 +669,13 @@ mod exact_visibility_tests {
         let branch = RefU64(26229);
         let visible_atta = RefU64(26233);
         let mut desired = HashMap::new();
-        record_model_visibility(&ModelAction::SetVisible { refnos: vec![branch], visible: false }, &mut desired);
+        record_model_visibility(
+            &ModelAction::SetVisible {
+                refnos: vec![branch],
+                visible: false,
+            },
+            &mut desired,
+        );
         assert!(!initial_model_visibility(&desired, branch, branch));
         assert!(initial_model_visibility(&desired, visible_atta, branch));
     }
@@ -642,7 +685,11 @@ mod exact_visibility_tests {
         let visible_atta = RefU64(26233);
         assert!(visibility_target_matches(&[branch], branch, branch));
         assert!(!visibility_target_matches(&[branch], visible_atta, branch));
-        assert!(visibility_target_matches(&[visible_atta], visible_atta, branch));
+        assert!(visibility_target_matches(
+            &[visible_atta],
+            visible_atta,
+            branch
+        ));
     }
 }
 
@@ -711,6 +758,8 @@ enum ViewCommand {
         up: Vec3,
         fit: bool,
     },
+    /// 尺寸标注层整层替换：`Some` 换成这一批，`None` 撤掉（计划 B3）。
+    Dimensions(Option<DimensionBatch>),
 }
 
 #[derive(Component)]
@@ -721,6 +770,16 @@ struct Headlight;
 
 #[derive(Component)]
 struct SceneRoot;
+
+/// 尺寸标注层的实体（计划 B3）。与 `SceneRoot` 平级而不挂在它底下：整场换模型
+/// （`Replace`）把 `SceneRoot` 连根拔掉时它不跟着消失——清不清层由宿主说
+/// （换场景 / 重连时宿主自己下 `clear_dimensions`），视口不替它猜。
+#[derive(Component)]
+struct DimensionLayer;
+
+/// 尺寸标注线共用的一枚不参与光照的材质。
+#[derive(Resource)]
+struct DimensionMaterial(Handle<StandardMaterial>);
 
 #[derive(Component, Clone, Copy)]
 struct ModelRoot {
@@ -989,6 +1048,9 @@ fn setup(
         materials.add(fallback_line_material(SELECT_COLOR)),
     ));
     commands.insert_resource(XRayMaterial(materials.add(xray_material())));
+    commands.insert_resource(DimensionMaterial(
+        materials.add(fallback_line_material(DIMENSION_COLOR)),
+    ));
     commands.insert_resource(InvalidTubiLineStateMaterials {
         highlight: line_materials.add(InvalidTubiLineMaterial::new(
             SELECT_COLOR,
@@ -1265,6 +1327,34 @@ fn fallback_line_material(color: Color) -> StandardMaterial {
     }
 }
 
+/// 模型数据（PDMS 毫米、Z-up）到世界（Y-up、1 单位 = 100 mm）的装载变换。`SceneRoot`、
+/// 包围盒换算与尺寸标注层三处用的必须是同一个——它们画的是同一个世界。
+fn scene_transform() -> Transform {
+    Transform::from_scale(Vec3::splat(MODEL_SCALE))
+        * Transform::from_rotation(Quat::from_rotation_x(-FRAC_PI_2))
+}
+
+/// 尺寸标注层的 `LineList` 网格：一批线段合进一个 mesh（计划 R2：大 BRAN 数百图元，
+/// 逐线段一个实体既费也断批）。端点非有限的线段丢掉；一条都不剩就不建。
+fn dimension_line_mesh(batch: &DimensionBatch) -> Option<Mesh> {
+    let positions: Vec<[f32; 3]> = batch
+        .lines
+        .iter()
+        .filter(|line| {
+            Vec3::from_array(line.from).is_finite() && Vec3::from_array(line.to).is_finite()
+        })
+        .flat_map(|line| [line.from, line.to])
+        .collect();
+    if positions.is_empty() {
+        return None;
+    }
+    let normals = vec![[0.0, 1.0, 0.0]; positions.len()];
+    let mut mesh = Mesh::new(PrimitiveTopology::LineList, RenderAssetUsages::default());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    Some(mesh)
+}
+
 /// 在局部 `+Z` 的 `[0, 1]` 范围内生成真实长度虚线。两端都落在线段端点，实例原点
 /// 仍是连接起点；短于一个节距的错误管段退化为一条完整诊断线，不会彻底消失。
 fn invalid_tubi_fallback_line_mesh(axis_length_mm: f32) -> Mesh {
@@ -1421,14 +1511,15 @@ fn load_models(
         view.render_states.clear();
         view.render_dirty.clear();
     }
-    let scene_transform = Transform::from_scale(Vec3::splat(MODEL_SCALE))
-        * Transform::from_rotation(Quat::from_rotation_x(-FRAC_PI_2));
+    let scene_transform = scene_transform();
     for model in &models {
         let aabb = &model.world_aabb;
         let Some((min, max)) = scene_bounds_from_mm(
             [aabb.mins.x, aabb.mins.y, aabb.mins.z],
             [aabb.maxs.x, aabb.maxs.y, aabb.maxs.z],
-        ) else { continue; };
+        ) else {
+            continue;
+        };
         extend_bounds(&mut view.bounds, model.refno.refno(), min, max);
         extend_bounds(&mut view.bounds, model.owner.refno(), min, max);
     }
@@ -1810,14 +1901,46 @@ fn apply_commands(
     mut mesh_params: ParamSet<(MeshRayCast, ResMut<Assets<Mesh>>)>,
     background: Res<BackgroundMesh>,
     mut grid: ResMut<GridState>,
+    dimension_layers: Query<Entity, With<DimensionLayer>>,
+    dimension_material: Res<DimensionMaterial>,
 ) {
     let Ok((camera_component, camera_global, mut camera_transform, mut projection)) =
         camera.single_mut()
     else {
         return;
     };
+    // `commands` 是延后落地的：同一帧里来两条 `Dimensions` 时，上面那个 Query 既还看得见
+    // 已经排队撤掉的旧层、又看不见刚 spawn 的新层。旧层只撤一遍，新层自己记着。
+    let mut dimension_layers_cleared = false;
+    let mut dimension_layer_spawned: Option<Entity> = None;
     while let Some(command) = view.commands.pop_front() {
         match command {
+            ViewCommand::Dimensions(batch) => {
+                if !dimension_layers_cleared {
+                    for entity in &dimension_layers {
+                        commands.entity(entity).despawn();
+                    }
+                    dimension_layers_cleared = true;
+                }
+                if let Some(entity) = dimension_layer_spawned.take() {
+                    commands.entity(entity).despawn();
+                }
+                if let Some(mesh) = batch.as_ref().and_then(dimension_line_mesh) {
+                    let handle = mesh_params.p1().add(mesh);
+                    let entity = commands
+                        .spawn((
+                            Mesh3d(handle),
+                            MeshMaterial3d(dimension_material.0.clone()),
+                            scene_transform(),
+                            Visibility::Visible,
+                            DimensionLayer,
+                            NotShadowCaster,
+                            NotShadowReceiver,
+                        ))
+                        .id();
+                    dimension_layer_spawned = Some(entity);
+                }
+            }
             ViewCommand::Pick(uv) => {
                 let hit = surface_hit(
                     uv,
@@ -2199,9 +2322,7 @@ fn scene_bounds_from_mm(min_mm: [f32; 3], max_mm: [f32; 3]) -> Option<(Vec3, Vec
     if !min.is_finite() || !max.is_finite() || (min.cmpgt(max)).any() {
         return None;
     }
-    let transform = Transform::from_scale(Vec3::splat(MODEL_SCALE))
-        * Transform::from_rotation(Quat::from_rotation_x(-FRAC_PI_2));
-    let matrix = transform.compute_matrix();
+    let matrix = scene_transform().compute_matrix();
     let mut out_min = Vec3::splat(f32::INFINITY);
     let mut out_max = Vec3::splat(f32::NEG_INFINITY);
     for x in [min.x, max.x] {
@@ -2276,10 +2397,17 @@ fn surface_hit(
 mod tests {
     #[test]
     fn focus_bounds_rotates_all_corners_and_rejects_invalid_input() {
-        let (min, max) = super::scene_bounds_from_mm([1000., 2000., 3000.], [4000., 6000., 8000.]).unwrap();
+        let (min, max) =
+            super::scene_bounds_from_mm([1000., 2000., 3000.], [4000., 6000., 8000.]).unwrap();
         let scale = super::MODEL_SCALE;
-        assert!(min.abs_diff_eq(bevy::prelude::Vec3::new(1000., 3000., -6000.) * scale, 0.001));
-        assert!(max.abs_diff_eq(bevy::prelude::Vec3::new(4000., 8000., -2000.) * scale, 0.001));
+        assert!(min.abs_diff_eq(
+            bevy::prelude::Vec3::new(1000., 3000., -6000.) * scale,
+            0.001
+        ));
+        assert!(max.abs_diff_eq(
+            bevy::prelude::Vec3::new(4000., 8000., -2000.) * scale,
+            0.001
+        ));
         assert!(super::scene_bounds_from_mm([f32::NAN; 3], [1.; 3]).is_none());
         assert!(super::scene_bounds_from_mm([2.; 3], [1.; 3]).is_none());
     }
@@ -2355,6 +2483,66 @@ mod tests {
         for pair in positions.chunks_exact(2).collect::<Vec<_>>().windows(2) {
             assert!(pair[1][0][2] > pair[0][1][2], "dashes need a visible gap");
         }
+    }
+
+    /// 尺寸标注层的一批线段合进一个 LineList：每条两顶点、按毫米原样落进网格（换系交给
+    /// 挂在实体上的装载变换），端点非有限的那条丢掉，一条都不剩就不建网格。
+    #[test]
+    fn dimension_lines_share_one_line_list_in_millimetres() {
+        let batch = DimensionBatch {
+            lines: vec![
+                DimensionLine {
+                    from: [0.0, 0.0, 0.0],
+                    to: [1_000.0, 0.0, 0.0],
+                },
+                DimensionLine {
+                    from: [f32::NAN, 0.0, 0.0],
+                    to: [0.0, 1.0, 0.0],
+                },
+                DimensionLine {
+                    from: [0.0, 500.0, 0.0],
+                    to: [0.0, 500.0, 250.0],
+                },
+            ],
+        };
+        let mesh = dimension_line_mesh(&batch).expect("两条有限线段");
+        assert_eq!(mesh.primitive_topology(), PrimitiveTopology::LineList);
+        let Some(VertexAttributeValues::Float32x3(positions)) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+        else {
+            panic!("尺寸标注线要有 Float32x3 位置");
+        };
+        assert_eq!(
+            positions,
+            &vec![
+                [0.0, 0.0, 0.0],
+                [1_000.0, 0.0, 0.0],
+                [0.0, 500.0, 0.0],
+                [0.0, 500.0, 250.0]
+            ]
+        );
+        assert!(dimension_line_mesh(&DimensionBatch::default()).is_none());
+        assert!(
+            dimension_line_mesh(&DimensionBatch {
+                lines: vec![DimensionLine {
+                    from: [0.0; 3],
+                    to: [f32::INFINITY, 0.0, 0.0],
+                }],
+            })
+            .is_none()
+        );
+    }
+
+    /// 尺寸标注层与模型几何过同一个装载变换：契约给的是 PDMS 毫米 Z-up，画到世界里得
+    /// 与管子落在同一处。这里对着包围盒换算（它也走 `scene_transform`）互证一次。
+    #[test]
+    fn the_dimension_layer_shares_the_scene_transform_with_model_geometry() {
+        let matrix = scene_transform().compute_matrix();
+        let point = matrix.transform_point3(Vec3::new(1000., 2000., 3000.));
+        assert!(point.abs_diff_eq(Vec3::new(1000., 3000., -2000.) * MODEL_SCALE, 0.001));
+        let (min, max) = scene_bounds_from_mm([1000., 2000., 3000.], [1000., 2000., 3000.])
+            .expect("退化包围盒也算");
+        assert!(min.abs_diff_eq(point, 0.001) && max.abs_diff_eq(point, 0.001));
     }
 
     #[test]

@@ -4,6 +4,7 @@
 mod command;
 mod data;
 mod data_publish_api;
+mod dimension_layer;
 mod focus_bounds;
 #[cfg(not(target_arch = "wasm32"))]
 mod gallery;
@@ -580,6 +581,11 @@ fn show_app(
     for models in app.pending_incremental_models.drain(..) {
         view3d.append(models);
     }
+    match app.pending_dimensions.take() {
+        Some(DimensionLayerUpdate::Set(batch)) => view3d.set_dimensions(batch),
+        Some(DimensionLayerUpdate::Clear) => view3d.clear_dimensions(),
+        None => {}
+    }
     let mut retried = 0;
     for command in app.view3d_commands.drain(..) {
         match command {
@@ -602,6 +608,12 @@ fn show_app(
         );
     }
     Ok(())
+}
+
+/// 交给视口的尺寸标注层指令（计划 B3）：整层换成这一批，或整层撤掉。
+enum DimensionLayerUpdate {
+    Set(plant_ui_view3d::DimensionBatch),
+    Clear,
 }
 
 /// 一次还没落地的树定位（ADR-0014）。
@@ -1102,6 +1114,10 @@ struct App {
     /// 或清层都进一帧：大 BRAN 的求解要跑几秒，那期间人早就右键了别的 BRAN 或点了隐藏，
     /// 晚到的旧结果靠它认出来丢掉——与搜索 / 清点同一套取消口径。
     dimensions_epoch: u64,
+    /// 等着交给视口的尺寸标注层指令（计划 B3）。与 `view3d_commands` 分开：那条队列装的是
+    /// `plant_ui::Cmd`，而这份线段批次是视口自己的类型，绘制层 crate 不该认识它。同一帧
+    /// 只留最后一条——换目标 / 清层都是整层替换，前一条还没交出去就已经作废。
+    pending_dimensions: Option<DimensionLayerUpdate>,
     bridge: data::Bridge,
     tree: TreeModel,
     /// 还没落地的那一次树定位。同时只留一个：连续定位只完成最后一次。
@@ -1799,6 +1815,7 @@ impl App {
             pending_room_frame: None,
             room_pane_focus: None,
             dimensions_epoch: 0,
+            pending_dimensions: None,
             // 交互通道与模型通道都按这一个供数模式造读面（ADR-0026）。
             bridge: data::spawn(ctx.clone(), tasks, read_face),
             tree: TreeModel::default(),
@@ -1974,9 +1991,9 @@ impl App {
                     };
                 }
                 data::Evt::ElementRooms(..) => {}
-                // 尺寸标注回包（计划 B1 / B2）。帧号对不上 = 右键之后又换了目标或点了隐藏，
-                // 丢弃。对上了就落进 `vm.dimensions`：菜单据它把「查看」翻成「隐藏」，B4 的
-                // 状态入口据它报数；几何本身 B3 接视口层时从这里转发下去。
+                // 尺寸标注回包（计划 B1 / B2 / B3）。帧号对不上 = 右键之后又换了目标或点了
+                // 隐藏，丢弃。对上了就落进 `vm.dimensions`（菜单据它把「查看」翻成「隐藏」，
+                // B4 的状态入口据它报数），几何翻成线段批次交给视口整层替换。
                 data::Evt::PipeDimensions {
                     epoch,
                     refno,
@@ -1985,14 +2002,25 @@ impl App {
                     let el = self.tree.element(refno);
                     self.vm.dimensions = match result {
                         Ok(data) => {
+                            let mapped = dimension_layer::batch_of(&data);
                             let msg = format!(
-                                "尺寸标注：BRAN {}，{} 个图元，{} 条提示，布局 {}",
+                                "尺寸标注：BRAN {}，{} 个图元 → {} 条线，{} 条提示，布局 {}",
                                 data.branch_refno,
                                 data.primitives.len(),
+                                mapped.batch.lines.len(),
                                 data.issues.len(),
                                 data.meta.layout_mode.as_deref().unwrap_or("-")
                             );
-                            self.logs.info_of(&mut self.vm.logs, el, msg);
+                            self.logs.info_of(&mut self.vm.logs, el.clone(), msg);
+                            if mapped.skipped > 0 {
+                                // 画面上少了东西必须说出来（fail-closed 只是不画半截，不是装没事）。
+                                self.logs.warn_of(
+                                    &mut self.vm.logs,
+                                    el,
+                                    format!("{} 个图元几何不合法，未画", mapped.skipped),
+                                );
+                            }
+                            self.pending_dimensions = Some(DimensionLayerUpdate::Set(mapped.batch));
                             DimensionsVm::Ready(DimensionsDataVm {
                                 refno,
                                 primitives: data.primitives.len(),
@@ -4394,12 +4422,13 @@ impl App {
         }
     }
 
-    /// 清掉尺寸标注层。也进一帧：在途的取数回来不再上屏。重连 / 换项目走的也是它——
-    /// 旧库的 refno 挂在层上，菜单会对着新库里同号的元素说「隐藏」。B3 接上视口后在
-    /// 这里一并下 `ClearDimensions`。
+    /// 清掉尺寸标注层。也进一帧：在途的取数回来不再上屏。重连 / 换项目 / 整场重装走的
+    /// 也是它——旧库的 refno 挂在层上，菜单会对着新库里同号的元素说「隐藏」；视口那一层
+    /// 与 `SceneRoot` 平级，整场换模型不会顺手把它带走，得由这里明说撤掉（计划 B3）。
     fn clear_pipe_dimensions(&mut self) {
         self.dimensions_epoch = self.dimensions_epoch.wrapping_add(1);
         self.vm.dimensions = DimensionsVm::Off;
+        self.pending_dimensions = Some(DimensionLayerUpdate::Clear);
     }
 
     fn refetch_props(&mut self, refno: RefU64) {
@@ -4702,6 +4731,9 @@ impl App {
         // 在途的范围查询说的是清场前那个世界，回包一律作废。
         self.focus_bounds_request.cancel();
         self.model_scope_epoch = self.model_scope_epoch.wrapping_add(1);
+        // 尺寸标注量的是清场前那份几何，重装回来的 BRAN 可能已经不是那个样子（计划 B3：
+        // 换场景清层）。要看就再右键一次。
+        self.clear_pipe_dimensions();
         self.loaded_models.clear();
         self.tree.visibility.clear();
         self.tree.pending_direction.clear();
