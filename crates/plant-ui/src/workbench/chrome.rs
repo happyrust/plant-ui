@@ -4,9 +4,13 @@
 //! 设计稿上的已应用 sesno / 文件 sesno / 待更新批次 / 待重试单元属于 gen-model
 //! 侧，等 M4-4 定下数据边界后再补，宁可少一格。
 
-use egui::{Align, Color32, CornerRadius, Layout, Margin, RichText, Sense, Stroke, Ui, pos2, vec2};
+use egui::{
+    Align, Color32, CornerRadius, Layout, Margin, Rect, RichText, Sense, Stroke, StrokeKind, Ui,
+    pos2, vec2,
+};
 use egui_phosphor::regular as ph;
 
+use super::{DockSide, DockVisibility};
 use crate::Cmd;
 use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Status, Tokens, radius, space};
@@ -18,6 +22,7 @@ pub fn title_bar(
     t: &Tokens,
     d: Density,
     vm: &WorkbenchVm,
+    vis: DockVisibility,
     search: &mut super::search::State,
     cmds: &mut Vec<Cmd>,
 ) {
@@ -55,6 +60,19 @@ pub fn title_bar(
                 }
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    // 空间管理摆在最右上角（对齐设计稿）：right_to_left 里最先添加 = 最靠角。
+                    // 逆序添加，落到屏上从左到右读作 铃铛 · 左 · 下 · 右。激活（accent）= 该侧此刻展开着。
+                    if dock_toggle(ui, t, d, DockSide::Right, vis.right).clicked() {
+                        cmds.push(Cmd::ToggleDock(DockSide::Right));
+                    }
+                    if dock_toggle(ui, t, d, DockSide::Bottom, vis.bottom).clicked() {
+                        cmds.push(Cmd::ToggleDock(DockSide::Bottom));
+                    }
+                    if dock_toggle(ui, t, d, DockSide::Left, vis.left).clicked() {
+                        cmds.push(Cmd::ToggleDock(DockSide::Left));
+                    }
+                    notification_bell(ui, t, d);
+                    divider(ui, t, d);
                     ui.label(
                         RichText::new(&vm.user)
                             .font(Font::meta(d))
@@ -511,6 +529,84 @@ fn meta_icon(ui: &mut Ui, d: Density, icon: &str, color: Color32) {
             ))
             .color(color),
     );
+}
+
+/// 空间管理用的一枚 dock 开关：方形按钮里画一个「窗口」轮廓，某一侧填实表示那一侧的
+/// dock。`on`（该侧此刻展开着）时整枚按 accent 高亮，配色与视口工具按钮同一套。
+fn dock_toggle(ui: &mut Ui, t: &Tokens, d: Density, side: DockSide, on: bool) -> egui::Response {
+    let s = d.px(30.0);
+    let (rect, resp) = ui.allocate_exact_size(vec2(s, s), Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return resp;
+    }
+    let (bg, fg) = if on {
+        (t.accent_bg, t.accent)
+    } else if resp.hovered() {
+        (t.bg_hover, t.text_primary)
+    } else {
+        (Color32::TRANSPARENT, t.text_secondary)
+    };
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(radius::MD), bg);
+    panel_glyph(ui, rect, side, fg, d);
+    let tip = match (side, on) {
+        (DockSide::Left, true) => "收起左侧面板",
+        (DockSide::Left, false) => "展开左侧面板",
+        (DockSide::Bottom, true) => "收起底部面板",
+        (DockSide::Bottom, false) => "展开底部面板",
+        (DockSide::Right, true) => "收起右侧面板",
+        (DockSide::Right, false) => "展开右侧面板",
+    };
+    resp.on_hover_text(tip)
+}
+
+/// dock 开关里的「窗口」小图：外框加某一侧的实心分区。内缩 1px 压在描边里侧，
+/// 免得实心块盖住圆角。
+fn panel_glyph(ui: &Ui, btn: Rect, side: DockSide, color: Color32, d: Density) {
+    let frame = Rect::from_center_size(btn.center(), vec2(d.px(15.0), d.px(12.0)));
+    let painter = ui.painter();
+    painter.rect_stroke(
+        frame,
+        CornerRadius::same(2),
+        Stroke::new(1.0, color),
+        StrokeKind::Inside,
+    );
+    let inner = frame.shrink(1.0);
+    let dock = match side {
+        DockSide::Left => Rect::from_min_max(
+            inner.min,
+            pos2(inner.left() + inner.width() * 0.34, inner.bottom()),
+        ),
+        DockSide::Right => Rect::from_min_max(
+            pos2(inner.right() - inner.width() * 0.34, inner.top()),
+            inner.max,
+        ),
+        DockSide::Bottom => Rect::from_min_max(
+            pos2(inner.left(), inner.bottom() - inner.height() * 0.42),
+            inner.max,
+        ),
+    };
+    painter.rect_filled(dock, CornerRadius::ZERO, color);
+}
+
+/// 通知铃铛。应用还没有通知源，点开是一句诚实的「暂无通知」——**不摆假的未读红点**
+/// （与状态栏「宁可少一格」同一条准绳）。接上真正的通知流后，未读点与列表在这里补。
+fn notification_bell(ui: &mut Ui, t: &Tokens, d: Density) {
+    let bell = ui.add(widgets::tool_btn(t, d, ph::BELL, false));
+    egui::Popup::menu(&bell).show(|ui| {
+        ui.set_min_width(d.px(220.0));
+        ui.label(
+            RichText::new("通知")
+                .font(Font::strong(d))
+                .color(t.text_primary),
+        );
+        ui.add_space(space::S1);
+        ui.label(
+            RichText::new("暂无通知")
+                .font(Font::meta(d))
+                .color(t.text_muted),
+        );
+    });
 }
 
 fn command_menu_button(d: Density, label: &str, has_popup: bool) -> egui::Button<'static> {

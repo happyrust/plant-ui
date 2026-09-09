@@ -3547,6 +3547,7 @@ impl App {
                     self.state.focus(Pane::Room);
                 }
                 Cmd::FocusPane(pane) => self.state.focus(pane),
+                Cmd::ToggleDock(side) => self.state.toggle_dock(side),
                 Cmd::OpenRoomBrowser => {
                     self.room_browser_state.open = true;
                     // 全表在途时只开窗不重发：这查询几十秒级，叠一份是纯浪费。

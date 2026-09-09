@@ -154,6 +154,11 @@ pub enum Cmd {
     /// 把某个常驻视图切到前台（如待重算横幅 -> 任务队列）。找不到该页签时
     /// 宿主是无操作——用户可以把页签拖走，那是他的布局。
     FocusPane(workbench::Pane),
+    /// 收起 / 展开某一侧 dock（左 / 下 / 右），腾挪工作台空间。
+    ///
+    /// dock 布局是界面自身的状态而非数据，所以这条不进 Vm：宿主转手交给
+    /// `WorkbenchState`（与 `FocusPane` 同一路），由绘制层按可见性重建 dock。
+    ToggleDock(workbench::DockSide),
     /// 清空日志缓冲。
     ClearLogs,
     /// 提交一条命令；解析与执行由宿主负责。
