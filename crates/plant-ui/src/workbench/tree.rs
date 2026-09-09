@@ -56,7 +56,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                         area = area.vertical_scroll_offset(y);
                     }
                     // 模型动作要有真的渲染器才做得成，独立壳里不摆这几项。
-                    let live = vm.view3d.is_some_and(|v| v.live);
+                    let live = vm.view3d.as_ref().is_some_and(|v| v.live);
                     let primary = vm.selection.primary();
                     area.show_rows(ui, d.row_h(), rows.len(), |ui, range| {
                         for row in &rows[range] {

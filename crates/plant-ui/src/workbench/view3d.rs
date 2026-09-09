@@ -128,7 +128,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
     ui.painter()
         .add(gradient(rect, t.viewport_top, t.viewport_bottom));
 
-    let Some(view) = vm.view3d else {
+    let Some(view) = vm.view3d.as_ref() else {
         note(ui, t, d, rect);
         return;
     };
@@ -144,7 +144,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
             Color32::from_white_alpha(PLACEHOLDER_ALPHA)
         },
     );
-    let hud = hud(ui, t, d, rect, &view, vm.room_view.as_ref(), cmds);
+    let hud = hud(ui, t, d, rect, view, vm.room_view.as_ref(), cmds);
     if !view.live {
         return;
     }
@@ -155,10 +155,11 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
         cmds.push(Cmd::ResizeViewport(wanted));
     }
 
-    axis_labels(ui, t, d, rect, &view);
+    axis_labels(ui, t, d, rect, view);
+    dimension_labels(ui, t, d, rect, view);
     // 浮层先画完再判拾取：工具栏、立方体、HUD 盖住的这几片是控件，不是模型。
     let bar = toolbar(ui, t, d, rect, vm, response.id, cmds);
-    let cube = viewcube::show(ui, t, d, &view, rect, response.id, cmds);
+    let cube = viewcube::show(ui, t, d, view, rect, response.id, cmds);
     if response.clicked_by(egui::PointerButton::Primary)
         && let Some(pointer) = response.interact_pointer_pos()
     {
@@ -304,24 +305,58 @@ fn camera(
 fn axis_labels(ui: &mut Ui, t: &Tokens, d: Density, view: Rect, vm3d: &View3dVm) {
     let uv_rect = cover_uv(view.size(), vm3d.size);
     for (axis, label) in ["X", "Y", "Z"].into_iter().enumerate() {
-        let Some([u, v]) = vm3d.axis_labels[axis] else {
+        let Some(center) =
+            vm3d.axis_labels[axis].and_then(|uv| texture_uv_to_view(view, uv_rect, uv))
+        else {
             continue;
         };
-        let rel = vec2(
-            (u - uv_rect.min.x) / uv_rect.width(),
-            (v - uv_rect.min.y) / uv_rect.height(),
-        );
-        if !(0.0..=1.0).contains(&rel.x) || !(0.0..=1.0).contains(&rel.y) {
-            continue;
-        }
         ui.painter().text(
-            view.min + rel * view.size(),
+            center,
             Align2::CENTER_CENTER,
             label,
             Font::mono_meta(d),
             viewcube::axis_color(t, axis),
         );
     }
+}
+
+/// 尺寸标注层的文字（计划 B3）：尺寸数值 / 位号 / 辅助文字，画在宿主投影好的锚点上。
+///
+/// 与 [`axis_labels`] 同一套「纹理 UV → 视口点」换算；被裁掉的不画。字底垫一块面板色
+/// 圆角底——线画在三维里、字画在 egui 上，没有这块底，白字落在浅色构件上就读不出来。
+/// 首版不做遮挡剔除与避让：被管子挡住的锚点照样出字，字与字叠了也不挪。
+fn dimension_labels(ui: &mut Ui, t: &Tokens, d: Density, view: Rect, vm3d: &View3dVm) {
+    if vm3d.dimension_labels.is_empty() {
+        return;
+    }
+    let uv_rect = cover_uv(view.size(), vm3d.size);
+    let pad = vec2(d.px(3.0), d.px(1.0));
+    for label in &vm3d.dimension_labels {
+        let Some(center) = texture_uv_to_view(view, uv_rect, label.uv) else {
+            continue;
+        };
+        let galley =
+            ui.painter()
+                .layout_no_wrap(label.text.clone(), Font::mono_micro(d), t.text_primary);
+        let text_rect = Align2::CENTER_CENTER.anchor_size(center, galley.size());
+        ui.painter().rect_filled(
+            text_rect.expand2(pad),
+            radius::SM,
+            t.bg_elevated.gamma_multiply(0.85),
+        );
+        ui.painter().galley(text_rect.min, galley, t.text_primary);
+    }
+}
+
+/// 宿主投影出来的纹理 UV 落到视口上的哪一点；被等比裁切裁掉的部分回 None。
+/// 与拾取的换算（[`pointer_texture_uv`]）互为反函数，truth 都压在 [`cover_uv`] 一处。
+fn texture_uv_to_view(view: Rect, uv_rect: Rect, [u, v]: [f32; 2]) -> Option<egui::Pos2> {
+    let rel = vec2(
+        (u - uv_rect.min.x) / uv_rect.width(),
+        (v - uv_rect.min.y) / uv_rect.height(),
+    );
+    ((0.0..=1.0).contains(&rel.x) && (0.0..=1.0).contains(&rel.y))
+        .then(|| view.min + rel * view.size())
 }
 
 /// 视口左侧的竖向工具栏，返回它占住的矩形（调用点拿它把点击挡在拾取之外）。
@@ -681,9 +716,33 @@ mod tests {
                 camera_rot: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
                 axis_labels: [None; 3],
                 grid_cell_mm: 1_000.0,
+                dimension_labels: Vec::new(),
             }),
             ..Default::default()
         }
+    }
+
+    /// 纹理 UV → 视口点：等比裁切裁掉的那一圈回 None，其余落在视口矩形内；与拾取那一路
+    /// （`pointer_texture_uv`）互为反函数。尺寸标注文字与轴标签都走它。
+    #[test]
+    fn texture_uv_maps_back_onto_the_viewport_and_drops_the_cropped_band() {
+        // 视口 2:1，纹理 1:1：上下各裁掉四分之一。
+        let view = Rect::from_min_size(pos2(10.0, 20.0), vec2(200.0, 100.0));
+        let texture = vec2(400.0, 400.0);
+        let uv_rect = cover_uv(view.size(), texture);
+        assert_eq!(
+            texture_uv_to_view(view, uv_rect, [0.5, 0.5]),
+            Some(pos2(110.0, 70.0))
+        );
+        assert_eq!(
+            texture_uv_to_view(view, uv_rect, [0.5, 0.1]),
+            None,
+            "裁掉的上带"
+        );
+        let pointer = vec2(50.0, 25.0);
+        let uv = pointer_texture_uv(view.size(), texture, pointer);
+        let back = texture_uv_to_view(view, uv_rect, uv).expect("在画内");
+        assert!((back - (view.min + pointer)).length() < 1e-3);
     }
 
     #[test]

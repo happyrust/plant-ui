@@ -266,7 +266,7 @@ impl Selection {
 
 /// 三维视口对绘制层就是一张纹理。M1-5 里它是磁盘上的占位图，M3 接回 Bevy 后
 /// 换成每帧更新的渲染目标，这一层不用改。
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct View3dVm {
     pub texture: egui::TextureId,
     /// 纹理的像素尺寸。视口要按它等比裁切铺满，不然图会被拉变形。
@@ -288,6 +288,18 @@ pub struct View3dVm {
     /// 宿主的网格换档就按这个数落档，HUD 把它原样念出来——两边同源，读数才不会
     /// 与眼睛看见的格子对不上。独立壳没有网格，给 0 表示「无读数」。
     pub grid_cell_mm: f32,
+    /// 尺寸标注层的文字（计划 B3）：尺寸数值 / 位号 / 辅助文字，锚点已由宿主投影成
+    /// 纹理 UV（与 `axis_labels` 同机制），出画与相机身后的已经筛掉。绘制层只在锚点
+    /// 画字，首版不做遮挡剔除与避让。没挂标注时为空。
+    pub dimension_labels: Vec<DimensionLabelVm>,
+}
+
+/// 一条投影好的尺寸标注文字。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DimensionLabelVm {
+    /// 文字中心在渲染纹理上的归一化 UV。
+    pub uv: [f32; 2],
+    pub text: String,
 }
 
 /// 应用运行日志数据。

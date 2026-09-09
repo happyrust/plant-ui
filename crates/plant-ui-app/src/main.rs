@@ -58,10 +58,11 @@ use plant_ui::style::theme_tokens::{self, set_weight_families_ready};
 use plant_ui::style::tokens::{Density, Tokens};
 use plant_ui::task_queue;
 use plant_ui::vm::{
-    AccessPointVm, CommandLineKind, CommandLineVm, DimensionsDataVm, DimensionsVm, LogElement,
-    ModelLoadVm, PropKind, PropRowVm, PropsDataVm, PropsVm, RoomDetailDataVm, RoomDetailVm,
-    RoomMemberVm, RoomRelationVm, RoomViewVm, RoomVm, RoomsDataVm, RowVisibility, SearchHitVm,
-    SearchRunVm, SearchVm, Selection, SubIndexVm, TreeRowVm, TreeVm, View3dVm, WorkbenchVm,
+    AccessPointVm, CommandLineKind, CommandLineVm, DimensionLabelVm, DimensionsDataVm,
+    DimensionsVm, LogElement, ModelLoadVm, PropKind, PropRowVm, PropsDataVm, PropsVm,
+    RoomDetailDataVm, RoomDetailVm, RoomMemberVm, RoomRelationVm, RoomViewVm, RoomVm, RoomsDataVm,
+    RowVisibility, SearchHitVm, SearchRunVm, SearchVm, Selection, SubIndexVm, TreeRowVm, TreeVm,
+    View3dVm, WorkbenchVm,
 };
 use plant_ui::workbench::{self, Pane, WorkbenchState};
 use plant_ui_data::{EleTreeNode, RefU64};
@@ -564,6 +565,14 @@ fn show_app(
         camera_rot: view3d.camera_rot,
         axis_labels: view3d.axis_labels,
         grid_cell_mm: view3d.grid_cell_mm,
+        // 尺寸标注文字：视口上一拍投影好的锚点（计划 B3），只带画内的那些。
+        dimension_labels: view3d
+            .visible_dimension_labels()
+            .map(|(uv, text)| DimensionLabelVm {
+                uv,
+                text: text.to_owned(),
+            })
+            .collect(),
     });
     let size = ctx.content_rect().size();
     egui::Area::new("plant-workbench".into())
@@ -2004,10 +2013,11 @@ impl App {
                         Ok(data) => {
                             let mapped = dimension_layer::batch_of(&data);
                             let msg = format!(
-                                "尺寸标注：BRAN {}，{} 个图元 → {} 条线，{} 条提示，布局 {}",
+                                "尺寸标注：BRAN {}，{} 个图元 → {} 条线 + {} 条文字，{} 条提示，布局 {}",
                                 data.branch_refno,
                                 data.primitives.len(),
                                 mapped.batch.lines.len(),
+                                mapped.batch.labels.len(),
                                 data.issues.len(),
                                 data.meta.layout_mode.as_deref().unwrap_or("-")
                             );
@@ -2109,7 +2119,7 @@ impl App {
                             }
                             // 独立壳（无实时渲染器）里不排视口动作：那支队列没有
                             // 消费者，塞进去只会越攒越多；数据那半已经交给页签。
-                            let live = self.vm.view3d.is_some_and(|v| v.live);
+                            let live = self.vm.view3d.as_ref().is_some_and(|v| v.live);
                             if for_viewport && live {
                                 // 面板在前成员在后；同一个 refno 两边都出现时只留一份。
                                 let mut seen: HashSet<RefU64> = HashSet::new();

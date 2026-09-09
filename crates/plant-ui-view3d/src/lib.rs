@@ -348,6 +348,11 @@ pub struct View3d {
     /// 隔离前的可见性快照（refno -> 是否可见）。`Some` = 正处于隔离中。
     /// 只记第一次：连续隔离退出时回到隔离前的世界，而不是上一间房。
     isolate_restore: Option<HashMap<RefU64, bool>>,
+    /// 尺寸标注层的文字（毫米锚点 + 文字），随 `Dimensions` 命令整层替换（计划 B3）。
+    dimension_labels: Vec<DimensionLabel>,
+    /// 上一帧把每条文字锚点投影到纹理上的结果，与 `dimension_labels` 同长同序；
+    /// 出画或在相机身后为 None。由 `publish_camera` 在变换传播之后写。
+    dimension_label_uvs: Vec<Option<[f32; 2]>>,
 }
 
 impl View3d {
@@ -450,6 +455,15 @@ impl View3d {
     /// 撤掉尺寸标注层。没挂着时是无操作。
     pub fn clear_dimensions(&mut self) {
         self.commands.push_back(ViewCommand::Dimensions(None));
+    }
+
+    /// 本帧落在画内的尺寸标注文字：纹理 UV（文字中心）+ 文字。出画与相机身后的已筛掉；
+    /// 命令刚下、还没过一帧变换传播时是空的——晚一帧出字，比拿旧相机投一帧错位置好。
+    pub fn visible_dimension_labels(&self) -> impl Iterator<Item = ([f32; 2], &str)> + '_ {
+        self.dimension_labels
+            .iter()
+            .zip(&self.dimension_label_uvs)
+            .filter_map(|(label, uv)| uv.map(|uv| (uv, label.text.as_str())))
     }
 
     /// 加载失败、还没重试成功的网格数。
@@ -584,6 +598,9 @@ impl MeshLoadProgress {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DimensionBatch {
     pub lines: Vec<DimensionLine>,
+    /// 文字（尺寸数值 / 位号 / 辅助文字）。字不进场景：视口逐帧把锚点投影成纹理 UV
+    /// 发布出去（`visible_dimension_labels`，与轴标签同机制），egui 侧在锚点画字。
+    pub labels: Vec<DimensionLabel>,
 }
 
 /// 尺寸标注层里的一条线段，两端毫米。
@@ -591,6 +608,13 @@ pub struct DimensionBatch {
 pub struct DimensionLine {
     pub from: [f32; 3],
     pub to: [f32; 3],
+}
+
+/// 尺寸标注层里的一条文字：`anchor` 是文字**中心**（毫米）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DimensionLabel {
+    pub anchor: [f32; 3],
+    pub text: String,
 }
 
 struct LoadingMesh {
@@ -969,6 +993,8 @@ fn setup(
         material_dirty: false,
         bounds: HashMap::new(),
         isolate_restore: None,
+        dimension_labels: Vec::new(),
+        dimension_label_uvs: Vec::new(),
     });
     commands.insert_resource(OrbitCamera::default());
 
@@ -1268,6 +1294,12 @@ fn publish_camera(
         m.z_axis.to_array(),
     ];
     view.grid_cell_mm = grid.level * MM_PER_WORLD;
+    // 尺寸标注文字的锚点：毫米 → 世界 → 纹理 UV，与轴标签同一条投影（计划 B3）。
+    view.dimension_label_uvs = project_dimension_labels(&view.dimension_labels, |world| {
+        camera
+            .world_to_ndc(transform, world)
+            .and_then(ndc_to_texture_uv)
+    });
     if !world_axes.0 {
         view.axis_labels = [None; 3];
         return;
@@ -1277,9 +1309,32 @@ fn publish_camera(
     for (axis, dir) in AXIS_DIRS.into_iter().enumerate() {
         view.axis_labels[axis] = camera
             .world_to_ndc(transform, dir * tip)
-            .filter(|ndc| ndc.z > 0.0 && ndc.z < 1.0)
-            .map(|ndc| [ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5]);
+            .and_then(ndc_to_texture_uv);
     }
+}
+
+/// NDC → 渲染纹理上的归一化 UV（左上原点）；在相机身后或裁剪范围外回 None。
+fn ndc_to_texture_uv(ndc: Vec3) -> Option<[f32; 2]> {
+    (ndc.z > 0.0 && ndc.z < 1.0).then(|| [ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5])
+}
+
+/// 把每条尺寸标注文字的毫米锚点过装载变换，再交给 `project`（相机的世界点 → 纹理 UV）；
+/// 锚点非有限直接 None。与 `dimension_labels` 同长同序，egui 侧按下标对回文字。
+fn project_dimension_labels(
+    labels: &[DimensionLabel],
+    mut project: impl FnMut(Vec3) -> Option<[f32; 2]>,
+) -> Vec<Option<[f32; 2]>> {
+    let scene = scene_transform().compute_matrix();
+    labels
+        .iter()
+        .map(|label| {
+            let anchor = Vec3::from_array(label.anchor);
+            anchor
+                .is_finite()
+                .then(|| project(scene.transform_point3(anchor)))
+                .flatten()
+        })
+        .collect()
 }
 
 /// 构件类型 -> 基色。原样搬 rs-plant3-d 的 `default_color_rules`：
@@ -1925,6 +1980,12 @@ fn apply_commands(
                 if let Some(entity) = dimension_layer_spawned.take() {
                     commands.entity(entity).despawn();
                 }
+                // 文字随层整批换；投影等下一拍 `publish_camera`（要传播完的相机姿态）。
+                view.dimension_labels = batch
+                    .as_ref()
+                    .map(|batch| batch.labels.clone())
+                    .unwrap_or_default();
+                view.dimension_label_uvs.clear();
                 if let Some(mesh) = batch.as_ref().and_then(dimension_line_mesh) {
                     let handle = mesh_params.p1().add(mesh);
                     let entity = commands
@@ -2504,6 +2565,7 @@ mod tests {
                     to: [0.0, 500.0, 250.0],
                 },
             ],
+            labels: Vec::new(),
         };
         let mesh = dimension_line_mesh(&batch).expect("两条有限线段");
         assert_eq!(mesh.primitive_topology(), PrimitiveTopology::LineList);
@@ -2528,9 +2590,61 @@ mod tests {
                     from: [0.0; 3],
                     to: [f32::INFINITY, 0.0, 0.0],
                 }],
+                ..Default::default()
             })
             .is_none()
         );
+    }
+
+    /// 文字锚点先过装载变换再交给相机投影，与 `dimension_labels` 同长同序；非有限的锚点
+    /// 直接 None，不拿 NaN 去问相机。NDC → 纹理 UV 把相机身后与裁剪外的筛掉，左上为原点。
+    #[test]
+    fn dimension_label_anchors_are_projected_through_the_scene_transform() {
+        let labels = vec![
+            DimensionLabel {
+                anchor: [1000.0, 2000.0, 3000.0],
+                text: "1000".into(),
+            },
+            DimensionLabel {
+                anchor: [f32::NAN, 0.0, 0.0],
+                text: "bad".into(),
+            },
+            DimensionLabel {
+                anchor: [0.0; 3],
+                text: "origin".into(),
+            },
+        ];
+        let mut asked = Vec::new();
+        let uvs = project_dimension_labels(&labels, |world| {
+            asked.push(world);
+            Some([world.x, world.y])
+        });
+        assert_eq!(uvs.len(), 3);
+        assert_eq!(uvs[1], None);
+        assert_eq!(asked.len(), 2, "NaN 锚点不该问到相机");
+        // PDMS (1000, 2000, 3000) mm → 世界 (10, 30, -20)：Z-up 转 Y-up、1 单位 = 100 mm。
+        assert!(
+            asked[0].abs_diff_eq(Vec3::new(10.0, 30.0, -20.0), 1e-4),
+            "{}",
+            asked[0]
+        );
+        let uv = uvs[0].expect("投影结果原样带回");
+        assert!(
+            (uv[0] - 10.0).abs() < 1e-4 && (uv[1] - 30.0).abs() < 1e-4,
+            "{uv:?}"
+        );
+        assert_eq!(uvs[2], Some([0.0, 0.0]));
+
+        assert_eq!(
+            ndc_to_texture_uv(Vec3::new(0.0, 0.0, 0.5)),
+            Some([0.5, 0.5])
+        );
+        assert_eq!(
+            ndc_to_texture_uv(Vec3::new(-1.0, 1.0, 0.5)),
+            Some([0.0, 0.0])
+        );
+        assert_eq!(ndc_to_texture_uv(Vec3::new(0.0, 0.0, 1.5)), None);
+        assert_eq!(ndc_to_texture_uv(Vec3::new(0.0, 0.0, -0.1)), None);
     }
 
     /// 尺寸标注层与模型几何过同一个装载变换：契约给的是 PDMS 毫米 Z-up，画到世界里得
@@ -2636,6 +2750,8 @@ mod tests {
             material_dirty: false,
             bounds: HashMap::new(),
             isolate_restore: None,
+            dimension_labels: Vec::new(),
+            dimension_label_uvs: Vec::new(),
         }
     }
 

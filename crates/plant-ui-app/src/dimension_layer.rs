@@ -10,15 +10,17 @@
 //! - `aid_line`：一条线，`dashed` / `dash_dot` 切成真实长度的虚线段（`dash_dot` 首版按 `dashed` 画）；
 //! - `aid_arc` / `aid_circle`：弧 / 整圆采样成折线；
 //! - `aid_point` / `weld_mark`：位置上一枚小十字（三轴各一段，半长按字高定）；
-//! - `label` / `aid_text` 与各图元自带的 `text`：文字，B3 后半走 egui 覆盖层投影，这里不出线。
+//! - 文字：`linear_dim` / `angle_dim` 的 `text` 落在 `label_anchor`，`label` / `aid_text` 落在
+//!   `position`，`slope_mark` 的 `text` 落在线段中点——都只交锚点 + 字，视口逐帧投影成纹理 UV，
+//!   egui 侧画字（`axis_labels` 同机制）；空字符串不出字。
 //!
-//! 几何不合法（端点非有限、半径非正、轴退化、扫角非正）的图元**整个**丢掉并计数——fail-closed，
-//! 不画半截：少一条箭头的尺寸线看着像量到了别处。
+//! 几何不合法（端点非有限、半径非正、轴退化、扫角非正、锚点非有限）的图元**整个**丢掉并计数
+//! ——fail-closed，不画半截：少一条箭头的尺寸线看着像量到了别处。
 
 use bevy::math::Vec3;
 use plant_mbd::contract::Vec3V2;
 use plant_mbd::{MbdPrimitive, MbdV2LineSegment, MbdV2PipeData};
-use plant_ui_view3d::{DimensionBatch, DimensionLine};
+use plant_ui_view3d::{DimensionBatch, DimensionLabel, DimensionLine};
 
 /// 弧采样的角步长（度）。整圆 72 段肉眼看不出棱，再细只会让大 BRAN 的顶点数白翻倍（计划 R2）。
 const ARC_STEP_DEG: f32 = 5.0;
@@ -47,30 +49,61 @@ pub fn batch_of(data: &MbdV2PipeData) -> Mapped {
         .unwrap_or(DEFAULT_CHEIGHT_MM);
     let mut mapped = Mapped::default();
     for primitive in &data.primitives {
-        match lines_of(primitive, cheight) {
-            Some(lines) => mapped.batch.lines.extend(lines),
+        match pieces_of(primitive, cheight) {
+            Some(pieces) => {
+                mapped.batch.lines.extend(pieces.lines);
+                mapped.batch.labels.extend(pieces.labels);
+            }
             None => mapped.skipped += 1,
         }
     }
     mapped
 }
 
-/// 一个图元的全部线段；几何不合法回 None（整个图元丢弃）。纯文字图元回 `Some(空)`。
-fn lines_of(primitive: &MbdPrimitive, cheight: f32) -> Option<Vec<DimensionLine>> {
-    let mut out = Vec::new();
+/// 一个图元翻出来的线与字。
+#[derive(Default)]
+struct Pieces {
+    lines: Vec<DimensionLine>,
+    labels: Vec<DimensionLabel>,
+}
+
+impl Pieces {
+    /// 记一条文字；空字符串不出字，锚点非有限回 None（整个图元丢弃）。
+    fn label(&mut self, anchor: Vec3, text: &str) -> Option<()> {
+        if !anchor.is_finite() {
+            return None;
+        }
+        if !text.is_empty() {
+            self.labels.push(DimensionLabel {
+                anchor: anchor.to_array(),
+                text: text.to_owned(),
+            });
+        }
+        Some(())
+    }
+}
+
+/// 一个图元的全部线段与文字；几何不合法回 None（整个图元丢弃）。
+fn pieces_of(primitive: &MbdPrimitive, cheight: f32) -> Option<Pieces> {
+    let mut pieces = Pieces::default();
+    let out = &mut pieces.lines;
     match primitive {
         MbdPrimitive::LinearDim {
             start,
             end,
+            text,
             extension_lines,
             arrow_lines,
+            label_anchor,
             ..
         } => {
-            push_line(&mut out, *start, *end)?;
-            push_segments(&mut out, extension_lines)?;
-            push_segments(&mut out, arrow_lines)?;
+            push_line(out, *start, *end)?;
+            push_segments(out, extension_lines)?;
+            push_segments(out, arrow_lines)?;
+            pieces.label(Vec3::from_array(*label_anchor), text)?;
         }
         MbdPrimitive::AngleDim {
+            text,
             center,
             x_axis,
             normal,
@@ -78,22 +111,31 @@ fn lines_of(primitive: &MbdPrimitive, cheight: f32) -> Option<Vec<DimensionLine>
             start_angle_deg,
             sweep_angle_deg,
             leg_lines,
+            label_anchor,
             ..
         } => {
             let frame = ArcFrame::new(*center, *x_axis, *normal, *radius)?;
-            push_polyline(&mut out, &frame.sample(*start_angle_deg, *sweep_angle_deg)?);
-            push_segments(&mut out, leg_lines)?;
+            push_polyline(out, &frame.sample(*start_angle_deg, *sweep_angle_deg)?);
+            push_segments(out, leg_lines)?;
+            pieces.label(Vec3::from_array(*label_anchor), text)?;
         }
-        MbdPrimitive::LeaderLine { start, end, .. }
-        | MbdPrimitive::SlopeMark { start, end, .. } => {
-            push_line(&mut out, *start, *end)?;
+        MbdPrimitive::LeaderLine { start, end, .. } => {
+            push_line(out, *start, *end)?;
+        }
+        // 坡度符号的字没有自己的锚点：PML 把它贴在符号旁边，这里取线段中点。
+        MbdPrimitive::SlopeMark {
+            start, end, text, ..
+        } => {
+            let (from, to) = finite_pair(*start, *end)?;
+            out.push(line(from, to));
+            pieces.label((from + to) * 0.5, text)?;
         }
         MbdPrimitive::AidLine {
             start, end, style, ..
         } => {
             let (from, to) = finite_pair(*start, *end)?;
             if is_dashed(style.as_deref()) {
-                push_dashed(&mut out, from, to);
+                push_dashed(out, from, to);
             } else {
                 out.push(line(from, to));
             }
@@ -108,7 +150,7 @@ fn lines_of(primitive: &MbdPrimitive, cheight: f32) -> Option<Vec<DimensionLine>
             ..
         } => {
             let frame = ArcFrame::new(*center, *x_axis, *normal, *radius)?;
-            push_polyline(&mut out, &frame.sample(*start_angle_deg, *sweep_angle_deg)?);
+            push_polyline(out, &frame.sample(*start_angle_deg, *sweep_angle_deg)?);
         }
         MbdPrimitive::AidCircle {
             center,
@@ -117,15 +159,17 @@ fn lines_of(primitive: &MbdPrimitive, cheight: f32) -> Option<Vec<DimensionLine>
             ..
         } => {
             let frame = ArcFrame::circle(*center, *normal, *radius)?;
-            push_polyline(&mut out, &frame.sample(0.0, 360.0)?);
+            push_polyline(out, &frame.sample(0.0, 360.0)?);
         }
         MbdPrimitive::AidPoint { position, .. } | MbdPrimitive::WeldMark { position, .. } => {
-            push_mark(&mut out, *position, cheight * MARK_HALF_PER_CHEIGHT)?;
+            push_mark(out, *position, cheight * MARK_HALF_PER_CHEIGHT)?;
         }
-        // 文字：B3 后半走 egui 覆盖层，这里不出线。
-        MbdPrimitive::Label { .. } | MbdPrimitive::AidText { .. } => {}
+        MbdPrimitive::Label { text, position, .. }
+        | MbdPrimitive::AidText { text, position, .. } => {
+            pieces.label(Vec3::from_array(*position), text)?;
+        }
     }
-    Some(out)
+    Some(pieces)
 }
 
 fn line(from: Vec3, to: Vec3) -> DimensionLine {
@@ -315,6 +359,86 @@ mod tests {
         assert_eq!(lines[1].to, [0.0, 0.0, 200.0]);
         assert_eq!(lines[2].to, [24.0, 7.0, 0.0]);
         assert_eq!(lines[3].to, [24.0, -7.0, 0.0]);
+        // 尺寸数值落在求解器给的 label_anchor 上，不自己算中点。
+        assert_eq!(
+            mapped.batch.labels,
+            vec![DimensionLabel {
+                anchor: [500.0, 0.0, 0.0],
+                text: "1000".into(),
+            }]
+        );
+    }
+
+    /// 文字的锚点：`label` / `aid_text` 用自己的 `position`，`slope_mark` 取线段中点，
+    /// `angle_dim` 用 `label_anchor`；空字符串不出字；锚点非有限整个图元丢掉并计数。
+    #[test]
+    fn labels_sit_on_their_anchors_and_bad_anchors_drop_the_primitive() {
+        let mapped = batch_of(&data(
+            vec![
+                MbdPrimitive::Label {
+                    id: "lb".into(),
+                    text: "/PIPE-1".into(),
+                    position: [1.0, 2.0, 3.0],
+                },
+                MbdPrimitive::AidText {
+                    id: "t".into(),
+                    text: "N".into(),
+                    position: [4.0, 5.0, 6.0],
+                },
+                MbdPrimitive::SlopeMark {
+                    id: "s".into(),
+                    text: "1:100".into(),
+                    start: [0.0, 0.0, 0.0],
+                    end: [200.0, 0.0, 100.0],
+                },
+                MbdPrimitive::AidText {
+                    id: "empty".into(),
+                    text: String::new(),
+                    position: [0.0; 3],
+                },
+                MbdPrimitive::Label {
+                    id: "bad".into(),
+                    text: "x".into(),
+                    position: [f32::NAN, 0.0, 0.0],
+                },
+                linear([0.0; 3], [10.0, 0.0, 0.0], vec![], vec![]),
+            ],
+            None,
+        ));
+        assert_eq!(mapped.skipped, 1, "只有 NaN 锚点那条 label 被丢");
+        let texts: Vec<(&str, [f32; 3])> = mapped
+            .batch
+            .labels
+            .iter()
+            .map(|l| (l.text.as_str(), l.anchor))
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                ("/PIPE-1", [1.0, 2.0, 3.0]),
+                ("N", [4.0, 5.0, 6.0]),
+                ("1:100", [100.0, 0.0, 50.0]),
+                ("1000", [500.0, 0.0, 0.0]),
+            ]
+        );
+        // 坡度符号自己那条线照出。
+        assert_eq!(mapped.batch.lines.len(), 2);
+
+        // 尺寸线的锚点坏了：线也不画，整个图元丢。
+        let bad_anchor = MbdPrimitive::LinearDim {
+            id: "d".into(),
+            start: [0.0; 3],
+            end: [10.0, 0.0, 0.0],
+            text: "10".into(),
+            sub_kind: None,
+            extension_lines: vec![],
+            arrow_lines: vec![],
+            label_anchor: [0.0, f32::INFINITY, 0.0],
+            reference: None,
+        };
+        let mapped = batch_of(&data(vec![bad_anchor], None));
+        assert_eq!(mapped.skipped, 1);
+        assert!(mapped.batch.lines.is_empty() && mapped.batch.labels.is_empty());
     }
 
     /// 少一条箭头的尺寸线看着像量到了别处：任何一段不合法，整个图元丢掉并计数。
