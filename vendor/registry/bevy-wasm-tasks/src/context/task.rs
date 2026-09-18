@@ -24,6 +24,16 @@ impl TaskContext {
     /// Sleeps the background task until a given number of main thread updates have occurred. If
     /// you instead want to sleep for a given length of wall-clock time, sleep using tokio sleep or similar.
     /// function.
+    ///
+    /// Once the main thread is gone — the [`UpdateTicks`](crate::ticks::UpdateTicks) resource
+    /// (and with it the only tick `Sender`) has been dropped, which is what Bevy's
+    /// `World::clear_all()` does on exit — there will never be another update, so this future
+    /// stays pending forever instead of returning. Returning early here turned every
+    /// `loop { …; ctx.sleep_updates(1).await }` into a busy loop that never yields: harmless on a
+    /// tokio worker thread that is about to be torn down, but on wasm the task shares the page's
+    /// main thread, and a microtask that never ends blocks the whole unload (`pagehide` →
+    /// navigation) — a reload became "page unresponsive". The parked future is reclaimed with the
+    /// runtime / document.
     pub async fn sleep_updates(&mut self, updates_to_sleep: usize) {
         let target_tick = self
             .ticks
@@ -31,7 +41,7 @@ impl TaskContext {
             .wrapping_add(updates_to_sleep);
         while self.ticks.load(Ordering::SeqCst) < target_tick {
             if self.tick_rx.changed().await.is_err() {
-                return;
+                std::future::pending::<()>().await;
             }
         }
     }
@@ -77,5 +87,66 @@ impl TaskContext {
     {
         self.run_on_main_thread_with_config(runnable, Default::default())
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+
+    fn context(tick_tx: &tokio::sync::watch::Sender<()>) -> (TaskContext, Arc<AtomicUsize>) {
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ctx = TaskContext {
+            tick_rx: tick_tx.subscribe(),
+            task_channels: TaskChannels::default(),
+            ticks: Arc::clone(&ticks),
+        };
+        (ctx, ticks)
+    }
+
+    fn poll_once<F: Future>(future: &mut std::pin::Pin<&mut F>) -> Poll<F::Output> {
+        future.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    /// Normal life: the sleep wakes up once the main thread has ticked enough times.
+    #[test]
+    fn sleep_completes_after_enough_ticks() {
+        let (tick_tx, _keep) = tokio::sync::watch::channel(());
+        let (mut ctx, ticks) = context(&tick_tx);
+        let mut sleep = pin!(ctx.sleep_updates(2));
+        assert!(poll_once(&mut sleep).is_pending());
+        ticks.fetch_add(1, Ordering::SeqCst);
+        tick_tx.send(()).unwrap();
+        assert!(poll_once(&mut sleep).is_pending(), "one tick is not two");
+        ticks.fetch_add(1, Ordering::SeqCst);
+        tick_tx.send(()).unwrap();
+        assert!(poll_once(&mut sleep).is_ready());
+    }
+
+    /// The main thread is gone (tick `Sender` dropped): the sleep must stay pending forever
+    /// rather than return — a returning sleep is a busy loop on wasm (see `sleep_updates` docs).
+    #[test]
+    fn sleep_stays_pending_once_the_host_is_gone() {
+        let (tick_tx, _) = tokio::sync::watch::channel(());
+        let (mut ctx, _ticks) = context(&tick_tx);
+        drop(tick_tx);
+        let mut sleep = pin!(ctx.sleep_updates(1));
+        for _ in 0..3 {
+            assert!(poll_once(&mut sleep).is_pending());
+        }
+    }
+
+    /// Callers that want to finish instead of parking can still tell: `has_changed` only errors
+    /// when every `Sender` is gone.
+    #[test]
+    fn closed_channel_is_observable_without_awaiting() {
+        let (tick_tx, _) = tokio::sync::watch::channel(());
+        let (ctx, _ticks) = context(&tick_tx);
+        assert!(ctx.tick_rx.has_changed().is_ok());
+        drop(tick_tx);
+        assert!(ctx.tick_rx.has_changed().is_err());
     }
 }

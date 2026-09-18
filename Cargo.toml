@@ -38,12 +38,11 @@ bevy_egui35 = { path = "vendor/bevy_egui35", default-features = false, features 
     "render", "default_fonts", "manage_clipboard",
 ] }
 # 双端 spawn：原生走 tokio、浏览器走 spawn_local（view3d-migration.md 决定 5）
-# 可编辑源码树 = gitee happydpc/bevy-wasm-tasks rev 51aabcb + 一处改动：`sleep_updates` 在
-# 宿主退出（`UpdateTicks` 连同 watch Sender 被 `World::clear_all()` drop）之后永久挂起，
-# 而不是立刻返回——立刻返回会让每条 `loop { …; sleep_updates(1).await }` 变成不让出的死循环，
-# 浏览器里它与页面共用主线程，刷新 / 关页就卡死（2026-09-18 实机）。vendor/registry 里那份
-# 原版不再被引用。
-bevy-wasm-tasks = { path = "vendor/forks/bevy-wasm-tasks" }
+# rev 28b30f8 = 上游 51aabcb + 一处改动：`sleep_updates` 在宿主退出（`UpdateTicks` 连同
+# watch Sender 被 `World::clear_all()` drop）之后永久挂起，而不是立刻返回——立刻返回会让
+# 每条 `loop { …; sleep_updates(1).await }` 变成不让出的死循环，浏览器里它与页面共用主线程，
+# 刷新 / 关页就卡死（2026-09-18 实机）。改动已推回 gitee，所以这里仍是普通 git 依赖。
+bevy-wasm-tasks = { git = "https://gitee.com/happydpc/bevy-wasm-tasks", rev = "28b30f8ee6bdf912246c045c3cf5086059294354" }
 
 # 设置窗里那个「浏览…」的系统目录对话框。`default-features = false` 关掉 Linux 的
 # xdg-portal 与 tokio 集成：前者会拖进 ashpd / zbus 一整串没 vendored 的包，后者这里

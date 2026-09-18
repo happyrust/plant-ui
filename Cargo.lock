@@ -1032,6 +1032,7 @@ dependencies = [
 [[package]]
 name = "bevy-wasm-tasks"
 version = "0.13.0"
+source = "git+https://gitee.com/happydpc/bevy-wasm-tasks?rev=28b30f8ee6bdf912246c045c3cf5086059294354#28b30f8ee6bdf912246c045c3cf5086059294354"
 dependencies = [
  "bevy_app",
  "bevy_ecs",

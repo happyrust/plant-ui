@@ -19,9 +19,9 @@ replace-with = "vendored-sources"
 git = "https://gitee.com/happydpc/bevy"
 replace-with = "vendored-sources"
 
-[source."git+https://gitee.com/happydpc/bevy-wasm-tasks?rev=51aabcb8124ad80be902fa120c84a2e91d28c9ed"]
+[source."git+https://gitee.com/happydpc/bevy-wasm-tasks?rev=28b30f8ee6bdf912246c045c3cf5086059294354"]
 git = "https://gitee.com/happydpc/bevy-wasm-tasks"
-rev = "51aabcb8124ad80be902fa120c84a2e91d28c9ed"
+rev = "28b30f8ee6bdf912246c045c3cf5086059294354"
 replace-with = "vendored-sources"
 
 [source."git+https://gitee.com/happydpc/calamine"]
