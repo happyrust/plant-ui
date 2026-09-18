@@ -1032,7 +1032,6 @@ dependencies = [
 [[package]]
 name = "bevy-wasm-tasks"
 version = "0.13.0"
-source = "git+https://gitee.com/happydpc/bevy-wasm-tasks?rev=51aabcb8124ad80be902fa120c84a2e91d28c9ed#51aabcb8124ad80be902fa120c84a2e91d28c9ed"
 dependencies = [
  "bevy_app",
  "bevy_ecs",
@@ -6571,7 +6570,7 @@ dependencies = [
 
 [[package]]
 name = "plant-ui"
-version = "0.1.9"
+version = "0.1.11"
 dependencies = [
  "aios_core",
  "chrono",
@@ -6586,7 +6585,7 @@ dependencies = [
 
 [[package]]
 name = "plant-ui-app"
-version = "0.1.9"
+version = "0.1.11"
 dependencies = [
  "aios_core",
  "anyhow",
@@ -6620,7 +6619,7 @@ dependencies = [
 
 [[package]]
 name = "plant-ui-data"
-version = "0.1.9"
+version = "0.1.11"
 dependencies = [
  "aios_core",
  "anyhow",
@@ -6633,7 +6632,7 @@ dependencies = [
 
 [[package]]
 name = "plant-ui-view3d"
-version = "0.1.9"
+version = "0.1.11"
 dependencies = [
  "aios_core",
  "anyhow",
