@@ -834,6 +834,20 @@ async fn handle_read(
     ctx.request_repaint();
 }
 
+/// 宿主还在不在。两条 worker 每睡完一拍都要问一次，没了就收工。
+///
+/// Bevy 退出（原生关窗、浏览器刷新 / 关页 / 跳转时 winit 收到 `pagehide`）会走
+/// `exiting()` → `World::clear_all()`，把 `bevy-wasm-tasks` 的 `UpdateTicks` 连同它手上
+/// 唯一那份 watch `Sender` 一起 drop。此后 `sleep_updates` 不再挂起而是**立刻返回**——
+/// 不问这一句，`loop` 就成了一个没有任何 await 真正让出的死循环。原生端它跑在 tokio
+/// 线程上、进程随即退出，没人看见；浏览器里它与页面共用主线程，那个微任务永不结束，
+/// `pagehide` 之后的卸载流程整个被堵死，刷新就是「页面无响应」（2026-09-18 实机：
+/// 刷新 180 s 不回来，渲染进程一颗核 100%）。
+fn host_alive(task_ctx: &bevy_wasm_tasks::TaskContext) -> bool {
+    // `has_changed` 只在所有 Sender 都没了时回 `Err`——正是「宿主已退出」那一刻。
+    task_ctx.tick_rx.has_changed().is_ok()
+}
+
 /// 起数据线程：按供数模式造读面、抓工程标识与 SITE 根层，然后循环处理懒加载请求。
 ///
 /// 交互通道与模型通道各持一份读面句柄，`spawn` 里一起造——两条通道必须永远是同一面，
@@ -1026,6 +1040,9 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>, kind: ReadF
                 }
             }
             task_ctx.sleep_updates(1).await;
+            if !host_alive(&task_ctx) {
+                return;
+            }
         }
     };
     let worker = move |mut task_ctx: bevy_wasm_tasks::TaskContext| async move {
@@ -1198,6 +1215,10 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>, kind: ReadF
                 // 去收新请求——新点击不用等上一条查询做完才被看见。
                 let tick = std::pin::pin!(task_ctx.sleep_updates(1));
                 let _ = futures::future::select(inflight.select_next_some(), tick).await;
+            }
+            // 宿主没了就结束自己，在途查询随之丢掉——页面 / 进程本来就在退出。
+            if !host_alive(&task_ctx) {
+                return;
             }
         }
     };
@@ -1395,6 +1416,36 @@ mod tests {
             .expect("spawn")
             .0;
         assert!(!handle_read.contains("ReadFace::new("));
+    }
+
+    /// 两条 worker 每睡完一拍都得问一句宿主还在不在（`host_alive`），没了就 `return`。
+    /// Bevy 退出时 `World::clear_all()` 把 `UpdateTicks` 连同 watch Sender 一起 drop，
+    /// `sleep_updates` 从此立刻返回；少一处检查，浏览器里刷新就是一个永不结束的微任务
+    /// ——页面无响应（2026-09-18 实机复现）。
+    #[test]
+    fn every_worker_sleep_is_followed_by_a_host_check() {
+        let spawn = body().split_once("pub fn spawn(").expect("spawn").1;
+        let (model_lane, worker_lane) = spawn
+            .split_once("let worker = move |")
+            .expect("交互通道 worker");
+        for (lane, name) in [(model_lane, "模型通道"), (worker_lane, "交互通道")] {
+            let sleep = lane
+                .rfind("task_ctx.sleep_updates(1)")
+                .unwrap_or_else(|| panic!("{name}要睡拍"));
+            let check = lane
+                .rfind("if !host_alive(&task_ctx)")
+                .unwrap_or_else(|| panic!("{name}睡完要问宿主"));
+            assert!(sleep < check, "{name}：宿主检查要紧跟在睡拍之后");
+            let tail = &lane[check..];
+            assert!(
+                tail.split_once('}').is_some_and(|(block, _)| block.contains("return;")),
+                "{name}：宿主没了就 return，不许接着 loop"
+            );
+        }
+        assert!(
+            body().contains("task_ctx.tick_rx.has_changed().is_ok()"),
+            "宿主判据只认 watch 通道是否关闭"
+        );
     }
 
     /// 模型通道里眼睛那一臂的正文（`ModelLoad::Scopes` 的处理，不是枚举定义也不是路由）：
