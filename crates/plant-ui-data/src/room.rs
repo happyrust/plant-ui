@@ -420,19 +420,30 @@ fn room_detail_sql(room_key: &str) -> String {
 }
 
 /// 成员预览的名称补齐 + 整间重算在队检查，一趟发两条。
+///
+/// 名称那一句按记录 id 直选（`FROM pe:a, pe:b`），不写 `FROM pe WHERE id IN [...]`：
+/// SurrealDB 2.1 对后者不走主键，把整张 `pe` 扫一遍——AMS 两库 240k 条实测 8 个 key 要
+/// 1.6–1.8 s（空列表也要 1.0 s），直选 0.3 ms（2026-09-20 f13 隔离部署测出）。
+/// 房间详情点开后的 2.2 s 里有 1.7 s 就是这一句。没有预览成员时用 `RETURN []` 占住
+/// 第 0 槛，后面 `take(0)` 的位置不变。
 fn detail_follow_up_sql(ranked: &[(RefU64, u8, f32)], panels: &[RefU64]) -> String {
     let member_keys = ranked
         .iter()
         .map(|(refno, _, _)| refno.to_pe_key())
         .collect::<Vec<_>>()
         .join(", ");
+    let names_stmt = if member_keys.is_empty() {
+        "RETURN [];".to_string()
+    } else {
+        format!("SELECT VALUE [id, name, noun] FROM {member_keys};")
+    };
     let panel_targets = panels
         .iter()
         .map(|panel| format!("'{}'", panel.to_pdms_str()))
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "SELECT VALUE [id, name, noun] FROM pe WHERE id IN [{member_keys}]; \
+        "{names_stmt} \
          SELECT VALUE target_refno FROM model_update_pending WHERE action = 'room_recalc_panel' \
          AND status IN ['pending', 'failed'] AND (attempts?:0) < 5 \
          AND target_refno IN [{panel_targets}];"
@@ -590,11 +601,18 @@ mod tests {
         assert!(detail.contains("FROM room_relate WHERE in IN $panels;"));
         assert!(!detail.contains("IN (SELECT"));
 
-        let follow = detail_follow_up_sql(&[(refno(7), 8, 1.0)], &[refno(9)]);
-        assert!(follow.contains("FROM pe WHERE id IN [pe:0_7]"));
+        let follow = detail_follow_up_sql(&[(refno(7), 8, 1.0), (refno(8), 7, 2.0)], &[refno(9)]);
+        // 名称按记录 id 直选，不许再写 WHERE id IN（SurrealDB 2.1 会全表扫 pe）。
+        assert!(follow.starts_with("SELECT VALUE [id, name, noun] FROM pe:0_7, pe:0_8;"));
+        assert!(!follow.contains("WHERE id IN"));
         assert!(follow.contains("action = 'room_recalc_panel'"));
         assert!(follow.contains("(attempts?:0) < 5"));
         assert!(follow.contains("target_refno IN ['0/9']"));
+
+        // 没有预览成员时第 0 槛用 RETURN [] 占位，take(0) 的位置不动，也不会拼出 `FROM ;`。
+        let follow_empty = detail_follow_up_sql(&[], &[refno(9)]);
+        assert!(follow_empty.starts_with("RETURN [];"));
+        assert!(follow_empty.contains("target_refno IN ['0/9']"));
 
         let overview = overview_sql(&["-RM".to_string()]);
         assert!(overview.contains("noun = 'FRMW'"));
