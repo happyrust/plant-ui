@@ -5,17 +5,21 @@
 //! 侧，等 M4-4 定下数据边界后再补，宁可少一格。
 
 use egui::{
-    Align, Color32, CornerRadius, Layout, Margin, Rect, RichText, Sense, Stroke, StrokeKind, Ui,
-    pos2, vec2,
+    Align, Color32, CornerRadius, Key, KeyboardShortcut, Layout, Margin, Modifiers, PointerButton,
+    Rect, RichText, Sense, Stroke, StrokeKind, Ui, pos2, vec2,
 };
 use egui_phosphor::regular as ph;
 
 use super::{DockSide, DockVisibility};
-use crate::Cmd;
 use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Status, Tokens, radius, space};
 use crate::style::widgets;
-use crate::vm::{ModelLoadVm, WorkbenchVm};
+use crate::vm::{ModelLoadVm, NavEntryVm, NavHistoryVm, WorkbenchVm};
+use crate::{Cmd, NavStep};
+
+/// 右键列表最多列几条。栈上限 50，全摆出来是一屏菜单；围着游标取最近的十来条，
+/// 再远的多按几次箭头也到得了。
+const NAV_MENU_ROWS: usize = 12;
 
 pub fn title_bar(
     ui: &mut Ui,
@@ -97,6 +101,14 @@ pub fn command_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: 
             ui.set_height(d.command_bar_h());
             ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing.x = space::S1;
+
+                // 导航历史摆在最左（S1-D）：浏览器 / 资源管理器 / IDE 的箭头都在这儿，
+                // 而且与右边那组撤销 / 重做拉开——两组放一起最容易被当成同一回事。
+                nav_shortcuts(ui, &vm.nav, cmds);
+                nav_buttons(ui, t, d, &vm.nav, cmds);
+                ui.add_space(space::S2);
+                divider(ui, t, d);
+                ui.add_space(space::S2);
 
                 let project = ui.add(command_menu_button(d, "项目", true));
                 let project_popup = egui::Popup::menu(&project);
@@ -477,6 +489,139 @@ fn queue_count(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
     }
 }
 
+// ---------------------------------------------------------------- 导航历史
+
+/// 命令栏最左那两枚：后退 / 前进。点击走一步，右键弹最近位置列表。
+///
+/// 启用态只看 `vm.nav` 两侧有没有条目；hover 文案念出目标的名字与页签——按钮上只有
+/// 一个箭头，说不出自己要去哪。
+fn nav_buttons(ui: &mut Ui, t: &Tokens, d: Density, nav: &NavHistoryVm, cmds: &mut Vec<Cmd>) {
+    ui.spacing_mut().item_spacing.x = 2.0;
+    for (step, icon) in [
+        (NavStep::Back, ph::ARROW_LEFT),
+        (NavStep::Forward, ph::ARROW_RIGHT),
+    ] {
+        let target = match step {
+            NavStep::Back => nav.back_target(),
+            _ => nav.forward_target(),
+        };
+        let response = ui
+            .add_enabled(target.is_some(), widgets::tool_btn(t, d, icon, false))
+            .on_hover_text(nav_hint(step, target))
+            .on_disabled_hover_text(nav_hint(step, None));
+        if response.clicked() {
+            cmds.push(Cmd::Navigate(step));
+        }
+        // 禁用的那枚接不到右键；栈非空时至少有一枚是亮的，列表从它那儿开。
+        if !nav.is_empty() {
+            egui::Popup::context_menu(&response).show(|ui| nav_menu(ui, t, d, nav, cmds));
+        }
+    }
+    ui.spacing_mut().item_spacing.x = space::S1;
+}
+
+/// 右键弹出的最近位置列表：新的在上，当前项高亮，点一条直接跳。
+fn nav_menu(ui: &mut Ui, t: &Tokens, d: Density, nav: &NavHistoryVm, cmds: &mut Vec<Cmd>) {
+    ui.set_min_width(d.px(260.0));
+    ui.label(
+        RichText::new("最近位置")
+            .font(Font::micro(d))
+            .color(t.text_muted),
+    );
+    ui.add_space(space::S1);
+    let Some(cursor) = nav.cursor else {
+        return;
+    };
+    for i in nav_menu_range(nav.entries.len(), cursor, NAV_MENU_ROWS).rev() {
+        let entry = &nav.entries[i];
+        let current = i == cursor;
+        let hint = match (current, i > cursor) {
+            (true, _) => "当前".to_owned(),
+            (false, true) => {
+                pane_name(entry.pane).map_or("前进".to_owned(), |p| format!("{p} · 前进"))
+            }
+            (false, false) => pane_name(entry.pane).unwrap_or_default().to_owned(),
+        };
+        let (fg, bg) = if current {
+            (t.accent_strong, t.accent_bg)
+        } else {
+            (t.text_primary, Color32::TRANSPARENT)
+        };
+        let row = egui::Button::new(
+            RichText::new(format!(
+                "{}  {}",
+                super::noun_icon(&entry.noun),
+                entry.label
+            ))
+            .font(Font::label(d))
+            .color(fg),
+        )
+        .shortcut_text(RichText::new(hint).font(Font::micro(d)))
+        .fill(bg)
+        .min_size(vec2(d.px(248.0), d.px(28.0)));
+        if ui.add(row).clicked() {
+            cmds.push(Cmd::Navigate(NavStep::Jump(i)));
+            ui.close();
+        }
+    }
+    ui.separator();
+    ui.label(
+        RichText::new("Alt+← / Alt+→ · 鼠标侧键")
+            .font(Font::micro(d))
+            .color(t.text_muted),
+    );
+}
+
+/// 列表里露出的那一段下标：围着游标取 `rows` 条，靠边时向另一侧补齐。
+fn nav_menu_range(len: usize, cursor: usize, rows: usize) -> std::ops::Range<usize> {
+    if len <= rows {
+        return 0..len;
+    }
+    let half = rows / 2;
+    let start = cursor.saturating_sub(half).min(len - rows);
+    start..start + rows
+}
+
+/// `Alt+←` / `Alt+→` 与鼠标侧键。文本框有焦点时不吃键——`Alt+←` 在输入框里另有含义。
+fn nav_shortcuts(ui: &mut Ui, nav: &NavHistoryVm, cmds: &mut Vec<Cmd>) {
+    if ui.memory(|m| m.focused().is_some()) {
+        return;
+    }
+    let (back, forward) = ui.input_mut(|i| {
+        (
+            i.consume_shortcut(&KeyboardShortcut::new(Modifiers::ALT, Key::ArrowLeft))
+                || i.pointer.button_released(PointerButton::Extra1),
+            i.consume_shortcut(&KeyboardShortcut::new(Modifiers::ALT, Key::ArrowRight))
+                || i.pointer.button_released(PointerButton::Extra2),
+        )
+    });
+    if back && nav.back_target().is_some() {
+        cmds.push(Cmd::Navigate(NavStep::Back));
+    }
+    if forward && nav.forward_target().is_some() {
+        cmds.push(Cmd::Navigate(NavStep::Forward));
+    }
+}
+
+/// 箭头的 hover 文案：写出目标与快捷键；没有目标就说没有，不留一枚沉默的灰按钮。
+fn nav_hint(step: NavStep, target: Option<&NavEntryVm>) -> String {
+    let (verb, key) = match step {
+        NavStep::Back => ("后退", "Alt+←"),
+        _ => ("前进", "Alt+→"),
+    };
+    match target {
+        Some(entry) => match pane_name(entry.pane) {
+            Some(pane) => format!("{verb}到 {} · {pane} ({key})", entry.label),
+            None => format!("{verb}到 {} ({key})", entry.label),
+        },
+        None => format!("没有可{verb}的位置"),
+    }
+}
+
+fn pane_name(pane: Option<super::Pane>) -> Option<&'static str> {
+    pane.map(|p| p.title().1)
+}
+
 // ---------------------------------------------------------------- 小零件
 
 fn logo(ui: &mut Ui, t: &Tokens, d: Density) {
@@ -664,8 +809,48 @@ fn watermark_hint(lag: crate::task_queue::WatermarkLag) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::watermark_hint;
+    use super::{nav_hint, nav_menu_range, watermark_hint};
+    use crate::NavStep;
     use crate::task_queue::WatermarkLag;
+    use crate::vm::NavEntryVm;
+    use crate::workbench::Pane;
+
+    /// 箭头的 hover 文案要念出目标与页签、带快捷键；没有目标时说「没有」，
+    /// 不留一枚不解释自己的灰按钮（S1-D 形态表的态 3 / 态 4）。
+    #[test]
+    fn the_nav_hint_names_the_target_and_the_shortcut() {
+        let entry = NavEntryVm {
+            label: "PANE /1RS03TT9204P".into(),
+            noun: "PANE".into(),
+            pane: Some(Pane::Properties),
+        };
+        assert_eq!(
+            nav_hint(NavStep::Back, Some(&entry)),
+            "后退到 PANE /1RS03TT9204P · 属性 (Alt+←)"
+        );
+        let no_pane = NavEntryVm {
+            pane: None,
+            ..entry
+        };
+        assert_eq!(
+            nav_hint(NavStep::Forward, Some(&no_pane)),
+            "前进到 PANE /1RS03TT9204P (Alt+→)"
+        );
+        assert_eq!(nav_hint(NavStep::Back, None), "没有可后退的位置");
+        assert_eq!(nav_hint(NavStep::Forward, None), "没有可前进的位置");
+    }
+
+    /// 右键列表围着游标取一段：短栈全列；长栈里游标居中，靠边时向另一侧补齐到
+    /// 满行，不会出现「列表只剩三条」的稀疏形态。
+    #[test]
+    fn the_nav_menu_window_follows_the_cursor_and_stays_full() {
+        assert_eq!(nav_menu_range(5, 4, 12), 0..5);
+        assert_eq!(nav_menu_range(50, 49, 12), 38..50, "站在栈顶：向下补齐");
+        assert_eq!(nav_menu_range(50, 0, 12), 0..12, "站在栈底：向上补齐");
+        let mid = nav_menu_range(50, 25, 12);
+        assert_eq!(mid.len(), 12);
+        assert!(mid.contains(&25), "游标在窗口里: {mid:?}");
+    }
 
     /// 文案按水位说话、按 ADR-0019 说「保存」；尚无数据水位的库单独一句，不并进保存次数。
     #[test]

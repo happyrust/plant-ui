@@ -43,7 +43,7 @@ use bevy::render::view::RenderLayers;
 use bevy::render::{Render, RenderApp, RenderSystems, renderer::render_system};
 use bevy::transform::TransformSystems;
 use bevy_egui35::{EguiUserTextures, egui};
-use plant_ui::{CameraGesture, CameraMotion, ModelAction};
+use plant_ui::{CameraGesture, CameraMotion, CameraPose, ModelAction};
 
 pub mod mesh_source;
 
@@ -307,6 +307,9 @@ pub struct View3d {
     pub size: UVec2,
     /// 相机世界旋转的三列：right / up / back。egui 侧 ViewCube 的全部输入。
     pub camera_rot: [[f32; 3]; 3],
+    /// 相机此刻的完整位姿（位置 / 姿态 / 转心），与 `camera_rot` 同拍发布。
+    /// 宿主的导航历史每次换选中都抄一份走，回放时原样经 [`Self::restore_camera`] 送回。
+    pub camera_pose: CameraPose,
     /// X / Y / Z 轴端标签在渲染纹理上的归一化 UV；出画或在相机身后为 None。
     pub axis_labels: [Option<[f32; 2]>; 3],
     /// 当前地面网格的格距，**真实长度（毫米）**。HUD 的比例读数用它。
@@ -430,6 +433,12 @@ impl View3d {
             bottom: srgb(bottom),
             grid: srgb(grid),
         });
+    }
+
+    /// 导航历史回放：把相机送回一份记下的位姿。走 Snap 那条 0.3s 插值动画，
+    /// 中途任何手势立即让位——与 ViewCube 跳视角同一条规矩。
+    pub fn restore_camera(&mut self, pose: CameraPose) {
+        self.commands.push_back(ViewCommand::Pose(pose));
     }
 
     /// ViewCube 的视角跳转。方向已是世界系（换算在 egui 侧的立方体模块）。
@@ -782,6 +791,8 @@ enum ViewCommand {
         up: Vec3,
         fit: bool,
     },
+    /// 导航历史回放：相机回到这份位姿（位置 / 姿态 / 转心），0.3s 插值。
+    Pose(CameraPose),
     /// 尺寸标注层整层替换：`Some` 换成这一批，`None` 撤掉（计划 B3）。
     Dimensions(Option<DimensionBatch>),
 }
@@ -970,6 +981,11 @@ fn setup(
         texture,
         size: INITIAL_SIZE,
         camera_rot: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        camera_pose: CameraPose {
+            position: [0.0; 3],
+            rotation: Quat::IDENTITY.to_array(),
+            focus: [0.0; 3],
+        },
         axis_labels: [None; 3],
         grid_cell_mm: INITIAL_GRID_LEVEL * MM_PER_WORLD,
         image: image.clone(),
@@ -1282,17 +1298,26 @@ fn publish_camera(
     mut view: ResMut<View3d>,
     grid: Res<GridState>,
     world_axes: Res<WorldAxesEnabled>,
+    orbit: Res<OrbitCamera>,
     camera: Query<(&Camera, &GlobalTransform), With<ViewCamera>>,
 ) {
     let Ok((camera, transform)) = camera.single() else {
         return;
     };
-    let m = Mat3::from_quat(transform.rotation());
+    let rotation = transform.rotation();
+    let m = Mat3::from_quat(rotation);
     view.camera_rot = [
         m.x_axis.to_array(),
         m.y_axis.to_array(),
         m.z_axis.to_array(),
     ];
+    // 导航历史抄走的就是这一份：位置与姿态取自全局变换、转心取自轨道相机——
+    // 三者同一拍，回放时才不会「位置对了、第一下旋转绕错心」。
+    view.camera_pose = CameraPose {
+        position: transform.translation().to_array(),
+        rotation: rotation.to_array(),
+        focus: orbit.focus.to_array(),
+    };
     view.grid_cell_mm = grid.level * MM_PER_WORLD;
     // 尺寸标注文字的锚点：毫米 → 世界 → 纹理 UV，与轴标签同一条投影（计划 B3）。
     view.dimension_label_uvs = project_dimension_labels(&view.dimension_labels, |world| {
@@ -2053,6 +2078,18 @@ fn apply_commands(
                 }
                 orbit.focus = focus;
                 orbit.anim = Some(snap_anim(&camera_transform, focus, forward, up, dist));
+            }
+            // 导航历史回放：终点就是记下的那份位姿，不再按焦点 / 距离重算——
+            // 重算出来的是「朝着同一个转心的另一个机位」，不是人离开时看到的那一幅。
+            ViewCommand::Pose(pose) => {
+                orbit.focus = Vec3::from_array(pose.focus);
+                orbit.anim = Some(SnapAnim {
+                    from_pos: camera_transform.translation,
+                    from_rot: camera_transform.rotation,
+                    to_pos: Vec3::from_array(pose.position),
+                    to_rot: Quat::from_array(pose.rotation).normalize(),
+                    t: 0.0,
+                });
             }
             ViewCommand::Model(action) => match action {
                 ModelAction::SetXRay { refnos } => {

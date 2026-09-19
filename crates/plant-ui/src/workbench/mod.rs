@@ -167,6 +167,14 @@ impl WorkbenchState {
         }
     }
 
+    /// 此刻有焦点的那一格里激活的页签——导航历史记的「界面」就是它。
+    ///
+    /// 没有任何一格拿过焦点（刚启动、还没点过 dock）时为 `None`；回放时 `None`
+    /// 就不动页签。
+    pub fn active_pane(&mut self) -> Option<Pane> {
+        self.dock.find_active_focused().map(|(_, pane)| *pane)
+    }
+
     /// 收 / 展某一侧 dock。dock 布局属于界面自身，宿主收到 `Cmd::ToggleDock` 后
     /// 转手到这里（与 `focus` 同一路）。
     pub fn toggle_dock(&mut self, side: DockSide) {

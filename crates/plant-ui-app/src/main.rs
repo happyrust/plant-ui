@@ -12,6 +12,7 @@ mod logs;
 mod mbd_api;
 mod model_update_api;
 mod model_update_ws;
+mod nav_history;
 mod read_face;
 mod regenerate;
 mod search_index;
@@ -44,7 +45,6 @@ use chrono::{DateTime, Utc};
 use command::ParsedCommand;
 use eframe::egui;
 use logs::Retry;
-use plant_ui::Cmd;
 use plant_ui::data_publish::{self, State as DataPublishState};
 use plant_ui::fonts;
 use plant_ui::model_regenerate::{self, DeliveryUnits};
@@ -59,12 +59,13 @@ use plant_ui::style::tokens::{Density, Tokens};
 use plant_ui::task_queue;
 use plant_ui::vm::{
     AccessPointVm, CommandLineKind, CommandLineVm, DimensionLabelVm, DimensionsDataVm,
-    DimensionsVm, LogElement, ModelLoadVm, PropKind, PropRowVm, PropsDataVm, PropsVm,
-    RoomDetailDataVm, RoomDetailVm, RoomMemberVm, RoomRelationVm, RoomViewVm, RoomVm, RoomsDataVm,
-    RowVisibility, SearchHitVm, SearchRunVm, SearchVm, Selection, SubIndexVm, TreeRowVm, TreeVm,
-    View3dVm, WorkbenchVm,
+    DimensionsVm, LogElement, ModelLoadVm, NavEntryVm, NavHistoryVm, PropKind, PropRowVm,
+    PropsDataVm, PropsVm, RoomDetailDataVm, RoomDetailVm, RoomMemberVm, RoomRelationVm, RoomViewVm,
+    RoomVm, RoomsDataVm, RowVisibility, SearchHitVm, SearchRunVm, SearchVm, Selection, SubIndexVm,
+    TreeRowVm, TreeVm, View3dVm, WorkbenchVm,
 };
 use plant_ui::workbench::{self, Pane, WorkbenchState};
+use plant_ui::{CameraPose, Cmd, NavStep};
 use plant_ui_data::{EleTreeNode, RefU64};
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -557,6 +558,8 @@ fn show_app(
     if !render_states.is_empty() {
         app.sync_render_states(render_states);
     }
+    // 导航历史抄的相机：这一帧的位姿，与下面 `camera_rot` 同拍。
+    app.camera_pose = Some(view3d.camera_pose);
     app.vm.view3d = Some(View3dVm {
         texture: view3d.texture,
         size: egui::vec2(view3d.size.x as f32, view3d.size.y as f32),
@@ -606,6 +609,7 @@ fn show_app(
                 view3d.set_background(top, bottom, grid)
             }
             Cmd::SnapView { forward, up, fit } => view3d.snap(forward, up, fit),
+            Cmd::RestoreCamera(pose) => view3d.restore_camera(pose),
             Cmd::RetryFailedMeshes => retried = view3d.retry_failed_meshes(),
             _ => unreachable!("只缓存三维命令"),
         }
@@ -872,6 +876,17 @@ impl TreeModel {
             .unwrap_or_else(|| refno.to_string())
     }
 
+    /// 已加载树节点的 noun。PANEL 专用房间拓扑查询不得对 BRAN/EQUI 等普通
+    /// 节点并发发出；旧实现每次选中都无条件查询，严格 schema 下会把普通元素
+    /// 的正常选择误报成「PANEL 房间查询失败」。
+    fn noun(&self, refno: RefU64) -> Option<&str> {
+        self.roots
+            .iter()
+            .chain(self.children.values().flatten())
+            .find(|node| node.refno.refno() == refno)
+            .map(|node| node.noun.as_str())
+    }
+
     /// 日志行里的元素引用。名字按当下的缓存取一次，之后不再回填。
     fn element(&self, refno: RefU64) -> LogElement {
         LogElement {
@@ -1119,6 +1134,11 @@ struct App {
     /// 「房间」页签当前聚焦的房间。与上面那个分开：视口那半回包即清（一次性
     /// 动作），页签这半要一直立着——切换选中或重连才归零。
     room_pane_focus: Option<RefU64>,
+    /// 导航历史栈（S1-D）：一条 = 选择集 + 相机位姿 + 激活页签（+ 房间聚焦）。
+    /// 记录点只有两处——`set_selection` 换了主选中、`focus_room` 聚焦了一间房。
+    nav: nav_history::NavHistory,
+    /// 视口这一帧发布的相机位姿。入栈 / 走一步时抄给历史；独立壳没有相机时为 `None`。
+    camera_pose: Option<CameraPose>,
     /// 尺寸标注取数的帧号（`Req::PipeDimensions`，计划 B1）。每次右键「查看尺寸标注」
     /// 或清层都进一帧：大 BRAN 的求解要跑几秒，那期间人早就右键了别的 BRAN 或点了隐藏，
     /// 晚到的旧结果靠它认出来丢掉——与搜索 / 清点同一套取消口径。
@@ -1823,6 +1843,8 @@ impl App {
             room_panel_cache: HashMap::new(),
             pending_room_frame: None,
             room_pane_focus: None,
+            nav: nav_history::NavHistory::default(),
+            camera_pose: None,
             dimensions_epoch: 0,
             pending_dimensions: None,
             // 交互通道与模型通道都按这一个供数模式造读面（ADR-0026）。
@@ -3744,7 +3766,12 @@ impl App {
                 | Cmd::ResizeViewport(_)
                 | Cmd::SetViewportBackground { .. }
                 | Cmd::SnapView { .. }
+                | Cmd::RestoreCamera(_)
                 | Cmd::RetryFailedMeshes) => self.view3d_commands.push(command),
+                Cmd::Navigate(step) => {
+                    self.navigate(step);
+                    dirty = true;
+                }
                 Cmd::RegenerateModels { targets } => self.begin_regenerate_count(targets),
                 Cmd::RegenerateConfirm { accepted } => self.settle_regenerate_confirm(accepted),
                 // 「停在这里」**只停派发**。已经发出去的那一个停不了——服务端是
@@ -4394,6 +4421,9 @@ impl App {
                 // 过房间」，页签只画新元素的归属列表。
                 self.room_pane_focus = None;
                 self.vm.room_detail = RoomDetailVm::Uninit;
+                // 主选中换了 = 到了一个新地方，导航历史记一条。所有入口
+                // （树 / 视口拾取 / 搜索 / 日志 / 房间成员 / 命令行）都汇到这里。
+                self.record_nav();
             }
             // 全都取消选中了，属性回到「还没轮到它」而不是留着上一个的残影。
             None => {
@@ -4507,6 +4537,93 @@ impl App {
         self.room_pane_focus = Some(room);
         self.vm.room_detail.begin_query();
         let _ = self.bridge.req.send(data::Req::RoomDetail(room));
+        // 聚焦一间房也是「到了一个地方」：同一个选中换了房间算另一条历史。
+        self.record_nav();
+    }
+
+    // ---------------------------------------------------------------- 导航历史（S1-D）
+
+    /// 把此刻当成一个「地方」记进导航历史：选择集 + 有焦点的页签 + 房间聚焦 + 相机。
+    /// 回放期间（`nav.navigating`）由栈自己挡掉，不在调用点判。
+    fn record_nav(&mut self) {
+        let entry = nav_history::NavEntry {
+            selection: self.vm.selection.clone(),
+            pane: self.state.active_pane(),
+            room: self.room_pane_focus,
+            camera: self.camera_pose,
+        };
+        self.nav.record(entry, self.camera_pose);
+        self.sync_nav_vm();
+    }
+
+    /// 命令栏那两枚箭头 / 快捷键 / 右键列表按下去：走一步并回放目标。
+    ///
+    /// 回放 = 选中 → 树定位（展开祖先、滚到行）→ 页签 → 房间详情 → 相机。相机走
+    /// `RestoreCamera` 的 0.3s 插值；房间只还详情不重做隔离 / 取景——那一下会把刚
+    /// 还回去的相机顶掉，而且隔离改的是整个场景的可见性，不该由「后退」悄悄做。
+    fn navigate(&mut self, step: NavStep) {
+        let Some(entry) = self.nav.step(step, self.camera_pose) else {
+            return;
+        };
+        self.nav.navigating = true;
+        if let Some(primary) = entry.selection.primary() {
+            // `locate` 先把主选中落成单选并把树带过去；多选再整体换回来。
+            self.locate(primary, false);
+            if entry.selection.len() > 1 {
+                self.set_selection(entry.selection.clone());
+            }
+        }
+        if let Some(pane) = entry.pane {
+            self.state.focus(pane);
+        }
+        if let Some(room) = entry.room {
+            self.restore_room_detail(room);
+        }
+        if let Some(camera) = entry.camera {
+            self.view3d_commands.push(Cmd::RestoreCamera(camera));
+        }
+        self.nav.navigating = false;
+        self.sync_nav_vm();
+    }
+
+    /// 只把「房间」页签的详情还回去，不动视口。与 [`Self::focus_room`] 的分别就是
+    /// 不置 `focus_room_pending`——回包到了只喂页签那一半。
+    fn restore_room_detail(&mut self, room: RefU64) {
+        self.room_pane_focus = Some(room);
+        self.vm.room_detail.begin_query();
+        let _ = self.bridge.req.send(data::Req::RoomDetail(room));
+    }
+
+    /// 历史栈变了就把只读投影同步给绘制层：按钮启用态、hover 文案、右键列表都读它。
+    /// 名字按此刻的树缓存取；树上还没有它（视口拾取到的成员、祖先还没回来）就退回 refno。
+    fn sync_nav_vm(&mut self) {
+        let entries = self
+            .nav
+            .entries()
+            .iter()
+            .map(|entry| {
+                let (label, noun) = match entry.selection.primary() {
+                    Some(refno) => {
+                        let rest = entry.selection.len() - 1;
+                        let mut label = self.tree.label(refno);
+                        if rest > 0 {
+                            label.push_str(&format!(" +{rest}"));
+                        }
+                        (label, self.tree.noun(refno).unwrap_or("").to_owned())
+                    }
+                    None => ("未选中".to_owned(), String::new()),
+                };
+                NavEntryVm {
+                    label,
+                    noun,
+                    pane: entry.pane,
+                }
+            })
+            .collect();
+        self.vm.nav = NavHistoryVm {
+            entries,
+            cursor: self.nav.cursor(),
+        };
     }
 
     /// 「显示房间模型」：把这间房自己的几何取回来显示，再取景到它。
@@ -5019,6 +5136,9 @@ impl App {
         self.focus_room_pending = None;
         self.pending_room_frame = None;
         self.room_pane_focus = None;
+        // 历史栈上的 refno 属于旧接入点：同一个号未必还是同一个元素，整栈作废。
+        self.nav.clear();
+        self.sync_nav_vm();
         // 尺寸标注层挂的是旧库的 BRAN：清掉，在途的取数回来也不再上屏。
         self.clear_pipe_dimensions();
         self.vm.selection_branch = None;

@@ -105,10 +105,43 @@ pub enum CameraGesture {
     End,
 }
 
+/// 相机的一次完整位姿：位置、姿态与轨道转心，都是**宿主世界系**的量。
+///
+/// 导航历史记的就是它——「回到上一次操作的地方」里的「地方」有一半是相机。
+/// 三个量缺一不可：只记姿态回不到原位，只记位置转起来会绕错心。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CameraPose {
+    pub position: [f32; 3],
+    /// 四元数 `(x, y, z, w)`。
+    pub rotation: [f32; 4],
+    /// 轨道相机的转心。回放时一起还回去，不然回到原位之后第一下旋转就会绕着别处转。
+    pub focus: [f32; 3],
+}
+
+/// 导航历史上的一步（命令栏最左那两枚箭头，或右键列表里点的一条）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavStep {
+    Back,
+    Forward,
+    /// 右键列表里直接点某一条：历史栈上的下标（与 `vm.nav.entries` 同序）。
+    Jump(usize),
+}
+
 /// UI 发出的命令：独立应用直接执行，接进 Bevy 后转成 Event。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cmd {
     SelectElement(aios_core::RefU64),
+    /// 导航历史：后退 / 前进 / 跳到某一条。
+    ///
+    /// 历史栈归宿主——一条 = 选择集 + 相机位姿 + 激活页签（+ 房间聚焦），记录点在
+    /// 宿主的 `set_selection` / `focus_room`；绘制层只拿 `vm.nav` 画按钮与右键列表。
+    /// 回放期间宿主自己守住不再入栈，绘制层不必知道「这次选中是回放来的」。
+    Navigate(NavStep),
+    /// 宿主 → 视口：把相机送回一份记下的位姿（导航历史回放）。
+    ///
+    /// 与 `SnapView` 走同一条 0.3s 插值动画，中途任何手势立即让位。绘制层不会发它
+    /// ——它和 `ResizeViewport` / `SetViewportBackground` 一样，只是借这条队列过路。
+    RestoreCamera(CameraPose),
     /// 模型树上的选择集变更（Ctrl 加减 / Shift 区间）。
     ///
     /// 绘制层算好**结果**整体交出，而不是发「加了谁减了谁」：区间要按可见行序算，

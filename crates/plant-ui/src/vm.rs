@@ -79,6 +79,49 @@ pub struct WorkbenchVm {
     pub queue: QueueStatusVm,
     /// 当前项目接入点（状态栏那枚数据库芯片点开后的内容）。
     pub access_point: AccessPointVm,
+    /// 导航历史在命令栏那两枚箭头上的只读投影。栈本身归宿主。
+    pub nav: NavHistoryVm,
+}
+
+/// 导航历史的只读投影：绘制层只需要「能不能退 / 进」、目标叫什么、右键列表画哪几条。
+///
+/// 栈与游标都在宿主手上（`Cmd::Navigate` 的处置方），这里是每次变化后同步过来的
+/// 一份快照——不在这里做任何推进，按下去发命令就完了。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NavHistoryVm {
+    /// 由旧到新。
+    pub entries: Vec<NavEntryVm>,
+    /// 此刻站在哪一条上。`None` = 栈空。
+    pub cursor: Option<usize>,
+}
+
+/// 历史栈上的一条在界面上的样子。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NavEntryVm {
+    /// 主选中的显示名（`noun name`；树上还没有它时退回 refno）。多选时带余量 `+N`。
+    pub label: String,
+    /// 主选中的 PDMS 类型，右键列表的行首图标按它取（`workbench::noun_icon`）。
+    pub noun: String,
+    /// 记录那一刻的激活页签；hover 文案与右键列表的右栏写它。
+    pub pane: Option<crate::workbench::Pane>,
+}
+
+impl NavHistoryVm {
+    /// 后退一步会落到哪一条；`None` = 没有可后退的位置。
+    pub fn back_target(&self) -> Option<&NavEntryVm> {
+        let cursor = self.cursor?;
+        cursor.checked_sub(1).and_then(|i| self.entries.get(i))
+    }
+
+    /// 前进一步会落到哪一条；`None` = 没有可前进的位置。
+    pub fn forward_target(&self) -> Option<&NavEntryVm> {
+        let cursor = self.cursor?;
+        self.entries.get(cursor + 1)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// 一个项目接入点在界面上的样子：这一刻**实际生效**的那组地址与身份。
@@ -866,6 +909,33 @@ mod tests {
         // 但它仍占着这一层：宿主认帧、B4 报错都要知道失败的是哪一条。
         assert_eq!(failed.refno(), Some(r(7)));
         assert_eq!(DimensionsVm::Off.refno(), None);
+    }
+
+    /// 两枚箭头的启用态只看游标两侧有没有条目：站在栈顶前进灰、站在栈底后退灰、
+    /// 栈空两枚都灰。目标就是相邻那一条——hover 文案要念它的名字。
+    #[test]
+    fn nav_targets_are_the_neighbours_of_the_cursor() {
+        let entry = |label: &str| NavEntryVm {
+            label: label.into(),
+            noun: "EQUI".into(),
+            pane: None,
+        };
+        let empty = NavHistoryVm::default();
+        assert!(empty.back_target().is_none() && empty.forward_target().is_none());
+
+        let nav = NavHistoryVm {
+            entries: vec![entry("a"), entry("b"), entry("c")],
+            cursor: Some(2),
+        };
+        assert_eq!(nav.back_target().map(|e| e.label.as_str()), Some("b"));
+        assert!(nav.forward_target().is_none(), "站在栈顶没有前进");
+
+        let nav = NavHistoryVm {
+            cursor: Some(0),
+            ..nav
+        };
+        assert!(nav.back_target().is_none(), "站在栈底没有后退");
+        assert_eq!(nav.forward_target().map(|e| e.label.as_str()), Some("b"));
     }
 
     #[test]

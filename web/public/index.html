@@ -15,6 +15,19 @@
     <script type="module">
       import init, { start } from "./pkg/plant_ui_app.js";
 
+      // 鼠标侧键（button 3 / 4）归应用的导航历史，不让浏览器拿去做页面后退 / 前进。
+      // Chrome 是在侧键松开那一下决定翻页的，只看 pointerup / mouseup 有没有被取消；
+      // winit 只取消 pointerdown（那一下顺带压掉了兼容的 mouseup），所以松开这一下要在这里补上。
+      // Alt+← / Alt+→ 不用管：winit 对 canvas 上每次 keydown 都 preventDefault。
+      const canvas = document.getElementById("plant-ui");
+      for (const type of ["pointerup", "mouseup"]) {
+        canvas.addEventListener(type, (event) => {
+          if (event.button === 3 || event.button === 4) {
+            event.preventDefault();
+          }
+        });
+      }
+
       async function loadConfig() {
         const [legacyResponse, currentResponse] = await Promise.all([
           fetch("/assets/config/e3d.project.ron", { cache: "no-store" }),
