@@ -147,12 +147,13 @@ pub async fn room_panels(room: RefnoEnum) -> Result<Vec<RefU64>> {
 pub async fn room_detail(room: RefnoEnum, preview: usize) -> Result<Option<RoomDetail>> {
     let room_key = room.to_pe_key();
     let mut response = SUL_DB.query(room_detail_sql(&room_key)).await?.check()?;
-    let names: Vec<Option<String>> = response.take(0)?;
+    // 槛 0 是 LET $panels（与 element_edges_sql 同款），从 1 起才是结果。
+    let names: Vec<Option<String>> = response.take(1)?;
     let Some(name) = names.into_iter().next().flatten() else {
         return Ok(None);
     };
-    let panels: Vec<RefnoEnum> = response.take(1)?;
-    let member_edges: Vec<(RefnoEnum, u8, f32)> = response.take(2)?;
+    let panels: Vec<RefnoEnum> = response.take(2)?;
+    let member_edges: Vec<(RefnoEnum, u8, f32)> = response.take(3)?;
     let panels: Vec<RefU64> = panels.into_iter().map(|p| p.refno()).collect();
 
     // 同一构件跨多面板只留最强的一条。
@@ -405,12 +406,16 @@ fn room_panels_sql(room_key: &str) -> String {
     format!("SELECT VALUE out FROM room_panel_relate WHERE in = {room_key};")
 }
 
+/// 面板集先用 `LET` 物化一次再喂给 `IN`：写成 `IN (SELECT …)` 时 SurrealDB 2.1 会对
+/// `room_relate` 的每一行重算那个子查询——AMS 两库 64k 条边实测 146.6 s，改成变量后 0.44 s
+/// （同一结果集，2026-09-19 f20 隔离部署测出）。
 fn room_detail_sql(room_key: &str) -> String {
     format!(
-        "SELECT VALUE name FROM {room_key}; \
+        "LET $panels = (SELECT VALUE out FROM room_panel_relate WHERE in = {room_key}); \
+         SELECT VALUE name FROM {room_key}; \
          SELECT VALUE out FROM room_panel_relate WHERE in = {room_key}; \
          SELECT VALUE [out, inside_count, center_dist] FROM room_relate \
-         WHERE in IN (SELECT VALUE out FROM room_panel_relate WHERE in = {room_key});"
+         WHERE in IN $panels;"
     )
 }
 
@@ -581,7 +586,9 @@ mod tests {
         let detail = room_detail_sql("pe:1_5");
         assert!(detail.contains("SELECT VALUE name FROM pe:1_5"));
         assert!(detail.contains("FROM room_panel_relate WHERE in = pe:1_5"));
-        assert!(detail.contains("WHERE in IN (SELECT VALUE out FROM room_panel_relate"));
+        assert!(detail.starts_with("LET $panels = (SELECT VALUE out FROM room_panel_relate WHERE in = pe:1_5);"));
+        assert!(detail.contains("FROM room_relate WHERE in IN $panels;"));
+        assert!(!detail.contains("IN (SELECT"));
 
         let follow = detail_follow_up_sql(&[(refno(7), 8, 1.0)], &[refno(9)]);
         assert!(follow.contains("FROM pe WHERE id IN [pe:0_7]"));
