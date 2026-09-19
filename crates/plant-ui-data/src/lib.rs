@@ -22,13 +22,27 @@ pub async fn connect() -> Result<()> {
         Ok(())
     }
     #[cfg(target_arch = "wasm32")]
-    connect_once().await
+    {
+        // `SUL_DB` is a process-global handle.  The browser bridge calls
+        // `connect()` before every request, so calling the Surreal client a
+        // second time returns `Already connected`.  Keep the guard on the
+        // wasm side too; a mutex (rather than a bare bool) also makes callers
+        // that arrive while the first handshake is in flight wait for it.
+        static CONNECTED: futures::lock::Mutex<bool> = futures::lock::Mutex::new(false);
+        let mut connected = CONNECTED.lock().await;
+        if !*connected {
+            connect_once().await?;
+            *connected = true;
+        }
+        Ok(())
+    }
 }
 
 async fn connect_once() -> Result<()> {
     // UI reads the service-owned schema. Full initialization also installs SQL
     // resources, which are deliberately absent from the standalone UI package.
-    aios_core::aios_db_mgr::aios_mgr::init_surreal_with_signin(aios_core::try_get_db_option()?).await?;
+    aios_core::aios_db_mgr::aios_mgr::init_surreal_with_signin(aios_core::try_get_db_option()?)
+        .await?;
     // 平表读连接池后台预热（P4）：4 条连接的握手+签入约 2s，放启动期消化，
     // 首次整场重载不再吃这口冷启动（并发安全，重载若抢先会等同一次初始化）。
     #[cfg(not(target_arch = "wasm32"))]
