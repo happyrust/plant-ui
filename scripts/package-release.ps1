@@ -41,6 +41,7 @@ Copy-Item (Join-Path $uiRoot "web\public") (Join-Path $backendRelease "web") -Re
 Copy-Item (Join-Path $uiTarget "release\plant-ui-app.exe") $pcRelease
 Copy-Item (Join-Path $uiRoot "DbOption.toml") $pcRelease
 Copy-Item (Join-Path $uiRoot "resource") $pcRelease -Recurse
+Copy-Item (Join-Path $uiRoot "web\public\assets") $pcRelease -Recurse
 
 @'
 param(

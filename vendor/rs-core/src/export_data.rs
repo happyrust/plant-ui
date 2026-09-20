@@ -522,7 +522,6 @@ struct InstRelate {
     pub generic: String,
     pub has_cata_neg: bool,
     pub solid: bool,
-    pub zone_refno: Option<Thing>,
     pub dt: Option<surrealdb::sql::Datetime>,
 }
 

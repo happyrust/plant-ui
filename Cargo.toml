@@ -10,7 +10,7 @@ members = [
 exclude = ["vendor"]
 
 [workspace.package]
-version = "0.1.8"
+version = "0.1.11"
 edition = "2024"
 
 [workspace.dependencies]
@@ -20,6 +20,10 @@ plant-ui-view3d = { path = "crates/plant-ui-view3d" }
 # vendored from rs-core-pin (= git rev 5667b70 + get_world fallthrough fix), editable
 # `render` 开着 bevy_render：三维搬进来之后几何侧要它（view3d-migration.md 决定 1）
 aios_core = { path = "vendor/rs-core", default-features = false, features = ["render"] }
+# MBD 尺寸标注的冻结契约（gen-model/.planning/2026-09-09-plant-ui-mbd-dimensions，D1：单一契约源）。
+# 纯求解器库（glam 0.29 / serde，无 DB、HTTP、e3d 依赖，wasm 编得动），与 gen-model 服务端
+# 消费的是同一棵树；这里只用 contract 类型解 /api/mbd/v2/pipe 的响应体，不在客户端跑求解。
+plant-mbd = { path = "../vendor/plant-mbd/crates/plant-mbd" }
 
 # 三维那一半的地基。特性列表照抄 rs-plant3-d，换列表要连带核对 e3d_plugin 的用法。
 bevy = { git = "https://gitee.com/happydpc/bevy", default-features = false, features = [
@@ -34,7 +38,11 @@ bevy_egui35 = { path = "vendor/bevy_egui35", default-features = false, features 
     "render", "default_fonts", "manage_clipboard",
 ] }
 # 双端 spawn：原生走 tokio、浏览器走 spawn_local（view3d-migration.md 决定 5）
-bevy-wasm-tasks = { git = "https://gitee.com/happydpc/bevy-wasm-tasks", rev = "51aabcb8124ad80be902fa120c84a2e91d28c9ed" }
+# rev 28b30f8 = 上游 51aabcb + 一处改动：`sleep_updates` 在宿主退出（`UpdateTicks` 连同
+# watch Sender 被 `World::clear_all()` drop）之后永久挂起，而不是立刻返回——立刻返回会让
+# 每条 `loop { …; sleep_updates(1).await }` 变成不让出的死循环，浏览器里它与页面共用主线程，
+# 刷新 / 关页就卡死（2026-09-18 实机）。改动已推回 gitee，所以这里仍是普通 git 依赖。
+bevy-wasm-tasks = { git = "https://gitee.com/happydpc/bevy-wasm-tasks", rev = "28b30f8ee6bdf912246c045c3cf5086059294354" }
 
 # 设置窗里那个「浏览…」的系统目录对话框。`default-features = false` 关掉 Linux 的
 # xdg-portal 与 tokio 集成：前者会拖进 ashpd / zbus 一整串没 vendored 的包，后者这里

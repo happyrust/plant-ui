@@ -5,8 +5,14 @@ use serde_json::Value;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+#[path = "model_record_union.rs"]
+mod model_record_union;
+
 use plant_ui::model_update::{Enqueued, Failure, Preview};
-use plant_ui::task_queue::{DbnumReport, Health, PendingUnits, Poll, QueueSnapshot, TaskList};
+use plant_ui::task_queue::{
+    DbnumReport, Health, ModelSource, PendingUnits, Poll, QueueSnapshot, TaskList,
+};
+use plant_ui_data::{Attr, AttrKind};
 
 /// 服务端的统一错误包封 `{ code, message, detail }`（`web_service/mod.rs` 的 `ApiError`）。
 ///
@@ -128,6 +134,233 @@ pub async fn query(
     .await
 }
 
+#[derive(Debug, Deserialize)]
+struct TreeNodesReply {
+    source: String,
+    nodes: Vec<aios_core::pdms_types::EleTreeNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TreeAncestorsReply {
+    source: String,
+    refnos: Vec<aios_core::RefnoEnum>,
+}
+
+fn require_direct(source: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        source == "direct",
+        "模型树接口返回了非 direct 数据源: {source}"
+    );
+    Ok(())
+}
+
+pub async fn tree_roots(base: &str) -> anyhow::Result<Vec<aios_core::pdms_types::EleTreeNode>> {
+    let reply: TreeNodesReply = get(base, "/api/v1/tree/roots").await?;
+    require_direct(&reply.source)?;
+    Ok(reply.nodes)
+}
+
+pub async fn tree_children(
+    base: &str,
+    refno: aios_core::RefU64,
+) -> anyhow::Result<Vec<aios_core::pdms_types::EleTreeNode>> {
+    let path = format!(
+        "/api/v1/tree/children?refno={}",
+        urlencode(&refno.to_slash_string())
+    );
+    let reply: TreeNodesReply = get(base, &path).await?;
+    require_direct(&reply.source)?;
+    Ok(reply.nodes)
+}
+
+pub async fn tree_ancestors(
+    base: &str,
+    refno: aios_core::RefU64,
+) -> anyhow::Result<Vec<aios_core::RefU64>> {
+    let path = format!(
+        "/api/v1/tree/ancestors?refno={}",
+        urlencode(&refno.to_slash_string())
+    );
+    let reply: TreeAncestorsReply = get(base, &path).await?;
+    require_direct(&reply.source)?;
+    Ok(reply
+        .refnos
+        .into_iter()
+        .map(|refno| refno.refno())
+        .collect())
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchReply {
+    #[serde(default)]
+    items: Vec<SearchItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchItem {
+    refno: String,
+    name: String,
+    #[serde(default)]
+    noun: String,
+    dbnum: u32,
+}
+
+pub async fn search_names(
+    base: &str,
+    query: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<plant_ui_data::NameHit>> {
+    let path = format!("/api/v1/search?query={}&limit={}", urlencode(query), limit);
+    let reply: SearchReply = get(base, &path).await?;
+    reply
+        .items
+        .into_iter()
+        .map(|item| {
+            Ok(plant_ui_data::NameHit {
+                refno: item
+                    .refno
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("模型服务返回非法 refno {}", item.refno))?,
+                name: item.name,
+                noun: item.noun,
+                dbnum: item.dbnum,
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ElementAttributesReply {
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    complete: bool,
+    #[serde(default)]
+    attributes: Vec<ElementAttribute>,
+    #[serde(default)]
+    diagnostics: ElementAttributeDiagnostics,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ElementAttribute {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    value_type: String,
+    #[serde(default)]
+    display: String,
+    #[serde(default)]
+    is_unset: bool,
+    #[serde(default)]
+    editable: bool,
+    #[serde(default)]
+    is_uda: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ElementAttributeDiagnostics {
+    #[serde(default)]
+    outside_schema: Vec<String>,
+    #[serde(default)]
+    shape_conflicts: Vec<Value>,
+    #[serde(default)]
+    undecoded: Vec<Value>,
+    #[serde(default)]
+    uda_issues: Vec<String>,
+}
+
+/// Complete file-side attributes.  There is intentionally no SurrealDB
+/// fallback: an empty cache is a valid read-through state, not an empty
+/// attribute set.
+pub async fn element_attributes(
+    base: &str,
+    refno: aios_core::RefU64,
+    project: &str,
+    mdb: &str,
+    namespace: &str,
+) -> anyhow::Result<Vec<Attr>> {
+    let reply: ElementAttributesReply = post(
+        base,
+        "/api/v1/element/attributes",
+        element_attributes_body(refno, project, mdb, namespace),
+        Duration::from_secs(30),
+    )
+    .await
+    .map_err(|error| {
+        let failure = failure_of(&error);
+        if failure.code == "not_found"
+            || failure.message.contains("HTTP 404")
+            || failure.message.contains("405")
+        {
+            anyhow::anyhow!("gen-model 版本不支持文件侧属性，请升级 gen-model")
+        } else {
+            error
+        }
+    })?;
+    render_element_attributes(reply)
+}
+
+fn render_element_attributes(reply: ElementAttributesReply) -> anyhow::Result<Vec<Attr>> {
+    anyhow::ensure!(
+        reply.source == "e3d-io",
+        "属性接口返回了非 e3d-io 数据源: {}",
+        reply.source
+    );
+    let mut rows = reply
+        .attributes
+        .into_iter()
+        .map(|attribute| Attr {
+            name: attribute.name,
+            value: attribute.display,
+            is_uda: attribute.is_uda,
+            kind: if attribute.is_unset {
+                AttrKind::Unset
+            } else if !attribute.editable {
+                AttrKind::Opaque
+            } else {
+                match attribute.value_type.as_str() {
+                    "int" => AttrKind::Int,
+                    "real" => AttrKind::Real,
+                    "bool" => AttrKind::Bool,
+                    "text" | "word" => AttrKind::Text,
+                    _ => AttrKind::Opaque,
+                }
+            },
+        })
+        .collect::<Vec<_>>();
+    if !reply.complete {
+        let issue_count = reply.diagnostics.outside_schema.len()
+            + reply.diagnostics.shape_conflicts.len()
+            + reply.diagnostics.undecoded.len()
+            + reply.diagnostics.uda_issues.len();
+        rows.insert(
+            0,
+            Attr {
+                name: "⚠ diagnostics".into(),
+                value: format!("文件属性不完整（{issue_count} 项诊断），已显示可安全解码的值"),
+                kind: AttrKind::Opaque,
+                is_uda: false,
+            },
+        );
+    }
+    Ok(rows)
+}
+
+fn element_attributes_body(
+    refno: aios_core::RefU64,
+    project: &str,
+    mdb: &str,
+    namespace: &str,
+) -> String {
+    serde_json::json!({
+        "project": project,
+        "mdb": mdb,
+        "namespace": namespace,
+        "refno": refno.to_slash_string(),
+    })
+    .to_string()
+}
+
 /// `None` 必须**整个不发** `dbnums` 键——发 `null` 或空表都不行：老服务端的
 /// 请求体解析没有这个字段，多出来的键无害，但语义上 `Some([])` 是「一个批次
 /// 都不排」，与「全范围」是两个相反的东西，混了会把勾选门变成摆设。
@@ -157,8 +390,14 @@ pub async fn poll_queue(base: &str) -> anyhow::Result<Poll> {
         Err(error) => (Vec::new(), Some(crate::logs::error_chain(&error))),
     };
     let health = get::<Health>(base, "/api/v1/health").await.ok();
+    // 欠账表有三种答案，不是两种。取到了是一种；**服务端没有这个端点**是另一种
+    // ——那不是「暂时取不到」，是这一档在服务端已经不存在（gen-model 2026-09-08 起
+    // 模型工作内联进 dbnum 任务，欠账表退役）。把它按失败处理，界面会把上一份快照
+    // 冻在那儿当成实况，越冻越旧。所以：端点不在 = 答案已知且为空，另记一格让界面
+    // 整段不画；只有真取不到（超时 / 500）才沿用上一份。
     let pending = get::<PendingUnits>(base, "/api/v1/update/pending-units").await;
-    let pending_known = pending.is_ok();
+    let pending_unsupported = pending.as_ref().err().is_some_and(pending_endpoint_retired);
+    let pending_known = pending.is_ok() || pending_unsupported;
     let pending = pending.map(|p| p.units).unwrap_or_default();
     // `/dbnums` 要重扫项目目录，是这四个里最慢的一个；取不到就少画「本期不执行」
     // 那一格，不该拖垮整次轮询。
@@ -173,8 +412,32 @@ pub async fn poll_queue(base: &str) -> anyhow::Result<Poll> {
         health,
         pending,
         pending_known,
+        pending_unsupported,
         dbnums,
     })
+}
+
+/// 这次失败是不是「服务端没有这个端点」。
+///
+/// 只认 404 / 405 与 `not_found`：那说明这一档在服务端已经不存在，答案是**可信的空**。
+/// 超时、500、连不上都不算——那些是「暂时看不见」，界面该沿用上一份快照。
+/// 判据与 `element_attributes` 那条老服务端探测同一把尺子（本文件上方）。
+fn pending_endpoint_retired(error: &anyhow::Error) -> bool {
+    let failure = failure_of(error);
+    failure.code == "not_found"
+        || failure.message.contains("HTTP 404")
+        || failure.message.contains("HTTP 405")
+}
+
+/// Current file/cache coverage.  The startup path uses this instead of the
+/// SurrealDB project query in read-through mode, where an uncached DESI quite
+/// deliberately has no `pe` rows yet.
+pub async fn dbnum_report(base: &str) -> anyhow::Result<DbnumReport> {
+    get(base, "/api/v1/dbnums").await
+}
+
+pub async fn service_health(base: &str) -> anyhow::Result<Health> {
+    get(base, "/api/v1/health").await
 }
 
 /// 暂停 / 恢复出队。暂停**只挡出队**，正在跑的那一批会跑完为止。
@@ -216,9 +479,326 @@ pub async fn retry_pending_unit(
     Ok(())
 }
 
+/// 删掉一个 refno **精确子树**下已经生成的模型数据。
+///
+/// `confirm` 服务端强制要求等于 `refno`，不等就是 400——这个接口不接受随手一点。
+/// 它删的是产物不是本体：`pe` 一行不动，删完那片元素在三维里就是「未加载」。
+///
+/// 容器也删得动（`WORL / SITE / ZONE` 在这里不受限，那道门只挡生成根），
+/// 所以「整片删一次」只需要对右键那一行调一次。
+pub async fn delete_model_subtree(
+    base: &str,
+    refno: &str,
+    project: &str,
+    mdb: &str,
+    namespace: &str,
+) -> anyhow::Result<()> {
+    let query = format!(
+        "refno={}&confirm={}&project={}&mdb={}&namespace={}",
+        urlencode(refno),
+        urlencode(refno),
+        urlencode(project),
+        urlencode(mdb),
+        urlencode(namespace),
+    );
+    let _: serde_json::Value = delete(
+        base,
+        &format!("/api/v1/model/subtree?{query}"),
+        Duration::from_secs(300),
+    )
+    .await?;
+    Ok(())
+}
+
+/// `POST /api/v1/model/ensure` 的回执状态。
+///
+/// 四档对界面是四件不同的事，别压成一个布尔：`Generated` 是真做了一趟，
+/// `AlreadyAvailable` 是同根的活刚被别的元素触发过（这正是删除之后靠
+/// `force:false` 拿到的免费去重），`NoRenderableGeometry` 是这一片本来就没有
+/// 可画的东西——它不是失败，重试一百遍还是同一个结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnsureStatus {
+    Generated,
+    AlreadyAvailable,
+    NoRenderableGeometry,
+    /// 服务端换了新状态名。当成「做过了」计数，但要在日志里点名。
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnsureReply {
+    pub status: EnsureStatus,
+    /// 服务端解出来的生成根。客户端归根算错时，这一份是唯一的对照物。
+    pub generation_root: String,
+    pub generation_roots: Vec<String>,
+    pub model_available: bool,
+    pub generation_root_count: usize,
+    pub cached_root_count: usize,
+    pub generated_root_count: usize,
+    /// 这批模型此刻在哪儿（spec §4.12）：`Memory` = 服务端没等初始化队列、直接从文件算进
+    /// 进程内投影，活不过服务端重启，持久由初始化发布负责；`Database` = 已落 rocksdb。
+    /// 老服务端不给这一格 → `None`，日志里不多说。
+    pub model_source: Option<ModelSource>,
+    /// `memory` 的理由（`initialization_publishing` / `data_watermark_unestablished` / `read-through`）。
+    pub model_source_reason: Option<String>,
+}
+
+impl EnsureReply {
+    /// 日志里跟在计数后面的那半句。只有「内存」值得说：人得知道现在看到的是 API 现算的、
+    /// 翻面后同一版会从 rocksdb 读出来；「数据库」是常态，不出声。
+    pub fn source_note(&self) -> Option<String> {
+        match self.model_source? {
+            ModelSource::Database => None,
+            ModelSource::Memory => Some(format!(
+                "；{}，由 API 供数",
+                ModelSource::Memory
+                    .label(self.model_source_reason.as_deref())
+                    .trim_start_matches("模型来源：")
+            )),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct EnsureBody {
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    generation_root: String,
+    #[serde(default)]
+    generation_roots: Vec<String>,
+    #[serde(default)]
+    model_available: bool,
+    #[serde(default)]
+    generation_root_count: usize,
+    #[serde(default)]
+    cached_root_count: usize,
+    #[serde(default)]
+    generated_root_count: usize,
+    #[serde(default)]
+    model_source: Option<String>,
+    #[serde(default)]
+    model_source_reason: Option<String>,
+}
+
+/// 让一个 refno 有可渲染模型。`force` 只在人明确要求「无论如何重跑一遍」时为真。
+///
+/// **重新生成走的是 `force = false`**：删除已经把这一片清空了，第一个元素触发
+/// 真生成，同根后面的元素读到 `renderable > 0` 直接回 `AlreadyAvailable`——
+/// 去重是服务端免费给的，客户端不必自己裁剪嵌套单元。
+///
+/// 超时给到 125 秒，比服务端那道 120 秒稍长：让服务端的超时语义先生效
+/// （它回 504 并说明后台继续跑），而不是客户端先把连接掐掉、什么都不知道。
+pub async fn ensure_model(
+    base: &str,
+    refno: &str,
+    force: bool,
+    project: &str,
+    mdb: &str,
+    namespace: &str,
+) -> anyhow::Result<EnsureReply> {
+    let body = serde_json::json!({
+        "refno": refno,
+        "force": force,
+        "project": project,
+        "mdb": mdb,
+        "namespace": namespace,
+    });
+    let reply: EnsureBody = post(
+        base,
+        "/api/v1/model/ensure",
+        body.to_string(),
+        Duration::from_secs(125),
+    )
+    .await?;
+    Ok(EnsureReply {
+        status: ensure_status(&reply.status),
+        generation_root: reply.generation_root,
+        generation_roots: reply.generation_roots,
+        model_available: reply.model_available,
+        generation_root_count: reply.generation_root_count,
+        cached_root_count: reply.cached_root_count,
+        generated_root_count: reply.generated_root_count,
+        model_source: reply.model_source.as_deref().and_then(ModelSource::parse),
+        model_source_reason: reply.model_source_reason,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelRecordsPage {
+    #[serde(default)]
+    items: Vec<aios_core::GeomInstQuery>,
+    next_cursor: Option<usize>,
+    /// `model-memory` / `model-database`——这一页是从哪儿读的（老字段）。
+    #[serde(default)]
+    source: String,
+    /// 这根所属的库（spec §4.12 新加）。老服务端不给。
+    #[serde(default)]
+    dbnum: Option<u32>,
+}
+
+impl ModelRecordsPage {
+    fn scope(&self) -> model_record_union::RecordScope {
+        model_record_union::RecordScope {
+            dbnum: self.dbnum,
+            source: ModelSource::from_records_label(&self.source),
+        }
+    }
+}
+
+/// 一次装载的回执：记录之外还带上每个库认下的取数源，日志据此说出「哪几个库此刻
+/// 还在吃内存投影」。
+#[derive(Debug, Default)]
+pub struct ModelRecords {
+    pub records: Vec<aios_core::GeomInstQuery>,
+    /// dbnum 升序；老服务端没给 dbnum 的那一桶键为 `None`。
+    pub sources: Vec<(Option<u32>, ModelSource)>,
+}
+
+impl ModelRecords {
+    /// 还在吃内存投影的库号。空 = 全部以 rocksdb 为准（或服务端根本没说）。
+    pub fn memory_dbnums(&self) -> Vec<u32> {
+        self.sources
+            .iter()
+            .filter_map(|(dbnum, source)| {
+                (*source == ModelSource::Memory).then_some(*dbnum).flatten()
+            })
+            .collect()
+    }
+
+    /// 日志里跟在「N 个元素、M 个网格实例」后面的那半句：哪几个库的模型此刻是 API
+    /// 现算的。全部以 rocksdb 为准（或服务端没说）时什么都不说——那是常态，不值得占一句。
+    pub fn memory_note(&self) -> Option<String> {
+        let memory = self.memory_dbnums();
+        if memory.is_empty() {
+            // 老服务端不给 dbnum 时整次装载是一个桶：那一桶若是内存也得说出来。
+            return self
+                .sources
+                .iter()
+                .any(|(dbnum, source)| dbnum.is_none() && *source == ModelSource::Memory)
+                .then(|| {
+                    "；由 API 从内存供数（初始化收口后自动改读 rocksdb，不必重载）".to_owned()
+                });
+        }
+        Some(format!(
+            "；其中 {} 由 API 从内存供数（初始化收口后自动改读 rocksdb，不必重载）",
+            memory
+                .iter()
+                .map(|dbnum| format!("db{dbnum}"))
+                .collect::<Vec<_>>()
+                .join("、")
+        ))
+    }
+}
+
+/// Read generated geometry through gen-model's records endpoint.  Which store a
+/// root is read from is the **server's** call, per dbnum (spec §4.12): an
+/// initialized dbnum answers from rocksdb, one still initializing answers from the
+/// process projection.  There is intentionally no SurrealDB fallback here, and a
+/// single dbnum is never assembled from two sources: mixing the two epochs would
+/// make a single viewport load internally inconsistent.
+pub async fn model_records(
+    base: &str,
+    roots: &[aios_core::RefU64],
+    project: &str,
+    mdb: &str,
+    namespace: &str,
+) -> anyhow::Result<ModelRecords> {
+    let mut out = model_record_union::ModelRecordUnion::default();
+    for root in roots {
+        let mut scope_records = Vec::new();
+        let mut scope = None;
+        let mut cursor = None;
+        loop {
+            let body = serde_json::json!({
+                "project": project,
+                "mdb": mdb,
+                "namespace": namespace,
+                "generation_root": root.to_slash_string(),
+                "limit": 5000,
+                "cursor": cursor,
+            });
+            let page: ModelRecordsPage = post(
+                base,
+                "/api/v1/model/records",
+                body.to_string(),
+                Duration::from_secs(30),
+            )
+            .await?;
+            // 同一根分页中途翻面（第一页内存、第二页 rocksdb）：两页算的未必是同一版，
+            // 与跨根混源同一条纪律，整根报错让调用点重来。
+            let this = page.scope();
+            match scope {
+                None => scope = Some(this),
+                Some(first) if first != this && this.source.is_some() && first.source.is_some() => {
+                    anyhow::bail!(
+                        "生成根 {} 的记录分页中途换了取数源（{} → {}），这一趟不可用，请重查",
+                        root.to_slash_string(),
+                        first.source.map(|s| s.as_str()).unwrap_or("?"),
+                        this.source.map(|s| s.as_str()).unwrap_or("?"),
+                    )
+                }
+                Some(_) => {}
+            }
+            scope_records.extend(page.items);
+            let Some(next) = page.next_cursor else { break };
+            cursor = Some(next);
+        }
+        out.extend_scope(
+            scope.unwrap_or_else(model_record_union::RecordScope::legacy),
+            scope_records,
+        )?;
+    }
+    Ok(ModelRecords {
+        sources: out.sources(),
+        records: out.finish(),
+    })
+}
+
+fn ensure_status(raw: &str) -> EnsureStatus {
+    match raw {
+        "generated" | "Generated" => EnsureStatus::Generated,
+        "already_available" | "AlreadyAvailable" => EnsureStatus::AlreadyAvailable,
+        "no_renderable_geometry" | "NoRenderableGeometry" => EnsureStatus::NoRenderableGeometry,
+        _ => EnsureStatus::Unknown,
+    }
+}
+
+/// query 串里的 refno 带 `/`，项目名与 MDB 带 `/` 也带空格。
+/// 只做百分号转义，不引第三方依赖——这几个字段的字符集很窄。
+fn urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
 async fn get<T: DeserializeOwned>(base: &str, path: &str) -> anyhow::Result<T> {
     let mut req = ehttp::Request::get(format!("{base}{path}"));
     req.timeout = Some(Duration::from_secs(15));
+    let response = ehttp::fetch_async(req)
+        .await
+        .map_err(transport)
+        .context("请求模型服务失败")?;
+    request(response)
+}
+
+/// `ehttp` 只给了 get / post / head 三个构造器，DELETE 自己改 `method`。
+/// 服务端那条路由把参数全放在 query 串里，所以不带请求体。
+async fn delete<T: DeserializeOwned>(
+    base: &str,
+    path: &str,
+    timeout: Duration,
+) -> anyhow::Result<T> {
+    let mut req = ehttp::Request::get(format!("{base}{path}"));
+    req.method = ehttp::Method::DELETE;
+    req.timeout = Some(timeout);
     let response = ehttp::fetch_async(req)
         .await
         .map_err(transport)
@@ -298,6 +878,46 @@ mod tests {
     use super::*;
     use plant_ui::model_update::FailForm;
 
+    #[test]
+    fn element_attribute_request_carries_the_full_service_identity() {
+        let refno = aios_core::RefU64::from(42);
+        let body: serde_json::Value = serde_json::from_str(&element_attributes_body(
+            refno,
+            "AvevaMarineSample",
+            "/ALL",
+            "ams",
+        ))
+        .unwrap();
+        assert_eq!(body["project"], "AvevaMarineSample");
+        assert_eq!(body["mdb"], "/ALL");
+        assert_eq!(body["namespace"], "ams");
+        assert_eq!(body["refno"], refno.to_slash_string());
+    }
+
+    #[test]
+    fn file_side_uda_marker_survives_the_http_mapping() {
+        let reply: ElementAttributesReply = serde_json::from_str(
+            r#"{
+                "source":"e3d-io",
+                "complete":true,
+                "attributes":[{
+                    "name":"MYUDA",
+                    "value_type":"text",
+                    "display":"value",
+                    "is_uda":true,
+                    "is_unset":false,
+                    "editable":true
+                }]
+            }"#,
+        )
+        .unwrap();
+        let rows = render_element_attributes(reply).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "MYUDA");
+        assert!(rows[0].is_uda);
+        assert_eq!(rows[0].kind, AttrKind::Text);
+    }
+
     /// ADR-020 勾选子集的客户端半边：`None` 整个不发键（老服务端兼容 + 全范围），
     /// `Some` 原样上送——**包括空表**，那是「全不勾」而不是「没选择」。
     #[test]
@@ -342,6 +962,65 @@ mod tests {
             "{}",
             bare.message
         );
+    }
+
+    /// `DELETE /model/subtree` 的 `confirm` 必须与 `refno` 逐字相同，且 `/`
+    /// 要转义——服务端拿它当「你确实想删这一个」的凭据，不等就是 400。
+    #[test]
+    fn the_delete_confirm_matches_the_refno_after_escaping() {
+        assert_eq!(urlencode("24381/100677"), "24381%2F100677");
+        assert_eq!(urlencode("/ALL"), "%2FALL");
+        assert_eq!(urlencode("ProjAMS"), "ProjAMS");
+
+        let refno = "24381/100677";
+        let query = format!("refno={}&confirm={}", urlencode(refno), urlencode(refno));
+        assert_eq!(query, "refno=24381%2F100677&confirm=24381%2F100677");
+    }
+
+    /// ensure 的四档状态对界面是四件不同的事，压成布尔就分不出「重做过了」与
+    /// 「同根刚被别人做过」——后者正是删除之后 `force:false` 拿到的免费去重。
+    #[test]
+    fn ensure_status_keeps_the_four_outcomes_apart() {
+        assert_eq!(ensure_status("generated"), EnsureStatus::Generated);
+        assert_eq!(
+            ensure_status("already_available"),
+            EnsureStatus::AlreadyAvailable
+        );
+        assert_eq!(
+            ensure_status("no_renderable_geometry"),
+            EnsureStatus::NoRenderableGeometry
+        );
+        // 服务端换名字不许静默当成成功的那一档：它要能在日志里被点名。
+        assert_eq!(ensure_status("brand_new_state"), EnsureStatus::Unknown);
+    }
+
+    /// 欠账端点的三种答案要分得开：取到了、**服务端没有这一档**、暂时取不到。
+    ///
+    /// 只有 404 / 405 / `not_found` 算第二种——那是 gen-model 2026-09-08 起模型工作
+    /// 内联进 dbnum 任务、欠账表退役之后的常态，答案是可信的空，界面整段不画。
+    /// 超时与 500 是第三种：沿用上一份快照，不许冒充「欠账清零」。
+    #[test]
+    fn only_a_missing_endpoint_counts_as_the_owed_table_being_gone() {
+        let api =
+            |code: &str, message: &str| anyhow::Error::new(ApiError(Failure::new(code, message)));
+        assert!(pending_endpoint_retired(&api("not_found", "no such route")));
+        assert!(pending_endpoint_retired(&api(
+            "internal",
+            "HTTP 404: unknown path"
+        )));
+        assert!(pending_endpoint_retired(&api(
+            "internal",
+            "HTTP 405: method not allowed"
+        )));
+        assert!(!pending_endpoint_retired(&api(
+            "timeout",
+            "io: Connection refused"
+        )));
+        assert!(!pending_endpoint_retired(&api(
+            "internal",
+            "HTTP 500: boom"
+        )));
+        assert!(!pending_endpoint_retired(&anyhow::anyhow!("解析响应失败")));
     }
 
     /// 连不上、超时、握手不成对用的人是同一件事：服务够不着，没有任何数据被改动，

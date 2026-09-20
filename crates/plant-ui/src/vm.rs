@@ -17,14 +17,23 @@ pub struct WorkbenchVm {
     pub user: String,
     /// 数据源是否就绪（状态栏指示点）。
     pub data_source_ok: bool,
+    /// 数据树、属性与三维都越过同一个增量刷新屏障后递增。自动化用它确认自己
+    /// 观察的不是数据批次结束前的旧一帧。
+    pub refresh_generation: u64,
     /// 有一次取回工作正在跑。菜单据此置灰，免得连点堆出几轮全量重载。
     pub get_work_busy: bool,
-    /// 设计库里还没被应用到模型的会话数；`None` = 还没读到，那一行整个不画。
+    /// 有一趟重新生成正在跑。它与取回工作互相置灰——两者都会大动三维，
+    /// 而重新生成中途还会删库里的产物，两条路交叉起来说不清谁踩了谁。
+    /// eye 不受影响：显示 / 隐藏改的只是画面。
+    pub regen_busy: bool,
+    /// 本期执行范围内两枚水位（数据水位 / 模型水位）各落后文件多少；`None` = 还没取到过
+    /// 队列快照，那一行整个不画。
     ///
     /// 摆在取回工作旁边，是为了把两个入口的分工说清楚：取回工作只取界面，
-    /// 真要把这些会话应用进模型得走「模型更新」。它是提示不是判据——
-    /// 数据侧的 `file_latest_sesno` 只有上一次扫描时那么新。
-    pub pending_sessions: Option<u32>,
+    /// 真要把水位推上去得走「模型更新」。它是提示不是判据——
+    /// 数据来自 `/dbnums` 的上一拍轮询，只有那时那么新。界面上说「保存」不说
+    /// 「会话」（ADR-0019），按水位说话、不说「待应用」（2026-09-08）。
+    pub watermark_lag: Option<crate::task_queue::WatermarkLag>,
     /// 已加载元素计数（状态栏右侧）。
     pub element_count: usize,
     /// 当前选择集（状态栏 + 属性视图跟随其 `primary`）。
@@ -45,8 +54,17 @@ pub struct WorkbenchVm {
     pub rooms: RoomVm,
     /// 「房间」页签聚焦房间的详情，`Cmd::FocusRoom` 后由宿主填。
     pub room_detail: RoomDetailVm,
+    /// 尺寸标注层（计划 B2–B4）：视口此刻挂着哪条 BRAN 的尺寸标注、到了哪一步。
+    /// 不跟选中走——右键「查看尺寸标注」才换，之后换选中它照样挂着。
+    pub dimensions: DimensionsVm,
+    /// 主选中能挂尺寸标注的 BRAN（自己是 BRAN，或所在 BRAN；计划 B2 / D3）。视口右键
+    /// 菜单作用于主选中，而「它是不是管道元素」只有宿主对着已加载的树才答得出，所以随
+    /// 选中与树的变化由宿主填。`None` = 主选中不是管道元素，或者它还不在已加载的树里。
+    pub selection_branch: Option<RefU64>,
     /// 命令交互视图。
     pub command: CommandVm,
+    /// 标题栏搜索框的查询结果。
+    pub search: SearchVm,
     /// 应用运行日志。
     pub logs: LogsVm,
     /// 三维视口的画面（M1-5 是占位纹理，M3 换成 Bevy 的渲染目标）。
@@ -61,6 +79,49 @@ pub struct WorkbenchVm {
     pub queue: QueueStatusVm,
     /// 当前项目接入点（状态栏那枚数据库芯片点开后的内容）。
     pub access_point: AccessPointVm,
+    /// 导航历史在命令栏那两枚箭头上的只读投影。栈本身归宿主。
+    pub nav: NavHistoryVm,
+}
+
+/// 导航历史的只读投影：绘制层只需要「能不能退 / 进」、目标叫什么、右键列表画哪几条。
+///
+/// 栈与游标都在宿主手上（`Cmd::Navigate` 的处置方），这里是每次变化后同步过来的
+/// 一份快照——不在这里做任何推进，按下去发命令就完了。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NavHistoryVm {
+    /// 由旧到新。
+    pub entries: Vec<NavEntryVm>,
+    /// 此刻站在哪一条上。`None` = 栈空。
+    pub cursor: Option<usize>,
+}
+
+/// 历史栈上的一条在界面上的样子。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NavEntryVm {
+    /// 主选中的显示名（`noun name`；树上还没有它时退回 refno）。多选时带余量 `+N`。
+    pub label: String,
+    /// 主选中的 PDMS 类型，右键列表的行首图标按它取（`workbench::noun_icon`）。
+    pub noun: String,
+    /// 记录那一刻的激活页签；hover 文案与右键列表的右栏写它。
+    pub pane: Option<crate::workbench::Pane>,
+}
+
+impl NavHistoryVm {
+    /// 后退一步会落到哪一条；`None` = 没有可后退的位置。
+    pub fn back_target(&self) -> Option<&NavEntryVm> {
+        let cursor = self.cursor?;
+        cursor.checked_sub(1).and_then(|i| self.entries.get(i))
+    }
+
+    /// 前进一步会落到哪一条；`None` = 没有可前进的位置。
+    pub fn forward_target(&self) -> Option<&NavEntryVm> {
+        let cursor = self.cursor?;
+        self.entries.get(cursor + 1)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// 一个项目接入点在界面上的样子：这一刻**实际生效**的那组地址与身份。
@@ -79,6 +140,9 @@ pub struct AccessPointVm {
     pub user: String,
     pub model_api_url: String,
     pub data_api_url: String,
+    /// 这一刻实际生效的供数模式（ADR-0026）。设置里那一格可能被 `PLANT_READ_FACE`
+    /// 压过，这里报的是真正在用的那一面，不是文件里写的。
+    pub read_face: crate::settings::ReadFaceKind,
     /// 这组配置来自哪儿。`get_db_option()` 在没人注入配置时会**静默回落**去读工作
     /// 目录的 `DbOption.toml`——不把来源说出来，人就没法知道自己连到了哪儿。
     pub source: String,
@@ -214,20 +278,6 @@ impl Selection {
         self.cursor = None;
     }
 
-    /// Drop selections that no longer exist after a tree refresh.
-    ///
-    /// If the anchor or primary selection disappears, move it to the last
-    /// surviving item, matching the existing Ctrl-toggle semantics.
-    pub fn retain(&mut self, mut keep: impl FnMut(RefU64) -> bool) {
-        self.items.retain(|refno| keep(*refno));
-        if self.anchor.is_some_and(|refno| !self.items.contains(&refno)) {
-            self.anchor = self.items.last().copied();
-        }
-        if self.cursor.is_some_and(|refno| !self.items.contains(&refno)) {
-            self.cursor = self.items.last().copied();
-        }
-    }
-
     pub fn contains(&self, refno: RefU64) -> bool {
         self.items.contains(&refno)
     }
@@ -259,7 +309,7 @@ impl Selection {
 
 /// 三维视口对绘制层就是一张纹理。M1-5 里它是磁盘上的占位图，M3 接回 Bevy 后
 /// 换成每帧更新的渲染目标，这一层不用改。
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct View3dVm {
     pub texture: egui::TextureId,
     /// 纹理的像素尺寸。视口要按它等比裁切铺满，不然图会被拉变形。
@@ -281,6 +331,18 @@ pub struct View3dVm {
     /// 宿主的网格换档就按这个数落档，HUD 把它原样念出来——两边同源，读数才不会
     /// 与眼睛看见的格子对不上。独立壳没有网格，给 0 表示「无读数」。
     pub grid_cell_mm: f32,
+    /// 尺寸标注层的文字（计划 B3）：尺寸数值 / 位号 / 辅助文字，锚点已由宿主投影成
+    /// 纹理 UV（与 `axis_labels` 同机制），出画与相机身后的已经筛掉。绘制层只在锚点
+    /// 画字，首版不做遮挡剔除与避让。没挂标注时为空。
+    pub dimension_labels: Vec<DimensionLabelVm>,
+}
+
+/// 一条投影好的尺寸标注文字。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DimensionLabelVm {
+    /// 文字中心在渲染纹理上的归一化 UV。
+    pub uv: [f32; 2],
+    pub text: String,
 }
 
 /// 应用运行日志数据。
@@ -307,6 +369,77 @@ pub enum CommandLineKind {
     Input,
     Output,
     Error,
+}
+
+/// 标题栏搜索框的查询**结果**。输入串与下拉高亮是绘制状态，不进 Vm。
+///
+/// `query` 与 `running` 分成两个字段，是因为结果总要晚一拍回来：那段时间里手上的
+/// `hits` 仍是上一个查询串的结果，合用一个字段就分不出「这些命中是给谁的」，
+/// 下拉会把旧结果挂在新输入下面。
+#[derive(Debug, Clone, Default)]
+pub struct SearchVm {
+    /// `hits` 与 `sub_hits` 是**哪一个**输入串的结果（原样回显用户输入，
+    /// 绘制层拿它对表）。
+    pub query: String,
+    /// 在途的那次查询；`None` = 没有。
+    pub running: Option<SearchRunVm>,
+    /// 名字**以输入开头**的命中。走库的名称索引，不限设计库，可能含树外元素。
+    pub hits: Vec<SearchHitVm>,
+    /// 名字**中间含输入**的命中。走本地 ngram 索引，范围是当前 MDB 的设计库。
+    pub sub_hits: Vec<SearchHitVm>,
+    /// 子串那一路此刻的状态。它决定下拉里该说哪句话，也决定该不该有子串这一节。
+    pub sub_state: SubIndexVm,
+    /// 任一路命中数触到上限，后面还有没显示出来的。
+    pub truncated: bool,
+    /// 前缀那一路失败的原因。子串那一路的失败在 `sub_state` 里——库断了子串
+    /// 照样能搜，两件事不该合成一句话。
+    pub error: Option<String>,
+    /// 子串能搜的设计库个数（当前 MDB 声明的那些）。0 = 没有可搜的范围。
+    pub scope_dbs: usize,
+    /// 这两路命中是从哪一面搜出来的（ADR-0026）。下拉靠它说清两件事：
+    ///
+    /// - 库供数的两路索引都只认已经进了 `pe` 的元素，空结果与子串段首要把这个
+    ///   范围标出来，否则「没有」听起来像是整个工程里没有；
+    /// - [`SubIndexVm::Off`] 在两面的意思不一样。库供数下它是「这个构建没有本地
+    ///   子串索引」；服务供数下本来就不建本地索引，前缀那一路吃的服务端快照索引
+    ///   自己就含子串——那时候再说一句「按中间片段搜索仅桌面端提供」是假话。
+    pub coverage: crate::settings::ReadFaceKind,
+}
+
+/// 子串索引这一刻的状态。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SubIndexVm {
+    /// 索引就绪，子串那一节说话算数。
+    Ready,
+    /// 正在建（首次启动或数据变了）。这期间只有前缀那半。
+    Building { done: usize, total: usize },
+    /// 建不起来。带上原因，并告诉人 `reindex` 这个门。
+    Failed(String),
+    /// 这个构建不提供子串搜索（浏览器端），或者还没连上库。
+    #[default]
+    Off,
+}
+
+/// 在途的那次搜索。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchRunVm {
+    pub query: String,
+}
+
+/// 搜索命中的一行。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchHitVm {
+    pub refno: RefU64,
+    /// PDMS 全名，带前导 `/`。
+    pub name: String,
+    pub noun: String,
+    /// 命中落在当前 MDB 的设计库里。false = 树外元素：选得中、看得到属性，
+    /// 但模型树上没有它那一行，下拉里要提前说清楚。
+    pub in_tree: bool,
+    /// 命中所在的库编号。绘制层不画它——树外元素属性为空时，宿主要拿它去
+    /// `/dbnums` 上查这个库是不是元件库，才说得出空表的由来（计划 §5.5）。
+    /// 模型树只长设计库元素，所以这是元件库元素唯一的进门处。
+    pub dbnum: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -461,11 +594,13 @@ pub struct TreeRowVm {
     /// 画面变过来之间隔着查询与网格装载。那段时间里图标停在原样，再点一下要的是
     /// **反转上一次指令**，不是反转图标。
     pub next_visible: bool,
+    /// 这一行能挂尺寸标注的 BRAN（计划 B2 / D3）：自己是 BRAN 就是自己，是 BRAN 的成员
+    /// （ELBO / ATTA / TUBI…）就是所在 BRAN；PIPE / ZONE / EQUI 这些为 `None`，右键菜单里
+    /// 不出「查看尺寸标注」。宿主展平时顺着父链算好，绘制层不必回头找父行。
+    pub dimension_branch: Option<RefU64>,
 }
 
 /// 属性视图数据状态（跟随 `WorkbenchVm::selected`）。
-///
-/// 没有「空」态：属性表至少带 TYPE 与 NAME，选中了元素就不会一条都没有。
 #[derive(Debug, Clone, Default)]
 pub enum PropsVm {
     /// 尚未选中任何元素——是「还没轮到它」而不是「查完了没有」。
@@ -475,6 +610,13 @@ pub enum PropsVm {
     Loading(Option<PropsDataVm>),
     /// 属性到位，按设计稿分组展示。
     Ready(PropsDataVm),
+    /// 查询成功但一条属性都没有，宿主替它说清为什么（ADR-0026 / 计划 §5.5）。
+    ///
+    /// 服务供数下属性表至少带 TYPE 与 NAME，选中了元素就不会一条都没有；库供数会——
+    /// 元件库元素压根不入模型本体库，设计库元素也可能只同步了 `pe` 那一行。这两种
+    /// 空表画成一张只剩 refno 的表，看着像「这个元素没有属性」，那是句谎话。
+    /// 它不是失败态：没有可重试的操作，也不该画成红的。
+    Verdict(String),
     /// 查询失败，附原因。
     Failed(String),
 }
@@ -686,12 +828,114 @@ pub struct RoomMemberVm {
     pub inside_count: u8,
 }
 
+/// 尺寸标注层的状态（计划 B2）。同时只挂一条 BRAN：再看另一条就把前一条换掉，
+/// 「隐藏尺寸标注」回到 [`Self::Off`]。
+///
+/// 三个非空态都带 refno：右键菜单要认得出「落点这条 BRAN 就是挂着的那条」，才好把
+/// 「查看」翻成「隐藏」。失败态**不算挂着**（[`Self::shows`]）——画面上什么都没有，
+/// 菜单上那一项仍是「查看」，再点一次就是重试；错误本身由 B4 的状态入口呈现。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum DimensionsVm {
+    /// 没挂任何尺寸标注。
+    #[default]
+    Off,
+    /// 取数在途（服务端每次请求新开 `DbSet` 跑求解，大 BRAN 要几秒）。
+    Loading(RefU64),
+    /// 取到了。B3 之前只有这份摘要；视口层接上后几何走 View3d 命令，不进 Vm。
+    Ready(DimensionsDataVm),
+    /// 取数失败。`message` 是分好型的 `MbdError` 的人话（宿主拼好，绘制层不解析）。
+    Failed { refno: RefU64, message: String },
+}
+
+impl DimensionsVm {
+    /// 此刻占着这一层的那条 BRAN（在途 / 已上屏 / 失败），`Off` 时为 None。
+    pub fn refno(&self) -> Option<RefU64> {
+        match self {
+            Self::Off => None,
+            Self::Loading(refno) | Self::Failed { refno, .. } => Some(*refno),
+            Self::Ready(data) => Some(data.refno),
+        }
+    }
+
+    /// 这条 BRAN 的尺寸标注此刻算不算「显示着」——在途或已上屏都算，失败不算。
+    /// 右键菜单据此在「查看」与「隐藏」之间切换。
+    pub fn shows(&self, refno: RefU64) -> bool {
+        match self {
+            Self::Loading(shown) => *shown == refno,
+            Self::Ready(data) => data.refno == refno,
+            Self::Off | Self::Failed { .. } => false,
+        }
+    }
+}
+
+/// 一条 BRAN 尺寸标注的摘要（B4 状态条 / tooltip 的数据源）。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DimensionsDataVm {
+    pub refno: RefU64,
+    /// 图元数（尺寸线 / 引线 / 标记 / 弧…）。
+    pub primitives: usize,
+    /// 求解器给的提示数（抑制、降级、定位问题）。
+    pub issues: usize,
+    /// 求解器的布局模式（契约 `meta.layout_mode`，如 `isodim_main`）。
+    pub layout_mode: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn r(n: u64) -> RefU64 {
         RefU64(n)
+    }
+
+    /// 菜单上「查看 / 隐藏」的切换只认在途与已上屏：失败了画面上什么都没有，
+    /// 那一项得还是「查看」（= 重试），不能摆一个「隐藏」让人去藏一幅不存在的图。
+    #[test]
+    fn a_failed_dimension_layer_does_not_count_as_shown() {
+        assert!(!DimensionsVm::Off.shows(r(7)));
+        assert!(DimensionsVm::Loading(r(7)).shows(r(7)));
+        assert!(!DimensionsVm::Loading(r(7)).shows(r(8)));
+        let ready = DimensionsVm::Ready(DimensionsDataVm {
+            refno: r(7),
+            ..Default::default()
+        });
+        assert!(ready.shows(r(7)));
+        assert!(!ready.shows(r(8)));
+        let failed = DimensionsVm::Failed {
+            refno: r(7),
+            message: "x".into(),
+        };
+        assert!(!failed.shows(r(7)));
+        // 但它仍占着这一层：宿主认帧、B4 报错都要知道失败的是哪一条。
+        assert_eq!(failed.refno(), Some(r(7)));
+        assert_eq!(DimensionsVm::Off.refno(), None);
+    }
+
+    /// 两枚箭头的启用态只看游标两侧有没有条目：站在栈顶前进灰、站在栈底后退灰、
+    /// 栈空两枚都灰。目标就是相邻那一条——hover 文案要念它的名字。
+    #[test]
+    fn nav_targets_are_the_neighbours_of_the_cursor() {
+        let entry = |label: &str| NavEntryVm {
+            label: label.into(),
+            noun: "EQUI".into(),
+            pane: None,
+        };
+        let empty = NavHistoryVm::default();
+        assert!(empty.back_target().is_none() && empty.forward_target().is_none());
+
+        let nav = NavHistoryVm {
+            entries: vec![entry("a"), entry("b"), entry("c")],
+            cursor: Some(2),
+        };
+        assert_eq!(nav.back_target().map(|e| e.label.as_str()), Some("b"));
+        assert!(nav.forward_target().is_none(), "站在栈顶没有前进");
+
+        let nav = NavHistoryVm {
+            cursor: Some(0),
+            ..nav
+        };
+        assert!(nav.back_target().is_none(), "站在栈底没有后退");
+        assert_eq!(nav.forward_target().map(|e| e.label.as_str()), Some("b"));
     }
 
     #[test]
@@ -711,21 +955,6 @@ mod tests {
         assert_eq!(s.primary(), Some(r(2)));
         s.toggle(r(2));
         assert_eq!(s.primary(), Some(r(1)));
-    }
-
-    #[test]
-    fn tree_refresh_retain_moves_primary_to_a_survivor_or_clears_it() {
-        let mut s = Selection::single(r(1));
-        s.toggle(r(2));
-        s.toggle(r(3));
-
-        s.retain(|refno| refno != r(3));
-        assert_eq!(s.to_vec(), vec![r(1), r(2)]);
-        assert_eq!(s.primary(), Some(r(2)));
-
-        s.retain(|_| false);
-        assert!(s.is_empty());
-        assert_eq!(s.primary(), None);
     }
 
     #[test]

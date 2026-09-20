@@ -1,0 +1,1214 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC%3Awght%40100..900&display=swap"
+      rel="stylesheet"
+    />
+
+    <style>
+      *, ::before, ::after {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <div style="height: 872px; position: relative; width: 2640px">
+      <div
+        data-pencil-name="更新任务详情 · 终态行内明细"
+        style="align-items: flex-start; background-color: #F4F6F8; box-sizing: border-box; display: flex; flex-direction: column; gap: 16px; height: fit-content; justify-content: flex-start; left: 0px; overflow: hidden; padding: 40px; position: absolute; top: 0px; width: 1360px"
+      >
+        <div
+          data-pencil-name="标题区"
+          style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: column; flex-shrink: 0; gap: 6px; height: fit-content; justify-content: flex-start; width: 100%"
+        >
+          <div
+            data-pencil-name="标题"
+            style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 22px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+          >
+            更新任务详情 · 终态行内明细
+          </div>
+          <div
+            data-pencil-name="副标题"
+            style='box-sizing: border-box; color: #6B7280; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 13px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: 21px; text-align: left; width: 100%'
+          >
+            dbnum 任务结束后，行内明细按四段交代：数据段给增 / 删 /
+            改三个大数，房间段给受影响房间与搬间明细。终态行默认折叠，点开后是下面这块；每一格都指得到契约字段，服务端不给的整格不画。
+          </div>
+        </div>
+        <div
+          data-pencil-name="面板"
+          style="align-items: flex-start; background-color: #FFFFFF; border-radius: 8px; box-sizing: border-box; display: flex; flex-direction: column; flex-shrink: 0; gap: 0px; height: fit-content; justify-content: flex-start; outline-offset: -0.5px; outline: 1px solid #E3E6EB; overflow: hidden; width: 100%"
+        >
+          <div
+            data-pencil-name="页签条"
+            style="align-items: center; background-color: #F7F8FA; border-color: #E3E6EB; border-style: solid; border-width: 0px 0px 1px 0px; box-sizing: content-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 4px; height: 38.5px; justify-content: flex-start; margin: 0px 0px -0.5px 0px; padding: 0px 12px; width: 1280px"
+          >
+            <div
+              data-pencil-name="页签 命令行"
+              style="align-items: center; background-color: #00000000; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 6px; height: fit-content; justify-content: flex-start; padding: 10px 14px; width: fit-content"
+            >
+              <div
+                data-pencil-name="文字"
+                style='box-sizing: border-box; color: #6B7280; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 13px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+              >
+                命令行
+              </div>
+            </div>
+            <div
+              data-pencil-name="页签 日志"
+              style="align-items: center; background-color: #00000000; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 6px; height: fit-content; justify-content: flex-start; padding: 10px 14px; width: fit-content"
+            >
+              <div
+                data-pencil-name="文字"
+                style='box-sizing: border-box; color: #6B7280; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 13px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+              >
+                日志
+              </div>
+            </div>
+            <div
+              data-pencil-name="页签 任务队列"
+              style="align-items: center; background-color: #FFFFFF; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 6px; height: fit-content; justify-content: flex-start; padding: 10px 14px; width: fit-content"
+            >
+              <div
+                data-pencil-name="文字"
+                style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 13px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+              >
+                任务队列
+              </div>
+            </div>
+          </div>
+          <div
+            data-pencil-name="摘要条"
+            style="align-items: center; border-color: #E3E6EB; border-style: solid; border-width: 0px 0px 1px 0px; box-sizing: content-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 24px; height: 42.5px; justify-content: space-between; margin: 0px 0px -0.5px 0px; padding: 12px 16px; width: 1280px"
+          >
+            <div
+              data-pencil-name="左"
+              style="align-items: center; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 20px; height: fit-content; justify-content: flex-start; width: fit-content"
+            >
+              <div
+                data-pencil-name="摘要 本期执行范围"
+                style="align-items: center; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 6px; height: fit-content; justify-content: flex-start; width: fit-content"
+              >
+                <div
+                  data-pencil-name="名"
+                  style='box-sizing: border-box; color: #6B7280; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                >
+                  本期执行范围
+                </div>
+                <div
+                  data-pencil-name="值"
+                  style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 13px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                >
+                  20 个设计库
+                </div>
+              </div>
+              <div
+                data-pencil-name="摘要 在跑"
+                style="align-items: center; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 6px; height: fit-content; justify-content: flex-start; width: fit-content"
+              >
+                <div
+                  data-pencil-name="名"
+                  style='box-sizing: border-box; color: #6B7280; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                >
+                  在跑
+                </div>
+                <div
+                  data-pencil-name="值"
+                  style='box-sizing: border-box; color: #2F6FED; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 13px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                >
+                  3 个任务
+                </div>
+              </div>
+              <div
+                data-pencil-name="摘要 落后"
+                style="align-items: center; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 6px; height: fit-content; justify-content: flex-start; width: fit-content"
+              >
+                <div
+                  data-pencil-name="名"
+                  style='box-sizing: border-box; color: #6B7280; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                >
+                  落后
+                </div>
+                <div
+                  data-pencil-name="值"
+                  style='box-sizing: border-box; color: #D97706; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 13px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                >
+                  1 个库
+                </div>
+              </div>
+              <div
+                data-pencil-name="摘要 上次追平"
+                style="align-items: center; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 6px; height: fit-content; justify-content: flex-start; width: fit-content"
+              >
+                <div
+                  data-pencil-name="名"
+                  style='box-sizing: border-box; color: #6B7280; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                >
+                  上次追平
+                </div>
+                <div
+                  data-pencil-name="值"
+                  style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 13px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                >
+                  09-08 14:33
+                </div>
+              </div>
+            </div>
+            <div
+              data-pencil-name="右"
+              style="align-items: center; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 8px; height: fit-content; justify-content: flex-start; width: fit-content"
+            >
+              <svg
+                data-pencil-name="图标"
+                data-icon-name="radio"
+                data-icon-set="lucide"
+                viewBox="0 0 13.99993896484375 14"
+                preserveAspectRatio="xMidYMid meet"
+                xmlns="http://www.w3.org/2000/svg"
+                style="box-sizing: border-box; flex-shrink: 0; height: 14px; width: 14px"
+              >
+                <path
+                  d="M2.7583 2.31055q-0.12646 0.02734-0.23926 0.11279-0.10938 0.08203-0.30761 0.32129-1.35693 1.52441-1.5962 3.56836-0.02734 0.2666-0.02734 0.68701 0 0.42041 0.02734 0.68701 0.21191 1.85937 1.36036 3.28809 0.12305 0.18457 0.29736 0.37256 0.17773 0.18799 0.25293 0.24609 0.07861 0.05469 0.18799 0.08887 0.11279 0.03418 0.21191 0.02051 0.22559-0.02734 0.37256-0.18799 0.14697-0.16064 0.14697-0.37256 0-0.16748-0.05127-0.25635-0.04785-0.09228-0.229-0.31787-0.50586-0.54346-0.81348-1.13135-0.60156-1.13477-0.60156-2.43701 0-1.30225 0.60156-2.43701 0.30762-0.58789 0.81348-1.13135 0.18115-0.22559 0.229-0.31445 0.05127-0.09229 0.05127-0.27344 0-0.18457-0.12646-0.33838-0.12646-0.15381-0.32129-0.19482-0.12646-0.02734-0.23926 0z m8.2168 0q-0.2085 0.05469-0.33496 0.24609-0.12646 0.18799-0.08545 0.41016 0.01367 0.11279 0.06836 0.19824 0.05811 0.08203 0.22558 0.2666 0.49219 0.52979 0.79981 1.13135 0.60156 1.13477 0.60156 2.43701 0 1.30225-0.60156 2.43701-0.30762 0.60156-0.79981 1.13135-0.16748 0.18457-0.22558 0.27002-0.05469 0.08203-0.06836 0.19482-0.02734 0.2085 0.07178 0.37598 0.09912 0.16748 0.27343 0.24609 0.17432 0.0752 0.36914 0.02051 0.11279-0.02734 0.20166-0.0957 0.09229-0.07178 0.25977-0.25293 1.40137-1.5415 1.6543-3.64014 0.02734-0.23926 0.02734-0.68017 0-0.44092-0.02734-0.69385-0.19824-1.62354-1.08008-2.91211-0.16748-0.24951-0.39307-0.52295-0.22217-0.27344-0.37597-0.41357-0.11279-0.09912-0.26661-0.14014-0.15381-0.04102-0.29394-0.01367z m-6.53858 1.65088q-0.18115 0.01367-0.38964 0.22558-0.75537 0.76904-1.02198 1.90381-0.09912 0.42041-0.09912 0.90918 0 0.48877 0.09912 0.90918 0.19482 0.86816 0.71436 1.5415 0.12305 0.16748 0.28369 0.33496 0.16406 0.16748 0.23242 0.21192 0.2666 0.12305 0.52637 0 0.25977-0.12646 0.31445-0.40674 0.02734-0.15381-0.02392-0.28711-0.04785-0.1333-0.18457-0.30078-0.40674-0.44775-0.60499-0.93652-0.19482-0.49219-0.19482-1.06641 0-0.57422 0.19482-1.06299 0.19824-0.49219 0.60499-0.93994 0.13672-0.16748 0.18457-0.30078 0.05127-0.1333 0.02392-0.28711-0.02734-0.08203-0.0581-0.13672-0.02734-0.05811-0.09571-0.14355-0.19482-0.2085-0.50586-0.16748z m4.95606 0q-0.19482 0.01367-0.33496 0.16748-0.06836 0.08545-0.09912 0.14355-0.02734 0.05469-0.05469 0.13672-0.02734 0.15381 0.02051 0.28711 0.05127 0.1333 0.18798 0.30078 0.72803 0.7998 0.78614 1.79443 0.08203 1.25781-0.78614 2.21143-0.13672 0.16748-0.18798 0.30078-0.04785 0.1333-0.02051 0.28711 0.05469 0.28027 0.31445 0.40674 0.25977 0.12305 0.52637 0 0.06836-0.04443 0.23584-0.21192 0.43408-0.44775 0.70752-1.03564 0.27344-0.58789 0.35889-1.23047 0.04102-0.32471 0.02734-0.72119-0.01367-0.3999-0.09912-0.70752-0.19482-0.86816-0.71436-1.5415-0.12646-0.16748-0.28711-0.33496-0.16064-0.16748-0.229-0.21192-0.15381-0.06836-0.35205-0.04101z m-2.67285 1.31591q-0.3623 0.05811-0.69385 0.2837-0.32813 0.22217-0.52295 0.52978-0.2666 0.46143-0.24609 0.97412 0.02051 0.50928 0.31445 0.93652 0.29395 0.42725 0.78613 0.62208 0.43408 0.16748 0.89551 0.10595 0.46143-0.06494 0.82373-0.35205 0.36572-0.28711 0.54688-0.71777 0.12646-0.32471 0.12646-0.65967 0-0.33496-0.12646-0.64258-0.18115-0.43408-0.54004-0.72119-0.35547-0.28711-0.8169-0.35889-0.28027-0.04102-0.54687 0z m0.5332 1.20313q0.18115 0.08545 0.2666 0.2666 0.02734 0.05811 0.04102 0.09912 0.01367 0.04102 0.01367 0.15381 0 0.11279-0.01367 0.15381-0.01367 0.04102-0.04102 0.09912-0.09912 0.18115-0.2666 0.28027-0.08545 0.04102-0.25293 0.04102-0.16748 0-0.25293-0.04102-0.16748-0.09912-0.2666-0.28027-0.02734-0.05811-0.04102-0.09912-0.01367-0.04102-0.01367-0.15381 0-0.11279 0.01367-0.15381 0.01367-0.04102 0.04102-0.09912 0.11279-0.22217 0.36572-0.30762 0.04102-0.01367 0.18115-0.00683 0.14014 0.00684 0.22559 0.04785z"
+                  fill="#16A34A"
+                ></path>
+              </svg>
+              <div
+                data-pencil-name="长连接"
+                style='box-sizing: border-box; color: #6B7280; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+              >
+                实时进度已连接
+              </div>
+            </div>
+          </div>
+          <div
+            data-pencil-name="表头"
+            style="align-items: center; background-color: #F7F8FA; border-color: #E3E6EB; border-style: solid; border-width: 0px 0px 1px 0px; box-sizing: content-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 16px; height: 31.5px; justify-content: flex-start; margin: 0px 0px -0.5px 0px; padding: 8px 16px; width: 1280px"
+          >
+            <div
+              data-pencil-name="列 设计库"
+              style='box-sizing: border-box; color: #9AA1AC; flex-shrink: 0; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; width: 176px'
+            >
+              设计库
+            </div>
+            <div
+              data-pencil-name="列 任务"
+              style='box-sizing: border-box; color: #9AA1AC; flex-shrink: 0; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; width: 112px'
+            >
+              任务
+            </div>
+            <div
+              data-pencil-name="列 进度"
+              style='box-sizing: border-box; color: #9AA1AC; flex: 1 1 0; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left'
+            >
+              进度（数据 ─ 模型 ─ 房间 ─ 水位）末段亮起才算追平
+            </div>
+            <div
+              data-pencil-name="列 操作"
+              style='box-sizing: border-box; color: #9AA1AC; flex-shrink: 0; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; width: 184px'
+            >
+              操作
+            </div>
+          </div>
+          <div
+            data-pencil-name="任务行"
+            style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: column; flex-shrink: 0; gap: 0px; height: fit-content; justify-content: flex-start; width: 100%"
+          >
+            <div
+              data-pencil-name="行 7997 · 已完成 · 展开明细"
+              style="align-items: flex-start; border-color: #E3E6EB; border-style: solid; border-width: 0px 0px 1px 0px; box-sizing: content-box; display: flex; flex-direction: column; flex-shrink: 0; gap: 0px; height: 476.5px; justify-content: flex-start; margin: 0px 0px -0.5px 0px; width: 1280px"
+            >
+              <div
+                data-pencil-name="主行"
+                style="align-items: center; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 16px; height: fit-content; justify-content: flex-start; padding: 12px 16px; width: 100%"
+              >
+                <div
+                  data-pencil-name="库"
+                  style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: column; flex-shrink: 0; gap: 2px; height: fit-content; justify-content: flex-start; width: 176px"
+                >
+                  <div
+                    data-pencil-name="号"
+                    style="align-items: center; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 8px; height: fit-content; justify-content: flex-start; width: fit-content"
+                  >
+                    <div
+                      data-pencil-name="dbnum"
+                      style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 15px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                    >
+                      7997
+                    </div>
+                    <div
+                      data-pencil-name="类型"
+                      style="align-items: flex-start; background-color: #F7F8FA; border-radius: 4px; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 0px; height: fit-content; justify-content: flex-start; outline-offset: -0.5px; outline: 1px solid #E3E6EB; padding: 2px 6px; width: fit-content"
+                    >
+                      <div
+                        data-pencil-name="文字"
+                        style='box-sizing: border-box; color: #6B7280; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 10px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                      >
+                        DESI
+                      </div>
+                    </div>
+                  </div>
+                  <div
+                    data-pencil-name="文件"
+                    style='box-sizing: border-box; color: #9AA1AC; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                  >
+                    ams7997_0001
+                  </div>
+                </div>
+                <div
+                  data-pencil-name="任务形态"
+                  style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 0px; height: fit-content; justify-content: flex-start; width: 112px"
+                >
+                  <div
+                    data-pencil-name="徽标"
+                    style="align-items: flex-start; background-color: #E8F0FE; border-radius: 4px; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 0px; height: fit-content; justify-content: flex-start; padding: 3px 8px; width: fit-content"
+                  >
+                    <div
+                      data-pencil-name="文字"
+                      style='box-sizing: border-box; color: #2F6FED; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 500; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                    >
+                      dbnum 任务
+                    </div>
+                  </div>
+                </div>
+                <div
+                  data-pencil-name="进度"
+                  style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: row; flex: 1 1 0; gap: 10px; height: fit-content; justify-content: flex-start"
+                >
+                  <div
+                    data-pencil-name="段 数据 ✓ 3 次保存"
+                    style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: column; flex: 1 1 0; gap: 6px; height: fit-content; justify-content: flex-start"
+                  >
+                    <div
+                      data-pencil-name="条"
+                      style="background-color: #16A34A; border-radius: 3px; box-sizing: border-box; flex-shrink: 0; height: 5px; width: 100%"
+                    ></div>
+                    <div
+                      data-pencil-name="说明"
+                      style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: 15px; text-align: left; width: 100%'
+                    >
+                      数据 ✓ 3 次保存
+                    </div>
+                  </div>
+                  <div
+                    data-pencil-name="段 模型 ✓ 12 根"
+                    style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: column; flex: 1 1 0; gap: 6px; height: fit-content; justify-content: flex-start"
+                  >
+                    <div
+                      data-pencil-name="条"
+                      style="background-color: #16A34A; box-sizing: border-box; flex-shrink: 0; height: 5px; width: 100%"
+                    ></div>
+                    <div
+                      data-pencil-name="说明"
+                      style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: 15px; text-align: left; width: 100%'
+                    >
+                      模型 ✓ 12 根
+                    </div>
+                  </div>
+                  <div
+                    data-pencil-name="段 房间 ✓ 3 间"
+                    style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: column; flex: 1 1 0; gap: 6px; height: fit-content; justify-content: flex-start"
+                  >
+                    <div
+                      data-pencil-name="条"
+                      style="background-color: #16A34A; border-radius: 3px; box-sizing: border-box; flex-shrink: 0; height: 5px; width: 100%"
+                    ></div>
+                    <div
+                      data-pencil-name="说明"
+                      style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: 15px; text-align: left; width: 100%'
+                    >
+                      房间 ✓ 3 间 · 搬间 2 件
+                    </div>
+                  </div>
+                  <div
+                    data-pencil-name="段 水位 ✓"
+                    style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: column; flex: 1 1 0; gap: 6px; height: fit-content; justify-content: flex-start"
+                  >
+                    <div
+                      data-pencil-name="条"
+                      style="background-color: #16A34A; border-radius: 3px; box-sizing: border-box; flex-shrink: 0; height: 5px; width: 100%"
+                    ></div>
+                    <div
+                      data-pencil-name="说明"
+                      style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: 15px; text-align: left; width: 100%'
+                    >
+                      水位 ✓ 推进至 08-07 14:33
+                    </div>
+                  </div>
+                </div>
+                <div
+                  data-pencil-name="操作"
+                  style="align-items: flex-end; box-sizing: border-box; display: flex; flex-direction: column; flex-shrink: 0; gap: 4px; height: fit-content; justify-content: flex-start; width: 184px"
+                >
+                  <div
+                    data-pencil-name="标 已完成"
+                    style="align-items: center; background-color: #F7F8FA; border-radius: 6px; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 0px; height: fit-content; justify-content: flex-start; outline-offset: -0.5px; outline: 1px solid #E3E6EB; padding: 7px 14px; width: fit-content"
+                  >
+                    <div
+                      data-pencil-name="文字"
+                      style='box-sizing: border-box; color: #16A34A; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                    >
+                      已完成
+                    </div>
+                  </div>
+                  <div
+                    data-pencil-name="提示"
+                    style='box-sizing: border-box; color: #9AA1AC; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 10px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                  >
+                    开跑 10:07 · 结束 10:12 · 用时 04:38
+                  </div>
+                </div>
+              </div>
+              <div
+                data-pencil-name="行内明细"
+                style="align-items: flex-start; background-color: #F7F8FA; border-color: #E3E6EB; border-style: solid; border-width: 1px 0px 0px 0px; box-sizing: content-box; display: flex; flex-direction: column; flex-shrink: 0; gap: 14px; height: 403.5px; justify-content: flex-start; margin: -0.5px 0px 0px 0px; padding: 16px 20px; width: 1280px"
+              >
+                <div
+                  data-pencil-name="段 数据"
+                  style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: column; flex-shrink: 0; gap: 8px; height: fit-content; justify-content: flex-start; width: 100%"
+                >
+                  <div
+                    data-pencil-name="段头"
+                    style="align-items: center; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 10px; height: fit-content; justify-content: flex-start; width: fit-content"
+                  >
+                    <div
+                      data-pencil-name="色条"
+                      style="background-color: #16A34A; border-radius: 2px; box-sizing: border-box; flex-shrink: 0; height: 16px; width: 4px"
+                    ></div>
+                    <div
+                      data-pencil-name="段名"
+                      style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                    >
+                      数据
+                    </div>
+                    <div
+                      data-pencil-name="摘要"
+                      style='box-sizing: border-box; color: #6B7280; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                    >
+                      保存窗口 08-01 09:12 → 08-07 14:33 · 已应用 · 水位推进至 08-07 14:33
+                    </div>
+                  </div>
+                  <div
+                    data-pencil-name="段体"
+                    style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: column; flex-shrink: 0; gap: 8px; height: fit-content; justify-content: flex-start; padding: 0px 0px 0px 14px; width: 100%"
+                  >
+                    <div
+                      data-pencil-name="增删改三数"
+                      style="align-items: center; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 28px; height: fit-content; justify-content: flex-start; width: fit-content"
+                    >
+                      <div
+                        data-pencil-name="数 新增"
+                        style="align-items: center; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 6px; height: fit-content; justify-content: flex-start; width: fit-content"
+                      >
+                        <div
+                          data-pencil-name="值"
+                          style='box-sizing: border-box; color: #16A34A; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 20px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                        >
+                          +18
+                        </div>
+                        <div
+                          data-pencil-name="标"
+                          style='box-sizing: border-box; color: #9AA1AC; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                        >
+                          新增
+                        </div>
+                      </div>
+                      <div
+                        data-pencil-name="数 修改"
+                        style="align-items: center; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 6px; height: fit-content; justify-content: flex-start; width: fit-content"
+                      >
+                        <div
+                          data-pencil-name="值"
+                          style='box-sizing: border-box; color: #2F6FED; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 20px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                        >
+                          ~64
+                        </div>
+                        <div
+                          data-pencil-name="标"
+                          style='box-sizing: border-box; color: #9AA1AC; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                        >
+                          修改
+                        </div>
+                      </div>
+                      <div
+                        data-pencil-name="数 删除"
+                        style="align-items: center; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 6px; height: fit-content; justify-content: flex-start; width: fit-content"
+                      >
+                        <div
+                          data-pencil-name="值"
+                          style='box-sizing: border-box; color: #DC2626; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 20px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                        >
+                          −3
+                        </div>
+                        <div
+                          data-pencil-name="标"
+                          style='box-sizing: border-box; color: #9AA1AC; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                        >
+                          删除
+                        </div>
+                      </div>
+                      <div
+                        data-pencil-name="合计"
+                        style='box-sizing: border-box; color: #9AA1AC; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                      >
+                        共 85 项变化 · 预览时 82，差的 3 项来自并入保存
+                      </div>
+                    </div>
+                    <div
+                      data-pencil-name="分布条"
+                      style="align-items: flex-start; border-radius: 3px; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 0px; height: 6px; justify-content: flex-start; overflow: hidden; width: 560px"
+                    >
+                      <div
+                        data-pencil-name="新增段"
+                        style="background-color: #16A34A; box-sizing: border-box; flex-shrink: 0; height: 6px; width: 119px"
+                      ></div>
+                      <div
+                        data-pencil-name="修改段"
+                        style="background-color: #2F6FED; box-sizing: border-box; flex-shrink: 0; height: 6px; width: 421px"
+                      ></div>
+                      <div
+                        data-pencil-name="删除段"
+                        style="background-color: #DC2626; box-sizing: border-box; flex-shrink: 0; height: 6px; width: 20px"
+                      ></div>
+                    </div>
+                    <div
+                      data-pencil-name="并入"
+                      style='box-sizing: border-box; color: #9AA1AC; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                    >
+                      预览后并入 3 次保存（08-07 14:21 / 14:27 / 14:33）
+                    </div>
+                  </div>
+                </div>
+                <div
+                  data-pencil-name="段 模型"
+                  style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: column; flex-shrink: 0; gap: 8px; height: fit-content; justify-content: flex-start; width: 100%"
+                >
+                  <div
+                    data-pencil-name="段头"
+                    style="align-items: center; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 10px; height: fit-content; justify-content: flex-start; width: fit-content"
+                  >
+                    <div
+                      data-pencil-name="色条"
+                      style="background-color: #16A34A; border-radius: 2px; box-sizing: border-box; flex-shrink: 0; height: 16px; width: 4px"
+                    ></div>
+                    <div
+                      data-pencil-name="段名"
+                      style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                    >
+                      模型
+                    </div>
+                    <div
+                      data-pencil-name="摘要"
+                      style='box-sizing: border-box; color: #6B7280; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                    >
+                      12 / 12 个交付单元已生成
+                    </div>
+                  </div>
+                  <div
+                    data-pencil-name="段体"
+                    style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: column; flex-shrink: 0; gap: 8px; height: fit-content; justify-content: flex-start; padding: 0px 0px 0px 14px; width: 100%"
+                  >
+                    <div
+                      data-pencil-name="省力注"
+                      style='box-sizing: border-box; color: #9AA1AC; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                    >
+                      元数据门省下 4 根（只改 NAME / DESC 一类，不整根重算） · 刚体前移 2
+                      根（只动方位，网格未重算）
+                    </div>
+                  </div>
+                </div>
+                <div
+                  data-pencil-name="段 房间"
+                  style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: column; flex-shrink: 0; gap: 8px; height: fit-content; justify-content: flex-start; width: 100%"
+                >
+                  <div
+                    data-pencil-name="段头"
+                    style="align-items: center; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 10px; height: fit-content; justify-content: flex-start; width: fit-content"
+                  >
+                    <div
+                      data-pencil-name="色条"
+                      style="background-color: #16A34A; border-radius: 2px; box-sizing: border-box; flex-shrink: 0; height: 16px; width: 4px"
+                    ></div>
+                    <div
+                      data-pencil-name="段名"
+                      style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                    >
+                      房间
+                    </div>
+                    <div
+                      data-pencil-name="摘要"
+                      style='box-sizing: border-box; color: #6B7280; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                    >
+                      重算 2 块面板 + 27 个构件 · 受影响 3 间 · 搬间 2 件
+                    </div>
+                  </div>
+                  <div
+                    data-pencil-name="段体"
+                    style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: column; flex-shrink: 0; gap: 8px; height: fit-content; justify-content: flex-start; padding: 0px 0px 0px 14px; width: 100%"
+                  >
+                    <div
+                      data-pencil-name="房间行组"
+                      style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: column; flex-shrink: 0; gap: 4px; height: fit-content; justify-content: flex-start; width: 100%"
+                    >
+                      <div
+                        data-pencil-name="房间 /R-101"
+                        style="align-items: center; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 12px; height: fit-content; justify-content: flex-start; width: fit-content"
+                      >
+                        <div
+                          data-pencil-name="名格"
+                          style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 0px; height: fit-content; justify-content: flex-start; width: 90px"
+                        >
+                          <div
+                            data-pencil-name="房间号"
+                            style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                          >
+                            /R-101
+                          </div>
+                        </div>
+                        <div
+                          data-pencil-name="迁移格"
+                          style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 0px; height: fit-content; justify-content: flex-start; width: 64px"
+                        >
+                          <div
+                            data-pencil-name="迁移"
+                            style='box-sizing: border-box; color: #DC2626; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                          >
+                            迁出 1
+                          </div>
+                        </div>
+                        <div
+                          data-pencil-name="重算数"
+                          style='box-sizing: border-box; color: #9AA1AC; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                        >
+                          重算 8 个构件
+                        </div>
+                      </div>
+                      <div
+                        data-pencil-name="房间 /R-102"
+                        style="align-items: center; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 12px; height: fit-content; justify-content: flex-start; width: fit-content"
+                      >
+                        <div
+                          data-pencil-name="名格"
+                          style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 0px; height: fit-content; justify-content: flex-start; width: 90px"
+                        >
+                          <div
+                            data-pencil-name="房间号"
+                            style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                          >
+                            /R-102
+                          </div>
+                        </div>
+                        <div
+                          data-pencil-name="迁移格"
+                          style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 0px; height: fit-content; justify-content: flex-start; width: 64px"
+                        >
+                          <div
+                            data-pencil-name="迁移"
+                            style='box-sizing: border-box; color: #DC2626; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                          >
+                            迁出 1
+                          </div>
+                        </div>
+                        <div
+                          data-pencil-name="重算数"
+                          style='box-sizing: border-box; color: #9AA1AC; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                        >
+                          重算 12 个构件
+                        </div>
+                      </div>
+                      <div
+                        data-pencil-name="房间 /R-205"
+                        style="align-items: center; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 12px; height: fit-content; justify-content: flex-start; width: fit-content"
+                      >
+                        <div
+                          data-pencil-name="名格"
+                          style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 0px; height: fit-content; justify-content: flex-start; width: 90px"
+                        >
+                          <div
+                            data-pencil-name="房间号"
+                            style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                          >
+                            /R-205
+                          </div>
+                        </div>
+                        <div
+                          data-pencil-name="迁移格"
+                          style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 0px; height: fit-content; justify-content: flex-start; width: 64px"
+                        >
+                          <div
+                            data-pencil-name="迁移"
+                            style='box-sizing: border-box; color: #16A34A; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                          >
+                            迁入 2
+                          </div>
+                        </div>
+                        <div
+                          data-pencil-name="重算数"
+                          style='box-sizing: border-box; color: #9AA1AC; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                        >
+                          重算 7 个构件
+                        </div>
+                      </div>
+                    </div>
+                    <div
+                      data-pencil-name="搬间明细"
+                      style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: column; flex-shrink: 0; gap: 4px; height: fit-content; justify-content: flex-start; padding: 6px 0px 0px 0px; width: 100%"
+                    >
+                      <div
+                        data-pencil-name="搬间标"
+                        style='box-sizing: border-box; color: #9AA1AC; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                      >
+                        搬间明细
+                      </div>
+                      <div
+                        data-pencil-name="搬间 EQUI /P-1201A"
+                        style="align-items: center; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 8px; height: fit-content; justify-content: flex-start; width: fit-content"
+                      >
+                        <svg
+                          data-pencil-name="箭头"
+                          data-icon-name="move-right"
+                          data-icon-set="lucide"
+                          viewBox="0 0 13.99993896484375 14"
+                          preserveAspectRatio="xMidYMid meet"
+                          xmlns="http://www.w3.org/2000/svg"
+                          style="box-sizing: border-box; flex-shrink: 0; height: 13px; width: 13px"
+                        >
+                          <path
+                            d="M10.40088 4.10156q-0.18115 0.02734-0.32129 0.16748-0.11279 0.11279-0.14697 0.28028-0.03418 0.16748 0.0205 0.32129 0.02734 0.07178 0.14014 0.19824 0.11279 0.12646 0.61524 0.61523 0.70068 0.71436 0.70068 0.72803 0 0.01367-5.20557 0.01367l-5.19531 0-0.08545 0.04102q-0.22217 0.11279-0.30078 0.33838-0.0752 0.22217 0.00684 0.43408 0.05811 0.0957 0.14013 0.18115 0.08545 0.08203 0.18457 0.12646l0.09571 0.02735 5.18164 0q5.17822 0 5.17822 0.01367 0 0.01367-0.70068 0.72803-0.50244 0.48877-0.61524 0.61523-0.11279 0.12646-0.14014 0.19824-0.05469 0.15381-0.0205 0.32129 0.03418 0.16748 0.14697 0.28028 0.18115 0.18115 0.42041 0.18115l0.02734 0q0.12647 0 0.19825-0.04102 0.0957-0.05811 0.34863-0.29394 0.18115-0.18457 0.82715-0.81348l0.16748-0.18115q1.23047-1.23389 1.27148-1.30225 0.07178-0.12646 0.07178-0.28027 0-0.15381-0.07178-0.28027-0.04102-0.08203-1.2749-1.30567-1.23047-1.22705-1.30225-1.26123-0.06836-0.0376-0.23584-0.06494-0.04102 0-0.12646 0.01367z"
+                            fill="#9AA1AC"
+                          ></path>
+                        </svg>
+                        <div
+                          data-pencil-name="元件格"
+                          style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 0px; height: fit-content; justify-content: flex-start; width: 150px"
+                        >
+                          <div
+                            data-pencil-name="元件"
+                            style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                          >
+                            EQUI /P-1201A
+                          </div>
+                        </div>
+                        <div
+                          data-pencil-name="去向"
+                          style='box-sizing: border-box; color: #6B7280; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                        >
+                          /R-101 → /R-205
+                        </div>
+                      </div>
+                      <div
+                        data-pencil-name="搬间 PIPE /100-B2"
+                        style="align-items: center; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 8px; height: fit-content; justify-content: flex-start; width: fit-content"
+                      >
+                        <svg
+                          data-pencil-name="箭头"
+                          data-icon-name="move-right"
+                          data-icon-set="lucide"
+                          viewBox="0 0 13.99993896484375 14"
+                          preserveAspectRatio="xMidYMid meet"
+                          xmlns="http://www.w3.org/2000/svg"
+                          style="box-sizing: border-box; flex-shrink: 0; height: 13px; width: 13px"
+                        >
+                          <path
+                            d="M10.40088 4.10156q-0.18115 0.02734-0.32129 0.16748-0.11279 0.11279-0.14697 0.28028-0.03418 0.16748 0.0205 0.32129 0.02734 0.07178 0.14014 0.19824 0.11279 0.12646 0.61524 0.61523 0.70068 0.71436 0.70068 0.72803 0 0.01367-5.20557 0.01367l-5.19531 0-0.08545 0.04102q-0.22217 0.11279-0.30078 0.33838-0.0752 0.22217 0.00684 0.43408 0.05811 0.0957 0.14013 0.18115 0.08545 0.08203 0.18457 0.12646l0.09571 0.02735 5.18164 0q5.17822 0 5.17822 0.01367 0 0.01367-0.70068 0.72803-0.50244 0.48877-0.61524 0.61523-0.11279 0.12646-0.14014 0.19824-0.05469 0.15381-0.0205 0.32129 0.03418 0.16748 0.14697 0.28028 0.18115 0.18115 0.42041 0.18115l0.02734 0q0.12647 0 0.19825-0.04102 0.0957-0.05811 0.34863-0.29394 0.18115-0.18457 0.82715-0.81348l0.16748-0.18115q1.23047-1.23389 1.27148-1.30225 0.07178-0.12646 0.07178-0.28027 0-0.15381-0.07178-0.28027-0.04102-0.08203-1.2749-1.30567-1.23047-1.22705-1.30225-1.26123-0.06836-0.0376-0.23584-0.06494-0.04102 0-0.12646 0.01367z"
+                            fill="#9AA1AC"
+                          ></path>
+                        </svg>
+                        <div
+                          data-pencil-name="元件格"
+                          style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 0px; height: fit-content; justify-content: flex-start; width: 150px"
+                        >
+                          <div
+                            data-pencil-name="元件"
+                            style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                          >
+                            PIPE /100-B2
+                          </div>
+                        </div>
+                        <div
+                          data-pencil-name="去向"
+                          style='box-sizing: border-box; color: #6B7280; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                        >
+                          /R-102 → /R-205
+                        </div>
+                      </div>
+                    </div>
+                    <div
+                      data-pencil-name="房间尾注"
+                      style='box-sizing: border-box; color: #9AA1AC; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                    >
+                      其余 25 个构件重算后归属不变 · 房间随任务收尾就地重算，读实时几何
+                    </div>
+                  </div>
+                </div>
+                <div
+                  data-pencil-name="段 水位"
+                  style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: column; flex-shrink: 0; gap: 8px; height: fit-content; justify-content: flex-start; width: 100%"
+                >
+                  <div
+                    data-pencil-name="段头"
+                    style="align-items: center; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 10px; height: fit-content; justify-content: flex-start; width: fit-content"
+                  >
+                    <div
+                      data-pencil-name="色条"
+                      style="background-color: #16A34A; border-radius: 2px; box-sizing: border-box; flex-shrink: 0; height: 16px; width: 4px"
+                    ></div>
+                    <div
+                      data-pencil-name="段名"
+                      style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                    >
+                      水位
+                    </div>
+                    <div
+                      data-pencil-name="摘要"
+                      style='box-sizing: border-box; color: #6B7280; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                    >
+                      数据水位推进至 08-07 14:33 · 模型水位已追平 · 库判定：一致
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div
+              data-pencil-name="行 7999"
+              style="align-items: flex-start; border-color: #E3E6EB; border-style: solid; border-width: 0px 0px 1px 0px; box-sizing: content-box; display: flex; flex-direction: column; flex-shrink: 0; gap: 0px; height: 72.5px; justify-content: flex-start; margin: 0px 0px -0.5px 0px; width: 1280px"
+            >
+              <div
+                data-pencil-name="主行"
+                style="align-items: center; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 16px; height: fit-content; justify-content: flex-start; padding: 12px 16px; width: 100%"
+              >
+                <div
+                  data-pencil-name="库"
+                  style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: column; flex-shrink: 0; gap: 2px; height: fit-content; justify-content: flex-start; width: 176px"
+                >
+                  <div
+                    data-pencil-name="号"
+                    style="align-items: center; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 8px; height: fit-content; justify-content: flex-start; width: fit-content"
+                  >
+                    <div
+                      data-pencil-name="dbnum"
+                      style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 15px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                    >
+                      7999
+                    </div>
+                    <div
+                      data-pencil-name="类型"
+                      style="align-items: flex-start; background-color: #F7F8FA; border-radius: 4px; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 0px; height: fit-content; justify-content: flex-start; outline-offset: -0.5px; outline: 1px solid #E3E6EB; padding: 2px 6px; width: fit-content"
+                    >
+                      <div
+                        data-pencil-name="文字"
+                        style='box-sizing: border-box; color: #6B7280; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 10px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                      >
+                        DESI
+                      </div>
+                    </div>
+                  </div>
+                  <div
+                    data-pencil-name="文件"
+                    style='box-sizing: border-box; color: #9AA1AC; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                  >
+                    ams7999_0001
+                  </div>
+                </div>
+                <div
+                  data-pencil-name="任务形态"
+                  style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 0px; height: fit-content; justify-content: flex-start; width: 112px"
+                >
+                  <div
+                    data-pencil-name="徽标"
+                    style="align-items: flex-start; background-color: #E8F0FE; border-radius: 4px; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 0px; height: fit-content; justify-content: flex-start; padding: 3px 8px; width: fit-content"
+                  >
+                    <div
+                      data-pencil-name="文字"
+                      style='box-sizing: border-box; color: #2F6FED; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 500; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                    >
+                      dbnum 任务
+                    </div>
+                  </div>
+                </div>
+                <div
+                  data-pencil-name="进度"
+                  style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: row; flex: 1 1 0; gap: 10px; height: fit-content; justify-content: flex-start"
+                >
+                  <div
+                    data-pencil-name="段 数据 2 次保存待跑"
+                    style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: column; flex: 1 1 0; gap: 6px; height: fit-content; justify-content: flex-start"
+                  >
+                    <div
+                      data-pencil-name="条"
+                      style="background-color: #E5E7EB; border-radius: 3px; box-sizing: border-box; flex-shrink: 0; height: 5px; width: 100%"
+                    ></div>
+                    <div
+                      data-pencil-name="说明"
+                      style='box-sizing: border-box; color: #6B7280; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: 15px; text-align: left; width: 100%'
+                    >
+                      数据 2 次保存待跑
+                    </div>
+                  </div>
+                  <div
+                    data-pencil-name="段 模型 —"
+                    style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: column; flex: 1 1 0; gap: 6px; height: fit-content; justify-content: flex-start"
+                  >
+                    <div
+                      data-pencil-name="条"
+                      style="background-color: #E5E7EB; border-radius: 3px; box-sizing: border-box; flex-shrink: 0; height: 5px; width: 100%"
+                    ></div>
+                    <div
+                      data-pencil-name="说明"
+                      style='box-sizing: border-box; color: #6B7280; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: 15px; text-align: left; width: 100%'
+                    >
+                      模型 —
+                    </div>
+                  </div>
+                  <div
+                    data-pencil-name="段 房间 —"
+                    style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: column; flex: 1 1 0; gap: 6px; height: fit-content; justify-content: flex-start"
+                  >
+                    <div
+                      data-pencil-name="条"
+                      style="background-color: #E5E7EB; border-radius: 3px; box-sizing: border-box; flex-shrink: 0; height: 5px; width: 100%"
+                    ></div>
+                    <div
+                      data-pencil-name="说明"
+                      style='box-sizing: border-box; color: #6B7280; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: 15px; text-align: left; width: 100%'
+                    >
+                      房间 —
+                    </div>
+                  </div>
+                  <div
+                    data-pencil-name="段 水位 —"
+                    style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: column; flex: 1 1 0; gap: 6px; height: fit-content; justify-content: flex-start"
+                  >
+                    <div
+                      data-pencil-name="条"
+                      style="background-color: #E5E7EB; border-radius: 3px; box-sizing: border-box; flex-shrink: 0; height: 5px; width: 100%"
+                    ></div>
+                    <div
+                      data-pencil-name="说明"
+                      style='box-sizing: border-box; color: #6B7280; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: 15px; text-align: left; width: 100%'
+                    >
+                      水位 —
+                    </div>
+                  </div>
+                </div>
+                <div
+                  data-pencil-name="操作"
+                  style="align-items: flex-end; box-sizing: border-box; display: flex; flex-direction: column; flex-shrink: 0; gap: 4px; height: fit-content; justify-content: flex-start; width: 184px"
+                >
+                  <div
+                    data-pencil-name="按钮 已在队列第 2 位"
+                    style="align-items: center; background-color: #F7F8FA; border-radius: 6px; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 0px; height: fit-content; justify-content: flex-start; outline-offset: -0.5px; outline: 1px solid #E3E6EB; padding: 7px 14px; width: fit-content"
+                  >
+                    <div
+                      data-pencil-name="文字"
+                      style='box-sizing: border-box; color: #9AA1AC; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                    >
+                      已在队列第 2 位
+                    </div>
+                  </div>
+                  <div
+                    data-pencil-name="提示"
+                    style='box-sizing: border-box; color: #9AA1AC; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 10px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: 14px; text-align: right; width: 100%'
+                  >
+                    提前执行不会插队
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div
+        data-pencil-name="更新任务详情 · 段形态表"
+        style="align-items: flex-start; background-color: #F4F6F8; box-sizing: border-box; display: flex; flex-direction: column; gap: 16px; height: fit-content; justify-content: flex-start; left: 1440px; padding: 40px; position: absolute; top: 0px; width: 1200px"
+      >
+        <div
+          data-pencil-name="标题区"
+          style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: column; flex-shrink: 0; gap: 6px; height: fit-content; justify-content: flex-start; width: 100%"
+        >
+          <div
+            data-pencil-name="标题"
+            style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 22px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+          >
+            更新任务详情 · 段形态表（数据 / 房间）
+          </div>
+          <div
+            data-pencil-name="副标题"
+            style='box-sizing: border-box; color: #6B7280; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 13px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: 21px; text-align: left; width: 100%'
+          >
+            同一块行内明细在几种真实处境下各画什么。硬规矩不变：每一格都指得到契约字段；服务端不给的整格不画，不猜、不冒充。
+          </div>
+        </div>
+        <div
+          data-pencil-name="卡 数据段"
+          style="align-items: flex-start; background-color: #FFFFFF; border-radius: 10px; box-sizing: border-box; display: flex; flex-direction: column; flex-shrink: 0; gap: 10px; height: fit-content; justify-content: flex-start; outline-offset: -0.5px; outline: 1px solid #E3E6EB; padding: 16px; width: 100%"
+        >
+          <div
+            data-pencil-name="卡头"
+            style="align-items: center; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 10px; height: fit-content; justify-content: flex-start; width: fit-content"
+          >
+            <div
+              data-pencil-name="段签"
+              style="align-items: flex-start; background-color: #F7F8FA; border-radius: 3px; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 0px; height: fit-content; justify-content: flex-start; padding: 3px 8px; width: fit-content"
+            >
+              <div
+                data-pencil-name="签文"
+                style='box-sizing: border-box; color: #6B7280; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+              >
+                数据段
+              </div>
+            </div>
+            <div
+              data-pencil-name="处境"
+              style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 13px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+            >
+              老服务端只给总数，增 / 删 / 改分解字段缺席
+            </div>
+          </div>
+          <div
+            data-pencil-name="示例"
+            style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+          >
+            85 项变化（预览时 82）
+          </div>
+          <div
+            data-pencil-name="规矩"
+            style='box-sizing: border-box; color: #9AA1AC; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; width: 100%'
+          >
+            三个大数与分布条整组不画，只留总数一句；不许把缺席的 0 / 0 / 0 画成「无变化」。
+          </div>
+        </div>
+        <div
+          data-pencil-name="卡 房间段"
+          style="align-items: flex-start; background-color: #FFFFFF; border-radius: 10px; box-sizing: border-box; display: flex; flex-direction: column; flex-shrink: 0; gap: 10px; height: fit-content; justify-content: flex-start; outline-offset: -0.5px; outline: 1px solid #E3E6EB; padding: 16px; width: 100%"
+        >
+          <div
+            data-pencil-name="卡头"
+            style="align-items: center; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 10px; height: fit-content; justify-content: flex-start; width: fit-content"
+          >
+            <div
+              data-pencil-name="段签"
+              style="align-items: flex-start; background-color: #F7F8FA; border-radius: 3px; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 0px; height: fit-content; justify-content: flex-start; padding: 3px 8px; width: fit-content"
+            >
+              <div
+                data-pencil-name="签文"
+                style='box-sizing: border-box; color: #6B7280; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+              >
+                房间段
+              </div>
+            </div>
+            <div
+              data-pencil-name="处境"
+              style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 13px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+            >
+              本任务无房间工作
+            </div>
+          </div>
+          <div
+            data-pencil-name="示例"
+            style='box-sizing: border-box; color: #6B7280; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+          >
+            房间 —（本任务未触及带房间归属的构件）
+          </div>
+          <div
+            data-pencil-name="规矩"
+            style='box-sizing: border-box; color: #9AA1AC; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; width: 100%'
+          >
+            段头一句带过，段体不画；行上四段里房间段照样亮✓（无工作也是成功），不许画成未知态。
+          </div>
+        </div>
+        <div
+          data-pencil-name="卡 房间段"
+          style="align-items: flex-start; background-color: #FFFFFF; border-radius: 10px; box-sizing: border-box; display: flex; flex-direction: column; flex-shrink: 0; gap: 10px; height: fit-content; justify-content: flex-start; outline-offset: -0.5px; outline: 1px solid #E3E6EB; padding: 16px; width: 100%"
+        >
+          <div
+            data-pencil-name="卡头"
+            style="align-items: center; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 10px; height: fit-content; justify-content: flex-start; width: fit-content"
+          >
+            <div
+              data-pencil-name="段签"
+              style="align-items: flex-start; background-color: #F7F8FA; border-radius: 3px; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 0px; height: fit-content; justify-content: flex-start; padding: 3px 8px; width: fit-content"
+            >
+              <div
+                data-pencil-name="签文"
+                style='box-sizing: border-box; color: #6B7280; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+              >
+                房间段
+              </div>
+            </div>
+            <div
+              data-pencil-name="处境"
+              style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 13px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+            >
+              重算失败 · 留痕不排队（G2）
+            </div>
+          </div>
+          <div
+            data-pencil-name="失败框"
+            style="align-items: flex-start; background-color: #FDECEC; border-radius: 6px; box-sizing: border-box; display: flex; flex-direction: column; flex-shrink: 0; gap: 8px; height: fit-content; justify-content: flex-start; padding: 12px 14px; width: 100%"
+          >
+            <div
+              data-pencil-name="失败头"
+              style="align-items: center; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 8px; height: fit-content; justify-content: flex-start; width: fit-content"
+            >
+              <svg
+                data-pencil-name="叉"
+                data-icon-name="circle-x"
+                data-icon-set="lucide"
+                viewBox="0 0 13.99993896484375 14"
+                preserveAspectRatio="xMidYMid meet"
+                xmlns="http://www.w3.org/2000/svg"
+                style="box-sizing: border-box; flex-shrink: 0; height: 14px; width: 14px"
+              >
+                <path
+                  d="M6.69238 0.60156q-1.16211 0.04102-2.22851 0.50586-1.06299 0.46143-1.90381 1.26807-0.8374 0.80322-1.34326 1.85254-0.48877 1.0083-0.60157 2.15674-0.02734 0.19482-0.02734 0.61523 0 0.42041 0.02734 0.61523 0.11279 1.14844 0.60157 2.15674 0.65967 1.40137 1.89697 2.33789 1.24072 0.93652 2.75146 1.20313 0.5332 0.09912 1.13477 0.09912 0.75537 0 1.43213-0.15381 0.68018-0.15381 1.35351-0.4751 1.26123-0.61865 2.16358-1.70215 0.90234-1.0835 1.25439-2.44384 0.29395-1.11768 0.18116-2.25244-0.11279-1.13477-0.60157-2.17041-0.58789-1.20313-1.62011-2.08497-1.02881-0.88184-2.31397-1.2749-1.0083-0.30762-2.15674-0.25293z m0.96729 1.18946q1.07666 0.14014 1.99267 0.68017 0.91602 0.54004 1.56201 1.4082 0.82715 1.104 1.00831 2.54639 0.01367 0.16748 0.01367 0.57422 0 0.40674-0.01367 0.57422-0.14014 1.16211-0.7212 2.12939-0.58105 0.96387-1.53466 1.62354-0.4751 0.33496-1.04932 0.56055-0.57422 0.22217-1.18945 0.30761-0.25293 0.04102-0.72803 0.04102-0.4751 0-0.72803-0.04102-1.07666-0.15381-1.95849-0.68701-0.88184-0.5332-1.52784-1.3877-0.82715-1.104-1.0083-2.54638-0.01367-0.16748-0.01367-0.57422 0-0.40674 0.01367-0.57422 0.14014-1.12109 0.66993-2.05078 0.5332-0.92969 1.43212-1.58936 0.54346-0.40674 1.20655-0.66992 0.6665-0.2666 1.32617-0.3247l0.25293-0.02735q0.0957-0.01367 0.4751 0 0.37939 0.01367 0.51953 0.02735z m-2.56348 2.89843q-0.25293 0.08545-0.37939 0.30762-0.04102 0.08545-0.04102 0.25293 0 0.16748 0.04785 0.25293 0.05127 0.08203 0.75196 0.79639l0.69726 0.70068-0.69726 0.70068q-0.70068 0.71436-0.75196 0.79981-0.04785 0.08203-0.04785 0.23584 0 0.15381 0.03418 0.23926 0.0376 0.08203 0.1333 0.18115 0.09912 0.0957 0.18115 0.1333 0.08545 0.03418 0.23926 0.03418 0.15381 0 0.23584-0.04785 0.08545-0.05127 0.79981-0.75196l0.70068-0.69726 0.70068 0.69726q0.71436 0.70068 0.79639 0.75196 0.08545 0.04785 0.23926 0.04785 0.15381 0 0.23584-0.03418 0.08545-0.0376 0.18115-0.1333 0.09912-0.09912 0.1333-0.18115 0.0376-0.08545 0.0376-0.23926 0-0.15381-0.05127-0.23584-0.04785-0.08545-0.74854-0.79981l-0.68359-0.70068 0.68359-0.70068q0.70068-0.71436 0.74854-0.79639 0.05127-0.08545 0.05127-0.25293 0-0.16748-0.04102-0.25293-0.09912-0.16748-0.28027-0.2666-0.05811-0.02734-0.09912-0.04102-0.04102-0.01367-0.15381-0.01367l-0.01367 0q-0.14014 0-0.21875 0.0376-0.0752 0.03418-0.24268 0.18799-0.12646 0.10938-0.54687 0.52978l-0.72803 0.7417-0.70068-0.69726q-0.43408-0.43408-0.56055-0.54688-0.18115-0.16748-0.25977-0.20166-0.0752-0.0376-0.20849-0.04443-0.1333-0.00684-0.17432 0.00683z"
+                  fill="#DC2626"
+                ></path>
+              </svg>
+              <div
+                data-pencil-name="失败句"
+                style='box-sizing: border-box; color: #DC2626; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+              >
+                1 块面板重算失败：/R-205 —— 读实时几何超时
+              </div>
+            </div>
+            <div
+              data-pencil-name="后果"
+              style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+            >
+              牵涉的 2 根凭证不前移 · 模型水位卡在 08-07 14:10 · 该库不判一致
+            </div>
+            <div
+              data-pencil-name="不重试句"
+              style='box-sizing: border-box; color: #9AA1AC; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+            >
+              不会自动重试；下一窗、重启后的仅模型任务、或下面两个入口重算这几根时，房间随之重算
+            </div>
+            <div
+              data-pencil-name="出路按钮组"
+              style="align-items: flex-start; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 8px; height: fit-content; justify-content: flex-start; padding: 4px 0px 0px 0px; width: fit-content"
+            >
+              <div
+                data-pencil-name="按钮 重算这几根"
+                style="align-items: flex-start; background-color: #FFFFFF; border-radius: 6px; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 0px; height: fit-content; justify-content: flex-start; outline-offset: -0.5px; outline: 1px solid #CBD2DA; padding: 6px 12px; width: fit-content"
+              >
+                <div
+                  data-pencil-name="按钮文字"
+                  style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                >
+                  重算这几根
+                </div>
+              </div>
+              <div
+                data-pencil-name="按钮 再执行一次这个库"
+                style="align-items: flex-start; background-color: #FFFFFF; border-radius: 6px; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 0px; height: fit-content; justify-content: flex-start; outline-offset: -0.5px; outline: 1px solid #CBD2DA; padding: 6px 12px; width: fit-content"
+              >
+                <div
+                  data-pencil-name="按钮文字"
+                  style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+                >
+                  再执行一次这个库
+                </div>
+              </div>
+            </div>
+          </div>
+          <div
+            data-pencil-name="规矩"
+            style='box-sizing: border-box; color: #9AA1AC; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; width: 100%'
+          >
+            两个按钮都是命令面（重算走 model/ensure，再执行 =
+            再排一次任务），不给队列重试；行上房间段画 ✕，水位段不亮。
+          </div>
+        </div>
+        <div
+          data-pencil-name="卡 房间段"
+          style="align-items: flex-start; background-color: #FFFFFF; border-radius: 10px; box-sizing: border-box; display: flex; flex-direction: column; flex-shrink: 0; gap: 10px; height: fit-content; justify-content: flex-start; outline-offset: -0.5px; outline: 1px solid #E3E6EB; padding: 16px; width: 100%"
+        >
+          <div
+            data-pencil-name="卡头"
+            style="align-items: center; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 10px; height: fit-content; justify-content: flex-start; width: fit-content"
+          >
+            <div
+              data-pencil-name="段签"
+              style="align-items: flex-start; background-color: #F7F8FA; border-radius: 3px; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 0px; height: fit-content; justify-content: flex-start; padding: 3px 8px; width: fit-content"
+            >
+              <div
+                data-pencil-name="签文"
+                style='box-sizing: border-box; color: #6B7280; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+              >
+                房间段
+              </div>
+            </div>
+            <div
+              data-pencil-name="处境"
+              style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 13px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+            >
+              服务端没有房间段字段（两代并存）
+            </div>
+          </div>
+          <div
+            data-pencil-name="示例"
+            style='box-sizing: border-box; color: #9AA1AC; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+          >
+            （整段不画）
+          </div>
+          <div
+            data-pencil-name="规矩"
+            style='box-sizing: border-box; color: #9AA1AC; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; width: 100%'
+          >
+            老服务端的回执里没有房间一段 →
+            行上四段退回三段，明细里房间段整段不画；不猜、不冒充「无变更」。与欠账段三态同一条纪律。
+          </div>
+        </div>
+        <div
+          data-pencil-name="卡 搬间明细"
+          style="align-items: flex-start; background-color: #FFFFFF; border-radius: 10px; box-sizing: border-box; display: flex; flex-direction: column; flex-shrink: 0; gap: 10px; height: fit-content; justify-content: flex-start; outline-offset: -0.5px; outline: 1px solid #E3E6EB; padding: 16px; width: 100%"
+        >
+          <div
+            data-pencil-name="卡头"
+            style="align-items: center; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 10px; height: fit-content; justify-content: flex-start; width: fit-content"
+          >
+            <div
+              data-pencil-name="段签"
+              style="align-items: flex-start; background-color: #F7F8FA; border-radius: 3px; box-sizing: border-box; display: flex; flex-direction: row; flex-shrink: 0; gap: 0px; height: fit-content; justify-content: flex-start; padding: 3px 8px; width: fit-content"
+            >
+              <div
+                data-pencil-name="签文"
+                style='box-sizing: border-box; color: #6B7280; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+              >
+                搬间明细
+              </div>
+            </div>
+            <div
+              data-pencil-name="处境"
+              style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 13px; font-style: normal; font-weight: 600; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+            >
+              搬间超长 · 收敛列表
+            </div>
+          </div>
+          <div
+            data-pencil-name="示例"
+            style='box-sizing: border-box; color: #1F2430; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 12px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; white-space: nowrap'
+          >
+            搬间 214 件：列前 10 件，尾行「展开全部 214 件」
+          </div>
+          <div
+            data-pencil-name="规矩"
+            style='box-sizing: border-box; color: #9AA1AC; font-family: "Noto Sans SC", system-ui, sans-serif; font-size: 11px; font-style: normal; font-weight: 400; letter-spacing: 0px; line-height: normal; text-align: left; width: 100%'
+          >
+            行内明细是常驻视图的展开区，列表必须有上限；房间行组同款规矩（受影响房间超 10
+            间时收成「N 间 · 展开」）。
+          </div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

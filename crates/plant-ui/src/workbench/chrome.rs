@@ -4,16 +4,32 @@
 //! 设计稿上的已应用 sesno / 文件 sesno / 待更新批次 / 待重试单元属于 gen-model
 //! 侧，等 M4-4 定下数据边界后再补，宁可少一格。
 
-use egui::{Align, Color32, CornerRadius, Layout, Margin, RichText, Sense, Stroke, Ui, pos2, vec2};
+use egui::{
+    Align, Color32, CornerRadius, Key, KeyboardShortcut, Layout, Margin, Modifiers, PointerButton,
+    Rect, RichText, Sense, Stroke, StrokeKind, Ui, pos2, vec2,
+};
 use egui_phosphor::regular as ph;
 
-use crate::Cmd;
+use super::{DockSide, DockVisibility};
 use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Status, Tokens, radius, space};
 use crate::style::widgets;
-use crate::vm::{ModelLoadVm, WorkbenchVm};
+use crate::vm::{ModelLoadVm, NavEntryVm, NavHistoryVm, WorkbenchVm};
+use crate::{Cmd, NavStep};
 
-pub fn title_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
+/// 右键列表最多列几条。栈上限 50，全摆出来是一屏菜单；围着游标取最近的十来条，
+/// 再远的多按几次箭头也到得了。
+const NAV_MENU_ROWS: usize = 12;
+
+pub fn title_bar(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    vm: &WorkbenchVm,
+    vis: DockVisibility,
+    search: &mut super::search::State,
+    cmds: &mut Vec<Cmd>,
+) {
     // 栏体(Frame)与 hairline 必须严丝合缝：全局 item_spacing.y=6 会把
     // hairline 推出面板裁剪区（Panel 只比栏体高 1px）。
     ui.spacing_mut().item_spacing.y = 0.0;
@@ -48,6 +64,19 @@ pub fn title_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
                 }
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    // 空间管理摆在最右上角（对齐设计稿）：right_to_left 里最先添加 = 最靠角。
+                    // 逆序添加，落到屏上从左到右读作 铃铛 · 左 · 下 · 右。激活（accent）= 该侧此刻展开着。
+                    if dock_toggle(ui, t, d, DockSide::Right, vis.right).clicked() {
+                        cmds.push(Cmd::ToggleDock(DockSide::Right));
+                    }
+                    if dock_toggle(ui, t, d, DockSide::Bottom, vis.bottom).clicked() {
+                        cmds.push(Cmd::ToggleDock(DockSide::Bottom));
+                    }
+                    if dock_toggle(ui, t, d, DockSide::Left, vis.left).clicked() {
+                        cmds.push(Cmd::ToggleDock(DockSide::Left));
+                    }
+                    notification_bell(ui, t, d);
+                    divider(ui, t, d);
                     ui.label(
                         RichText::new(&vm.user)
                             .font(Font::meta(d))
@@ -55,7 +84,7 @@ pub fn title_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
                     );
                     avatar(ui, t, d, &vm.user);
                     divider(ui, t, d);
-                    search_box(ui, t, d, d.px(320.0), "搜索元素、REFNO 或命令", "Ctrl K");
+                    super::search::search_box(ui, t, d, vm, search, cmds);
                 });
             });
         });
@@ -72,6 +101,14 @@ pub fn command_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: 
             ui.set_height(d.command_bar_h());
             ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing.x = space::S1;
+
+                // 导航历史摆在最左（S1-D）：浏览器 / 资源管理器 / IDE 的箭头都在这儿，
+                // 而且与右边那组撤销 / 重做拉开——两组放一起最容易被当成同一回事。
+                nav_shortcuts(ui, &vm.nav, cmds);
+                nav_buttons(ui, t, d, &vm.nav, cmds);
+                ui.add_space(space::S2);
+                divider(ui, t, d);
+                ui.add_space(space::S2);
 
                 let project = ui.add(command_menu_button(d, "项目", true));
                 let project_popup = egui::Popup::menu(&project);
@@ -93,7 +130,11 @@ pub fn command_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: 
                     ui.separator();
                     // 没连上库时取回工作无从谈起：没有树可重查，也没有
                     // 模型可重载。禁用而不是隐藏——菜单项换位置比灰着更难找。
+                    //
+                    // 重新生成跑着的时候也灰。那一趟正在逐个删掉并重做库里的产物，
+                    // 中间插一次清场重装，重装的是一份删了一半的模型。
                     let busy = vm.get_work_busy;
+                    let regen = vm.regen_busy;
                     let label = if busy {
                         "正在取回工作…"
                     } else {
@@ -101,16 +142,22 @@ pub fn command_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: 
                     };
                     let get_work = ui
                         .add_enabled(
-                            vm.data_source_ok && !busy,
+                            vm.data_source_ok && !busy && !regen,
                             command_menu_action(
                                 d,
                                 ph::ARROW_CLOCKWISE,
                                 label,
-                                if busy { "请稍候" } else { "GET WORK" },
+                                if busy || regen {
+                                    "请稍候"
+                                } else {
+                                    "GET WORK"
+                                },
                             ),
                         )
                         .on_disabled_hover_text(if busy {
                             "取回工作正在进行"
+                        } else if regen {
+                            "重新生成模型正在进行"
                         } else {
                             "连接数据源后可用"
                         });
@@ -118,15 +165,13 @@ pub fn command_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: 
                         cmds.push(Cmd::GetWork);
                         ui.close();
                     }
-                    // 取回工作只取界面。设计库里还躺着没应用的会话时，
+                    // 取回工作只取界面。哪一枚水位落后于文件时，
                     // 这一行是唯一告诉人「该去的是另一个入口」的地方。
-                    if let Some(pending) = vm.pending_sessions.filter(|n| *n > 0) {
+                    if let Some(lag) = vm.watermark_lag.filter(|l| !l.is_empty()) {
                         ui.label(
-                            RichText::new(format!(
-                                "设计库还有 {pending} 个会话未应用 · 去「模型更新」"
-                            ))
-                            .font(Font::micro(d))
-                            .color(t.text_muted),
+                            RichText::new(watermark_hint(lag))
+                                .font(Font::micro(d))
+                                .color(t.text_muted),
                         );
                     }
                 });
@@ -224,9 +269,9 @@ pub fn status_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
                     Some(refno) => {
                         let rest = vm.selection.len() - 1;
                         let text = if rest > 0 {
-                            format!("{refno} +{rest}")
+                            format!("{} +{rest}", refno.to_e3d_id())
                         } else {
-                            refno.to_string()
+                            refno.to_e3d_id()
                         };
                         ui.label(
                             RichText::new(text)
@@ -242,6 +287,13 @@ pub fn status_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
                 };
 
                 queue_count(ui, t, d, vm);
+
+                divider(ui, t, d);
+                ui.label(
+                    RichText::new(format!("刷新 {}", vm.refresh_generation))
+                        .font(Font::mono_micro(d))
+                        .color(t.text_muted),
+                );
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(
@@ -351,6 +403,9 @@ fn access_point_detail(ui: &mut Ui, t: &Tokens, d: Density, ap: &crate::vm::Acce
         ("用户", ap.user.as_str()),
         ("模型服务", ap.model_api_url.as_str()),
         ("数据中心", ap.data_api_url.as_str()),
+        // 树 / 属性 / 搜索 / 三维实例此刻从哪儿读（ADR-0026）。库供数是保留档，
+        // 用着它的人得看得出来。
+        ("供数", ap.read_face.label()),
     ] {
         access_point_row(ui, t, d, label, value);
     }
@@ -434,6 +489,139 @@ fn queue_count(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
     }
 }
 
+// ---------------------------------------------------------------- 导航历史
+
+/// 命令栏最左那两枚：后退 / 前进。点击走一步，右键弹最近位置列表。
+///
+/// 启用态只看 `vm.nav` 两侧有没有条目；hover 文案念出目标的名字与页签——按钮上只有
+/// 一个箭头，说不出自己要去哪。
+fn nav_buttons(ui: &mut Ui, t: &Tokens, d: Density, nav: &NavHistoryVm, cmds: &mut Vec<Cmd>) {
+    ui.spacing_mut().item_spacing.x = 2.0;
+    for (step, icon) in [
+        (NavStep::Back, ph::ARROW_LEFT),
+        (NavStep::Forward, ph::ARROW_RIGHT),
+    ] {
+        let target = match step {
+            NavStep::Back => nav.back_target(),
+            _ => nav.forward_target(),
+        };
+        let response = ui
+            .add_enabled(target.is_some(), widgets::tool_btn(t, d, icon, false))
+            .on_hover_text(nav_hint(step, target))
+            .on_disabled_hover_text(nav_hint(step, None));
+        if response.clicked() {
+            cmds.push(Cmd::Navigate(step));
+        }
+        // 禁用的那枚接不到右键；栈非空时至少有一枚是亮的，列表从它那儿开。
+        if !nav.is_empty() {
+            egui::Popup::context_menu(&response).show(|ui| nav_menu(ui, t, d, nav, cmds));
+        }
+    }
+    ui.spacing_mut().item_spacing.x = space::S1;
+}
+
+/// 右键弹出的最近位置列表：新的在上，当前项高亮，点一条直接跳。
+fn nav_menu(ui: &mut Ui, t: &Tokens, d: Density, nav: &NavHistoryVm, cmds: &mut Vec<Cmd>) {
+    ui.set_min_width(d.px(260.0));
+    ui.label(
+        RichText::new("最近位置")
+            .font(Font::micro(d))
+            .color(t.text_muted),
+    );
+    ui.add_space(space::S1);
+    let Some(cursor) = nav.cursor else {
+        return;
+    };
+    for i in nav_menu_range(nav.entries.len(), cursor, NAV_MENU_ROWS).rev() {
+        let entry = &nav.entries[i];
+        let current = i == cursor;
+        let hint = match (current, i > cursor) {
+            (true, _) => "当前".to_owned(),
+            (false, true) => {
+                pane_name(entry.pane).map_or("前进".to_owned(), |p| format!("{p} · 前进"))
+            }
+            (false, false) => pane_name(entry.pane).unwrap_or_default().to_owned(),
+        };
+        let (fg, bg) = if current {
+            (t.accent_strong, t.accent_bg)
+        } else {
+            (t.text_primary, Color32::TRANSPARENT)
+        };
+        let row = egui::Button::new(
+            RichText::new(format!(
+                "{}  {}",
+                super::noun_icon(&entry.noun),
+                entry.label
+            ))
+            .font(Font::label(d))
+            .color(fg),
+        )
+        .shortcut_text(RichText::new(hint).font(Font::micro(d)))
+        .fill(bg)
+        .min_size(vec2(d.px(248.0), d.px(28.0)));
+        if ui.add(row).clicked() {
+            cmds.push(Cmd::Navigate(NavStep::Jump(i)));
+            ui.close();
+        }
+    }
+    ui.separator();
+    ui.label(
+        RichText::new("Alt+← / Alt+→ · 鼠标侧键")
+            .font(Font::micro(d))
+            .color(t.text_muted),
+    );
+}
+
+/// 列表里露出的那一段下标：围着游标取 `rows` 条，靠边时向另一侧补齐。
+fn nav_menu_range(len: usize, cursor: usize, rows: usize) -> std::ops::Range<usize> {
+    if len <= rows {
+        return 0..len;
+    }
+    let half = rows / 2;
+    let start = cursor.saturating_sub(half).min(len - rows);
+    start..start + rows
+}
+
+/// `Alt+←` / `Alt+→` 与鼠标侧键。文本框有焦点时不吃键——`Alt+←` 在输入框里另有含义。
+fn nav_shortcuts(ui: &mut Ui, nav: &NavHistoryVm, cmds: &mut Vec<Cmd>) {
+    if ui.memory(|m| m.focused().is_some()) {
+        return;
+    }
+    let (back, forward) = ui.input_mut(|i| {
+        (
+            i.consume_shortcut(&KeyboardShortcut::new(Modifiers::ALT, Key::ArrowLeft))
+                || i.pointer.button_released(PointerButton::Extra1),
+            i.consume_shortcut(&KeyboardShortcut::new(Modifiers::ALT, Key::ArrowRight))
+                || i.pointer.button_released(PointerButton::Extra2),
+        )
+    });
+    if back && nav.back_target().is_some() {
+        cmds.push(Cmd::Navigate(NavStep::Back));
+    }
+    if forward && nav.forward_target().is_some() {
+        cmds.push(Cmd::Navigate(NavStep::Forward));
+    }
+}
+
+/// 箭头的 hover 文案：写出目标与快捷键；没有目标就说没有，不留一枚沉默的灰按钮。
+fn nav_hint(step: NavStep, target: Option<&NavEntryVm>) -> String {
+    let (verb, key) = match step {
+        NavStep::Back => ("后退", "Alt+←"),
+        _ => ("前进", "Alt+→"),
+    };
+    match target {
+        Some(entry) => match pane_name(entry.pane) {
+            Some(pane) => format!("{verb}到 {} · {pane} ({key})", entry.label),
+            None => format!("{verb}到 {} ({key})", entry.label),
+        },
+        None => format!("没有可{verb}的位置"),
+    }
+}
+
+fn pane_name(pane: Option<super::Pane>) -> Option<&'static str> {
+    pane.map(|p| p.title().1)
+}
+
 // ---------------------------------------------------------------- 小零件
 
 fn logo(ui: &mut Ui, t: &Tokens, d: Density) {
@@ -488,6 +676,84 @@ fn meta_icon(ui: &mut Ui, d: Density, icon: &str, color: Color32) {
     );
 }
 
+/// 空间管理用的一枚 dock 开关：方形按钮里画一个「窗口」轮廓，某一侧填实表示那一侧的
+/// dock。`on`（该侧此刻展开着）时整枚按 accent 高亮，配色与视口工具按钮同一套。
+fn dock_toggle(ui: &mut Ui, t: &Tokens, d: Density, side: DockSide, on: bool) -> egui::Response {
+    let s = d.px(30.0);
+    let (rect, resp) = ui.allocate_exact_size(vec2(s, s), Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return resp;
+    }
+    let (bg, fg) = if on {
+        (t.accent_bg, t.accent)
+    } else if resp.hovered() {
+        (t.bg_hover, t.text_primary)
+    } else {
+        (Color32::TRANSPARENT, t.text_secondary)
+    };
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(radius::MD), bg);
+    panel_glyph(ui, rect, side, fg, d);
+    let tip = match (side, on) {
+        (DockSide::Left, true) => "收起左侧面板",
+        (DockSide::Left, false) => "展开左侧面板",
+        (DockSide::Bottom, true) => "收起底部面板",
+        (DockSide::Bottom, false) => "展开底部面板",
+        (DockSide::Right, true) => "收起右侧面板",
+        (DockSide::Right, false) => "展开右侧面板",
+    };
+    resp.on_hover_text(tip)
+}
+
+/// dock 开关里的「窗口」小图：外框加某一侧的实心分区。内缩 1px 压在描边里侧，
+/// 免得实心块盖住圆角。
+fn panel_glyph(ui: &Ui, btn: Rect, side: DockSide, color: Color32, d: Density) {
+    let frame = Rect::from_center_size(btn.center(), vec2(d.px(15.0), d.px(12.0)));
+    let painter = ui.painter();
+    painter.rect_stroke(
+        frame,
+        CornerRadius::same(2),
+        Stroke::new(1.0, color),
+        StrokeKind::Inside,
+    );
+    let inner = frame.shrink(1.0);
+    let dock = match side {
+        DockSide::Left => Rect::from_min_max(
+            inner.min,
+            pos2(inner.left() + inner.width() * 0.34, inner.bottom()),
+        ),
+        DockSide::Right => Rect::from_min_max(
+            pos2(inner.right() - inner.width() * 0.34, inner.top()),
+            inner.max,
+        ),
+        DockSide::Bottom => Rect::from_min_max(
+            pos2(inner.left(), inner.bottom() - inner.height() * 0.42),
+            inner.max,
+        ),
+    };
+    painter.rect_filled(dock, CornerRadius::ZERO, color);
+}
+
+/// 通知铃铛。应用还没有通知源，点开是一句诚实的「暂无通知」——**不摆假的未读红点**
+/// （与状态栏「宁可少一格」同一条准绳）。接上真正的通知流后，未读点与列表在这里补。
+fn notification_bell(ui: &mut Ui, t: &Tokens, d: Density) {
+    let bell = ui.add(widgets::tool_btn(t, d, ph::BELL, false));
+    egui::Popup::menu(&bell).show(|ui| {
+        ui.set_min_width(d.px(220.0));
+        ui.label(
+            RichText::new("通知")
+                .font(Font::strong(d))
+                .color(t.text_primary),
+        );
+        ui.add_space(space::S1);
+        ui.label(
+            RichText::new("暂无通知")
+                .font(Font::meta(d))
+                .color(t.text_muted),
+        );
+    });
+}
+
 fn command_menu_button(d: Density, label: &str, has_popup: bool) -> egui::Button<'static> {
     let label = if has_popup {
         format!("{label}  {}", ph::CARET_DOWN)
@@ -519,50 +785,134 @@ fn open_menu_marker(ui: &mut Ui, t: &Tokens, d: Density, response: &egui::Respon
     }
 }
 
-/// 纯视觉搜索框（M1-1）；真实的命令面板 / 搜索交互不在本里程碑。
-fn search_box(ui: &mut Ui, t: &Tokens, d: Density, width: f32, placeholder: &str, key: &str) {
-    let h = d.px(26.0);
-    let (rect, _) = ui.allocate_exact_size(vec2(width, h), Sense::click());
-    let cr = CornerRadius::same(radius::MD);
-    ui.painter().rect_filled(rect, cr, t.bg_input);
-    ui.painter().rect_stroke(
-        rect,
-        cr,
-        Stroke::new(1.0_f32, t.border),
-        egui::StrokeKind::Inside,
-    );
-    let pad = d.px(10.0);
-    let ig = ui.painter().layout_no_wrap(
-        ph::MAGNIFYING_GLASS.to_owned(),
-        egui::FontId::new(d.px(13.0), egui::FontFamily::Proportional),
-        t.text_muted,
-    );
-    let iw = ig.size().x;
-    ui.painter().galley(
-        pos2(rect.left() + pad, rect.center().y - ig.size().y / 2.0),
-        ig,
-        t.text_muted,
-    );
-    let pg = ui
-        .painter()
-        .layout_no_wrap(placeholder.to_owned(), Font::meta(d), t.text_muted);
-    ui.painter().galley(
-        pos2(
-            rect.left() + pad + iw + d.px(8.0),
-            rect.center().y - pg.size().y / 2.0,
-        ),
-        pg,
-        t.text_muted,
-    );
-    let kg = ui
-        .painter()
-        .layout_no_wrap(key.to_owned(), Font::mono_micro(d), t.text_muted);
-    ui.painter().galley(
-        pos2(
-            rect.right() - pad - kg.size().x,
-            rect.center().y - kg.size().y / 2.0,
-        ),
-        kg,
-        t.text_muted,
-    );
+/// 取回工作旁那行提示，按**两枚水位**说话（CONTEXT.md「水位」；2026-09-08 用户口径：
+/// 不说「待应用 / pending」）。说「保存」不说「会话」（ADR-0019）。三句各说一件事、不相加：
+/// 数据水位落后文件几次保存；几个库尚无数据水位（需初始化——它们没有「落后几次」可数）；
+/// 模型水位落后于数据水位的库数（服务端判 `lagging`，「不判」或没给判决时这一句不出现）。
+fn watermark_hint(lag: crate::task_queue::WatermarkLag) -> String {
+    let mut parts = Vec::new();
+    if lag.data_behind > 0 {
+        parts.push(format!("数据水位落后 {} 次保存", lag.data_behind));
+    }
+    if lag.data_unestablished > 0 {
+        parts.push(format!(
+            "{} 个库尚无数据水位（需初始化）",
+            lag.data_unestablished
+        ));
+    }
+    if lag.model_lagging > 0 {
+        parts.push(format!("模型水位：{} 个库落后", lag.model_lagging));
+    }
+    parts.push("去「模型更新」".to_owned());
+    parts.join(" · ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{nav_hint, nav_menu_range, watermark_hint};
+    use crate::NavStep;
+    use crate::task_queue::WatermarkLag;
+    use crate::vm::NavEntryVm;
+    use crate::workbench::Pane;
+
+    /// 箭头的 hover 文案要念出目标与页签、带快捷键；没有目标时说「没有」，
+    /// 不留一枚不解释自己的灰按钮（S1-D 形态表的态 3 / 态 4）。
+    #[test]
+    fn the_nav_hint_names_the_target_and_the_shortcut() {
+        let entry = NavEntryVm {
+            label: "PANE /1RS03TT9204P".into(),
+            noun: "PANE".into(),
+            pane: Some(Pane::Properties),
+        };
+        assert_eq!(
+            nav_hint(NavStep::Back, Some(&entry)),
+            "后退到 PANE /1RS03TT9204P · 属性 (Alt+←)"
+        );
+        let no_pane = NavEntryVm {
+            pane: None,
+            ..entry
+        };
+        assert_eq!(
+            nav_hint(NavStep::Forward, Some(&no_pane)),
+            "前进到 PANE /1RS03TT9204P (Alt+→)"
+        );
+        assert_eq!(nav_hint(NavStep::Back, None), "没有可后退的位置");
+        assert_eq!(nav_hint(NavStep::Forward, None), "没有可前进的位置");
+    }
+
+    /// 右键列表围着游标取一段：短栈全列；长栈里游标居中，靠边时向另一侧补齐到
+    /// 满行，不会出现「列表只剩三条」的稀疏形态。
+    #[test]
+    fn the_nav_menu_window_follows_the_cursor_and_stays_full() {
+        assert_eq!(nav_menu_range(5, 4, 12), 0..5);
+        assert_eq!(nav_menu_range(50, 49, 12), 38..50, "站在栈顶：向下补齐");
+        assert_eq!(nav_menu_range(50, 0, 12), 0..12, "站在栈底：向上补齐");
+        let mid = nav_menu_range(50, 25, 12);
+        assert_eq!(mid.len(), 12);
+        assert!(mid.contains(&25), "游标在窗口里: {mid:?}");
+    }
+
+    /// 文案按水位说话、按 ADR-0019 说「保存」；尚无数据水位的库单独一句，不并进保存次数。
+    #[test]
+    fn the_watermark_hint_speaks_watermarks_and_saves_and_keeps_unestablished_apart() {
+        assert_eq!(
+            watermark_hint(WatermarkLag {
+                data_behind: 8,
+                data_unestablished: 0,
+                model_lagging: 0,
+            }),
+            "数据水位落后 8 次保存 · 去「模型更新」"
+        );
+        assert_eq!(
+            watermark_hint(WatermarkLag {
+                data_behind: 8,
+                data_unestablished: 2,
+                model_lagging: 0,
+            }),
+            "数据水位落后 8 次保存 · 2 个库尚无数据水位（需初始化） · 去「模型更新」"
+        );
+        let only_init = watermark_hint(WatermarkLag {
+            data_behind: 0,
+            data_unestablished: 1,
+            model_lagging: 0,
+        });
+        assert_eq!(only_init, "1 个库尚无数据水位（需初始化） · 去「模型更新」");
+        for text in [&only_init] {
+            assert!(!text.contains("会话"), "界面上不说会话号：{text}");
+            assert!(
+                !text.contains("待应用") && !text.contains("未应用"),
+                "按水位说话，不说 pending：{text}"
+            );
+        }
+    }
+
+    /// 模型水位单独一句，且只在服务端判 `lagging` 时出现；数据水位已追平而模型水位落后
+    /// 也要说——那正是「属性是新的、三维是旧的」这种分叉的解释（09-02 计划 §七）。
+    #[test]
+    fn the_hint_names_a_lagging_model_watermark_separately() {
+        let both = watermark_hint(WatermarkLag {
+            data_behind: 8,
+            data_unestablished: 0,
+            model_lagging: 2,
+        });
+        assert_eq!(
+            both,
+            "数据水位落后 8 次保存 · 模型水位：2 个库落后 · 去「模型更新」"
+        );
+        let model_only = watermark_hint(WatermarkLag {
+            data_behind: 0,
+            data_unestablished: 0,
+            model_lagging: 1,
+        });
+        assert_eq!(model_only, "模型水位：1 个库落后 · 去「模型更新」");
+        assert!(
+            !WatermarkLag {
+                data_behind: 0,
+                data_unestablished: 0,
+                model_lagging: 1,
+            }
+            .is_empty(),
+            "只有模型水位落后也值得画那一行"
+        );
+    }
 }

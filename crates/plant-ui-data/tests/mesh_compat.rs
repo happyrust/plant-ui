@@ -101,3 +101,89 @@ async fn configured_site_models_have_meshes() {
         models.iter().map(|model| model.insts.len()).sum::<usize>()
     );
 }
+
+/// Validate every model belonging to one parsed PDMS Ref0, rather than a few
+/// hand-picked SITE names. This is the AMS8000 acceptance path: the database
+/// query is the same one used by Plant UI and every referenced mesh is decoded
+/// before it is counted as displayable.
+#[tokio::test]
+#[ignore = "需要本机 SurrealDB 与 PLANT_TEST_* 环境变量，用 --ignored 显式跑"]
+async fn configured_ref0_models_are_displayable() {
+    std::env::set_current_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+        .expect("无法切换到工作区目录");
+    let dir = std::env::var_os("PLANT_TEST_MESH_DIR").expect("PLANT_TEST_MESH_DIR 未设置");
+    let port = std::env::var("PLANT_TEST_DB_PORT")
+        .expect("PLANT_TEST_DB_PORT 未设置")
+        .parse()
+        .expect("PLANT_TEST_DB_PORT 不是有效端口");
+    let ref0: u32 = std::env::var("PLANT_TEST_REF0")
+        .expect("PLANT_TEST_REF0 未设置")
+        .parse()
+        .expect("PLANT_TEST_REF0 不是有效 u32");
+
+    let mut db = aios_core::options::DbOption::default();
+    db.v_ip = "ws://127.0.0.1".into();
+    db.v_port = port;
+    db.v_user = "root".into();
+    db.v_password = "root".into();
+    db.surreal_ns = "1516".into();
+    db.project_name = "AvevaMarineSample".into();
+    db.mdb_name = "ALL".into();
+    aios_core::set_db_option(db).expect("数据库配置设置失败");
+
+    plant_ui_data::connect().await.expect("数据库连接失败");
+    let roots = plant_ui_data::site_nodes()
+        .await
+        .expect("SITE 查询失败")
+        .into_iter()
+        .map(|site| site.refno.refno())
+        .collect::<Vec<_>>();
+    let models = plant_ui_data::model_instances_anc(&roots, |_, _| {})
+        .await
+        .expect("Plant UI 模型查询失败")
+        .into_iter()
+        .filter(|model| model.refno.refno().get_0() == ref0)
+        .collect::<Vec<_>>();
+    assert!(!models.is_empty(), "Ref0 {ref0} 没有模型实例");
+
+    let mut mesh_instances = 0usize;
+    let mut unique_hashes = std::collections::BTreeSet::new();
+    for model in &models {
+        for inst in &model.insts {
+            mesh_instances += 1;
+            if !unique_hashes.insert(inst.geo_hash.clone()) {
+                continue;
+            }
+            let path = std::path::Path::new(&dir).join(format!("{}.mesh", inst.geo_hash));
+            let bytes =
+                std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            let mesh = PlantMesh::des_from_bytes(&bytes)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            assert_eq!(
+                mesh.vertices.len(),
+                mesh.normals.len(),
+                "{} 的顶点/法线数量不一致",
+                path.display()
+            );
+            assert_eq!(
+                mesh.indices.len() % 3,
+                0,
+                "{} 的索引不是三角形",
+                path.display()
+            );
+            assert!(
+                mesh.indices
+                    .iter()
+                    .all(|&index| index < mesh.vertices.len() as u32),
+                "{} 有越界索引",
+                path.display()
+            );
+            mesh.gen_bevy_mesh();
+        }
+    }
+    eprintln!(
+        "Ref0 {ref0}: {} 个元素，{mesh_instances} 个网格实例，{} 个唯一 mesh 均可显示",
+        models.len(),
+        unique_hashes.len()
+    );
+}

@@ -48,6 +48,11 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
             let mut ignored = Vec::new();
             ready(ui, t, d, data, &vm.rooms, &mut ignored);
         }
+        // 查成功、就是一条属性都没有。这不是错误：没有可重试的动作，
+        // 画成红的加一枚「重试」只会让人反复按（ADR-0026 / 计划 §5.5）。
+        PropsVm::Verdict(verdict) => {
+            note(ui, t, d, PaneState::Empty, ph::INFO, verdict);
+        }
         // 重查的是当前选中元素；选中已经挪走的话 App 侧会把这条丢掉。
         PropsVm::Failed(reason) => {
             if note(ui, t, d, PaneState::Error, ph::WARNING, reason)
@@ -119,7 +124,7 @@ fn current_element(
                 );
             });
             ui.horizontal(|ui| {
-                refno_chip(ui, t, d, &data.refno.to_string());
+                refno_chip(ui, t, d, &data.refno.to_e3d_id());
                 room_chip(ui, t, d, data, rooms, cmds);
             });
         });
@@ -183,6 +188,9 @@ fn room_chip(
 /// 字走真控件而不是 `painter().galley`：refno 是这一屏最常被抄去别处（命令行、
 /// 日志、工单）的一串字符，画上去的字形选不中，也就复制不走。芯片按文字宽度
 /// 撑开，因此不截断——截断的 refno 抄出去是废的。
+///
+/// 显示用 E3D 的 `=24381/36931` 而不是 `Display` 的 `24381_36931`：后者是库键
+/// 的写法，抄进 E3D 命令行不认。抄出去就能用，是这枚芯片存在的全部理由。
 fn refno_chip(ui: &mut Ui, t: &Tokens, d: Density, refno: &str) {
     let pad = d.px(8.0);
     let text = RichText::new(refno)

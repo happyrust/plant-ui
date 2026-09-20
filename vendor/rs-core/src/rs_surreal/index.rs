@@ -67,7 +67,11 @@ pub async fn define_pe_index() -> anyhow::Result<()> {
         -- pe.owner 字段的索引，与 define_owner_index 建的 pe_owner 边表索引是两回事。
         -- 缺它时按 owner 过滤是全表扫：200,873 行上 count 一个 50 行的结果要 1.25s。
         DEFINE INDEX IF NOT EXISTS pe_owner_index ON TABLE pe COLUMNS owner;
-        DEFINE INDEX IF NOT EXISTS inst_relate_zone_refno_index ON TABLE inst_relate COLUMNS zone_refno;
+        -- zone_refno 已随层级查询优化 P3 退役（读侧全部走 anc CONTAINS，gen-model
+        -- 不再写该列）。这里从 DEFINE 换成一次性摘除：老库把历史上由本函数建出的
+        -- 索引清掉，新库是安全 no-op；gen-model 启动序列同样会清（两个历史索引名
+        -- 都在它的迁移语句里），双保险。
+        REMOVE INDEX IF EXISTS inst_relate_zone_refno_index ON TABLE inst_relate;
                 "#,
         )
         .await?;

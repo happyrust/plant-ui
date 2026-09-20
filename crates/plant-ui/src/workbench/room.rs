@@ -46,7 +46,14 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
     }
 }
 
-fn ready(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, data: &RoomsDataVm, cmds: &mut Vec<Cmd>) {
+fn ready(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    vm: &WorkbenchVm,
+    data: &RoomsDataVm,
+    cmds: &mut Vec<Cmd>,
+) {
     if data.relations.is_empty() {
         note(
             ui,
@@ -58,7 +65,7 @@ fn ready(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, data: &RoomsData
         );
         return;
     }
-    let live = vm.view3d.is_some_and(|v| v.live);
+    let live = vm.view3d.as_ref().is_some_and(|v| v.live);
     let focused = detail_data(&vm.room_detail).map(|det| det.room);
     egui::Frame::new().fill(t.bg_panel).show(ui, |ui| {
         ui.set_min_size(ui.available_size());

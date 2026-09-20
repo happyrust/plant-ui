@@ -11,7 +11,7 @@ use egui_phosphor::regular as ph;
 use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Status, Tokens, space};
 use crate::style::widgets::{self, Eye, PaneNote, PaneState, RowIcon, TreeRow};
-use crate::vm::{RoomVm, RowVisibility, Selection, TreeRowVm, TreeVm, WorkbenchVm};
+use crate::vm::{DimensionsVm, RoomVm, RowVisibility, Selection, TreeRowVm, TreeVm, WorkbenchVm};
 use crate::{Cmd, ModelAction};
 
 pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Vec<Cmd>) {
@@ -56,7 +56,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                         area = area.vertical_scroll_offset(y);
                     }
                     // 模型动作要有真的渲染器才做得成，独立壳里不摆这几项。
-                    let live = vm.view3d.is_some_and(|v| v.live);
+                    let live = vm.view3d.as_ref().is_some_and(|v| v.live);
                     let primary = vm.selection.primary();
                     area.show_rows(ui, d.row_h(), rows.len(), |ui, range| {
                         for row in &rows[range] {
@@ -96,6 +96,18 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                                     )
                                 })
                                 .inner;
+                            // 自动化只认真正的树行：AccessKit 角色负责排除命令历史、
+                            // 属性面板和状态栏，标签里的 refno 则提供跨重命名稳定身份。
+                            // 当前名称仍随数据刷新，便于同时断言 rename 的新旧语义。
+                            let accessible_label =
+                                tree_item_accessible_label(row.refno, row.name.as_str());
+                            ui.ctx().accesskit_node_builder(out.response.id, |node| {
+                                node.set_role(egui::accesskit::Role::TreeItem);
+                                node.set_label(accessible_label);
+                                if let Some(expanded) = row.expandable {
+                                    node.set_expanded(expanded);
+                                }
+                            });
                             // 点箭头只折叠 / 展开；点眼睛只切可见性；点行其他区域选中；
                             // 双击整行也展开。`clicked` / `double_clicked` 都只认主键，
                             // 右键落不进这几支——右键在下面单独处理。
@@ -145,13 +157,29 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                                 cmds.push(Cmd::SelectElement(row.refno));
                             }
                             out.response.context_menu(|ui| {
-                                row_menu(ui, t, d, row, &vm.selection, &vm.rooms, live, cmds)
+                                row_menu(
+                                    ui,
+                                    t,
+                                    d,
+                                    row,
+                                    &vm.selection,
+                                    &vm.rooms,
+                                    &vm.dimensions,
+                                    live,
+                                    vm.regen_busy,
+                                    cmds,
+                                )
                             });
                         }
                     });
                 });
         }
     }
+}
+
+fn tree_item_accessible_label(refno: aios_core::RefU64, name: &str) -> String {
+    // E3D 形式自带等号，前缀里就不再补一个，否则读屏念出来是「refno 等于 等于」。
+    format!("refno {}; name={name}", refno.to_e3d_id())
 }
 
 /// Vm 的四态可见性翻成组件层的画法。两个枚举是同一件事在两层的说法——
@@ -206,7 +234,9 @@ fn row_menu(
     row: &TreeRowVm,
     selection: &Selection,
     rooms: &RoomVm,
+    dimensions: &DimensionsVm,
     live: bool,
+    regen_busy: bool,
     cmds: &mut Vec<Cmd>,
 ) {
     // 右键落在集内 = 对整批操作；落在集外 = 只对这一行。
@@ -229,11 +259,37 @@ fn row_menu(
         }
         grouped = true;
     }
-    element_menu(ui, t, d, row.refno, &targets, rooms, live, cmds, grouped);
+    element_menu(
+        ui,
+        t,
+        d,
+        row.refno,
+        &targets,
+        rooms,
+        ElementDimensions {
+            branch: row.dimension_branch,
+            layer: dimensions,
+        },
+        live,
+        regen_busy,
+        cmds,
+        grouped,
+    );
 }
 
-/// 元素菜单的公共部分：模型动作 + 房间归属 + 复制 REFNO。模型树的行菜单与
-/// 三维视口的右键菜单是同一件事的两个入口，内容必须一致，所以收在一处。
+/// 右键落点与尺寸标注层的关系，菜单据此决定「查看尺寸标注」出不出、出成哪一句。
+///
+/// `branch` 是落点能挂尺寸标注的 BRAN——落点自己是 BRAN 就是它，是成员就是所在 BRAN，
+/// 不是管道元素就 None（计划 B2 / D3：其余元素不出现该项）。归属那一步由宿主对着已
+/// 加载的树算好挂在 `TreeRowVm` / `WorkbenchVm` 上，两个入口各取各的，这里不回头找。
+#[derive(Clone, Copy)]
+pub(super) struct ElementDimensions<'a> {
+    pub branch: Option<aios_core::RefU64>,
+    pub layer: &'a DimensionsVm,
+}
+
+/// 元素菜单的公共部分：模型动作 + 房间归属 + 尺寸标注 + 复制 REFNO。模型树的行
+/// 菜单与三维视口的右键菜单是同一件事的两个入口，内容必须一致，所以收在一处。
 ///
 /// `refno` 是右键落点那一个元素（定位与房间归属对它），`targets` 是批量动作的
 /// 作用集（显示 / 隐藏 / 复制对它们）。
@@ -245,7 +301,9 @@ pub(super) fn element_menu(
     refno: aios_core::RefU64,
     targets: &[aios_core::RefU64],
     rooms: &RoomVm,
+    dimensions: ElementDimensions<'_>,
     live: bool,
+    regen_busy: bool,
     cmds: &mut Vec<Cmd>,
     mut grouped: bool,
 ) {
@@ -282,7 +340,10 @@ pub(super) fn element_menu(
             ),
         ] {
             if ui.button(format!("{icon}  {label}")).clicked() {
-                cmds.push(Cmd::Model(action));
+                cmds.push(match action {
+                    ModelAction::Focus(target) => Cmd::FocusTreeScope(target),
+                    action => Cmd::Model(action),
+                });
                 ui.close();
             }
         }
@@ -294,6 +355,31 @@ pub(super) fn element_menu(
         ui.separator();
     }
     room_menu_section(ui, t, d, refno, rooms, live, cmds);
+    // 尺寸标注（计划 B2）：与房间归属同组——都是「看这个元素的一份数据」。只对管道
+    // 元素出现（`branch` 有值），其余元素连灰项都不摆：一个永远点不了的项只会让人
+    // 去猜为什么。吃 `live` 门禁：线画在三维视口里，没有渲染器就没有地方显示它。
+    if live && let Some(branch) = dimensions.branch {
+        dimension_menu_item(ui, refno, branch, dimensions.layer, cmds);
+    }
+    // 自成一组。上面那几项改的是「我看不看得见」，这一项改的是模型库里的产物
+    // ——删掉的几何只能重新算回来。挤进同一组里，手滑的代价差得太远。
+    //
+    // 吃 `live` 门禁：跑完要把结果显示出来，没有渲染器的壳里点了只能改库、
+    // 看不见结果，而现有约定是「不接线就不显示」，不摆灰色占位。
+    if live {
+        ui.separator();
+        let label = format!("{}  重新生成模型{suffix}", ph::ARROWS_CLOCKWISE);
+        if ui
+            .add_enabled(!regen_busy, egui::Button::new(label))
+            .on_disabled_hover_text("已经有一趟重新生成在跑了")
+            .clicked()
+        {
+            cmds.push(Cmd::RegenerateModels {
+                targets: targets.to_vec(),
+            });
+            ui.close();
+        }
+    }
     ui.separator();
     if ui
         .button(format!("{}  复制 REFNO{suffix}", ph::COPY_SIMPLE))
@@ -308,6 +394,39 @@ pub(super) fn element_menu(
             .join("\n");
         ui.ctx().copy_text(text);
         ui.close();
+    }
+}
+
+/// 「查看尺寸标注」/「隐藏尺寸标注」那一项（计划 B2）。
+///
+/// 一项两态而不是两项：同时只挂一条 BRAN，落点这条正显示着（在途也算）就只剩
+/// 「隐藏」可做，没显示就只剩「查看」——两项并排总有一项是废的。失败态算没显示：
+/// 再点一次就是重试（`DimensionsVm::shows`）。落点是成员时在悬停里说清作用的是
+/// 整条 BRAN，免得人以为只会标这一个弯头。
+fn dimension_menu_item(
+    ui: &mut Ui,
+    refno: aios_core::RefU64,
+    branch: aios_core::RefU64,
+    layer: &DimensionsVm,
+    cmds: &mut Vec<Cmd>,
+) {
+    let (label, cmd) = dimension_menu_action(branch, layer);
+    let resp = ui.button(format!("{}  {label}", ph::RULER));
+    if resp.clicked() {
+        cmds.push(cmd);
+        ui.close();
+    }
+    if branch != refno {
+        resp.on_hover_text(format!("作用于所在的整条 BRAN（{branch}）"));
+    }
+}
+
+/// 落点这条 BRAN 在菜单上该出哪一句、点了发什么。抽出来是为了让测试不必起 egui。
+fn dimension_menu_action(branch: aios_core::RefU64, layer: &DimensionsVm) -> (&'static str, Cmd) {
+    if layer.shows(branch) {
+        ("隐藏尺寸标注", Cmd::ClearPipeDimensions)
+    } else {
+        ("查看尺寸标注", Cmd::ShowPipeDimensions(branch))
     }
 }
 
@@ -431,7 +550,11 @@ fn room_menu_items(
     if live && let Some(primary) = data.relations.first() {
         let resp = ui.add_enabled(
             primary.room.is_some(),
-            egui::Button::new(format!("{}  显示房间模型（{}）", ph::CUBE, primary.room_num)),
+            egui::Button::new(format!(
+                "{}  显示房间模型（{}）",
+                ph::CUBE,
+                primary.room_num
+            )),
         );
         if resp.clicked()
             && let Some(room) = primary.room
@@ -487,4 +610,86 @@ fn note(ui: &mut Ui, t: &Tokens, d: Density, state: PaneState, icon: &str, text:
             retry: state == PaneState::Error,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{dimension_menu_action, tree_item_accessible_label};
+    use crate::Cmd;
+    use crate::vm::{DimensionsDataVm, DimensionsVm};
+    use aios_core::RefU64;
+
+    /// 一项两态：落点这条 BRAN 正显示着（在途也算）→「隐藏」；没显示、或显示着的是
+    /// 别的 BRAN →「查看」并带上落点那条。失败态是「查看」= 重试，不是「隐藏」。
+    #[test]
+    fn the_dimension_item_flips_between_show_and_hide_per_branch() {
+        let bran = RefU64(7);
+        let other = RefU64(8);
+        assert_eq!(
+            dimension_menu_action(bran, &DimensionsVm::Off),
+            ("查看尺寸标注", Cmd::ShowPipeDimensions(bran))
+        );
+        assert_eq!(
+            dimension_menu_action(bran, &DimensionsVm::Loading(bran)),
+            ("隐藏尺寸标注", Cmd::ClearPipeDimensions)
+        );
+        let ready = DimensionsVm::Ready(DimensionsDataVm {
+            refno: bran,
+            ..Default::default()
+        });
+        assert_eq!(
+            dimension_menu_action(bran, &ready),
+            ("隐藏尺寸标注", Cmd::ClearPipeDimensions)
+        );
+        // 挂着的是另一条：对这条只能「查看」，点了就是换过去。
+        assert_eq!(
+            dimension_menu_action(other, &ready),
+            ("查看尺寸标注", Cmd::ShowPipeDimensions(other))
+        );
+        let failed = DimensionsVm::Failed {
+            refno: bran,
+            message: "服务够不着".into(),
+        };
+        assert_eq!(
+            dimension_menu_action(bran, &failed),
+            ("查看尺寸标注", Cmd::ShowPipeDimensions(bran))
+        );
+    }
+
+    /// 「查看尺寸标注」只对管道元素出现，且吃 live 门禁（线画在视口里）；不是管道
+    /// 元素时连灰项都不摆。钉源码：这一段挪到门禁外面，独立壳里就会多出一个点了
+    /// 没有任何反应的项。
+    #[test]
+    fn the_dimension_item_is_gated_on_a_pipe_target_and_a_live_viewport() {
+        let source = include_str!("tree.rs");
+        let body = source.split_once("#[cfg(test)]").expect("正文").0;
+        let menu = body
+            .split_once("pub(super) fn element_menu(")
+            .expect("element_menu")
+            .1
+            .split_once("fn dimension_menu_item(")
+            .expect("下一个函数")
+            .0;
+        assert!(
+            menu.contains("if live && let Some(branch) = dimensions.branch {"),
+            "尺寸标注项要同时吃 live 门禁与管道靶子：{menu}"
+        );
+        assert_eq!(
+            menu.matches("dimension_menu_item(").count(),
+            1,
+            "菜单里只该有一处画这一项"
+        );
+    }
+
+    #[test]
+    fn accessible_tree_identity_survives_rename_without_name_matching() {
+        let refno = RefU64(0x1234);
+        let before = tree_item_accessible_label(refno, "OLD-EQUI");
+        let after = tree_item_accessible_label(refno, "NEW-EQUI");
+        assert!(before.contains("refno =0/4660"));
+        assert!(after.contains("refno =0/4660"));
+        assert!(!after.contains("0_4660"));
+        assert!(!after.contains("OLD-EQUI"));
+        assert!(after.contains("name=NEW-EQUI"));
+    }
 }

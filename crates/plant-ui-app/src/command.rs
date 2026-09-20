@@ -21,6 +21,11 @@ pub(crate) enum ParsedCommand {
     Empty,
     Help,
     Clear,
+    /// 强制重建子串搜索索引。
+    ///
+    /// 它是「戳看不见的改动」唯一的门：没有 gen-model 水位的设计库里发生纯改名，
+    /// 行数与水位都不动，自动校验永远发现不了（ADR-0023 决定 5）。
+    Reindex,
     Query(QueryInput),
     LocateName(String),
     LocateRef(RefU64),
@@ -146,6 +151,9 @@ pub(crate) fn parse(input: &str) -> ParsedCommand {
     }
     if input.eq_ignore_ascii_case("clear") {
         return ParsedCommand::Clear;
+    }
+    if input.eq_ignore_ascii_case("reindex") {
+        return ParsedCommand::Reindex;
     }
     if let Some(name) = input.strip_prefix('/') {
         let name = name.trim();

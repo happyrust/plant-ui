@@ -3,6 +3,7 @@
 
 pub mod data_publish;
 pub mod fonts;
+pub mod model_regenerate;
 pub mod model_update;
 pub mod project_picker;
 pub mod room_browser;
@@ -19,7 +20,7 @@ pub use aios_core::RefU64;
 ///
 /// 动作自带 `refno`：右键菜单打开后选中还可能被别处改掉，回头读 `vm.selection`
 /// 就会作用到另一个元素上。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ModelAction {
     /// 可见性作用于一整批：「隐藏这几个」是选中之后最常做的一件事，
     /// 拆成 N 条命令会在宿主侧变成 N 次深度展开与 N 次事件写入。
@@ -27,11 +28,10 @@ pub enum ModelAction {
         refnos: Vec<aios_core::RefU64>,
         visible: bool,
     },
-    /// Remove these model roots (or all roots owned by them) from the scene.
+    /// 从三维场景中卸载这些模型及其网格。
     ///
-    /// Unlike hiding, unloading also forgets render, picking and retry state.
-    /// GET WORK uses this when the refreshed design tree proves an element was
-    /// deleted or moved out of the loaded hierarchy.
+    /// 与 `SetVisible(false)` 不同，卸载会同时释放场景实体与渲染状态；用于 GET WORK
+    /// 已确认元素从资料树消失、而整场模型重查仍在后台进行的窗口期。
     Unload { refnos: Vec<aios_core::RefU64> },
     /// 原子替换当前 X-Ray 目标集。空集恢复全部模型的常态 / 选中材质。
     /// 只改变材质，不改变可见性、隔离快照或相机。
@@ -53,6 +53,9 @@ pub enum ModelAction {
     /// refno。塞一组进去的结果是定位到其中某一个、还说不清是哪一个。定位本来
     /// 就是「带我到它跟前」，作用于主选中是说得清的语义。
     Focus(aios_core::RefU64),
+    /// 相机对准一个由数据面返回的树范围包围盒。该动作只改变相机，
+    /// 不加载模型、不改变可见性，也不写入模型 bounds 索引。
+    FocusBounds { min_mm: [f32; 3], max_mm: [f32; 3] },
     /// 相机覆盖一组元素的合并包围盒（房间取景用）。与 `Focus` 分开：房间 FRMW
     /// 自身没有几何实体，能取景的只有它的面板与成员；合并**已加载**那部分的
     /// 包围盒，没加载的不参与，一个都没加载时不动相机。
@@ -102,10 +105,43 @@ pub enum CameraGesture {
     End,
 }
 
+/// 相机的一次完整位姿：位置、姿态与轨道转心，都是**宿主世界系**的量。
+///
+/// 导航历史记的就是它——「回到上一次操作的地方」里的「地方」有一半是相机。
+/// 三个量缺一不可：只记姿态回不到原位，只记位置转起来会绕错心。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CameraPose {
+    pub position: [f32; 3],
+    /// 四元数 `(x, y, z, w)`。
+    pub rotation: [f32; 4],
+    /// 轨道相机的转心。回放时一起还回去，不然回到原位之后第一下旋转就会绕着别处转。
+    pub focus: [f32; 3],
+}
+
+/// 导航历史上的一步（命令栏最左那两枚箭头，或右键列表里点的一条）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavStep {
+    Back,
+    Forward,
+    /// 右键列表里直接点某一条：历史栈上的下标（与 `vm.nav.entries` 同序）。
+    Jump(usize),
+}
+
 /// UI 发出的命令：独立应用直接执行，接进 Bevy 后转成 Event。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cmd {
     SelectElement(aios_core::RefU64),
+    /// 导航历史：后退 / 前进 / 跳到某一条。
+    ///
+    /// 历史栈归宿主——一条 = 选择集 + 相机位姿 + 激活页签（+ 房间聚焦），记录点在
+    /// 宿主的 `set_selection` / `focus_room`；绘制层只拿 `vm.nav` 画按钮与右键列表。
+    /// 回放期间宿主自己守住不再入栈，绘制层不必知道「这次选中是回放来的」。
+    Navigate(NavStep),
+    /// 宿主 → 视口：把相机送回一份记下的位姿（导航历史回放）。
+    ///
+    /// 与 `SnapView` 走同一条 0.3s 插值动画，中途任何手势立即让位。绘制层不会发它
+    /// ——它和 `ResizeViewport` / `SetViewportBackground` 一样，只是借这条队列过路。
+    RestoreCamera(CameraPose),
     /// 模型树上的选择集变更（Ctrl 加减 / Shift 区间）。
     ///
     /// 绘制层算好**结果**整体交出，而不是发「加了谁减了谁」：区间要按可见行序算，
@@ -148,13 +184,38 @@ pub enum Cmd {
     /// 打开房间浏览器浮窗并（重新）拉取全表。全表是全库扫描级的重查询，
     /// 所以由这条命令按需触发，不进启动路径；查询在途时再按只开窗不重发。
     OpenRoomBrowser,
+    /// 右键「查看尺寸标注」（计划 B2）：取这条 BRAN 的 MBD 尺寸标注并挂到视口上。
+    ///
+    /// 带的是**BRAN** 的 refno，不是右键落点：落点是 ELBO / ATTA 这类成员时，归属到
+    /// 所在 BRAN 的那一步在绘制层就做完了（`TreeRowVm::dimension_branch` /
+    /// `WorkbenchVm::selection_branch`，两者都由宿主对着已加载的树算好），宿主拿到的
+    /// 一律是可以直接去问服务的目标。同时只挂一条：再看另一条就把前一条换掉。
+    ShowPipeDimensions(aios_core::RefU64),
+    /// 右键「隐藏尺寸标注」：清掉视口上挂着的尺寸标注层。不带 refno——这一层同时只有
+    /// 一条 BRAN，清的就是它；在途的取数回来也不再上屏（宿主按帧号丢弃）。
+    ClearPipeDimensions,
     /// 把某个常驻视图切到前台（如待重算横幅 -> 任务队列）。找不到该页签时
     /// 宿主是无操作——用户可以把页签拖走，那是他的布局。
     FocusPane(workbench::Pane),
+    /// 收起 / 展开某一侧 dock（左 / 下 / 右），腾挪工作台空间。
+    ///
+    /// dock 布局是界面自身的状态而非数据，所以这条不进 Vm：宿主转手交给
+    /// `WorkbenchState`（与 `FocusPane` 同一路），由绘制层按可见性重建 dock。
+    ToggleDock(workbench::DockSide),
     /// 清空日志缓冲。
     ClearLogs,
     /// 提交一条命令；解析与执行由宿主负责。
     SubmitCommand(String),
+    /// 标题栏搜索框：按名称找元素。
+    ///
+    /// 一条命令两路结果：前缀走 `pe.name` 索引（全库范围，毫秒级），子串走本地
+    /// ngram 索引（当前 MDB 范围，亚毫秒）。两路都跟着按键走——子串那一路曾经
+    /// 是秒级的库内逐行扫，只能由回车显式发起，ADR-0023 之后不再是了。
+    SearchElements {
+        query: String,
+    },
+    /// 关掉搜索：结果作废，在途的那次回来也不再上屏。
+    CloseSearch,
     /// 打开项目选择窗口。
     OpenProjectPicker,
     /// 使用宿主提供的配置加载一个项目。
@@ -186,9 +247,17 @@ pub enum Cmd {
     /// （gen-model ADR-020）：`None` = 全范围（队列面板的即时扫描走它）；
     /// `Some` 时未勾选的库不入队、水位不动。向导确认总是显式给名单——
     /// 预览之后新冒出来的库不在那份确认里，不该被顺手执行。
-    ExecuteModelUpdate { dbnums: Option<Vec<u32>> },
+    ExecuteModelUpdate {
+        dbnums: Option<Vec<u32>>,
+    },
     /// 任务队列上的「立刻扫一遍」。它**不插队**，作用只是别等服务端下一个 30 秒轮询。
     ScanNow,
+    /// 库行上的「立即执行」（09-08 计划 D1 A）：对一个 dbnum 提前排一次它的任务，
+    /// 打的还是既有 execute、带单库名单。它不插队、不改本期执行范围；与自动发现
+    /// 排出的是同一种任务。
+    RunDbnumNow {
+        dbnum: u32,
+    },
     /// 暂停 / 恢复队列出队。暂停**只挡出队**，正在跑的那一批会跑完为止——
     /// 服务端没有中止接口，所以这条命令也不该被当成「停下来」。
     SetQueuePaused(bool),
@@ -221,6 +290,8 @@ pub enum Cmd {
     ResizeViewport([u32; 2]),
     /// 对模型的显示 / 定位类动作。
     Model(ModelAction),
+    /// Query all published descendants, ensuring missing geometry once.
+    FocusTreeScope(RefU64),
     /// 主题下发的三维视口配色：渐变背景上下两色与地面网格线色。
     ///
     /// 背景渐变画在宿主的全屏背景面片上（拷问定案第 2 题，用户点名 Bevy 内画），
@@ -247,4 +318,45 @@ pub enum Cmd {
     /// 只碰失败的那些：网格文件名是内容哈希，已经加载成功的换个目录取到的还是
     /// 同一份内容。由宿主在设置保存之后发出，界面上没有对应的按钮。
     RetryFailedMeshes,
+    /// 模型树右键「重新生成模型」：删掉这几行范围内**已经生成**的模型，再重做一遍。
+    ///
+    /// **不进 [`ModelAction`]。** 那个枚举里的每一项改的都是「三维此刻画成什么样」，
+    /// 撤销它只要再下一条相反的命令；这一条改的是模型库里的产物，删掉的几何只能
+    /// 重新算回来。两者混在一个枚举里，宿主那边就只剩注释在提醒这件事。
+    ///
+    /// 这一条只发起**清点**：宿主先跑 deep query 数出「多少个已生成元素、归成多少个
+    /// 生成单元」，把数字摆进确认框，等 [`Self::RegenerateConfirm`] 才动手。
+    RegenerateModels {
+        targets: Vec<aios_core::RefU64>,
+    },
+    /// 确认框的回执。`false`（取消 / 关窗）时一个请求都不发。
+    RegenerateConfirm {
+        accepted: bool,
+    },
+    /// 「停在这里」。**只停派发**：已经发出去的那一个停不了——服务端那边是
+    /// `await_background_without_cancelling`，连超时都不杀后台任务。所以按钮文案
+    /// 里不许出现「取消」，见 `model_regenerate::STOP_LABEL`。
+    RegenerateStop,
+}
+
+#[cfg(test)]
+mod tests {
+    /// 重新生成是对**模型库**的动作，不是对三维场景的动作。混进 `ModelAction`
+    /// 之后，宿主那边处理可见性的那一路会顺手把它也接了，而那条路上没有确认框、
+    /// 没有互斥、没有账本——删除会变成一次没人拦得住的点击。
+    #[test]
+    fn regeneration_is_not_a_scene_action() {
+        let source = include_str!("lib.rs");
+        let model_action = source
+            .split_once("pub enum ModelAction {")
+            .expect("ModelAction exists")
+            .1
+            .split_once("\n}")
+            .expect("ModelAction ends")
+            .0;
+        assert!(
+            !model_action.contains("Regenerate"),
+            "重新生成不该是三维动作: {model_action}"
+        );
+    }
 }

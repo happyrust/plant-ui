@@ -24,10 +24,7 @@ async fn probe_room_queries_round_trip() {
     );
 
     // 找一间有成员的合规房间，把 detail 与 element_rooms 串起来验证一致性。
-    let Some(target) = overview
-        .iter()
-        .find(|r| r.valid_name && r.member_count > 0)
-    else {
+    let Some(target) = overview.iter().find(|r| r.valid_name && r.member_count > 0) else {
         println!("库里没有带成员的合规房间，探针只验证了 overview 这一层");
         return;
     };

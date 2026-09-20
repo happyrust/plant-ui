@@ -17,3 +17,21 @@
 /.github/copilot-instructions.md
 /pe_owner
 
+# 会话临时物（2026-09-09 检查点收编）：各代理会话落在仓库根的日志、截图与缓存，
+# 以及运行期网格资产（web/public/assets/meshes 有 4.8 万个文件 600+MB，绝不入库）。
+/_*.log
+/_name_corpus.tsv
+/_m0_config.toml.bak
+/_oracle_search_prompt.md
+/*.png
+/.codex-artifacts/
+/.codex-fix/
+/.codex-release/
+/.sim-verify/
+/.tgrep/
+/artifacts/
+/rustc-ice-*.txt
+/start-codex-test.ps1
+/web/public/assets/meshes/
+/web/public/assets/config/
+

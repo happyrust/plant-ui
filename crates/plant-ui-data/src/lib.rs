@@ -7,11 +7,42 @@ use anyhow::Result;
 pub use aios_core::pdms_types::EleTreeNode;
 pub use aios_core::{RefU64, RefnoEnum};
 
+/// 名称子串搜索的本地 ngram 索引（ADR-0023）。浏览器端不建索引，整模块只在
+/// 原生端存在——`plant-ui-data` 是 wasm 双端 crate，tantivy 编不进那一端。
+#[cfg(not(target_arch = "wasm32"))]
+pub mod name_index;
 pub mod room;
 
 /// 连接本地 SurrealDB（读取工作目录的 DbOption.toml，走 aios_core 全局句柄 SUL_DB）。
 pub async fn connect() -> Result<()> {
-    aios_core::init_surreal().await?;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static CONNECTED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+        CONNECTED.get_or_try_init(connect_once).await?;
+        Ok(())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        // `SUL_DB` is a process-global handle.  The browser bridge calls
+        // `connect()` before every request, so calling the Surreal client a
+        // second time returns `Already connected`.  Keep the guard on the
+        // wasm side too; a mutex (rather than a bare bool) also makes callers
+        // that arrive while the first handshake is in flight wait for it.
+        static CONNECTED: futures::lock::Mutex<bool> = futures::lock::Mutex::new(false);
+        let mut connected = CONNECTED.lock().await;
+        if !*connected {
+            connect_once().await?;
+            *connected = true;
+        }
+        Ok(())
+    }
+}
+
+async fn connect_once() -> Result<()> {
+    // UI reads the service-owned schema. Full initialization also installs SQL
+    // resources, which are deliberately absent from the standalone UI package.
+    aios_core::aios_db_mgr::aios_mgr::init_surreal_with_signin(aios_core::try_get_db_option()?)
+        .await?;
     // 平表读连接池后台预热（P4）：4 条连接的握手+签入约 2s，放启动期消化，
     // 首次整场重载不再吃这口冷启动（并发安全，重载若抢先会等同一次初始化）。
     #[cfg(not(target_arch = "wasm32"))]
@@ -74,50 +105,28 @@ pub async fn model_instances(roots: &[RefU64]) -> Result<Vec<aios_core::GeomInst
     model_instances_with_progress(roots, |_, _| {}).await
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BranchQuery {
-    Root,
-    Descendants,
-}
-
-fn branch_query(noun: &str) -> BranchQuery {
-    match noun {
-        "BRAN" | "HANG" => BranchQuery::Root,
-        _ => BranchQuery::Descendants,
-    }
-}
-
-/// 强制走旧深遍历路径的运维开关（现场回退用，一个版本后随旧路径一起退役）。
-fn legacy_model_query_forced() -> bool {
-    std::env::var("PLANT_UI_LEGACY_MODEL_QUERY").is_ok_and(|v| v == "1")
-}
-
 /// 查询已经生成好的模型，并按查询分块报告进度。
 ///
-/// 自动选路：`inst_relate.anc` 已回填 → [`model_instances_anc`]（每根一条
-/// `anc CONTAINS` 索引查询，根间并发）；未回填（gen-model 新版启动会自愈回填）
-/// 或探测失败 → [`model_instances_legacy`]。`PLANT_UI_LEGACY_MODEL_QUERY=1`
-/// 强制旧路径。这里仍然只读 SurrealDB；mesh 文件由 View3d 的 AssetLoader 消费，
-/// 不会触发模型生成。
+/// 唯一路径是 [`model_instances_anc`]（每根一条 `anc CONTAINS` 索引查询，
+/// 根间并发）。旧深遍历路径（`model_instances_legacy`）与
+/// `PLANT_UI_LEGACY_MODEL_QUERY` 回退开关已随层级查询优化 P3 退役——它经
+/// `query_inst_refnos_by_zone` 消费 `inst_relate.zone_refno`，而 gen-model
+/// 已不再写该列，旧路径对新行只会静默漏，不配再当回退保险丝。
+///
+/// `anc` 未回填的库不再静默降级，而是响亮失败：升级 gen-model 并对该库启动
+/// 一次（启动序列的幂等自愈回填）即恢复。这里仍然只读 SurrealDB；mesh 文件
+/// 由 View3d 的 AssetLoader 消费，不会触发模型生成。
 pub async fn model_instances_with_progress(
     roots: &[RefU64],
     progress: impl FnMut(usize, usize),
 ) -> Result<Vec<aios_core::GeomInstQuery>> {
-    if legacy_model_query_forced() {
-        return model_instances_legacy(roots, progress).await;
-    }
     match aios_core::inst_relate_anc_ready().await {
         Ok(true) => model_instances_anc(roots, progress).await,
-        Ok(false) => {
-            eprintln!(
-                "inst_relate.anc 未回填（升级 gen-model 并启动一次即自愈），本次走旧深遍历路径"
-            );
-            model_instances_legacy(roots, progress).await
-        }
-        Err(error) => {
-            eprintln!("anc 覆盖探测失败（{error}），本次走旧深遍历路径");
-            model_instances_legacy(roots, progress).await
-        }
+        Ok(false) => anyhow::bail!(
+            "inst_relate.anc 未回填，模型查询无法进行：用新版 gen-model 对该库启动一次\
+             （启动序列自愈回填）后重试"
+        ),
+        Err(error) => Err(error.context("anc 覆盖探测失败")),
     }
 }
 
@@ -128,8 +137,9 @@ pub async fn model_instances_with_progress(
 /// 并发（`buffered` 保输入序，结果顺序确定）。根类型无关——SITE/ZONE/PIPE/
 /// BRAN/叶子一律同一条查询，不再需要辨名词、SITE→ZONE 中转与深遍历。
 ///
-/// 进度口径：每根完成算 1 步（旧路径按 500 行分块计步，粒度不同但语义同为
-/// 「已完成/总数」）。pub 供对拍验收（`tests/anc_model_query_parity.rs`）
+/// 进度口径：每根完成算 1 步（退役前的旧路径按 500 行分块计步，粒度不同但
+/// 语义同为「已完成/总数」）。pub 供计时探针（`tests/anc_model_query_parity.rs`
+/// 的 timing 用例；对拍基线已随旧路径退役，验收记录见 gen-model 方案文档 P2 节）
 /// 与排障直接调用。
 pub async fn model_instances_anc(
     roots: &[RefU64],
@@ -152,13 +162,28 @@ pub async fn model_instances_anc(
             .await
         })
     });
-    let resolved: Vec<(Vec<aios_core::RefnoEnum>, Vec<aios_core::RefnoEnum>)> =
+    let mut resolved: Vec<(Vec<aios_core::RefnoEnum>, Vec<aios_core::RefnoEnum>)> =
         futures::stream::iter(resolutions)
             .buffered(CONCURRENCY)
             .collect::<Vec<_>>()
             .await
             .into_iter()
             .collect::<Result<_>>()?;
+    // `anc CONTAINS root` only returns descendants: a leaf element's own
+    // inst_relate/tubi_relate row has no self entry in `anc`.  Include the
+    // requested root in both probe lists so clicking a directly-rendered
+    // element (for example `=24384/23264`) does not produce an empty scene.
+    // The projection queries are noun-agnostic and simply return no rows for
+    // the list that does not apply (inst vs BRAN/tubi).
+    include_query_roots(roots, &mut resolved);
+    // e3d-model 的隐式直管每段各占一行 `inst_relate`（id 是几何身份摘要，不是 PE
+    // refno），同一 BRAN 的每一段都会让 anc 解析返回一次相同的 `in`。先按 refno
+    // 去重，随后一次查询取回该 BRAN 的全部派生行；否则分块边界会把同一批直管
+    // 重复装进场景。
+    for (inst_refnos, _) in &mut resolved {
+        inst_refnos.sort_by_key(|refno| refno.refno().0);
+        inst_refnos.dedup();
+    }
 
     // 2) 全局块队列：跨根摊平再并行。按根并发时，巨型 SITE 的十几个批在自己根
     //    的 future 里串成链、成为整场的尾巴（AMS 实测根偏斜让 8 路根并发几乎
@@ -195,11 +220,15 @@ pub async fn model_instances_anc(
         spawn_query(async move {
             match job {
                 Job::Inst(idx, chunk) => {
-                    let (mut models, missing) =
-                        aios_core::query_insts_flat(chunk.iter()).await?;
+                    let ((mut models, missing), derived) = futures::future::try_join(
+                        aios_core::query_insts_flat(chunk.iter()),
+                        query_derived_insts_by_inputs(&chunk),
+                    )
+                    .await?;
                     if !missing.is_empty() {
                         models.extend(aios_core::query_insts_slim(missing.iter()).await?);
                     }
+                    models.extend(derived);
                     anyhow::Ok((idx, models))
                 }
                 Job::Bran(idx, chunk) => anyhow::Ok((
@@ -227,6 +256,59 @@ pub async fn model_instances_anc(
     Ok(models)
 }
 
+fn include_query_roots(
+    roots: &[RefU64],
+    resolved: &mut [(Vec<aios_core::RefnoEnum>, Vec<aios_core::RefnoEnum>)],
+) {
+    debug_assert_eq!(roots.len(), resolved.len());
+    for (root, (inst_refnos, bran_refnos)) in roots.iter().copied().zip(resolved) {
+        inst_refnos.push(root.into());
+        bran_refnos.push(root.into());
+    }
+}
+
+/// e3d-model 新路径把一根 BRAN 的每段隐式直管分别落为一行 `inst_relate`，**id 是几何身份的
+/// 摘要而不是 PE refno**，旧的 `query_insts_flat([bran])` 只会点查 `inst_relate:<bran>`，
+/// 因此必须按 `in` 补取。这里刻意按 `in` 反查 + 排除 refno 键，而不是按 id 形状匹配：
+/// 摘要 id 2026-09-04 起不带 `derived_` 前缀，`string::starts_with` 那种写法也会让规划器
+/// 退回整表扫。旧 `tubi_relate` 仍由 [`tubi_to_geom`] 兼容读取，两条路径互不替代。
+async fn query_derived_insts_by_inputs(
+    refnos: &[aios_core::RefnoEnum],
+) -> Result<Vec<aios_core::GeomInstQuery>> {
+    if refnos.is_empty() {
+        return Ok(Vec::new());
+    }
+    let inputs = refnos
+        .iter()
+        .map(|refno| refno.to_pe_key().to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let direct = aios_core::get_inst_relate_keys(refnos);
+    let mut response = SUL_DB
+        .query(format!(
+            r#"SELECT
+                   in AS refno, in.old_pe AS old_refno, in.owner AS owner,
+                   generic, aabb.d AS world_aabb, world_trans.d AS world_trans,
+                   out.ptset.d.pt AS pts,
+                   IF booled_id != NONE {{
+                       [{{ "geo_hash": booled_id, "is_tubi": generic = 'TUBI' }}]
+                   }} ELSE {{
+                       (SELECT (transform ?? trans.d) AS transform, record::id(out) AS geo_hash,
+                               generic = 'TUBI' AS is_tubi
+                        FROM out->geo_relate
+                       WHERE visible && out.meshed && (transform ?? trans.d) != NONE && geo_type = 'Pos')
+                   }} AS insts,
+                   generic != 'TUBI' && booled_id != NONE AS has_neg,
+                   dt AS date
+               FROM inst_relate
+               WHERE in IN [{inputs}] AND id NOT IN [{direct}]
+                 AND aabb.d != NONE AND world_trans.d != NONE"#
+        ))
+        .await?
+        .check()?;
+    Ok(response.take(0)?)
+}
+
 /// 非 wasm 下把查询未来包进 `tokio::spawn` 真任务：`buffered` 本身是单任务
 /// 轮询，51k 行的响应反序列化会全部挤在一个线程上（release 实测 ~56µs/行，
 /// 单线程地板 ~3s）——spawn 让解析散到多线程运行时，与 rs-core 侧的平表读
@@ -246,67 +328,9 @@ fn spawn_query<F: std::future::Future>(fut: F) -> F {
     fut
 }
 
-/// 旧路径：深遍历解可见实例集 + 分批 `query_insts`。保留一个版本作现场回退
-/// 与对拍基线（anc 回填完成、AMS 对拍通过后随开关一起退役）。
-pub async fn model_instances_legacy(
-    roots: &[RefU64],
-    mut progress: impl FnMut(usize, usize),
-) -> Result<Vec<aios_core::GeomInstQuery>> {
-    let mut refnos = Vec::new();
-    let mut branch_refnos = Vec::new();
-    let mut zone_refnos = Vec::new();
-    let roots = roots
-        .iter()
-        .copied()
-        .map(Into::into)
-        .collect::<Vec<aios_core::RefnoEnum>>();
-    let nouns = aios_core::get_type_names(roots.iter()).await?;
-    for (root, noun) in roots.into_iter().zip(nouns) {
-        match noun.as_str() {
-            "ZONE" => zone_refnos.push(root),
-            "SITE" => {
-                zone_refnos.extend(aios_core::query_filter_deep_children(root, &["ZONE"]).await?);
-            }
-            _ => refnos.extend(aios_core::query_deep_visible_inst_refnos(root).await?),
-        }
-        match branch_query(&noun) {
-            BranchQuery::Root => branch_refnos.push(root),
-            BranchQuery::Descendants => {
-                branch_refnos
-                    .extend(aios_core::query_filter_deep_children(root, &["BRAN", "HANG"]).await?);
-            }
-        }
-    }
-    for chunk in zone_refnos.chunks(500) {
-        refnos.extend(aios_core::query_inst_refnos_by_zone(chunk.iter()).await?);
-    }
-    let mut models = Vec::new();
-    let total = refnos.len().div_ceil(500) + branch_refnos.len().div_ceil(500);
-    let mut done = 0;
-    progress(done, total);
-    for chunk in refnos.chunks(500) {
-        models.extend(aios_core::query_insts(chunk.iter(), false).await?);
-        done += 1;
-        progress(done, total);
-    }
-    for chunk in branch_refnos.chunks(500) {
-        models.extend(
-            aios_core::query_tubi_insts_by_brans(chunk)
-                .await?
-                .into_iter()
-                .map(tubi_to_geom),
-        );
-        done += 1;
-        progress(done, total);
-    }
-    Ok(models)
-}
-
-/// 直管段实例 → 几何实例的统一换装（新旧路径共用；`owner` 取自身、单实例
-/// `is_tubi`、generic 缺省 PIPE 都是旧路径的既有口径）。
-fn tubi_to_geom(
-    tubi: aios_core::rs_surreal::inst::TubiInstQuery,
-) -> aios_core::GeomInstQuery {
+/// 直管段实例 → 几何实例的统一换装（`owner` 取自身、单实例 `is_tubi`、
+/// generic 缺省 PIPE 都是退役前旧路径的既有口径，anc 路径原样继承）。
+fn tubi_to_geom(tubi: aios_core::rs_surreal::inst::TubiInstQuery) -> aios_core::GeomInstQuery {
     let refno = tubi.refno;
     aios_core::GeomInstQuery {
         refno,
@@ -318,6 +342,7 @@ fn tubi_to_geom(
             geo_hash: tubi.geo_hash,
             transform: Default::default(),
             is_tubi: true,
+            is_invalid_tubi: tubi.invalid,
         }],
         has_neg: false,
         generic: tubi.generic.unwrap_or_else(|| "PIPE".into()),
@@ -326,44 +351,84 @@ fn tubi_to_geom(
     }
 }
 
-#[cfg(test)]
-mod model_scope_tests {
-    use super::{BranchQuery, branch_query};
+/// 一个范围里**已经生成过模型**的元素，连同各自的祖先链（refno 的 u64 原值）。
+///
+/// 「重新生成模型」的取材查询。走的是模型查询同一条 `inst_relate.anc` 索引，
+/// 任意根类型通吃（SITE / ZONE / PIPE / BRAN / 叶子一律同一条），所以右键
+/// 落在容器行上也不必先展开子层。
+///
+/// 两条纪律：
+///
+/// - **必须在任何删除之前调**。它认的是 `inst_relate` 行，删完就查不到了；
+///   删完再查回的是空集，而空集在调用方那里长得像「这里本来就没模型」。
+/// - `anc` 未回填的库响亮失败，与 [`model_instances_with_progress`] 同一句话。
+///   这条路没有深遍历回退——那条旧路径已随层级查询优化 P3 退役。
+/// **直管段单独算一份。** 隐含直管走 `tubi_relate` 而不是 `inst_relate`，
+/// 只有直管没有管件的 BRAN 在上一条查询里一行都没有。漏掉它们的话，一整根
+/// 光管的支管会被当成「没生成过」，重新生成时直接跳过。
+pub async fn generated_scope(root: RefU64) -> Result<GeneratedScope> {
+    match aios_core::inst_relate_anc_ready().await {
+        Ok(true) => {}
+        Ok(false) => anyhow::bail!(
+            "inst_relate.anc 未回填，取不到已生成元素：用新版 gen-model 对该库启动一次\
+             （启动序列自愈回填）后重试"
+        ),
+        Err(error) => return Err(error.context("anc 覆盖探测失败")),
+    }
+    let root: RefnoEnum = root.into();
+    let (elements, tubing) = futures::future::try_join(
+        aios_core::query_generated_subtree_with_anc(root),
+        aios_core::query_bran_refnos_by_root_anc(root),
+    )
+    .await?;
+    Ok(GeneratedScope {
+        elements,
+        tubing_branches: tubing.into_iter().map(|refno| refno.refno()).collect(),
+    })
+}
 
-    #[test]
-    fn site_and_zone_scopes_include_descendant_straight_tubes() {
-        assert_eq!(branch_query("ZONE"), BranchQuery::Descendants);
-        assert_eq!(branch_query("SITE"), BranchQuery::Descendants);
+/// 一个范围里已经生产出来的模型，按两张边表分开装。
+#[derive(Debug, Clone, Default)]
+pub struct GeneratedScope {
+    /// `inst_relate` 上的几何元素，各自带祖先链。
+    pub elements: Vec<aios_core::rs_surreal::inst::GeneratedElement>,
+    /// `tubi_relate` 上带直管的 BRAN / HANG。它们本身就是交付单元粒度。
+    pub tubing_branches: Vec<RefU64>,
+}
+
+impl GeneratedScope {
+    /// 确认框上报的「已生成元素」数。两张表各数各的，不去重——
+    /// 一根 BRAN 既有管件又有直管时，那是两类产物，都要重做。
+    pub fn element_count(&self) -> usize {
+        self.elements.len() + self.tubing_branches.len()
     }
 }
 
-/// 设计库里还没被应用到模型的会话数。
-///
-/// 直连 gen-model 的 `dbnum_watermark` 表读，不走它的 HTTP 接口：取回工作是纯
-/// 数据库操作，不该因为那个服务没起就连提示都给不出。**代价是这里认得后端的表名
-/// 和字段名**——那张表改了结构，这一处得跟着改，而编译器不会提醒。
-///
-/// 两个边界必须知道：
-///
-/// - `file_latest_sesno` 是**上一次扫描或应用时记下的**，不是实时读文件。所以这个
-///   数只配当提示，不能拿来判断「需不需要取回」。
-/// - 水位为 0 的库是从没应用过的（gen-model 那边叫「需初始化」），不参与这个加法。
-///   算进去的话一个新登记的库会报出一个天文数字。
-pub async fn pending_sessions() -> Result<u32> {
-    let sql = format!(
-        "SELECT VALUE [applied_sesno, file_latest_sesno] FROM {WATERMARK_TABLE} \
-         WHERE db_type = 'DESI' AND applied_sesno > 0 AND file_latest_sesno > applied_sesno"
-    );
-    let mut response = SUL_DB.query(&sql).await?;
-    let rows: Vec<(i32, i32)> = response.take(0)?;
-    Ok(rows
-        .into_iter()
-        .map(|(applied, latest)| (latest - applied).max(0) as u32)
-        .sum())
+/// 一批 refno 的 noun。缺行的不进表——**按对返回而不是按位置**，
+/// 中间少一行不会把后面所有 noun 都错位一格。
+pub async fn nouns_of(refnos: &[RefU64]) -> Result<std::collections::HashMap<RefU64, String>> {
+    // 与模型查询同一个分批口径：id 列表载荷太大时单条 WS 消息会撑爆。
+    const CHUNK: usize = 1500;
+    let mut out = std::collections::HashMap::with_capacity(refnos.len());
+    for chunk in refnos.chunks(CHUNK) {
+        let keys = chunk
+            .iter()
+            .map(|refno| RefnoEnum::from(*refno).to_pe_key())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut response = SUL_DB
+            .query(format!("select value [id, noun] from [{keys}]"))
+            .await?;
+        let rows: Vec<(RefnoEnum, String)> = response.take(0)?;
+        out.extend(rows.into_iter().map(|(refno, noun)| (refno.refno(), noun)));
+    }
+    Ok(out)
 }
 
-/// gen-model 的水位表。跟着 `gen-model/src/data_interface/dbnum_state.rs` 走。
-const WATERMARK_TABLE: &str = "dbnum_watermark";
+// 「设计库里还没应用的保存数」不再从这里直读 gen-model 的 `dbnum_watermark` 表：
+// 那张表在零解析（direct）部署里是空的，而且它让本 crate 认得后端的表名与字段名。
+// 提示现在从队列轮询的 `GET /api/v1/dbnums` 回包算（`task_queue::Vm::watermark_lag`），
+// 那份本来就每拍都取、每行都带 `applied_sesno` / `file_latest_sesno`。
 
 /// 取回工作前先把本进程的查询缓存丢干净。
 ///
@@ -379,6 +444,79 @@ pub async fn resolve_name(name: &str) -> Result<Option<RefU64>> {
     Ok(aios_core::get_refno_by_name(name)
         .await?
         .map(|refno| refno.refno()))
+}
+
+/// 名称搜索的一条命中。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameHit {
+    pub refno: RefU64,
+    /// PDMS 全名，带前导 `/`。
+    pub name: String,
+    pub noun: String,
+    /// 元素所在的设计库编号。调用方拿它分辨命中是不是在当前 MDB 的模型树里。
+    pub dbnum: u32,
+}
+
+/// 按名称前缀找元素，走 `pe.name` 索引的范围扫。
+///
+/// 范围扫是这条路便宜的**唯一**理由：`name >= 前缀 AND name < 前缀+最大字符`
+/// 在 8,819,107 行的 pe 上实测 1~2ms（查询计划 `Iterate Index`）。凡是改成
+/// `string::starts_with` 之类的函数写法，规划器立刻退回 `Iterate Table`，同一个
+/// 前缀要 37 秒——两者在结果上等价，在能不能用上差着四个数量级。
+///
+/// 前导 `/` 可省：库里存的是 `/1RX-210` 这种全名，而人念的是 `1RX-210`。
+/// 大小写也可省：库里 878 万行里有 784 个小写开头的名字（元件库居多），所以
+/// 原样与全大写各扫一遍再并起来，而不是假装名字一定是大写的。
+///
+/// **不限当前 MDB。** 这里回的是模型本体里的全部命中，其中可能有树外元素；
+/// 拿 `dbnum` 与当前 MDB 的设计库名单一比就知道是哪一种，那是调用方的事
+/// （树定位本来就允许选中树外元素，只是不切换 MDB）。
+pub async fn search_names_by_prefix(prefix: &str, limit: usize) -> Result<Vec<NameHit>> {
+    let prefix = aios_core::helper::to_e3d_name(prefix.trim()).into_owned();
+    if prefix.len() <= 1 {
+        return Ok(Vec::new());
+    }
+    let upper = prefix.to_uppercase();
+    let mut hits = prefix_scan(&prefix, limit).await?;
+    if upper != prefix {
+        let more = prefix_scan(&upper, limit).await?;
+        let known = hits.iter().map(|hit| hit.refno).collect::<Vec<_>>();
+        hits.extend(more.into_iter().filter(|hit| !known.contains(&hit.refno)));
+        hits.sort_by(|a, b| a.name.cmp(&b.name));
+        hits.truncate(limit);
+    }
+    Ok(hits)
+}
+
+async fn prefix_scan(prefix: &str, limit: usize) -> Result<Vec<NameHit>> {
+    // 索引按名称升序迭代，所以结果天然按名称排好，不必再 ORDER BY——加上它
+    // 规划器就得先把整段范围收齐再排，宽前缀（一个 `/A` 几十万行）会当场卡住。
+    // `?? ''` / `?? 0` 不是装饰：整批行里只要有一行缺 noun 或 dbnum，
+    // 反序列化就整条查询失败，搜索框会为了一行没关系的元素报「搜索失败」。
+    let sql = "SELECT VALUE [id, name, noun ?? '', dbnum ?? 0] FROM pe \
+               WHERE name >= $lo AND name < $hi LIMIT $limit";
+    let mut response = SUL_DB
+        .query(sql)
+        .bind(("lo", prefix.to_owned()))
+        .bind(("hi", format!("{prefix}\u{10FFFF}")))
+        .bind(("limit", limit))
+        .await?;
+    let rows: Vec<(RefnoEnum, String, String, u32)> = response.take(0)?;
+    Ok(rows.into_iter().map(into_hit).collect())
+}
+
+// 这里曾经有一个 `search_names_containing`：库内逐行 `string::contains`。
+// ADR-0023 把它整个删掉了——三种写法（子查询限库 83.6s / 一句到底 88.9s /
+// NOINDEX 116.4s）说的是同一件事，在 `pe` 上逐行读 11 列文档本身就是九十秒的
+// 活，SQL 层面无药可救。子串这一路改由 `name_index` 的本地 ngram 索引承担。
+
+fn into_hit((refno, name, noun, dbnum): (RefnoEnum, String, String, u32)) -> NameHit {
+    NameHit {
+        refno: refno.refno(),
+        name,
+        noun,
+        dbnum,
+    }
 }
 
 /// 连接后的工程标识：项目名、当前 MDB 名、SurrealDB 命名空间、当前 MDB（DESI）
@@ -427,6 +565,9 @@ pub struct Attr {
     pub name: String,
     pub value: String,
     pub kind: AttrKind,
+    /// 文件侧属性接口会把 UDA 名称规范化为不带 `:` 的形式，因此不能再靠
+    /// 名称前缀判断分组。旧数据库读取仍按原始键名填充这个标志。
+    pub is_uda: bool,
 }
 
 /// 元素的 UI 属性表：走 `get_ui_named_attmap`（含 UDA、引用转全名、
@@ -465,6 +606,7 @@ pub async fn element_props(refno: RefnoEnum) -> Result<Vec<Attr>> {
                 name: k.clone(),
                 value,
                 kind,
+                is_uda: k.starts_with(':'),
             }
         })
         .collect())
@@ -524,5 +666,46 @@ fn fmt_attr(v: &aios_core::NamedAttrValue) -> String {
         "unset".into()
     } else {
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leaf_model_queries_include_the_clicked_root_itself() {
+        let root = RefU64::from_two_nums(24384, 23264);
+        let descendant = RefU64::from_two_nums(24384, 23265);
+        let mut resolved = vec![(vec![descendant.into()], Vec::new())];
+
+        include_query_roots(&[root], &mut resolved);
+
+        assert!(resolved[0].0.iter().any(|refno| refno.refno() == root));
+        assert!(resolved[0].1.iter().any(|refno| refno.refno() == root));
+    }
+
+    /// 库供数的根层靠 rs-core 的 `MDB_DESI_DBNOS` 从 `MDB.CURD` 解出设计库号。老库里
+    /// `STYP` 是整数 1，现在 gen-model 写进库的是字符串 `"1"`，而 SurrealQL 里 `"1" = 1`
+    /// 恒假——按原类型比就解出零个库、根层零个 SITE（2026-09-07 实机所见）。两边都转成
+    /// 字符串再比，两种形状都认。vendor 一旦重新同步会把这一行悄悄改回去，所以钉在本仓这边。
+    #[test]
+    fn mdb_desi_dbnos_compares_styp_as_text_on_both_sides() {
+        let source = include_str!("../../../vendor/rs-core/src/rs_surreal/mdb.rs");
+        let sql = source
+            .split_once("const MDB_DESI_DBNOS: &str = r#\"")
+            .expect("MDB_DESI_DBNOS")
+            .1
+            .split_once("\"#;")
+            .expect("常量结尾")
+            .0;
+        assert!(
+            sql.contains("where type::string(STYP) = type::string($db_type)"),
+            "STYP 又按原类型比了：{sql}"
+        );
+        assert!(
+            !sql.contains("STYP = $db_type"),
+            "整数比那一句还留着：{sql}"
+        );
     }
 }
