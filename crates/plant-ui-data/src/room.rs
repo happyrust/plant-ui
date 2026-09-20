@@ -87,7 +87,8 @@ pub struct RoomOverviewRow {
 pub async fn element_rooms(refno: RefnoEnum) -> Result<Vec<RoomRelation>> {
     let pe_key = refno.to_pe_key();
     let mut response = SUL_DB.query(element_edges_sql(&pe_key)).await?.check()?;
-    let rows: Vec<(RefnoEnum, String, u8, f32, RefnoEnum)> = response.take(1)?;
+    // 槛 0 / 1 是 LET $kids / LET $targets，边表在第 2 槛。
+    let rows: Vec<(RefnoEnum, String, u8, f32, RefnoEnum)> = response.take(2)?;
     if rows.is_empty() {
         return Ok(Vec::new());
     }
@@ -383,11 +384,20 @@ fn valid_room_num(num: &str) -> bool {
         && bytes[1..].iter().all(|b| b.is_ascii_digit())
 }
 
+/// 自身边 ∪ 直接子层边，子层与边都按记录 id 图遍历（`X<-pe_owner`、`<-room_relate`），
+/// 不写 `WHERE out = X`：SurrealDB 2.1 对 `pe_owner` / `room_relate` 的 `out` 不走任何索引，
+/// AMS 两库 332k 条 `pe_owner` + 64k 条 `room_relate` 两次全表扫 1.7–2.6 s（子层为空、
+/// 甚至记录不存在也一样），图遍历三句合计 0.02–0.03 s（2026-09-20 f13 隔离部署，34 个子 /
+/// 79 条边等五组逐行比对一致）。选中元素后「归属加载中…」那 2.4–3.0 s 里 ~2.2 s 就是这两句。
+///
+/// 数组变量不能直接接图边——`$targets<-room_relate` 会少行——要 `SELECT VALUE <-room_relate
+/// FROM $targets` 逐个取再 `array::flatten`。前两槛是 LET，边表在第 2 槛。
 fn element_edges_sql(pe_key: &str) -> String {
     format!(
-        "LET $kids = (SELECT VALUE in FROM pe_owner WHERE out = {pe_key}); \
-         SELECT VALUE [in, room_num, inside_count, center_dist, out] FROM room_relate \
-         WHERE out = {pe_key} OR out IN $kids;"
+        "LET $kids = (SELECT VALUE in FROM {pe_key}<-pe_owner); \
+         LET $targets = array::append($kids, {pe_key}); \
+         SELECT VALUE [in, room_num, inside_count, center_dist, out] \
+         FROM array::flatten(SELECT VALUE <-room_relate FROM $targets);"
     )
 }
 
@@ -586,9 +596,17 @@ mod tests {
     #[test]
     fn sql_renderers_pin_tables_and_predicates() {
         let edges = element_edges_sql("pe:1_2");
-        assert!(edges.contains("FROM pe_owner WHERE out = pe:1_2"));
-        assert!(edges.contains("FROM room_relate"));
-        assert!(edges.contains("WHERE out = pe:1_2 OR out IN $kids"));
+        // 子层与归属边都按记录 id 图遍历，不许再写 WHERE out = …（SurrealDB 2.1 全表扫
+        // pe_owner / room_relate）；前两槛是 LET，element_rooms() 从第 2 槛取边表。
+        assert!(edges.starts_with("LET $kids = (SELECT VALUE in FROM pe:1_2<-pe_owner);"));
+        assert!(edges.contains("LET $targets = array::append($kids, pe:1_2);"));
+        assert!(edges.contains(
+            "SELECT VALUE [in, room_num, inside_count, center_dist, out] \
+             FROM array::flatten(SELECT VALUE <-room_relate FROM $targets);"
+        ));
+        assert!(!edges.contains("WHERE out ="));
+        assert!(!edges.contains("FROM room_relate WHERE"));
+        assert_eq!(edges.matches("LET ").count(), 2);
 
         let panels = panel_rooms_sql(&["pe:1_10".to_string(), "pe:1_11".to_string()]);
         assert!(panels.contains("FROM room_panel_relate WHERE out IN [pe:1_10, pe:1_11]"));
