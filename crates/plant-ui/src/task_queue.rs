@@ -291,6 +291,9 @@ pub struct ServiceSectionHealth {
     pub status: String,
     #[serde(default)]
     pub last_error: Option<String>,
+    /// 只有 mirror 段使用：真实 Surreal 地址，或 gen-model `store_mode=mem` 时的 `embedded:mem`。
+    #[serde(default)]
+    pub endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

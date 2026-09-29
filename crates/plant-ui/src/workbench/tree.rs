@@ -477,6 +477,11 @@ fn room_menu_items(
 ) {
     let data = match rooms {
         RoomVm::Ready(data) | RoomVm::Loading(Some(data)) if data.refno == refno => data,
+        RoomVm::Unavailable(reason) => {
+            ui.add_enabled(false, egui::Button::new("当前运行模式未提供房间查询"))
+                .on_hover_text(reason);
+            return;
+        }
         RoomVm::Failed(_) => {
             ui.add_enabled(false, egui::Button::new("归属查询失败，详见日志"));
             return;

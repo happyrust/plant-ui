@@ -1478,14 +1478,15 @@ fn model_source_changed_line(
 
 /// 取回工作重装前那一轮 ensure 的流水账，落地时汇成一句日志。
 ///
-/// 三个数分别对应服务端回执的三档（ADR-0009）：真算了几个生成根、几个凭证当前直接
-/// 命中、几个范围压根没 ensure 成（连不上 / 超时 / 目标已不在库中）。失败不阻断重查
+/// 分别记录生成、命中、已删除和失败。目标已不在库中是重装的正常终态，不是生成失败；
+/// 连不上 / 超时等真实失败仍须明确报告。失败不阻断重查
 /// ——空场景比旧几何更坏——但必须数出来，否则「三维已就绪」那句就是在替旧几何背书。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct ReloadEnsureTally {
     targets: usize,
     generated_roots: usize,
     cached_roots: usize,
+    removed_targets: usize,
     failed_targets: usize,
 }
 
@@ -1497,6 +1498,7 @@ impl ReloadEnsureTally {
                 self.generated_roots += reply.generated_root_count;
                 self.cached_roots += reply.cached_root_count;
             }
+            Err(error) if data::reload_target_was_removed(error) => self.removed_targets += 1,
             Err(_) => self.failed_targets += 1,
         }
     }
@@ -1510,6 +1512,9 @@ impl ReloadEnsureTally {
             "核对 {} 个范围 → 重算 {} 个生成根、命中 {} 个",
             self.targets, self.generated_roots, self.cached_roots
         );
+        if self.removed_targets > 0 {
+            line.push_str(&format!("；{} 个范围已移除", self.removed_targets));
+        }
         if self.failed_targets > 0 {
             line.push_str(&format!(
                 "；{} 个范围核对失败，其下的模型可能仍是旧几何",
@@ -2046,6 +2051,9 @@ impl App {
                 {
                     self.vm.rooms = match result {
                         Ok(relations) => RoomVm::Ready(build_rooms(refno, relations)),
+                        Err(e) if e.downcast_ref::<data::MirrorFeatureUnavailable>().is_some() => {
+                            RoomVm::Unavailable(e.to_string())
+                        }
                         Err(e) => {
                             let el = self.tree.element(refno);
                             self.logs
@@ -2406,6 +2414,13 @@ impl App {
                                 "取回工作·模型服务返回未知按需生成状态，按「做过了」计",
                             ),
                         },
+                        Err(error) if data::reload_target_was_removed(error) => {
+                            self.logs.info_of(
+                                &mut self.vm.logs,
+                                element,
+                                "取回工作·范围已从源库移除，不再重装旧几何",
+                            );
+                        }
                         Err(error) => {
                             let failure = model_update_api::failure_of(error);
                             let way_out = match failure.form() {
@@ -4550,7 +4565,9 @@ impl App {
     fn refetch_rooms(&mut self, refno: RefU64) {
         self.vm.rooms.begin_query();
         let _ = self.bridge.req.send(data::Req::ElementRooms(refno));
-        let _ = self.bridge.req.send(data::Req::PanelRoom(refno));
+        if self.tree.noun(refno).is_some_and(is_panel_noun) {
+            let _ = self.bridge.req.send(data::Req::PanelRoom(refno));
+        }
     }
 
     /// 主选中一换就先恢复旧房间。新的 PANEL 是否有效要等归属回包确认，不能让
@@ -5397,7 +5414,7 @@ mod tests {
         RefU64, ReloadEnsureTally, ReloadSnapshot, RowVisibility, TreeModel, TreeRowVm, Window,
         auto_refresh, background_models_settled, begin_get_work, cache_model_scope,
         claim_unloaded_model_refnos, command_reply_is_current, complete_refresh_generation,
-        empty_props_verdict, expand_room_model_targets, finished_after, in_mdb_path,
+        empty_props_verdict, expand_room_model_targets, finished_after, in_mdb_path, is_panel_noun,
         mark_model_scope_unavailable, model_drains_idle, model_progress_terminal,
         model_source_changed_line, model_visibility_plan, needs_children_query, read_face_switch,
         refresh_anchor, regenerate_label, regenerate_summary, reload_snapshot,
@@ -5484,6 +5501,14 @@ mod tests {
             resolve_panel_room_reply(Some(other), panel, Some(room)),
             PanelRoomResolution::Ignore
         );
+    }
+
+    #[test]
+    fn panel_room_lookup_is_only_for_panel_nodes() {
+        assert!(is_panel_noun("PANE"));
+        assert!(is_panel_noun("pane"));
+        assert!(!is_panel_noun("BRAN"));
+        assert!(!is_panel_noun("EQUI"));
     }
 
     #[test]
@@ -6637,6 +6662,25 @@ mod tests {
     /// 重装前那一轮 ensure 的流水账：三档回执各记各的，失败不吞——「三维已就绪」
     /// 后面那半句就是靠它说出「哪几个范围可能仍是旧几何」。没有范围可核对时不多嘴。
     #[test]
+    fn reload_deleted_targets_are_terminal_not_failed_ensures() {
+        let mut tally = ReloadEnsureTally::default();
+        for _ in 0..9 {
+            tally.note(&Err(anyhow::Error::new(model_update_api::ApiError(
+                plant_ui::model_update::Failure::new("not_found", "deleted fixture"),
+            ))));
+        }
+        assert_eq!(tally.targets, 9);
+        assert_eq!(tally.failed_targets, 0, "confirmed deletion is not a generation failure");
+        let line = tally.summary().unwrap();
+        assert!(line.contains("9 个范围已移除"), "{line}");
+        assert!(!line.contains("旧几何") && !line.contains("失败"), "{line}");
+        tally.note(&Err(anyhow::Error::new(model_update_api::ApiError(
+            plant_ui::model_update::Failure::new("timeout", "transient fixture"),
+        ))));
+        assert_eq!(tally.failed_targets, 1, "real failures must remain visible");
+    }
+
+    #[test]
     fn ensure_tally_counts_generated_cached_and_failed_separately() {
         let reply = |status, generated, cached| model_update_api::EnsureReply {
             status,
@@ -6665,6 +6709,7 @@ mod tests {
                 targets: 3,
                 generated_roots: 2,
                 cached_roots: 8,
+                removed_targets: 0,
                 failed_targets: 1,
             }
         );
@@ -6802,6 +6847,10 @@ enum PanelRoomResolution {
     Ignore,
     Clear,
     Enable { panel: RefU64, room: RefU64 },
+}
+
+fn is_panel_noun(noun: &str) -> bool {
+    noun.eq_ignore_ascii_case("PANE")
 }
 
 fn resolve_panel_room_reply(

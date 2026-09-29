@@ -82,7 +82,7 @@ pub struct ServiceIdentity<'a> {
 ///   树目标。**库供数只查它**（v0.1.9 原样：`inst_relate.anc CONTAINS $root` 一根一条）。
 ///   拿并集去跑的话，嵌套在 `roots` 底下的生成根会把同一批实例数两遍。
 /// - `generation_roots`：**服务供数要查的名单**，调用方按前一步 `ensure` 回执算好——重装
-///   = `roots` ∪ 回执里的生成根；eye 显示 = 回执里的生成根，回执空则退到目标本身
+///   = 回执里的生成根（不能混入快照的几何叶子）；eye 显示 = 回执里的生成根，回执空则退到目标本身
 ///   （工作树落地时的形状，`/model/records` 按它分桶）。
 #[derive(Debug, Clone, Copy)]
 pub struct ModelInstancesReq<'a> {

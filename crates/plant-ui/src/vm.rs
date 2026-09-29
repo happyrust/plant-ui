@@ -725,6 +725,8 @@ pub enum RoomVm {
     /// 查询在途。切换元素时保留上一份数据供绘制，避免闪烁；首次查询为 None。
     Loading(Option<RoomsDataVm>),
     Ready(RoomsDataVm),
+    /// The selected runtime does not expose the required query transport.
+    Unavailable(String),
     Failed(String),
 }
 

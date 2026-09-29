@@ -26,9 +26,26 @@ use crate::search_index::{Scope, SearchIndex, SearchIndexState, SubstringHits};
 /// 那条慢路多扫一会儿。取满这个数就等于「后面还有」，界面据此提示缩小范围。
 pub const SEARCH_LIMIT: usize = 20;
 
-async fn require_mirror_feature(feature: &str) -> anyhow::Result<()> {
-    let health =
-        crate::model_update_api::service_health(&crate::model_update_api::base_url()).await?;
+/// Expected transport capability, not a failed query or an empty result.
+#[derive(Debug)]
+pub(crate) struct MirrorFeatureUnavailable(pub String);
+
+impl std::fmt::Display for MirrorFeatureUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) }
+}
+impl std::error::Error for MirrorFeatureUnavailable {}
+
+fn require_direct_mirror_endpoint(
+    health: &plant_ui::task_queue::Health,
+    feature: &str,
+) -> anyhow::Result<()> {
+    if health.mirror.endpoint.as_deref() == Some("embedded:mem") {
+        return Err(MirrorFeatureUnavailable(format!(
+            "镜像不可直连：{feature} 仍使用 SurrealDB 兼容读面，而当前 gen-model 是 \
+             store_mode=mem（库在服务进程里，无数据库端口）。请使用服务供数功能，或把 \
+             gen-model 的 store_mode 改为 rocksdb 并连一台在跑的 SurrealDB。"
+        )).into());
+    }
     if !health.mirror.status.eq_ignore_ascii_case("ready") {
         anyhow::bail!(
             "镜像不可用：{feature} 依赖 SurrealDB（当前状态 {}）",
@@ -39,6 +56,13 @@ async fn require_mirror_feature(feature: &str) -> anyhow::Result<()> {
             }
         );
     }
+    Ok(())
+}
+
+async fn require_mirror_feature(feature: &str) -> anyhow::Result<()> {
+    let health =
+        crate::model_update_api::service_health(&crate::model_update_api::base_url()).await?;
+    require_direct_mirror_endpoint(&health, feature)?;
     // Core startup deliberately does not connect plant-ui to SurrealDB.  The
     // compatibility pages attach lazily only after gen-model reports it ready.
     plant_ui_data::connect().await
@@ -920,9 +944,19 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>, kind: ReadF
                             // 直接算命中，只有被改到的根真重算。顺序做：一个范围可能
                             // 就是整个 ZONE，并发只会让服务端的 per-dbnum 锁互相撞。
                             // 失败不中止：空场景比旧几何更坏，重查照跑，回执里说清。
-                            // 服务供数查的是快照根 ∪ 回执里的生成根；库供数只查快照根
+                            // 服务供数只查 ensure 回执里的生成根；快照是几何叶子，
+                            // 不是 /model/records 的生成根。库供数仍只查快照根
                             // （两份都进 `ModelInstancesReq`，各取各的）。
-                            let mut record_roots = roots.clone();
+                            let mut record_roots = Vec::new();
+                            // Legacy snapshots may have no scope targets. Resolve their
+                            // leaves through ensure instead of calling them generation roots.
+                            let ensure_targets = if ensure_targets.is_empty()
+                                && matches!(model_face.as_ref(), ReadFace::Service(_))
+                            {
+                                roots.clone()
+                            } else {
+                                ensure_targets
+                            };
                             for target in &ensure_targets {
                                 let result = crate::model_update_api::ensure_model(
                                     &base,
@@ -940,6 +974,12 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>, kind: ReadF
                                             .iter()
                                             .filter_map(|root| root.parse::<RefU64>().ok()),
                                     );
+                                } else if result.as_ref().err().is_some_and(reload_failure_keeps_record_root) {
+                                    // Keep a failed scope explicit unless it is confirmed
+                                    // deleted. Querying a non-deletion failure reports a
+                                    // service error rather than falsely succeeding empty.
+                                    // The Store face ignores this roster and still reads roots.
+                                    record_roots.push(*target);
                                 }
                                 let _ = model_evt_tx.send(Evt::ReloadEnsured {
                                     target: *target,
@@ -1270,9 +1310,20 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>, kind: ReadF
     }
 }
 
+fn reload_failure_keeps_record_root(error: &anyhow::Error) -> bool {
+    !reload_target_was_removed(error)
+}
+
+/// Reload-only terminal outcome: an existing display target disappeared from
+/// the authoritative source. Share this rule with UI accounting and logging.
+/// Other failures must retain the retry/read path and their warning severity.
+pub(crate) fn reload_target_was_removed(error: &anyhow::Error) -> bool {
+    crate::model_update_api::failure_of(error).code == "not_found"
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ModelLoad, Req, route_model_load};
+    use super::{ModelLoad, Req, require_direct_mirror_endpoint, route_model_load};
     use plant_ui::RefU64;
     use std::sync::mpsc;
 
@@ -1283,6 +1334,36 @@ mod tests {
             .split_once("#[cfg(test)]")
             .map(|(body, _)| body)
             .unwrap_or(source)
+    }
+
+    #[test]
+    fn only_embedded_transport_absence_is_a_capability_state() {
+        let mut health = plant_ui::task_queue::Health::default();
+        health.mirror.status = "ready".into();
+        health.mirror.endpoint = Some("embedded:mem".into());
+        let error = require_direct_mirror_endpoint(&health, "房间").unwrap_err();
+        assert!(error.downcast_ref::<super::MirrorFeatureUnavailable>().is_some());
+        health.mirror.endpoint = Some("ws://127.0.0.1:8000".into());
+        health.mirror.status = "failed".into();
+        let error = require_direct_mirror_endpoint(&health, "房间").unwrap_err();
+        assert!(error.downcast_ref::<super::MirrorFeatureUnavailable>().is_none());
+        health.mirror.status = "ready".into();
+        assert!(require_direct_mirror_endpoint(&health, "房间").is_ok());
+    }
+
+    #[test]
+    fn embedded_mirror_never_falls_through_to_a_configured_tcp_store() {
+        let mut health = plant_ui::task_queue::Health::default();
+        health.mirror.status = "ready".into();
+        health.mirror.endpoint = Some("embedded:mem".into());
+        let error = require_direct_mirror_endpoint(&health, "房间")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("store_mode=mem"), "{error}");
+        assert!(error.contains("无数据库端口"), "{error}");
+        // 建议的出路必须是现行的两档之一，不能把人引向已退役的 spawned-* 写法。
+        assert!(error.contains("rocksdb"), "{error}");
+        assert!(!error.contains("spawned"), "{error}");
     }
 
     /// 属性面板只经读面：不直接打 HTTP 读接口，也不回退到库（ADR-0026）。
@@ -1518,6 +1599,28 @@ mod tests {
             !lane.contains("Err(error) =>"),
             "眼睛这一臂不许再为 ensure 失败单开一支"
         );
+    }
+
+    #[test]
+    fn reload_service_records_never_start_with_snapshot_geometry_leaves() {
+        let source = include_str!("data.rs");
+        let lane = source.split("let mut record_roots =").nth(1).unwrap()
+            .split("record_roots.sort_unstable();").next().unwrap();
+        assert!(lane.trim_start().starts_with("Vec::new();"));
+        assert!(lane.contains(".generation_roots"));
+        assert!(!lane.contains("record_roots.extend(roots"));
+        assert!(!lane.contains("record_roots = roots.clone()"));
+    }
+
+    #[test]
+    fn reload_drops_only_confirmed_missing_targets_not_transient_failures() {
+        let error = |code| anyhow::Error::new(crate::model_update_api::ApiError(
+            plant_ui::model_update::Failure::new(code, "fixture"),
+        ));
+        assert!(!super::reload_failure_keeps_record_root(&error("not_found")));
+        for code in ["timeout", "internal", "conflict", "SOURCE_CHANGED"] {
+            assert!(super::reload_failure_keeps_record_root(&error(code)), "{code}");
+        }
     }
 
     fn reload(roots: Vec<RefU64>, ensure_targets: Vec<RefU64>, debt_reload: bool) -> Req {

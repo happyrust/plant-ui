@@ -45,7 +45,7 @@
               configuredModelUrl && configuredModelUrl !== "http://127.0.0.1:8022"
                 ? configuredModelUrl
                 : window.location.origin,
-            data_api_url: current.data_api_url || "",
+            data_api_url: current.data_api_url?.trim() || window.location.origin,
             username: current.db?.username || "",
             password: current.db?.password || "",
           };

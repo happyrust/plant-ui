@@ -481,4 +481,15 @@ mod tests {
         assert_eq!(current.db.mdb_name, "/ALL");
         assert!(!current.auto_gen_mesh);
     }
+
+    /// gen-model 的 `store_mode=mem` 没有可供浏览器直连的数据库端口；旧 RON 启动形态也必须
+    /// 把数据 API 缺省到当前页面 origin，不能回落到打包机写死的 api_host。
+    #[test]
+    fn browser_legacy_entry_defaults_the_data_api_to_window_origin() {
+        let index = include_str!("../../../web/public/index.html");
+        assert!(
+            index.contains("data_api_url: current.data_api_url?.trim() || window.location.origin"),
+            "legacy browser entry must use the serving origin when data_api_url is blank"
+        );
+    }
 }
