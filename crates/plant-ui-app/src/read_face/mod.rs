@@ -142,6 +142,15 @@ impl ReadFace {
         }
     }
 
+    /// 根层每个 SITE 连同它所在的库号（`(库号, SITE 名)`）。模型更新面板的 SITE 列
+    /// 靠它认库；库供数给不出库号，回空表。
+    pub async fn site_dbs(&self) -> anyhow::Result<Vec<(u32, String)>> {
+        match self {
+            Self::Service(face) => face.site_dbs().await,
+            Self::Store(face) => face.site_dbs().await,
+        }
+    }
+
     /// 某节点的直接子层，按成员表原序。
     pub async fn children(&self, refno: RefU64) -> anyhow::Result<Vec<EleTreeNode>> {
         match self {

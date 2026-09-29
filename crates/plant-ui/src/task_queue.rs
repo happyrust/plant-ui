@@ -38,6 +38,10 @@ pub const KIND_DATA_BATCH: &str = "data_batch";
 pub const KIND_MODEL_DRAIN: &str = "model_drain";
 /// 房间归属重算轮。它与 dbnum 列表平级，不挂在任何 dbnum 行下（ADR-0011）。
 pub const KIND_ROOM_RECALC: &str = "room_recalc";
+/// 人工触发的指定 dbnum 整库模型重建（gen-model `task_registry.rs` `TASK_KIND_MODEL_REBUILD`，
+/// `POST /api/v1/dbnums/{dbnum}/model/rebuild` 排出来的那一行）。创建即 `running`，没有 `queued`；
+/// 同库重复请求回同一个 `task_id`。2026-09-10 重新计算计划 R1。
+pub const KIND_MODEL_REBUILD: &str = "model_rebuild";
 
 // ================================================================ 契约
 
@@ -164,7 +168,7 @@ pub struct RoomCounts {
 /// `batch` 之后，两边已经是同一个形状，没有理由维护两份。
 
 /// `GET /api/v1/health`。三个字段各撑一句界面上的话：`started_at` 撑「队列是重建的」，
-/// `gen_spatial_tree` 撑「房间增量没开」，`queue_paused` 是暂停横幅的兜底来源。
+/// `room_incremental` 撑「房间增量没开」，`queue_paused` 是暂停横幅的兜底来源。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Health {
     #[serde(default)]
@@ -189,8 +193,14 @@ pub struct Health {
     pub features: FeatureHealth,
     #[serde(default)]
     pub started_at: String,
-    #[serde(default)]
-    pub gen_spatial_tree: bool,
+    /// 房间增量开不开（gen-model `/health.room_incremental`）。它只管增量链，
+    /// 启动全量重建与人工重建不看它。
+    ///
+    /// 它接替 2026-08-07 退役的 `gen_spatial_tree`——那个键 `/health` 从此不发，
+    /// 继续读它就是永远读到 serde 默认 false，泳道会对着正在跑的房间轮说「没开」。
+    /// **缺键按 true**：老服务端不给这个键，而它在服务端的默认值本来就是开。
+    #[serde(default = "yes")]
+    pub room_incremental: bool,
     #[serde(default)]
     pub queue_paused: bool,
     /// `None` 有两种来路，界面上必须分得开：老服务端压根不给这个键；或者服务端以
@@ -216,6 +226,13 @@ pub struct Health {
     /// 不给这个键 → `None`，整条横幅不画。
     #[serde(default)]
     pub catalogue_reconcile: Option<CatalogueReconcile>,
+}
+
+/// [`Health::room_incremental`] 的缺省方向。`#[serde(default)]` 的 bool 是 false，
+/// 而这个键缺席只说明「服务端没提」——它的服务端默认值是开，缺键按关会把整条
+/// 泳道错杀成「没开」。
+fn yes() -> bool {
+    true
 }
 
 /// `/health.catalogue_reconcile`：CATA 库文件前移之后，哪些已发布的根还落在旧目录上。
@@ -448,7 +465,7 @@ impl DbnumStatus {
     }
 }
 
-/// 库行「立即执行」此刻该长什么样（09-08 计划 D1 A / 5.1，2026-09-09 D2–D8 拍板后 U2）。
+/// 库行「提前执行」此刻该长什么样（09-08 计划 D1 A / 5.1，2026-09-09 D2–D8 拍板后 U2）。
 ///
 /// 判据与文案在**按下之前**就说完——今天这几句都要等回执才知道。六档互斥，
 /// 顺序即优先级：范围（排除 / 够不着）→ 阻断 → 队列里已有它的活 → 两枚水位。
@@ -518,7 +535,7 @@ pub enum ActiveTask {
     Queued(Option<usize>),
 }
 
-/// 「立即执行」的判据（09-08 计划 5.1 那张表，逐行对应）。
+/// 「提前执行」的判据（09-08 计划 5.1 那张表，逐行对应）。
 pub fn early_run(db: &DbnumStatus, active: Option<ActiveTask>) -> EarlyRun {
     if db.excluded || db.not_in_project {
         return EarlyRun::Hidden;
@@ -557,6 +574,89 @@ pub fn early_run(db: &DbnumStatus, active: Option<ActiveTask>) -> EarlyRun {
         saves,
         first_import: false,
         chasing_roots: db.model_chasing_roots.filter(|n| *n > 0),
+    })
+}
+
+/// 库行「重算模型（整库）」的七态判据（2026-09-10 重新计算计划 D3）。
+///
+/// 与 [`early_run`] 吃同一份材料（`/dbnums` 的一行），差在三格：**文件没有新保存不灰**——
+/// 它正是为「数据没变、模型要重算」而设，与「提前执行」互补；**排着的数据任务不灰**——
+/// rebuild 与数据 Task 是两个 Task，服务端同库串行；**同库在飞的 rebuild 才灰**——再排只会
+/// 回同一个 `task_id`，不重复排。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ModelRebuild {
+    /// 排除 / 够不着：不在本期执行范围，这一格不画。
+    Hidden,
+    /// 阻断：灰，悬停给阻断原因原文。文件回退那种交给数据面的重建批次，模型不单独重算。
+    Blocked(String),
+    /// 尚无数据水位：没有数据就没有模型可重算，先在手动更新向导里首次导入——重算不替初始化。
+    NeedsInit,
+    /// 同库已有在飞的整库重建：灰，「回同一个 Task，不重复排」。
+    Rebuilding { task_id: String },
+    /// 其余：可点。悬停气泡的材料随判据备好，说不出的整行不画。
+    Ready(ModelRebuildPlan),
+}
+
+/// 「重算模型（整库）」悬停气泡的材料：只用 `/dbnums` 已有的字段，不预估根数——
+/// 应重算根数以回执 `expected_roots` 为准（服务端开工时才数得出）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelRebuildPlan {
+    pub dbnum: u32,
+    pub applied: i32,
+    /// 「还在赶」的根（服务端判）。有就说一句：这次重算会把它们也包进去。
+    pub chasing_roots: Option<u32>,
+    /// 「已放弃」的根（服务端判）。有就说一句：重算会再试它们一次。
+    pub dead_roots: Option<u32>,
+}
+
+impl ModelRebuildPlan {
+    /// 气泡正文，逐行。第一行永远有；后两行说不出就不画。
+    pub fn lines(&self) -> Vec<String> {
+        let mut lines = vec![format!(
+            "把该库全部生成根投进模型队列重算（数据水位 {} 不动，模型水位随收尾前移）",
+            group(self.applied as i64)
+        )];
+        if let Some(n) = self.chasing_roots {
+            lines.push(format!("{n} 根还在赶，这次重算会把它们也包进去"));
+        }
+        if let Some(n) = self.dead_roots {
+            lines.push(format!("{n} 根已放弃，重算会再试它们一次"));
+        }
+        lines.push(
+            "重建期间该库的按需生成回 409，三维视图会等它跑完 · 不插队、不改本期执行范围"
+                .to_owned(),
+        );
+        lines
+    }
+}
+
+/// 「重算模型（整库）」的判据（重新计算计划 §四 D3 前半）。`active_rebuild` 是同库此刻
+/// 在飞的 `model_rebuild` 任务号（[`Vm::active_model_rebuild`]）。
+pub fn model_rebuild(db: &DbnumStatus, active_rebuild: Option<&str>) -> ModelRebuild {
+    if db.excluded || db.not_in_project {
+        return ModelRebuild::Hidden;
+    }
+    if db.blocked {
+        return ModelRebuild::Blocked(
+            db.anomaly
+                .as_ref()
+                .map(|anomaly| anomaly.to_string())
+                .unwrap_or_else(|| "阻断，原因未随契约给出".to_owned()),
+        );
+    }
+    if let Some(task_id) = active_rebuild {
+        return ModelRebuild::Rebuilding {
+            task_id: task_id.to_owned(),
+        };
+    }
+    if !db.initialized {
+        return ModelRebuild::NeedsInit;
+    }
+    ModelRebuild::Ready(ModelRebuildPlan {
+        dbnum: db.dbnum,
+        applied: db.applied_sesno,
+        chasing_roots: db.model_chasing_roots.filter(|n| *n > 0),
+        dead_roots: db.model_dead_roots.filter(|n| *n > 0),
     })
 }
 
@@ -1086,10 +1186,10 @@ impl Vm {
 
     /// 顶栏那格「房间待收敛 N」。`None` = 这一格整个不画。
     ///
-    /// 房间增量没开时一个字都不提：当前项目的 `gen_spatial_tree` 是关的，PANE /
-    /// CWALL / CFLOOR 三张表全空，画出来必然是个永远不动的 0，比不画更糟。
+    /// 房间增量没开（`room_incremental = false`）时一个字都不提：增量链一条房间
+    /// 目标都不排，画出来必然是个永远不动的 0，比不画更糟。
     pub fn rooms_pending(&self) -> Option<usize> {
-        if !self.health.as_ref().is_some_and(|h| h.gen_spatial_tree) {
+        if !self.health.as_ref().is_some_and(|h| h.room_incremental) {
             return None;
         }
         let task = self.room_task()?;
@@ -1102,6 +1202,19 @@ impl Vm {
 
     fn task(&self, task_id: &str) -> Option<&TaskEntry> {
         self.tasks.iter().find(|t| t.task_id == task_id)
+    }
+
+    /// 这个库此刻在飞的整库模型重建（`kind = model_rebuild`、非终态）的任务号。
+    /// 「重算模型（整库）」按钮据它判灰（[`model_rebuild`]）：再排只会回同一个 Task。
+    pub fn active_model_rebuild(&self, dbnum: u32) -> Option<&str> {
+        self.tasks
+            .iter()
+            .find(|t| {
+                t.kind == KIND_MODEL_REBUILD
+                    && t.dbnum == Some(dbnum)
+                    && matches!(t.state.as_str(), "running" | "queued")
+            })
+            .map(|t| t.task_id.as_str())
     }
 }
 
@@ -1575,7 +1688,7 @@ pub fn status(vm: &Vm) -> crate::vm::QueueStatusVm {
 /// 房间任务的行 id 刻意不带 dbnum，那个字段是「最后一次触发来源」而非归属。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaneState {
-    /// `gen_spatial_tree` 关着。**只说这一句**，不摆一条永远是 0 的空泳道。
+    /// `room_incremental` 关着。**只说这一句**，不摆一条永远是 0 的空泳道。
     Off,
     Converging,
     Waiting,
@@ -1606,7 +1719,7 @@ pub struct Lane {
 /// 房间泳道。`None` = 还没读到 `/health`，说不出开没开，那就一个字不提。
 pub fn lane(vm: &Vm) -> Option<Lane> {
     let health = vm.health.as_ref()?;
-    if !health.gen_spatial_tree {
+    if !health.room_incremental {
         return Some(Lane {
             state: LaneState::Off,
             seen: false,
@@ -1700,6 +1813,28 @@ pub fn visible(all: &[RowVm], filter: Filter, search: &str) -> Vec<usize> {
     // 运行中置顶：队列再长也要一眼看得见现在在跑什么。
     hits.sort_by_key(|i| !all[*i].phase.running());
     hits
+}
+
+/// 每个库此刻在队列里的活（「提前执行」判据的材料，09-08 计划 D1 A）：按「这个库
+/// 有没有活」收一份索引，不看「这一行是什么」——终态历史行旁边那枚按钮也要认得出
+/// 同库还排着一条新的。运行中压过排队中；断线的 `Unknown` 也算占着队列：不知道它
+/// 开没开始，就不许放行「再排一次」。
+pub fn active_of(all: &[RowVm]) -> HashMap<u32, ActiveTask> {
+    let mut active: HashMap<u32, ActiveTask> = HashMap::new();
+    for r in all {
+        if r.phase.running() {
+            active.insert(r.dbnum, ActiveTask::Running);
+        } else if matches!(r.phase, Phase::Queued | Phase::Unknown) {
+            active.entry(r.dbnum).or_insert(ActiveTask::Queued(r.position));
+        }
+    }
+    active
+}
+
+/// [`active_of`] 从视图模型直接算的那一版。队列面板自己已经有行表，走 `active_of`；
+/// 别处（模型更新窗的「库状态」页）没有行表，用这一条。
+pub fn active_tasks(vm: &Vm) -> HashMap<u32, ActiveTask> {
+    active_of(&rows(vm))
 }
 
 // ================================================================ 绘制状态
@@ -1798,20 +1933,12 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, state: &mut State, cmd
         // 泳道与「本期不执行」贴底：它们与 dbnum 列表平级，不该跟着列表一起滚走
         // ——一个库默默阻断好几周的时候，滚出视野就等于没说。
         footer(ui, t, d, vm);
-        // 「立即执行」的判据材料（09-08 计划 D1 A）：`/dbnums` 按库、行表按「这个库
+        // 「提前执行」的判据材料（09-08 计划 D1 A）：`/dbnums` 按库、行表按「这个库
         // 有没有活」各收一份索引。空表 = 老服务端没给判据，操作列整列不画（D7）。
         let actions = !vm.dbnums.is_empty();
         let dbs: HashMap<u32, &DbnumStatus> =
             vm.dbnums.iter().map(|db| (db.dbnum, db)).collect();
-        let mut active: HashMap<u32, ActiveTask> = HashMap::new();
-        for r in &all {
-            if r.phase.running() {
-                active.insert(r.dbnum, ActiveTask::Running);
-            } else if matches!(r.phase, Phase::Queued | Phase::Unknown) {
-                // 断线的 Unknown 也算占着队列：不知道它开没开始，就不许放行「再排一次」。
-                active.entry(r.dbnum).or_insert(ActiveTask::Queued(r.position));
-            }
-        }
+        let active = active_of(&all);
         header(ui, t, d, actions);
 
         let hits = visible(&all, state.filter, &state.search);
@@ -1829,8 +1956,23 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, state: &mut State, cmd
                         .get(&row.dbnum)
                         .map(|db| early_run(db, active.get(&row.dbnum).copied()))
                         .unwrap_or(EarlyRun::Hidden);
-                    let (resp, note_fits) =
-                        queue_row(ui, t, d, row, vm.paused(), open, actions, &gate, vm, cmds);
+                    let rebuild = dbs
+                        .get(&row.dbnum)
+                        .map(|db| model_rebuild(db, vm.active_model_rebuild(row.dbnum)))
+                        .unwrap_or(ModelRebuild::Hidden);
+                    let (resp, note_fits) = queue_row(
+                        ui,
+                        t,
+                        d,
+                        row,
+                        vm.paused(),
+                        open,
+                        actions,
+                        &gate,
+                        &rebuild,
+                        vm,
+                        cmds,
+                    );
                     if resp.clicked() {
                         state.toggle(&row.task_id);
                     }
@@ -2285,10 +2427,11 @@ fn room_lane(ui: &mut Ui, t: &Tokens, d: Density, lane: &Lane) {
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = d.px(4.0);
         if lane.state == LaneState::Off {
-            // 房间增量没开时**只说这一句**：本项目 PANE / CWALL / CFLOOR 三张表都是空的，
+            // 房间增量没开时**只说这一句**：增量链一条房间目标都不排，错过的变更
+            // 靠下次启动全量重建回补（gen-model `room_incremental` 的口径）——
             // 画一条永远 0 的泳道比不画更糟。
             ui.label(
-                RichText::new("房间增量没开（gen_spatial_tree = false），本项目当前不做房间归属重算。")
+                RichText::new("房间增量没开（room_incremental = false），本项目当前不做增量房间归属重算。")
                     .font(Font::meta(d))
                     .color(t.text_muted),
             );
@@ -2428,7 +2571,7 @@ fn excluded_row(ui: &mut Ui, t: &Tokens, d: Density, db: &DbnumStatus) {
         .rect_filled(box_rect, CornerRadius::same(radius::SM), bg);
     ui.painter()
         .galley(pos2(box_rect.left() + pad, mid - g.size().y / 2.0), g, fg);
-    // 阻断行也有「立即执行」那一格，但它永远灰着、悬停给阻断原因原文（09-08 计划
+    // 阻断行也有「提前执行」那一格，但它永远灰着、悬停给阻断原因原文（09-08 计划
     // 5.1：判据在按下之前就说完）；排除 / 够不着的行不画这一格——它们本来就不在
     // 本期执行范围里。
     if let EarlyRun::Blocked(reason) = early_run(db, None) {
@@ -2441,7 +2584,7 @@ fn excluded_row(ui: &mut Ui, t: &Tokens, d: Density, db: &DbnumStatus) {
                 .max_rect(zone)
                 .id(egui::Id::new(("early-run-blocked", db.dbnum))),
             |ui| {
-                ui.add_enabled(false, widgets::button(t, d, "立即执行"))
+                ui.add_enabled(false, widgets::button(t, d, "提前执行"))
                     .on_disabled_hover_text(reason);
             },
         );
@@ -2458,7 +2601,7 @@ fn excluded_row(ui: &mut Ui, t: &Tokens, d: Density, db: &DbnumStatus) {
 /// 「排除」与「够不着」的意思恰好相反：前者是当前 MDB 没声明它，后者是声明了、
 /// 当前项目目录里没有它的文件。契约只有 `excluded` 的那阵子，够不着的库只能借
 /// 「不在当前 MDB 声明的名单里」那句话出现，读起来正好是反的（施工单 Q5）。
-fn not_running_reason(db: &DbnumStatus) -> String {
+pub(crate) fn not_running_reason(db: &DbnumStatus) -> String {
     match (&db.anomaly, db.blocked) {
         (Some(anomaly), _) => anomaly_brief(anomaly),
         (None, true) => "阻断，原因未随契约给出".to_owned(),
@@ -2541,9 +2684,13 @@ struct Cols {
     note_end: f32,
     /// 计时那一列右对齐到这里。没有操作列时它就是 `right`。
     timer_right: f32,
-    /// 「操作」列（库行「立即执行」，09-08 计划 D1 A）的左缘；`right` 是它的右缘。
+    /// 「操作」列（库行「提前执行」，09-08 计划 D1 A）的左缘；`action_right` 是它的右缘。
     /// `/dbnums` 一行都没有时不留这一列（老服务端不给就整列不画，D7）。
     action: f32,
+    action_right: f32,
+    /// 「操作」列里第二枚：「重算模型（整库）」图标按钮的左缘（2026-09-10 重新计算计划 D1 ②）；
+    /// `right` 是它的右缘。与「提前执行」互补：一个管「数据变了」，一个管「模型要重算」。
+    rebuild: f32,
     right: f32,
 }
 
@@ -2561,8 +2708,15 @@ fn cols(rect: Rect, d: Density, actions: bool) -> Cols {
     let right = rect.right() - pad;
     let window = rect.left() + d.px(168.0);
     // 操作列只在 `/dbnums` 给了行的时候存在：判据全部来自那张表，没有它
-    // 按钮一颗都画不出来，留一列空白只会让人以为坏了。
-    let action = if actions { right - d.px(74.0) } else { right };
+    // 按钮一颗都画不出来，留一列空白只会让人以为坏了。两枚按钮：「提前执行」
+    // 74 点 + 「重算模型（整库）」图标按钮 44 点（`Btn` 空标签 = 两侧内边距 + 图标），中间 4 点。
+    let rebuild = if actions { right - d.px(44.0) } else { right };
+    let action_right = if actions { rebuild - d.px(4.0) } else { right };
+    let action = if actions {
+        action_right - d.px(74.0)
+    } else {
+        right
+    };
     let timer_right = if actions { action - d.px(10.0) } else { right };
     // 时间对比会话号长（`08-01 09:12 → 08-07 14:33` vs `sesno 1 024 → 1 038`），
     // 这一列随 ADR-0019 从 150 加宽到 180。
@@ -2580,6 +2734,8 @@ fn cols(rect: Rect, d: Density, actions: bool) -> Cols {
         note_end,
         timer_right,
         action,
+        action_right,
+        rebuild,
         right,
     }
 }
@@ -2603,8 +2759,9 @@ fn row_id(task_id: &str) -> egui::Id {
 /// 在行下面补一行，不许截没。
 ///
 /// `actions` = 面板这一帧画不画操作列（`/dbnums` 空表就整列不画，D7）；`gate` 是这个库
-/// 「立即执行」的判据（[`early_run`]），`Hidden` 与「没这一行」都不画按钮。
-/// 按下推 [`Cmd::RunDbnumNow`]。
+/// 「提前执行」的判据（[`early_run`]），`rebuild` 是「重算模型（整库）」的判据
+/// （[`model_rebuild`]），`Hidden` 与「没这一行」都不画按钮。
+/// 按下分别推 [`Cmd::RunDbnumNow`] / [`Cmd::RebuildDbnumModel`]。
 #[allow(clippy::too_many_arguments)]
 fn queue_row(
     ui: &mut Ui,
@@ -2615,6 +2772,7 @@ fn queue_row(
     open: bool,
     actions: bool,
     gate: &EarlyRun,
+    rebuild: &ModelRebuild,
     vm: &Vm,
     cmds: &mut Vec<Cmd>,
 ) -> (egui::Response, bool) {
@@ -2635,6 +2793,9 @@ fn queue_row(
     let mid = rect.center().y;
     if actions && *gate != EarlyRun::Hidden {
         early_run_button(ui, t, d, rect, &c, row.task_id.as_str(), gate, vm, cmds);
+    }
+    if actions && *rebuild != ModelRebuild::Hidden {
+        model_rebuild_button(ui, t, d, rect, &c, row.task_id.as_str(), rebuild, vm, cmds);
     }
 
     ui.painter()
@@ -2810,7 +2971,7 @@ fn queue_row(
     (resp, true)
 }
 
-/// 库行上的「立即执行」（09-08 计划 D1 A / 5.1；D2–D8 2026-09-09 拍板后 U2）。
+/// 库行上的「提前执行」（09-08 计划 D1 A / 5.1；D2–D8 2026-09-09 拍板后 U2）。
 ///
 /// 六档判据在 [`early_run`]；这里只管把它画出来：可点的带粗版气泡，灰的把
 /// 「为什么按不下去」放在悬停里——判据与文案在**按下之前**就说完，不等回执。
@@ -2829,7 +2990,7 @@ fn early_run_button(
 ) {
     let zone = Rect::from_min_max(
         pos2(c.action, row_rect.center().y - d.px(12.0)),
-        pos2(c.right, row_rect.center().y + d.px(12.0)),
+        pos2(c.action_right, row_rect.center().y + d.px(12.0)),
     );
     ui.scope_builder(
         egui::UiBuilder::new()
@@ -2838,7 +2999,7 @@ fn early_run_button(
         |ui| match gate {
             EarlyRun::Hidden => {}
             EarlyRun::Blocked(reason) => {
-                ui.add_enabled(false, widgets::button(t, d, "立即执行"))
+                ui.add_enabled(false, widgets::button(t, d, "提前执行"))
                     .on_disabled_hover_text(reason);
             }
             EarlyRun::InQueue(position) => {
@@ -2846,20 +3007,20 @@ fn early_run_button(
                     Some(n) => format!("已在队列第 {n} 位，提前执行不会插队"),
                     None => "已在队列，提前执行不会插队".to_owned(),
                 };
-                ui.add_enabled(false, widgets::button(t, d, "立即执行"))
+                ui.add_enabled(false, widgets::button(t, d, "提前执行"))
                     .on_disabled_hover_text(hint);
             }
             EarlyRun::Running => {
-                ui.add_enabled(false, widgets::button(t, d, "立即执行"))
+                ui.add_enabled(false, widgets::button(t, d, "提前执行"))
                     .on_disabled_hover_text("正在执行中");
             }
             EarlyRun::UpToDate => {
-                ui.add_enabled(false, widgets::button(t, d, "立即执行"))
+                ui.add_enabled(false, widgets::button(t, d, "提前执行"))
                     .on_disabled_hover_text("文件没有新保存，无可执行");
             }
             EarlyRun::Ready(plan) => {
                 let resp = ui
-                    .add_enabled(vm.can_execute(), widgets::button(t, d, "立即执行"))
+                    .add_enabled(vm.can_execute(), widgets::button(t, d, "提前执行"))
                     .on_disabled_hover_text(execution_disabled_hint(vm));
                 let resp = resp.on_hover_ui(|ui| {
                     ui.set_max_width(d.px(340.0));
@@ -2889,6 +3050,83 @@ fn early_run_button(
                 });
                 if resp.clicked() {
                     cmds.push(Cmd::RunDbnumNow { dbnum: plan.dbnum });
+                }
+            }
+        },
+    );
+}
+
+/// 库行上的「重算模型（整库）」（2026-09-10 重新计算计划 D1 ② / R1）。
+///
+/// 图标按钮，挤在「提前执行」右边；判据在 [`model_rebuild`]，这里只管画：可点的带悬停气泡，
+/// 灰的把「为什么按不下去」放在悬停里——与「提前执行」同一条纪律，在按下之前就说完。
+/// 与模型树右键那条「重新生成」（客户端逐根 ensure）不是一回事：这一枚是服务端整库重建
+/// （`POST /dbnums/{dbnum}/model/rebuild`），进任务队列一行，不改数据水位。
+#[allow(clippy::too_many_arguments)]
+fn model_rebuild_button(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    row_rect: Rect,
+    c: &Cols,
+    task_id: &str,
+    gate: &ModelRebuild,
+    vm: &Vm,
+    cmds: &mut Vec<Cmd>,
+) {
+    let zone = Rect::from_min_max(
+        pos2(c.rebuild, row_rect.center().y - d.px(12.0)),
+        pos2(c.right, row_rect.center().y + d.px(12.0)),
+    );
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(zone)
+            .id(egui::Id::new(("model-rebuild", task_id))),
+        |ui| {
+            let button = || widgets::button(t, d, "").icon(ph::ARROWS_CLOCKWISE);
+            match gate {
+                ModelRebuild::Hidden => {}
+                ModelRebuild::Blocked(reason) => {
+                    ui.add_enabled(false, button())
+                        .on_disabled_hover_text(format!("重算模型（整库）：{reason}"));
+                }
+                ModelRebuild::NeedsInit => {
+                    ui.add_enabled(false, button()).on_disabled_hover_text(
+                        "重算模型（整库）：这个库尚未初始化，没有数据就没有模型可重算——先在手动更新向导里首次导入",
+                    );
+                }
+                ModelRebuild::Rebuilding { task_id } => {
+                    ui.add_enabled(false, button()).on_disabled_hover_text(format!(
+                        "重算模型（整库）：已在重建（{task_id}），再排只会回同一个任务；进度看它那一行"
+                    ));
+                }
+                ModelRebuild::Ready(plan) => {
+                    let resp = ui
+                        .add_enabled(vm.can_execute(), button())
+                        .on_disabled_hover_text(execution_disabled_hint(vm));
+                    let resp = resp.on_hover_ui(|ui| {
+                        ui.set_max_width(d.px(360.0));
+                        ui.label(
+                            RichText::new(format!(
+                                "重算模型（整库）db{}：重新生成该库全部模型",
+                                plan.dbnum
+                            ))
+                            .font(Font::strong(d))
+                            .color(t.text_primary),
+                        );
+                        let lines = plan.lines();
+                        for (i, line) in lines.iter().enumerate() {
+                            let last = i + 1 == lines.len();
+                            ui.label(
+                                RichText::new(line)
+                                    .font(if last { Font::micro(d) } else { Font::meta(d) })
+                                    .color(if last { t.text_muted } else { t.text_secondary }),
+                            );
+                        }
+                    });
+                    if resp.clicked() {
+                        cmds.push(Cmd::RebuildDbnumModel { dbnum: plan.dbnum });
+                    }
                 }
             }
         },
@@ -3203,7 +3441,7 @@ fn terminal_detail(
                 ui,
                 t,
                 d,
-                "不用手动重排：下一轮扫描会按原水位区间重新入队",
+                "不用手动重排：队列按水位派生，下一轮扫描会照原区间重新入队",
                 false,
             );
         }
@@ -4298,7 +4536,7 @@ mod tests {
         .expect("房间轮任务行应当能解出来");
         let mut model = vm(Vec::new(), list.tasks);
         model.health = Some(Health {
-            gen_spatial_tree: true,
+            room_incremental: true,
             ..Default::default()
         });
         assert_eq!(model.rooms_pending(), Some(30));
@@ -4724,12 +4962,12 @@ mod tests {
             }],
         );
         model.health = Some(Health {
-            gen_spatial_tree: false,
+            room_incremental: false,
             ..Default::default()
         });
         assert_eq!(model.rooms_pending(), None);
         model.health = Some(Health {
-            gen_spatial_tree: true,
+            room_incremental: true,
             ..Default::default()
         });
         assert_eq!(model.rooms_pending(), Some(30));
@@ -4746,15 +4984,28 @@ mod tests {
         }
     }
 
-    fn health(gen_spatial_tree: bool) -> Health {
+    fn health(room_incremental: bool) -> Health {
         Health {
-            gen_spatial_tree,
+            room_incremental,
             ..Default::default()
         }
     }
 
-    /// 房间增量没开时泳道只说「没开」这一句。当前项目 PANE / CWALL / CFLOOR 三张表
-    /// 全空，画一条永远是 0 的泳道比不画更糟。
+    /// `/health` 缺 `room_incremental` 键按「开」算：老服务端不发这个键，而它在
+    /// 服务端的默认值就是 true。这条护栏钉死一段历史：前任字段 `gen_spatial_tree`
+    /// 2026-08-07 从 `/health` 退役后，客户端继续按 serde 默认 false 读它，泳道对着
+    /// 正在跑的房间轮说了一个月「没开」——缺键的默认方向不能再错第二次。
+    #[test]
+    fn a_missing_room_incremental_key_means_the_feature_is_on() {
+        let bare: Health = serde_json::from_str("{}").expect("空 /health 也解得出来");
+        assert!(bare.room_incremental);
+        let off: Health =
+            serde_json::from_str(r#"{"room_incremental":false}"#).expect("显式 false 解得出来");
+        assert!(!off.room_incremental);
+    }
+
+    /// 房间增量没开时泳道只说「没开」这一句。增量链一条房间目标都不排，
+    /// 画一条永远是 0 的泳道比不画更糟。
     #[test]
     fn the_lane_says_only_that_the_feature_is_off() {
         let mut model = vm(
@@ -4999,7 +5250,7 @@ mod tests {
         assert_eq!(change_total(85, None, false), "85 项变化");
     }
 
-    /// 「立即执行」的判据（09-08 计划 5.1 那张表）：排除与够不着**不画这一格**
+    /// 「提前执行」的判据（09-08 计划 5.1 那张表）：排除与够不着**不画这一格**
     /// ——它们本来就不在本期执行范围里，画个灰按钮等于暗示「哪天能点」。
     #[test]
     fn early_run_is_hidden_for_excluded_and_unreachable_dbs() {
@@ -5140,6 +5391,148 @@ mod tests {
             initialized: true,
             ..Default::default()
         }
+    }
+
+    /// 「重算模型（整库）」的判据（2026-09-10 重新计算计划 D3）：排除 / 够不着不画；阻断灰 + 原文。
+    /// 与「提前执行」共这两格。
+    #[test]
+    fn model_rebuild_is_hidden_or_blocked_exactly_like_early_run() {
+        let excluded = DbnumStatus {
+            dbnum: 7999,
+            excluded: true,
+            ..Default::default()
+        };
+        let unreachable = DbnumStatus {
+            dbnum: 1112,
+            not_in_project: true,
+            ..Default::default()
+        };
+        assert_eq!(model_rebuild(&excluded, None), ModelRebuild::Hidden);
+        assert_eq!(model_rebuild(&unreachable, None), ModelRebuild::Hidden);
+        let blocked = DbnumStatus {
+            dbnum: 6004,
+            blocked: true,
+            initialized: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            model_rebuild(&blocked, None),
+            ModelRebuild::Blocked("阻断，原因未随契约给出".to_owned())
+        );
+    }
+
+    /// 与「提前执行」**不同**的那一格：文件没有新保存**不灰**——重算正是为「数据没变、
+    /// 模型要重算」而设（验收 §7.7 两枚按钮的互补关系）。
+    #[test]
+    fn model_rebuild_stays_ready_when_the_file_has_no_new_saves() {
+        let db = lagging_db(7998, 300, 300);
+        assert_eq!(early_run(&db, None), EarlyRun::UpToDate);
+        match model_rebuild(&db, None) {
+            ModelRebuild::Ready(plan) => {
+                assert_eq!(plan.dbnum, 7998);
+                assert_eq!(plan.applied, 300);
+                assert_eq!(plan.chasing_roots, None);
+                assert_eq!(plan.dead_roots, None);
+            }
+            other => panic!("追平的库也该可重算，得到 {other:?}"),
+        }
+    }
+
+    /// 尚无数据水位：灰。没有数据就没有模型可重算，重算不替初始化（D3；与「提前执行」
+    /// 在这一格相反——那边是首次导入可点）。
+    #[test]
+    fn model_rebuild_waits_for_initialization() {
+        let db = DbnumStatus {
+            dbnum: 7355,
+            db_type: "DESI".to_owned(),
+            applied_sesno: 0,
+            file_latest_sesno: 812,
+            initialized: false,
+            ..Default::default()
+        };
+        assert!(matches!(early_run(&db, None), EarlyRun::Ready(_)));
+        assert_eq!(model_rebuild(&db, None), ModelRebuild::NeedsInit);
+    }
+
+    /// 同库在飞的整库重建才灰（回同一个 Task，不重复排）；排着 / 跑着的**数据**任务不灰——
+    /// 两个 Task，服务端同库串行。判据只吃传进来的任务号，不看数据任务。
+    #[test]
+    fn model_rebuild_yields_only_to_an_active_rebuild_of_the_same_db() {
+        let db = lagging_db(8000, 26, 26);
+        assert_eq!(
+            model_rebuild(&db, Some("model-rebuild-8000-1")),
+            ModelRebuild::Rebuilding {
+                task_id: "model-rebuild-8000-1".to_owned()
+            }
+        );
+        assert!(matches!(model_rebuild(&db, None), ModelRebuild::Ready(_)));
+    }
+
+    /// `Vm::active_model_rebuild` 只认 `kind = model_rebuild`、同库、非终态的行。
+    #[test]
+    fn active_model_rebuild_ignores_other_kinds_dbs_and_terminal_rows() {
+        let mut vm = Vm::default();
+        let row = |task_id: &str, kind: &str, dbnum: u32, state: &str| TaskEntry {
+            task_id: task_id.to_owned(),
+            kind: kind.to_owned(),
+            dbnum: Some(dbnum),
+            state: state.to_owned(),
+            ..Default::default()
+        };
+        vm.tasks = vec![
+            row("db-1", KIND_DATA_BATCH, 8000, "running"),
+            row(
+                "model-rebuild-8000-old",
+                KIND_MODEL_REBUILD,
+                8000,
+                "succeeded",
+            ),
+            row("model-rebuild-7997-1", KIND_MODEL_REBUILD, 7997, "running"),
+        ];
+        assert_eq!(
+            vm.active_model_rebuild(8000),
+            None,
+            "数据任务与终态重建都不算"
+        );
+        assert_eq!(vm.active_model_rebuild(7997), Some("model-rebuild-7997-1"));
+        vm.tasks.push(row(
+            "model-rebuild-8000-2",
+            KIND_MODEL_REBUILD,
+            8000,
+            "running",
+        ));
+        assert_eq!(vm.active_model_rebuild(8000), Some("model-rebuild-8000-2"));
+    }
+
+    /// 气泡正文：第一行永远有（数据水位不动、模型水位随收尾前移）；追赶 / 已放弃两行
+    /// 只在服务端判了数才有；末行是 409 与不插队那句。不预估根数——那是回执 `expected_roots` 的事。
+    #[test]
+    fn model_rebuild_plan_lines_only_say_what_the_server_said() {
+        let bare = ModelRebuildPlan {
+            dbnum: 7997,
+            applied: 415,
+            chasing_roots: None,
+            dead_roots: None,
+        };
+        let lines = bare.lines();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("数据水位 415 不动"));
+        assert!(lines[1].contains("409"));
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("根还在赶") || l.contains("根已放弃"))
+        );
+
+        let full = ModelRebuildPlan {
+            chasing_roots: Some(12),
+            dead_roots: Some(2),
+            ..bare
+        };
+        let lines = full.lines();
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines[1].contains("12 根还在赶"));
+        assert!(lines[2].contains("2 根已放弃"));
     }
 
     /// 跨天靠日期本身说清，同一天也照样带日期——两端各自完整，不做「省略同一天」

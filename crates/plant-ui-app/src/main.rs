@@ -1929,6 +1929,16 @@ impl App {
                     self.vm.project = info.project;
                     self.desi_dbs = info.db_nums;
                     self.vm.search.scope_dbs = self.desi_dbs.len();
+                    // 模型更新面板的「显示 SITE」那一列。根层每个 SITE 只属于一个库，
+                    // 反过来一个库可以有好几个，所以按库归堆；顺序照根层原序，不重排
+                    // ——那是 MDB 里成员表的顺序，人在模型树上看到的就是它。
+                    self.model_update_state.site_names = info.site_dbs.into_iter().fold(
+                        std::collections::BTreeMap::new(),
+                        |mut acc: std::collections::BTreeMap<u32, Vec<String>>, (dbnum, name)| {
+                            acc.entry(dbnum).or_default().push(name);
+                            acc
+                        },
+                    );
                     self.mdb = info.mdb;
                     self.namespace = info.ns.clone();
                     self.data_observed_at = Some(info.observed_at);
@@ -3072,6 +3082,24 @@ impl App {
                         }
                     }
                 }
+                // 「重算模型（整库）」的回执：一库一个 task_id。成功只进日志、催一拍轮询让那一行
+                // 尽快出现；失败按 code 分型进日志（`not_found` = 这一档服务端没有这条路由，D9）。
+                data::Evt::ModelRebuild { dbnum, result } => match result {
+                    Ok(receipt) => {
+                        self.logs.info(&mut self.vm.logs, receipt.summary());
+                        self.poll_queue_now();
+                    }
+                    Err(error) => {
+                        let title = if model_update_api::endpoint_missing(&error) {
+                            format!(
+                                "重算模型（整库）db{dbnum} 未受理：这一档服务端没有整库重建接口"
+                            )
+                        } else {
+                            format!("重算模型（整库）db{dbnum} 提交失败")
+                        };
+                        self.logs.error(&mut self.vm.logs, &title, &error, None);
+                    }
+                },
                 data::Evt::GetWork(result) => {
                     match result {
                         Ok(fresh) => {
@@ -3649,7 +3677,7 @@ impl App {
                         from_wizard: false,
                     });
                 }
-                // 库行「立即执行」（09-08 计划 D1 A / U2）：同一个 execute，名单只有
+                // 库行「提前执行」（09-08 计划 D1 A / U2）：同一个 execute，名单只有
                 // 这一个库。判据在按钮上就说完了（task_queue::early_run），这里不再判
                 // ——按钮可点即此刻可执行，回执进日志，进度看队列行。
                 Cmd::RunDbnumNow { dbnum } => {
@@ -3667,6 +3695,25 @@ impl App {
                         namespace: self.namespace.clone(),
                         dbnums: Some(vec![dbnum]),
                         from_wizard: false,
+                    });
+                }
+                // 库行「重算模型（整库）」（2026-09-10 重新计算计划 D1 ② / R1）：服务端整库
+                // 重建，一库一个 task_id。判据在按钮上说完（task_queue::model_rebuild），这里
+                // 不再判——回执进日志，进度看队列里 `model_rebuild` 那一行。
+                Cmd::RebuildDbnumModel { dbnum } => {
+                    if !self.model_service_executable() {
+                        continue;
+                    }
+                    self.logs.info(
+                        &mut self.vm.logs,
+                        &format!("重算模型（整库）db{dbnum}：已提交，任务排上后进度在任务队列里"),
+                    );
+                    let _ = self.bridge.req.send(data::Req::ModelRebuild {
+                        base: self.model_api_url.clone(),
+                        project: self.vm.project.clone(),
+                        mdb: self.mdb.clone(),
+                        namespace: self.namespace.clone(),
+                        dbnum,
                     });
                 }
                 Cmd::SetQueuePaused(paused) => {
@@ -6942,9 +6989,17 @@ impl App {
             self.queue.applying(),
             &self.mdb,
             self.queue.health.as_ref().map(|health| health.sync_live),
+            // `/health` 报的数据面形态。读透形态下数据水位按设计不建立，「库状态」
+            // 那一列要说「不建立」而不是「尚未建立」——后者是「需初始化」的意思。
+            self.queue
+                .health
+                .as_ref()
+                .map(|health| health.data_face.as_str()),
             self.queue.execution_blocked_reason(),
             // 读透形态的预览是空表，向导的范围名单只能从队列轮询的那份 `/dbnums` 说。
             &self.queue.dbnums,
+            // 每个库此刻在队列里的活。队列面板自己有行表，本窗没有，走这一条。
+            &task_queue::active_tasks(&self.queue),
             &self.model_update,
             &mut self.model_update_state,
         ));

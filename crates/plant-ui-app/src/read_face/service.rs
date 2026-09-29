@@ -96,6 +96,10 @@ impl ServiceReadFace {
         model_update_api::tree_roots(&self.base()).await
     }
 
+    pub async fn site_dbs(&self) -> anyhow::Result<Vec<(u32, String)>> {
+        model_update_api::tree_root_dbs(&self.base()).await
+    }
+
     pub async fn children(&self, refno: RefU64) -> anyhow::Result<Vec<EleTreeNode>> {
         model_update_api::tree_children(&self.base(), refno).await
     }

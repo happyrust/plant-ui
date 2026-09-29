@@ -73,6 +73,13 @@ impl StoreReadFace {
         plant_ui_data::site_nodes().await
     }
 
+    /// 库供数说不出「这个 SITE 属于哪个库」：`site_nodes()` 回的是 `EleTreeNode`，
+    /// 上面没有库号那一格。空表 = 没有可说的，模型更新面板的 SITE 列在这一面不画
+    /// ——不是「这些库一个 SITE 都没有」。
+    pub async fn site_dbs(&self) -> anyhow::Result<Vec<(u32, String)>> {
+        Ok(Vec::new())
+    }
+
     pub async fn children(&self, refno: RefU64) -> anyhow::Result<Vec<EleTreeNode>> {
         plant_ui_data::child_nodes(refno.into()).await
     }

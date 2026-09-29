@@ -169,6 +169,15 @@ pub enum Req {
         /// `true` 只表示模型更新向导的确认按钮；队列里的即时扫描为 `false`。
         from_wizard: bool,
     },
+    /// 库行「重算模型（整库）」：`POST /api/v1/dbnums/{dbnum}/model/rebuild`
+    /// （2026-09-10 重新计算计划 R1）。回执一个 task_id，进度看任务队列。
+    ModelRebuild {
+        base: String,
+        project: String,
+        mdb: String,
+        namespace: String,
+        dbnum: u32,
+    },
     /// 取回工作：丢缓存，重查 SITE 根层与这些已展开分支的子层。
     ///
     /// 分支由 App 侧算好交下来。数据线程不认识展开状态，也不该认识——它只是
@@ -256,6 +265,9 @@ pub struct ReadyInfo {
     /// 开始读取根层的时刻。首次队列快照只补这之后完成的批次，避免启动期间漏刷新。
     pub observed_at: chrono::DateTime<chrono::Utc>,
     pub sites: Vec<EleTreeNode>,
+    /// 根层每个 SITE 属于哪个库（`(库号, SITE 名)`）。模型更新面板的 SITE 列用它认库；
+    /// 库供数给不出库号，那一面恒空。
+    pub site_dbs: Vec<(u32, String)>,
 }
 
 pub enum Evt {
@@ -361,6 +373,11 @@ pub enum Evt {
     ModelUpdateExecute {
         from_wizard: bool,
         result: anyhow::Result<Enqueued>,
+    },
+    /// 「重算模型（整库）」的回执，带上是哪个库。真值等下一拍队列轮询。
+    ModelRebuild {
+        dbnum: u32,
+        result: anyhow::Result<crate::model_update_api::ModelRebuildReceipt>,
     },
     /// 取回工作的整批结果。根层查不动就是整次失败——根层没了树无从谈起。
     GetWork(anyhow::Result<GetWork>),
@@ -522,7 +539,8 @@ async fn get_work(
 /// 启动序列只依赖当前供数模式的读面（工程标识 + SITE 根层并发取）；镜像离线不阻断
 /// 树、属性与三维。
 async fn ready(face: &ReadFace) -> anyhow::Result<ReadyInfo> {
-    let (identity, sites) = futures::try_join!(face.identity(), face.sites())?;
+    let (identity, sites, site_dbs) =
+        futures::try_join!(face.identity(), face.sites(), face.site_dbs())?;
     let observed_at = chrono::Utc::now();
     Ok(ReadyInfo {
         project: identity.project,
@@ -532,6 +550,7 @@ async fn ready(face: &ReadFace) -> anyhow::Result<ReadyInfo> {
         cache_versions: identity.cache_versions,
         observed_at,
         sites,
+        site_dbs,
     })
 }
 
@@ -761,6 +780,18 @@ async fn handle_read(
                 from_wizard,
                 result,
             });
+        }
+        Req::ModelRebuild {
+            base,
+            project,
+            mdb,
+            namespace,
+            dbnum,
+        } => {
+            let result =
+                crate::model_update_api::model_rebuild(&base, &project, &mdb, &namespace, dbnum)
+                    .await;
+            let _ = evt_tx.send(Evt::ModelRebuild { dbnum, result });
         }
         Req::QueuePoll { base } => {
             let result = crate::model_update_api::poll_queue(&base).await;

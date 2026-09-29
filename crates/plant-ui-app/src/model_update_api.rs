@@ -104,6 +104,59 @@ pub async fn execute(
     .await
 }
 
+/// `POST /api/v1/dbnums/{dbnum}/model/rebuild` 的 202 回执（gen-model spec §4.5.1；
+/// `model_rebuild.rs::ModelRebuildReceipt`）。同库已有在飞重建时服务端回同一个 `task_id`。
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ModelRebuildReceipt {
+    pub task_id: String,
+    pub dbnum: u32,
+    /// 应重算的生成根数——服务端开工时数出来的，比 `/dbnums` 四格拼的粗和准；界面上以它为准。
+    #[serde(default)]
+    pub expected_roots: usize,
+    /// 开工时作废掉的陈旧增量行数（R6）。老服务端不给，缺省 0。
+    #[serde(default)]
+    pub discarded_pending: u64,
+    #[serde(default)]
+    pub state: String,
+}
+
+impl ModelRebuildReceipt {
+    /// 日志那一行。
+    pub fn summary(&self) -> String {
+        let mut line = format!(
+            "已提交重算模型（整库）db{}：任务 {}，应重算 {} 根",
+            self.dbnum, self.task_id, self.expected_roots
+        );
+        if self.discarded_pending > 0 {
+            line.push_str(&format!("，作废旧增量行 {} 条", self.discarded_pending));
+        }
+        line.push_str("；进度看任务队列里它那一行");
+        line
+    }
+}
+
+/// 整库模型重建：把该库全部权威生成根投进模型队列重算（2026-09-10 重新计算计划 R1）。
+///
+/// 不改数据水位、不预删旧模型；重建期间同库 `model/ensure` 回 409。`watch_scope` 外 400；
+/// 服务端 `model_full_rebuild_enabled=false` 时同样是一条失败包封（message 原文带那个键名，
+/// 界面照 `code` 分型、原文进日志，不解析它）。两代并存：老服务端没这条路由 → 404，
+/// 调用方按「这一档服务端没有」处理，不重试。
+pub async fn model_rebuild(
+    base: &str,
+    project: &str,
+    mdb: &str,
+    namespace: &str,
+    dbnum: u32,
+) -> anyhow::Result<ModelRebuildReceipt> {
+    post(
+        base,
+        &format!("/api/v1/dbnums/{dbnum}/model/rebuild"),
+        serde_json::json!({ "project": project, "mdb": mdb, "namespace": namespace }).to_string(),
+        Duration::from_secs(60),
+    )
+    .await
+}
+
 #[derive(Debug, Deserialize)]
 pub struct QueryReply {
     pub tool: String,
@@ -501,6 +554,13 @@ pub async fn poll_queue(base: &str) -> anyhow::Result<Poll> {
 /// 超时、500、连不上都不算——那些是「暂时看不见」，界面该沿用上一份快照。
 /// 判据与 `element_attributes` 那条老服务端探测同一把尺子（本文件上方）。
 fn pending_endpoint_retired(error: &anyhow::Error) -> bool {
+    endpoint_missing(error)
+}
+
+/// 「这一档服务端没有这条路由」（404 / 405 / `not_found`）。两代服务端并存的通用判法
+/// （ADR-0027）：欠账表退役、整库重建 / 房间重算 / 重新解析三条新口在老服务端上缺席，
+/// 界面都按「服务端没给」整格降级，不重试、不当成故障。
+pub fn endpoint_missing(error: &anyhow::Error) -> bool {
     let failure = failure_of(error);
     failure.code == "not_found"
         || failure.message.contains("HTTP 404")
