@@ -370,8 +370,16 @@ pub const STATE_CODE_INIT: &'static str = "D00";
 pub struct EleTreeNode {
     pub refno: RefnoEnum,
     pub noun: String,
+    /// 显示名。有名字就是 NAME；无名元素是 E3D 的默认全名 `FLNM`
+    /// （`BEND 3 of BRANCH /C-IY-1R330-B`，见 [`crate::e3d_full_name`]）。
     #[serde(default)]
     pub name: String,
+    /// 无名元素的短形态——模型树一行显示的 `SITE 2` / `BEND 3`。有名字的元素、
+    /// 以及不给这一格的老服务端 / 老查询都是 `None`，显示时退回 `name`。
+    /// 服务供数由 gen-model `/tree/*` 节点的 `short_name` 带来，库供数由
+    /// `fill_default_full_names` 补名时一并填。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_name: Option<String>,
     pub owner: RefnoEnum,
     #[serde(default)]
     pub order: u16,
@@ -399,6 +407,7 @@ impl EleTreeNode {
             refno,
             noun,
             name,
+            short_name: None,
             owner,
             order,
             children_count,
@@ -437,6 +446,7 @@ impl From<PdmsElement> for EleTreeNode {
             refno: value.refno.into(),
             noun: value.noun,
             name: value.name,
+            short_name: None,
             owner: value.owner.into(),
             order: 0,
             children_count: value.children_count as _,

@@ -10,6 +10,7 @@
 
 use super::query_mdb_db_nums;
 use crate::consts::MAX_INSERT_LENGTH;
+use crate::e3d_full_name::{self, NameLink};
 use crate::parsed_data::CateAxisParam;
 use crate::pdms_types::{CataHashRefnoKV, EleTreeNode, PdmsElement};
 use crate::pe::SPdmsElement;
@@ -805,21 +806,64 @@ pub async fn get_children_ele_nodes(refno: RefnoEnum) -> anyhow::Result<Vec<EleT
     );
     let mut response = SUL_DB.query(sql).await?;
     let mut nodes: Vec<EleTreeNode> = response.take(0)?;
-    //检查名称，如果没有给名字的，需要给上默认值, todo 后续如果是删除了又增加，名称后面的数字可能会继续增加
-    let mut hashmap: HashMap<&str, i32> = HashMap::new();
-    for node in &mut nodes {
+    fill_default_full_names(refno, &mut nodes).await?;
+    Ok(nodes)
+}
+
+/// 给一个属主的整批成员补 E3D 默认全名（`FLNM`，见 [`crate::e3d_full_name`]）。
+///
+/// `nodes` 必须是该属主的**完整**成员表、按存储序：`ITYPOS` 的序号沿整条成员链数，
+/// 命名与否都占一个号，少一个兄弟后面全错一位。
+///
+/// 按属主成批算的另一半理由是属主那条尾巴（`… of EQUIPMENT /03SKID3-EQUIP1`）对同一批
+/// 兄弟完全相同——逐行现算就是每行一次祖先链查询，正是 `get_children_tree_nodes`
+/// 当初砍掉的那种逐行子查询。
+async fn fill_default_full_names(
+    owner: RefnoEnum,
+    nodes: &mut [EleTreeNode],
+) -> anyhow::Result<()> {
+    if nodes.iter().all(|node| !node.name.is_empty()) {
+        return Ok(());
+    }
+    let tail = owner_name_tail(owner).await?;
+    let mut ordinals: HashMap<String, usize> = HashMap::new();
+    for node in nodes.iter_mut() {
+        let ordinal = ordinals.entry(node.noun.clone()).or_default();
+        *ordinal += 1;
         if node.name.is_empty() {
-            let mut n = 1;
-            if let Some(k) = hashmap.get_mut(&node.noun.as_str()) {
-                *k += 1;
-                n = *k;
-            } else {
-                hashmap.insert(node.noun.as_str(), 1);
-            }
-            node.name = format!("{} {}", node.noun.as_str(), n);
+            node.name = e3d_full_name::with_tail(&node.noun, *ordinal, &tail);
+            // 短形态（`BEND 3`）与服务供数节点上的 `short_name` 同一口径，树默认显示它。
+            node.short_name = Some(e3d_full_name::with_tail(&node.noun, *ordinal, ""));
         }
     }
-    Ok(nodes)
+    Ok(())
+}
+
+/// 属主那条链拼成的尾巴：`BRANCH /C-IY-1R330-B`、`TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1`。
+///
+/// 一次取回 `owner` 起的整条祖先链；`owner_tail` 在第一个有名字的祖先、或库根处收尾，
+/// 所以那一级之后几项白取但不影响结果。`fn::order` 只对无名的那几级算，属主本身有名字
+/// （绝大多数情况）时一次图查询都不做。
+pub(crate) async fn owner_name_tail(owner: RefnoEnum) -> anyhow::Result<String> {
+    let sql = format!(
+        r#"select value [noun ?: '', name ?: '',
+                         if name == none || name == '' {{ (fn::order(id) ?: 0) + 1 }} else {{ 0 }},
+                         owner == none || owner == pe:0_0]
+           from fn::ancestor({})"#,
+        owner.to_pe_key()
+    );
+    let mut response = SUL_DB.query(sql).await?;
+    let chain: Vec<(String, String, i64, bool)> = response.take(0)?;
+    let links: Vec<NameLink> = chain
+        .into_iter()
+        .map(|(noun, name, ordinal, is_root)| NameLink {
+            noun,
+            name: name.trim().to_string(),
+            ordinal: ordinal.max(1) as usize,
+            is_root,
+        })
+        .collect();
+    Ok(e3d_full_name::owner_tail(&links))
 }
 
 /// [`get_children_ele_nodes`] 的模型树精简版：去掉两个逐行子查询——
@@ -842,19 +886,7 @@ pub async fn get_children_tree_nodes(refno: RefnoEnum) -> anyhow::Result<Vec<Ele
     let mut response = SUL_DB.query(sql).await?;
     let mut nodes: Vec<EleTreeNode> = response.take(0)?;
     // 无名节点补默认名，规则与 get_children_ele_nodes 保持一字不差。
-    let mut hashmap: HashMap<&str, i32> = HashMap::new();
-    for node in &mut nodes {
-        if node.name.is_empty() {
-            let mut n = 1;
-            if let Some(k) = hashmap.get_mut(&node.noun.as_str()) {
-                *k += 1;
-                n = *k;
-            } else {
-                hashmap.insert(node.noun.as_str(), 1);
-            }
-            node.name = format!("{} {}", node.noun.as_str(), n);
-        }
-    }
+    fill_default_full_names(refno, &mut nodes).await?;
     Ok(nodes)
 }
 
