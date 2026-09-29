@@ -2764,6 +2764,11 @@ mod tests {
             texture: egui::TextureId::Managed(0),
             size: UVec2::new(16, 16),
             camera_rot: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            camera_pose: CameraPose {
+                position: [0.0; 3],
+                rotation: Quat::IDENTITY.to_array(),
+                focus: [0.0; 3],
+            },
             axis_labels: [None; 3],
             grid_cell_mm: INITIAL_GRID_LEVEL * MM_PER_WORLD,
             image: Handle::default(),
