@@ -677,6 +677,9 @@ struct TreeModel {
     pending_visibility: HashMap<RefU64, RowVisibility>,
     /// 该行已经明确查空或查询失败，不能再从已显示的祖先继承 eye。
     visibility_unavailable: HashSet<RefU64>,
+    /// 无名元素显示全称（`ZONE 4 of SITE 2`）还是短名（`ZONE 4`）。跟设置窗那一格
+    /// （`Settings::tree_full_names`），改了就重新展平；有名字的元素两种都是 NAME。
+    full_names: bool,
 }
 
 /// 一个模型的实际渲染结果，来自 View3d 的回执。
@@ -787,6 +790,21 @@ fn is_bran_noun(noun: &str) -> bool {
     noun.eq_ignore_ascii_case("BRAN")
 }
 
+/// 树上一行显示的名字。`node.name` 是 E3D 的默认全名（有名字就是 NAME，无名是
+/// `ZONE 4 of SITE 2`）；`short_name` 是数据侧给无名元素的短形态（`ZONE 4`），有名字的
+/// 与老查询不带。不起名的老模型服务由服务供数那一面按同一规则补上短名
+/// （`model_update_api::fill_legacy_default_names`），走到这里的无名元素都有名字可显示。
+/// 默认显示短形态——E3D 模型树就是这么显示的；开了「显示全称」或没有短形态时显示 `name`。
+fn tree_label(node: &EleTreeNode, full_names: bool) -> String {
+    if full_names {
+        return node.name.clone();
+    }
+    node.short_name
+        .clone()
+        .filter(|short| !short.trim().is_empty())
+        .unwrap_or_else(|| node.name.clone())
+}
+
 impl TreeModel {
     /// 当前行的 eye。没有独立模型范围的树行继承最近祖先的实际状态；
     /// 一旦自己查过范围（含明确查空 / 失败），就以自己的结果为准。
@@ -838,7 +856,8 @@ impl TreeModel {
                 rows.push(TreeRowVm {
                     refno,
                     depth,
-                    name: n.name.clone(),
+                    name: tree_label(n, model.full_names),
+                    full_name: n.name.clone(),
                     noun: n.noun.clone(),
                     expandable,
                     loading: model.loading.contains(&refno),
@@ -1778,6 +1797,7 @@ impl App {
             .unwrap_or_default();
         // 环境变量压过设置时，设置窗那一格锁上并说明为什么（计划 D11）。
         settings_state.read_face_lock = startup.and_then(|startup| startup.read_face.lock_notice());
+        let tree_full_names = adopted.tree_full_names;
         settings_state.adopt(adopted);
         let mut app = Self {
             // 连接前不摆任何工程数据：项目 / 库标识等 Ready 事件带真实值。
@@ -1849,7 +1869,10 @@ impl App {
             pending_dimensions: None,
             // 交互通道与模型通道都按这一个供数模式造读面（ADR-0026）。
             bridge: data::spawn(ctx.clone(), tasks, read_face),
-            tree: TreeModel::default(),
+            tree: TreeModel {
+                full_names: tree_full_names,
+                ..TreeModel::default()
+            },
             pending_locate: None,
             logs: logs::LogBuffer::default(),
             pending_models: None,
@@ -5333,7 +5356,7 @@ mod tests {
         refresh_anchor, regenerate_label, regenerate_summary, reload_snapshot,
         resolve_panel_room_reply, restore_model_reload, settle_pending_directions,
         settle_refresh_generation, settled_pending_roots, sync_ime_window, take_hidden_for_replay,
-        task_matches_project, task_queue,
+        task_matches_project, task_queue, tree_label,
     };
     use crate::model_update_api;
     use chrono::{TimeZone, Utc};
@@ -5502,6 +5525,27 @@ mod tests {
             children_count: children,
             ..Default::default()
         }
+    }
+
+    /// 无名元素默认显示数据侧给的短名，开了「显示全称」才显示整条；有名字的元素没有短名，
+    /// 两种口径都是 NAME；老服务端 / 老查询不带短名时退回 `name`，不显示空串。
+    #[test]
+    fn unnamed_rows_show_the_short_name_unless_full_names_are_on() {
+        let mut zone = node(RefU64(7), "ZONE", 0);
+        zone.name = "ZONE 4 of SITE 2".into();
+        zone.short_name = Some("ZONE 4".into());
+        assert_eq!(tree_label(&zone, false), "ZONE 4");
+        assert_eq!(tree_label(&zone, true), "ZONE 4 of SITE 2");
+
+        let named = node(RefU64(8), "SITE", 1);
+        assert!(named.short_name.is_none(), "有名字的节点数据侧不给短名");
+        assert_eq!(tree_label(&named, false), named.name);
+        assert_eq!(tree_label(&named, true), named.name);
+
+        zone.short_name = None;
+        assert_eq!(tree_label(&zone, false), "ZONE 4 of SITE 2");
+        zone.short_name = Some("  ".into());
+        assert_eq!(tree_label(&zone, false), "ZONE 4 of SITE 2");
     }
 
     #[test]
@@ -6944,6 +6988,14 @@ impl App {
                 self.poll_queue_now();
             }
             self.persist_settings(&saved);
+            // 无名元素短名 / 全称只是同一份数据换个展平口径，重新展平就够，不重查。
+            // 树还在加载 / 失败态时只记下口径：那两个态不是展平出来的，别把它们覆成空表。
+            if self.tree.full_names != saved.tree_full_names {
+                self.tree.full_names = saved.tree_full_names;
+                if matches!(self.vm.tree, TreeVm::Ready(_)) {
+                    self.rebuild_tree();
+                }
+            }
             // 供数模式变了就热切（ADR-0026）：先落盘再换，换面失败也不丢这次改动——
             // 界面停在未连接态，下拉可再改回去。
             if let Some(kind) = read_face_switch(

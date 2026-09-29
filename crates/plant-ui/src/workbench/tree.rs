@@ -96,6 +96,12 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                                     )
                                 })
                                 .inner;
+                            // 无名元素默认只显示短名（`ZONE 4`）；整条 E3D 全名
+                            // （`ZONE 4 of SITE 2`）挂在悬停上，不另占一列。有名字的两者相同，
+                            // 不挂——`on_hover_text` 会让每一行都多一次布局。
+                            if row.full_name != row.name {
+                                out.response.clone().on_hover_text(&row.full_name);
+                            }
                             // 自动化只认真正的树行：AccessKit 角色负责排除命令历史、
                             // 属性面板和状态栏，标签里的 refno 则提供跨重命名稳定身份。
                             // 当前名称仍随数据刷新，便于同时断言 rename 的新旧语义。

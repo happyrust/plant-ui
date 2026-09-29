@@ -575,8 +575,12 @@ pub struct TreeRowVm {
     pub refno: RefU64,
     /// 层级深度（SITE 为 0）。
     pub depth: u16,
-    /// 显示名（无名节点由数据侧按 noun 补号）。
+    /// 这一行显示的名字。有名字的元素就是 NAME；无名元素由数据侧按 E3D 规则起名，
+    /// 默认是短形态 `ZONE 4`，设置里开了「显示全称」就是 `full_name`。
     pub name: String,
+    /// E3D 的默认全名（`FLNM`）：无名元素是 `ZONE 4 of SITE 2` 这种整条；有名字的与
+    /// `name` 相同。与显示名不同时挂在行的悬停提示里。
+    pub full_name: String,
     /// PDMS 类型（SITE / ZONE / PIPE / BRAN…），行尾 meta 显示。
     pub noun: String,
     /// None = 叶子；Some(open) = 可展开及其展开态。

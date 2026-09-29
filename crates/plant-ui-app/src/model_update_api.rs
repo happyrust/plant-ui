@@ -2,6 +2,7 @@ use anyhow::Context;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -146,6 +147,25 @@ struct TreeAncestorsReply {
     refnos: Vec<aios_core::RefnoEnum>,
 }
 
+/// `/tree/roots` 的另一种读法：节点连同服务端外包的库号，见 [`tree_root_dbs`]。
+#[derive(Debug, Deserialize)]
+struct TreeRootDbReply {
+    source: String,
+    #[serde(default)]
+    nodes: Vec<TreeRootDb>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TreeRootDb {
+    /// 整个节点也要解出来：名字得先过 [`fill_legacy_default_names`]，那一道要 noun 与 owner。
+    #[serde(flatten)]
+    node: aios_core::pdms_types::EleTreeNode,
+    /// 老服务端不注这一格；新服务端答不出库号时给 `null`（spec §4.10）。两种都是
+    /// 「说不出它属于哪个库」，调用方按「没有」处理。
+    #[serde(default)]
+    dbnum: Option<u32>,
+}
+
 fn require_direct(source: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         source == "direct",
@@ -154,10 +174,67 @@ fn require_direct(source: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 2026-09-20 之前的模型服务不给无名元素起名：节点的 `name` 回的是 noun 本身（`SITE`），
+/// 也不带 `short_name`，树上那一行就只剩类型、没有名字（gen-model `web-service-api.md`
+/// §4.10）。对着这一档服务端，客户端按 E3D 的规矩补短名 `<名词全词> <同名词序号>`
+/// （`SITE 10`、`ZONE 4`、`ELBOW 1`）：序号沿同一属主的成员原序数，有名字的兄弟也占号
+/// ——与新服务端（e3d-io `element_name`）、库供数（`aios_core::e3d_full_name`）同一套规则。
+///
+/// 只补得出短形态。整条 `FLNM` 要属主链上各级的名字，这一档 `/tree/*` 一个都不给，所以
+/// `name` 也落短名：「显示全称」对着老服务端显示的就是短名，悬停不挂。根层不受这一限：
+/// SITE 直接挂在 WORLD（库根，不进名字）下，短名就是全名。
+///
+/// `nodes` 必须是服务端回的整批——`/tree/children` 的整张成员表，或 `/tree/roots` 的整张
+/// SITE 表（按 `owner` 分开数，一个 WORLD 一套序号）；少一个兄弟，后面的序号全错一位。
+/// 带 `short_name` 的节点（新服务端）与有名字的节点原样不动。
+fn fill_legacy_default_names(nodes: &mut [aios_core::pdms_types::EleTreeNode]) {
+    let mut ordinals: HashMap<(aios_core::RefnoEnum, String), usize> = HashMap::new();
+    for node in nodes {
+        let ordinal = ordinals.entry((node.owner, node.noun.clone())).or_default();
+        *ordinal += 1;
+        let name = node.name.trim();
+        let unnamed = name.is_empty() || name == node.noun.trim();
+        if node.short_name.is_none() && unnamed {
+            let short = aios_core::e3d_full_name::with_tail(&node.noun, *ordinal, "");
+            node.name.clone_from(&short);
+            node.short_name = Some(short);
+        }
+    }
+}
+
 pub async fn tree_roots(base: &str) -> anyhow::Result<Vec<aios_core::pdms_types::EleTreeNode>> {
-    let reply: TreeNodesReply = get(base, "/api/v1/tree/roots").await?;
+    let mut reply: TreeNodesReply = get(base, "/api/v1/tree/roots").await?;
     require_direct(&reply.source)?;
+    fill_legacy_default_names(&mut reply.nodes);
     Ok(reply.nodes)
+}
+
+/// 根层每个 SITE 连同它所在的库号。
+///
+/// `EleTreeNode` 里没有库号那一格，而 `/tree/roots` 的每个节点上服务端另外注了一个
+/// `dbnum`（gen-model `handlers.rs::tree_nodes_with_dbnum`）——[`tree_roots`] 按
+/// `EleTreeNode` 反序列化，那一格就被丢掉了。模型更新面板要靠它认库，所以这里重解一遍
+/// 同一份回执，最后只交出「库号 + SITE 名」两格。
+pub async fn tree_root_dbs(base: &str) -> anyhow::Result<Vec<(u32, String)>> {
+    let reply: TreeRootDbReply = get(base, "/api/v1/tree/roots").await?;
+    require_direct(&reply.source)?;
+    Ok(root_dbs(reply.nodes))
+}
+
+/// [`tree_root_dbs`] 的纯函数那一半。名字与树上那一行过同一道补名，面板里的 SITE 名
+/// 才与树上一字不差。
+fn root_dbs(rows: Vec<TreeRootDb>) -> Vec<(u32, String)> {
+    let (mut nodes, dbnums): (Vec<_>, Vec<_>) =
+        rows.into_iter().map(|row| (row.node, row.dbnum)).unzip();
+    fill_legacy_default_names(&mut nodes);
+    nodes
+        .into_iter()
+        .zip(dbnums)
+        .filter_map(|(node, dbnum)| match dbnum {
+            Some(dbnum) if dbnum != 0 && !node.name.is_empty() => Some((dbnum, node.name)),
+            _ => None,
+        })
+        .collect()
 }
 
 pub async fn tree_children(
@@ -168,8 +245,9 @@ pub async fn tree_children(
         "/api/v1/tree/children?refno={}",
         urlencode(&refno.to_slash_string())
     );
-    let reply: TreeNodesReply = get(base, &path).await?;
+    let mut reply: TreeNodesReply = get(base, &path).await?;
     require_direct(&reply.source)?;
+    fill_legacy_default_names(&mut reply.nodes);
     Ok(reply.nodes)
 }
 
@@ -1101,5 +1179,96 @@ mod tests {
         // （都并进了既有排队行，或者水位本来就最新），那不是契约缺字段。
         let idle = serde_json::from_str::<Enqueued>("{}").expect("空回执合法");
         assert!(idle.enqueued.is_empty());
+    }
+
+    /// 2026-09-20 之前的模型服务给无名元素的 `name` 是 noun 本身、不带 `short_name`，
+    /// 树上那一行就只剩一个 `SITE`。客户端照 E3D 的规矩补短名：序号按属主分开数、只数
+    /// 同名词、有名字的兄弟也占号；名词印全词（`ELBO` → `ELBOW`）。
+    #[test]
+    fn a_legacy_service_gets_e3d_short_names_for_unnamed_nodes() {
+        let mut roots: TreeNodesReply = serde_json::from_str(
+            r#"{"source":"direct","nodes":[
+                {"refno":"24381_2","noun":"SITE","name":"/1RB-CIVI","owner":"24381_1","children_count":3,"dbnum":7997},
+                {"refno":"24381_5","noun":"SITE","name":"SITE","owner":"24381_1","children_count":1,"dbnum":7997},
+                {"refno":"14195_2","noun":"SITE","name":"SITE","owner":"14195_1","children_count":1,"dbnum":6003},
+                {"refno":"24381_9","noun":"SITE","name":"SITE","owner":"24381_1","children_count":0,"dbnum":7997}
+            ]}"#,
+        )
+        .unwrap();
+        fill_legacy_default_names(&mut roots.nodes);
+        let names: Vec<(&str, Option<&str>)> = roots
+            .nodes
+            .iter()
+            .map(|node| (node.name.as_str(), node.short_name.as_deref()))
+            .collect();
+        // 一个 WORLD 一套序号：6003 那只是它自己 WORLD 下的第一个，不接着 7997 往下数。
+        // 根层短名就是全名（WORLD 不进名字），两格相同。
+        assert_eq!(
+            names,
+            [
+                ("/1RB-CIVI", None),
+                ("SITE 2", Some("SITE 2")),
+                ("SITE 1", Some("SITE 1")),
+                ("SITE 3", Some("SITE 3")),
+            ]
+        );
+
+        let mut children: TreeNodesReply = serde_json::from_str(
+            r#"{"source":"direct","parent":"24383_73930","nodes":[
+                {"refno":"24383_73931","noun":"ATTA","name":"/1RCV-ATTA-1","owner":"24383_73930","children_count":0},
+                {"refno":"24383_73932","noun":"ELBO","name":"ELBO","owner":"24383_73930","children_count":0},
+                {"refno":"24383_73933","noun":"ATTA","name":"ATTA","owner":"24383_73930","children_count":0},
+                {"refno":"24383_73934","noun":"WELD","name":"","owner":"24383_73930","children_count":0},
+                {"refno":"24383_73935","noun":"ELBO","name":"ELBO","owner":"24383_73930","children_count":0}
+            ]}"#,
+        )
+        .unwrap();
+        fill_legacy_default_names(&mut children.nodes);
+        let names: Vec<&str> = children
+            .nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["/1RCV-ATTA-1", "ELBOW 1", "ATTACHMENT 2", "WELD 1", "ELBOW 2"]
+        );
+    }
+
+    /// 新服务端每个节点都带 `short_name`（有名的与 `name` 相同）：一格都不动，
+    /// 整条 `FLNM` 原样留给「显示全称」和悬停。
+    #[test]
+    fn a_current_service_keeps_its_own_names() {
+        let mut reply: TreeNodesReply = serde_json::from_str(
+            r#"{"source":"direct","nodes":[
+                {"refno":"24381_7","noun":"ZONE","name":"ZONE 4 of SITE 2","short_name":"ZONE 4","stored_name":null,"owner":"24381_5","children_count":2,"dbnum":7997},
+                {"refno":"24381_8","noun":"ZONE","name":"/Z-A","short_name":"/Z-A","stored_name":"/Z-A","owner":"24381_5","children_count":0,"dbnum":7997}
+            ]}"#,
+        )
+        .unwrap();
+        fill_legacy_default_names(&mut reply.nodes);
+        assert_eq!(reply.nodes[0].name, "ZONE 4 of SITE 2");
+        assert_eq!(reply.nodes[0].short_name.as_deref(), Some("ZONE 4"));
+        assert_eq!(reply.nodes[1].name, "/Z-A");
+        assert_eq!(reply.nodes[1].short_name.as_deref(), Some("/Z-A"));
+    }
+
+    /// 模型更新面板的 SITE 名与树上那一行过同一道补名。说不出库号的（老服务端不注、
+    /// 新服务端给 `null`）只是那一行不收——`null` 不许让整份根层回执解不动。
+    #[test]
+    fn root_dbs_share_the_tree_names_and_skip_unknown_databases() {
+        let reply: TreeRootDbReply = serde_json::from_str(
+            r#"{"source":"direct","nodes":[
+                {"refno":"24381_2","noun":"SITE","name":"/1RB-CIVI","owner":"24381_1","children_count":3,"dbnum":7997},
+                {"refno":"24381_5","noun":"SITE","name":"SITE","owner":"24381_1","children_count":1,"dbnum":7997},
+                {"refno":"9304_2","noun":"SITE","name":"/1RS-CIVI","owner":"9304_1","children_count":1,"dbnum":null},
+                {"refno":"15201_535","noun":"SITE","name":"SITE","owner":"15201_1","children_count":1}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            root_dbs(reply.nodes),
+            [(7997, "/1RB-CIVI".to_string()), (7997, "SITE 2".to_string())]
+        );
     }
 }
