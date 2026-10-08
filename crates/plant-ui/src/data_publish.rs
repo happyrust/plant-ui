@@ -35,7 +35,7 @@ impl PublishCategory {
             Self::Electrical => "电气专业-全量数据发布",
             Self::Instrumentation => "仪控专业-全量数据发布",
             Self::Ventilation => "通风专业-全量数据发布",
-            Self::Room => "房间数据发布",
+            Self::Room => "设备房间位置信息发布",
         }
     }
 
@@ -45,7 +45,8 @@ impl PublishCategory {
             Self::Electrical => "/get_dq_bran_data",
             Self::Instrumentation => "/get_yk_bran_data",
             Self::Ventilation => "/get_tf_bran_data",
-            Self::Room => "/get_pipe_room_code",
+            // 设备房间位置发布走与工艺发布相同的数据中心契约。
+            Self::Room => "/get_bran_data_room_code",
         }
     }
 }
@@ -80,17 +81,59 @@ pub struct PublishRequest {
     pub category: PublishCategory,
     pub design_phase: DesignPhase,
     pub elements: Vec<PublishElement>,
+    pub delete_refnos: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct DeletionCandidate {
+    pub id: String,
+    pub name: String,
+    #[serde(skip, default = "default_checked")]
+    pub selected: bool,
+}
+
+fn default_checked() -> bool {
+    true
 }
 
 #[derive(Debug, Default)]
 pub struct State {
     pub open: bool,
     pub preview_open: bool,
+    pub delete_confirmation_open: bool,
+    pub deletion_candidates: Vec<DeletionCandidate>,
+    pub pending_request: Option<PublishRequest>,
+    /// 从首次点击提交起，到宿主收到接口回执为止。
+    pub submitting: bool,
     pub request: PublishRequest,
     pub selected_refno: Option<RefU64>,
 }
 
 impl State {
+    fn start_lookup(&mut self) -> Cmd {
+        let request = self.request.clone();
+        self.pending_request = Some(request.clone());
+        self.submitting = true;
+        self.delete_confirmation_open = false;
+        self.deletion_candidates.clear();
+        Cmd::LookupDataPublishDeletions(request)
+    }
+
+    fn confirm_publish(&mut self) -> Option<Cmd> {
+        if self.submitting {
+            return None;
+        }
+        let mut request = self.pending_request.clone()?;
+        request.delete_refnos = self
+            .deletion_candidates
+            .iter()
+            .filter(|candidate| candidate.selected)
+            .map(|candidate| candidate.id.clone())
+            .collect();
+        self.submitting = true;
+        Some(Cmd::SubmitDataPublish(request))
+    }
+
     fn add_element(&mut self, element: PublishElement) -> bool {
         if self
             .request
@@ -130,6 +173,8 @@ pub fn show(
 ) -> Vec<Cmd> {
     if !state.open {
         state.preview_open = false;
+        state.delete_confirmation_open = false;
+        state.pending_request = None;
         return Vec::new();
     }
 
@@ -137,6 +182,7 @@ pub fn show(
     let mut window_open = state.open;
     egui::Window::new("三维数据接口")
         .id(egui::Id::new("data-publish-window"))
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .open(&mut window_open)
         .collapsible(false)
         .resizable(false)
@@ -261,14 +307,28 @@ pub fn show(
             });
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let submit = ui
-                    .add_enabled(
-                        !state.request.elements.is_empty(),
-                        widgets::button(tokens, density, "提交").primary(),
-                    )
-                    .on_disabled_hover_text("请至少添加一个元素");
+                let can_submit = !state.submitting
+                    && !state.delete_confirmation_open
+                    && !state.request.elements.is_empty();
+                let submit = ui.add_enabled(
+                    can_submit,
+                    widgets::button(tokens, density, "提交")
+                        .primary()
+                        .loading(state.submitting),
+                );
+                if !can_submit {
+                    submit
+                        .clone()
+                        .on_disabled_hover_text(if state.delete_confirmation_open {
+                            "请先关闭确认删除提资窗口"
+                        } else if state.submitting {
+                            "正在提交，请稍候"
+                        } else {
+                            "请至少添加一个元素"
+                        });
+                }
                 if submit.clicked() {
-                    commands.push(Cmd::SubmitDataPublish(state.request.clone()));
+                    commands.push(state.start_lookup());
                 }
                 if ui.add(widgets::button(tokens, density, "预览")).clicked() {
                     state.preview_open = true;
@@ -276,9 +336,11 @@ pub fn show(
             });
         });
 
-    state.open = window_open;
+    state.open = window_open || (state.submitting && state.delete_confirmation_open);
     if !state.open {
         state.preview_open = false;
+        state.delete_confirmation_open = false;
+        state.pending_request = None;
     } else if state.preview_open {
         show_preview(
             ctx,
@@ -289,7 +351,119 @@ pub fn show(
         );
     }
 
+    if state.open && state.delete_confirmation_open {
+        if let Some(command) = show_delete_confirmation(ctx, tokens, density, state) {
+            commands.push(command);
+        }
+    }
+
     commands
+}
+
+fn show_delete_confirmation(
+    ctx: &egui::Context,
+    tokens: &Tokens,
+    density: Density,
+    state: &mut State,
+) -> Option<Cmd> {
+    let mut open = state.delete_confirmation_open;
+    let mut close_requested = false;
+    let mut confirmed = false;
+    egui::Window::new("确认删除提资")
+        .id(egui::Id::new("data-publish-delete-confirmation"))
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .fixed_size([density.px(420.0), density.px(300.0)])
+        .show(ctx, |ui| {
+            ui.add_enabled_ui(!state.submitting, |ui| {
+                let widgets = &mut ui.visuals_mut().widgets;
+                for visuals in [
+                    &mut widgets.inactive,
+                    &mut widgets.hovered,
+                    &mut widgets.active,
+                ] {
+                    visuals.corner_radius = CornerRadius::ZERO;
+                }
+
+                let any_selected = state.deletion_candidates.iter().any(|item| item.selected);
+                let mut all_selected = !state.deletion_candidates.is_empty()
+                    && state.deletion_candidates.iter().all(|item| item.selected);
+                let partially_selected = any_selected && !all_selected;
+                if ui
+                    .add(
+                        egui::Checkbox::new(&mut all_selected, "全选")
+                            .indeterminate(partially_selected),
+                    )
+                    .changed()
+                {
+                    for candidate in &mut state.deletion_candidates {
+                        candidate.selected = all_selected;
+                    }
+                }
+
+                egui::Frame::new()
+                    .fill(tokens.bg_input)
+                    .stroke(Stroke::new(1.0, tokens.border))
+                    .corner_radius(CornerRadius::same(radius::MD))
+                    .inner_margin(Margin::same(space::S2 as i8))
+                    .show(ui, |ui| {
+                        ui.set_min_size(egui::vec2(density.px(375.0), density.px(160.0)));
+                        ScrollArea::vertical()
+                            .id_salt("data-publish-delete-candidates")
+                            .auto_shrink([false, false])
+                            .max_height(density.px(160.0))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                if state.deletion_candidates.is_empty() {
+                                    ui.label("没有待删除的提资");
+                                }
+                                for candidate in &mut state.deletion_candidates {
+                                    ui.horizontal_top(|ui| {
+                                        ui.add(egui::Checkbox::without_text(
+                                            &mut candidate.selected,
+                                        ));
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&candidate.name)
+                                                    .font(Font::body(density))
+                                                    .color(tokens.text_secondary),
+                                            )
+                                            .wrap(),
+                                        );
+                                    });
+                                }
+                            });
+                    });
+            });
+            ui.add_space((ui.available_height() - density.btn_h()).max(0.0));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let confirm = ui.add_enabled(
+                    !state.submitting,
+                    widgets::button(tokens, density, "确认")
+                        .primary()
+                        .loading(state.submitting),
+                );
+                if confirm.clicked() {
+                    confirmed = true;
+                }
+                if ui
+                    .add_enabled(!state.submitting, widgets::button(tokens, density, "取消"))
+                    .clicked()
+                {
+                    close_requested = true;
+                }
+            });
+        });
+    state.delete_confirmation_open = state.submitting || (open && !close_requested);
+    if confirmed {
+        return state.confirm_publish();
+    }
+    if !state.delete_confirmation_open {
+        state.pending_request = None;
+    }
+    None
 }
 
 fn form_label(ui: &mut egui::Ui, tokens: &Tokens, density: Density, text: &str) {
@@ -333,6 +507,7 @@ fn show_preview(
     let mut close_requested = false;
     egui::Window::new("预览数据")
         .id(egui::Id::new("data-publish-preview-window"))
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .open(open)
         .collapsible(false)
         .resizable(false)
@@ -450,6 +625,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn confirmation_submits_the_original_request_snapshot() {
+        let mut state = State::default();
+        state.request.title = "原始标题".into();
+        state.request.elements.push(PublishElement {
+            refno: 1_u64.into(),
+            name: "/PIPE-1".into(),
+        });
+        assert!(matches!(
+            state.start_lookup(),
+            Cmd::LookupDataPublishDeletions(_)
+        ));
+        state.deletion_candidates = vec![
+            DeletionCandidate {
+                id: "24383/66458".into(),
+                name: "/1WCC1135".into(),
+                selected: true,
+            },
+            DeletionCandidate {
+                id: "24383/66457".into(),
+                name: "/1WCC1134".into(),
+                selected: false,
+            },
+        ];
+        state.request.title = "之后修改的标题".into();
+        state.submitting = false;
+
+        let Some(Cmd::SubmitDataPublish(request)) = state.confirm_publish() else {
+            panic!("确认后应提交原始提资请求");
+        };
+        assert_eq!(request.title, "原始标题");
+        assert_eq!(request.delete_refnos, vec!["24383/66458"]);
+        assert!(state.submitting);
+        assert!(state.pending_request.is_some());
+        assert!(state.confirm_publish().is_none());
+    }
+
+    #[test]
     fn state_keeps_unique_elements_and_stable_request_snapshots() {
         let first = PublishElement {
             refno: 1_u64.into(),
@@ -482,7 +694,7 @@ mod tests {
         assert_eq!(submitted.design_phase, DesignPhase::Detailed);
         assert_eq!(PublishCategory::ALL.len(), 5);
         assert_eq!(PublishCategory::Room.label(), "房间数据发布");
-        assert_eq!(PublishCategory::Room.endpoint(), "/get_pipe_room_code");
+        assert_eq!(PublishCategory::Room.endpoint(), "/get_gy_bran_data");
         assert_eq!(
             submitted.elements,
             vec![

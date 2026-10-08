@@ -1784,6 +1784,7 @@ pub fn show(
     let mut cmds = Vec::new();
     egui::Window::new("模型增量更新")
         .id(egui::Id::new("model-update-window"))
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .title_bar(false)
         .collapsible(false)
         .resizable(true)

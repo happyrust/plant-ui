@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>plant-ui</title>
+    <title>rs-plant</title>
     <style>
       html, body, canvas { width: 100%; height: 100%; margin: 0; overflow: hidden; }
       body { background: #111827; }
@@ -11,9 +11,9 @@
     </style>
   </head>
   <body>
-    <canvas id="plant-ui"></canvas>
+    <canvas id="rs-plant"></canvas>
     <script type="module">
-      import init, { start } from "./pkg/plant_ui_app.js";
+      import init, { start } from "./pkg/rs-plant.js";
 
       // 鼠标侧键（button 3 / 4）归应用的导航历史，不让浏览器拿去做页面后退 / 前进。
       // Chrome 是在侧键松开那一下决定翻页的，只看 pointerup / mouseup 有没有被取消；
@@ -71,7 +71,7 @@
         loadConfig(),
         init(),
       ]);
-      start("#plant-ui", JSON.stringify(config));
+      start("#rs-plant", JSON.stringify(config));
     </script>
   </body>
 </html>

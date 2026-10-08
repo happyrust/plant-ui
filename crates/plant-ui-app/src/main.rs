@@ -48,6 +48,7 @@ use logs::Retry;
 use plant_ui::data_publish::{self, State as DataPublishState};
 use plant_ui::fonts;
 use plant_ui::model_regenerate::{self, DeliveryUnits};
+use plant_ui::manual_data_publish::{self, State as ManualDataPublishState};
 use plant_ui::model_update::{
     self, Feed as ModelUpdateFeed, State as ModelUpdateState, Vm as ModelUpdateVm,
 };
@@ -96,7 +97,7 @@ fn main() {}
 pub fn start(canvas: String, config_json: String) -> Result<(), wasm_bindgen::JsValue> {
     if !canvas.starts_with('#') || canvas.len() < 2 {
         return Err(wasm_bindgen::JsValue::from_str(
-            "canvas 必须是形如 #plant-ui 的 CSS id 选择器",
+            "canvas 必须是形如 #rs-plant 的 CSS id 选择器",
         ));
     }
     let config = startup::browser_runtime_config(&config_json)
@@ -316,11 +317,11 @@ fn run_gallery() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1600.0, 1000.0])
-            .with_title("plant-ui"),
+            .with_title("rs-plant"),
         ..Default::default()
     };
     eframe::run_native(
-        "plant-ui",
+        "rs-plant",
         options,
         Box::new(move |cc| {
             let (defs, _warnings) = fonts::definitions();
@@ -335,7 +336,7 @@ fn run_gallery() -> eframe::Result {
 
 fn run(canvas: &str, asset_root: String) {
     let window = Window {
-        title: "plant-ui".into(),
+        title: "rs-plant".into(),
         resolution: (1600.0_f32, 1000.0_f32).into(),
         ..Default::default()
     };
@@ -427,7 +428,7 @@ fn sync_ime_window(window: &mut Window, ime: Option<&egui::output::IMEOutput>) {
 /// wasm32-unknown-unknown` 直接 E0425。
 #[cfg(not(target_arch = "wasm32"))]
 fn attach_inspection(ctx: &egui::Context) {
-    if let Err(error) = egui_inspection::attach_from_env(ctx, Some("plant-ui".into())) {
+    if let Err(error) = egui_inspection::attach_from_env(ctx, Some("rs-plant".into())) {
         eprintln!("egui inspection unavailable: {error}");
     }
 }
@@ -1046,6 +1047,7 @@ struct App {
     rooms_overview: RoomBrowserVm,
     room_browser_state: RoomBrowserState,
     data_publish_state: DataPublishState,
+    manual_data_publish_state: ManualDataPublishState,
     project_picker_state: ProjectPickerState,
     settings_state: SettingsState,
     model_api_url: String,
@@ -1823,6 +1825,7 @@ impl App {
             rooms_overview: RoomBrowserVm::default(),
             room_browser_state: RoomBrowserState::default(),
             data_publish_state: DataPublishState::default(),
+            manual_data_publish_state: ManualDataPublishState::default(),
             project_picker_state: ProjectPickerState::new(Vec::new(), false),
             settings_state,
             model_api_url,
@@ -1913,7 +1916,7 @@ impl App {
         app
     }
 
-    fn pump_events(&mut self) {
+    fn pump_events(&mut self, ctx: &egui::Context) {
         if let Some(feed) = &mut self.queue_feed {
             feed.poll();
         }
@@ -3349,23 +3352,43 @@ impl App {
                         );
                     }
                 },
-                data::Evt::DataPublish(request, result) => match result {
-                    Ok(response) => self.logs.info(
-                        &mut self.vm.logs,
-                        format!(
-                            "{} 已提交（{}）：{}",
-                            request.category.label(),
-                            request.category.endpoint(),
-                            response
-                        ),
-                    ),
-                    Err(error) => self.logs.error(
-                        &mut self.vm.logs,
-                        format!("{}提交失败", request.category.label()),
-                        &error,
-                        None,
-                    ),
-                },
+                data::Evt::DataPublish(request, result) => {
+                    self.data_publish_state.submitting = false;
+                    self.data_publish_state.delete_confirmation_open = false;
+                    self.data_publish_state.pending_request = None;
+                    self.data_publish_state.deletion_candidates.clear();
+                    self.handle_publish_result(
+                        ctx,
+                        request.category.label(),
+                        request.category.endpoint(),
+                        result,
+                    );
+                }
+                data::Evt::DataPublishDeletions(result) => {
+                    self.data_publish_state.submitting = false;
+                    match result {
+                        Ok(candidates) => {
+                            self.data_publish_state.deletion_candidates = candidates;
+                            self.data_publish_state.delete_confirmation_open = true;
+                        }
+                        Err(error) => {
+                            self.data_publish_state.pending_request = None;
+                            let message =
+                                format!("获取待删除提资失败：{}", logs::error_chain(&error));
+                            eprintln!("[data_publish_delete_lookup] {message}");
+                            self.logs.error(&mut self.vm.logs, message, &error, None);
+                        }
+                    }
+                }
+                data::Evt::RoomCodePublish(result) => {
+                    self.manual_data_publish_state.submitting = false;
+                    self.handle_publish_result(
+                        ctx,
+                        "手动提资接口",
+                        "/send_room_code_to_data_center",
+                        result,
+                    );
+                }
                 data::Evt::CommandQuery {
                     epoch,
                     label,
@@ -3412,6 +3435,35 @@ impl App {
         if dirty {
             self.rebuild_tree();
         }
+    }
+
+    fn handle_publish_result(
+        &mut self,
+        ctx: &egui::Context,
+        label: &str,
+        endpoint: &str,
+        result: anyhow::Result<data_publish_api::SubmitResult>,
+    ) {
+        match result {
+            Ok(response) => {
+                let mut message = format!("{label} 已提交（{endpoint}）：{}", response.message);
+                if let Some(login_url) = response.login_url.filter(|url| !url.trim().is_empty()) {
+                    message.push_str(&format!("；登录地址：{login_url}"));
+                    ctx.open_url(egui::OpenUrl {
+                        url: login_url,
+                        new_tab: true,
+                    });
+                }
+                self.logs.info(&mut self.vm.logs, message);
+            }
+            Err(error) => self.logs.error(
+                &mut self.vm.logs,
+                format!("{label}提交失败：{}", logs::error_chain(&error)),
+                &error,
+                None,
+            ),
+        }
+        ctx.request_repaint();
     }
 
     fn succeed_model_progress(&mut self, label: impl Into<String>) {
@@ -3635,11 +3687,65 @@ impl App {
                 Cmd::LoadProject(_) => self.project_picker_state.open = false,
                 Cmd::OpenSettings => self.settings_state.open(),
                 Cmd::OpenDataPublish => self.data_publish_state.open = true,
+                Cmd::OpenManualDataPublish => self.manual_data_publish_state.open = true,
                 Cmd::SubmitDataPublish(request) => {
-                    let _ = self.bridge.req.send(data::Req::DataPublish {
-                        base: self.data_api_url.clone(),
-                        request,
-                    });
+                    if self
+                        .bridge
+                        .req
+                        .send(data::Req::DataPublish {
+                            base: self.data_api_url.clone(),
+                            request,
+                        })
+                        .is_err()
+                    {
+                        self.data_publish_state.submitting = false;
+                        self.logs.error(
+                            &mut self.vm.logs,
+                            "提交数据发布请求失败",
+                            &anyhow::anyhow!("数据请求线程不可用"),
+                            None,
+                        );
+                    }
+                }
+                Cmd::LookupDataPublishDeletions(request) => {
+                    if self
+                        .bridge
+                        .req
+                        .send(data::Req::LookupDataPublishDeletions {
+                            base: self.data_api_url.clone(),
+                            request,
+                        })
+                        .is_err()
+                    {
+                        self.data_publish_state.submitting = false;
+                        self.data_publish_state.pending_request = None;
+                        eprintln!("[data_publish_delete_lookup] 数据服务线程不可用");
+                        self.logs.error(
+                            &mut self.vm.logs,
+                            "获取待删除提资失败：数据服务线程不可用",
+                            &anyhow::anyhow!("数据服务线程不可用"),
+                            None,
+                        );
+                    }
+                }
+                Cmd::SubmitRoomCodePublish(request) => {
+                    if self
+                        .bridge
+                        .req
+                        .send(data::Req::RoomCodePublish {
+                            base: self.data_api_url.clone(),
+                            request,
+                        })
+                        .is_err()
+                    {
+                        self.manual_data_publish_state.submitting = false;
+                        self.logs.error(
+                            &mut self.vm.logs,
+                            "手动提资请求发送失败",
+                            &anyhow::anyhow!("数据请求线程不可用"),
+                            None,
+                        );
+                    }
                 }
                 Cmd::OpenModelUpdate => {
                     self.model_update_state.open = true;
@@ -7004,7 +7110,7 @@ impl App {
 
 impl App {
     fn ui(&mut self, ui: &mut egui::Ui) {
-        self.pump_events();
+        self.pump_events(ui.ctx());
         self.tick_model_progress();
         if self.model_progress_until.is_some() {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
@@ -7029,6 +7135,12 @@ impl App {
             d,
             &self.vm,
             &mut self.data_publish_state,
+        ));
+        cmds.extend(manual_data_publish::show(
+            ui.ctx(),
+            &t,
+            d,
+            &mut self.manual_data_publish_state,
         ));
         cmds.extend(model_update::show(
             ui.ctx(),

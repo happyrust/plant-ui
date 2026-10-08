@@ -80,7 +80,7 @@ batch_insert_sql_cnt = 100 #mysql 批量插入的数量
 # ../gen-model/bin/surreal.exe (fork 2.1.4)；
 # 数据目录：../gen-model/.surreal/ams-8009。
 v_ip = "localhost"
-v_port = 8009
+v_port = 1516
 v_user = "root"
 v_password = "root"
 pe_chunk = 300

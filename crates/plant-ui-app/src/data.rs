@@ -15,6 +15,7 @@ use std::sync::mpsc;
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use plant_ui::data_publish::PublishRequest;
+use plant_ui::manual_data_publish::RoomCodePublishRequest;
 use plant_ui::model_update::{Enqueued, Preview, ProgressEvent};
 use plant_ui::task_queue::Poll as QueuePoll;
 use plant_ui_data::{EleTreeNode, RefU64};
@@ -232,6 +233,14 @@ pub enum Req {
         base: String,
         request: PublishRequest,
     },
+    LookupDataPublishDeletions {
+        base: String,
+        request: PublishRequest,
+    },
+    RoomCodePublish {
+        base: String,
+        request: RoomCodePublishRequest,
+    },
     CommandQuery {
         epoch: u64,
         label: String,
@@ -411,7 +420,12 @@ pub enum Evt {
     QueueSetPaused(bool, anyhow::Result<()>),
     /// 复活死信的回执，带上是哪一个根。真值同样等下一拍快照。
     RetryPendingUnit(String, anyhow::Result<()>),
-    DataPublish(PublishRequest, anyhow::Result<String>),
+    DataPublish(
+        PublishRequest,
+        anyhow::Result<crate::data_publish_api::SubmitResult>,
+    ),
+    DataPublishDeletions(anyhow::Result<Vec<plant_ui::data_publish::DeletionCandidate>>),
+    RoomCodePublish(anyhow::Result<crate::data_publish_api::SubmitResult>),
     CommandQuery {
         epoch: u64,
         label: String,
@@ -841,6 +855,14 @@ async fn handle_read(
             )
             .await;
             let _ = evt_tx.send(Evt::RetryPendingUnit(root_refno, result));
+        }
+        Req::LookupDataPublishDeletions { base, request } => {
+            let result = crate::data_publish_api::lookup_deletions(&base, &request).await;
+            let _ = evt_tx.send(Evt::DataPublishDeletions(result));
+        }
+        Req::RoomCodePublish { base, request } => {
+            let result = crate::data_publish_api::submit_room_codes(&base, &request).await;
+            let _ = evt_tx.send(Evt::RoomCodePublish(result));
         }
         Req::DataPublish { base, request } => {
             let result = crate::data_publish_api::submit(&base, &request).await;

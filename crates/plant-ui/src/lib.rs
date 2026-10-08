@@ -4,6 +4,7 @@
 pub mod data_publish;
 pub mod fonts;
 pub mod model_regenerate;
+pub mod manual_data_publish;
 pub mod model_update;
 pub mod project_picker;
 pub mod room_browser;
@@ -234,8 +235,11 @@ pub enum Cmd {
     OpenSettings,
     /// 打开三维数据发布任务窗。
     OpenDataPublish,
+    OpenManualDataPublish,
+    SubmitRoomCodePublish(manual_data_publish::RoomCodePublishRequest),
     /// 提交三维数据发布请求；实际发送由宿主负责。
     SubmitDataPublish(data_publish::PublishRequest),
+    LookupDataPublishDeletions(data_publish::PublishRequest),
     /// 打开并刷新模型增量更新预览。
     OpenModelUpdate,
     /// 重新读取当前项目的增量范围。
