@@ -693,8 +693,8 @@ mod tests {
         assert_eq!(submitted.category.endpoint(), "/get_dq_bran_data");
         assert_eq!(submitted.design_phase, DesignPhase::Detailed);
         assert_eq!(PublishCategory::ALL.len(), 5);
-        assert_eq!(PublishCategory::Room.label(), "房间数据发布");
-        assert_eq!(PublishCategory::Room.endpoint(), "/get_gy_bran_data");
+        assert_eq!(PublishCategory::Room.label(), "设备房间位置信息发布");
+        assert_eq!(PublishCategory::Room.endpoint(), "/get_bran_data_room_code");
         assert_eq!(
             submitted.elements,
             vec![
