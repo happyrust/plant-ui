@@ -182,6 +182,7 @@ pub fn show(
     let mut window_open = state.open;
     egui::Window::new("三维数据接口")
         .id(egui::Id::new("data-publish-window"))
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .open(&mut window_open)
         .collapsible(false)
         .resizable(false)
@@ -370,6 +371,7 @@ fn show_delete_confirmation(
     let mut confirmed = false;
     egui::Window::new("确认删除提资")
         .id(egui::Id::new("data-publish-delete-confirmation"))
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
@@ -505,6 +507,7 @@ fn show_preview(
     let mut close_requested = false;
     egui::Window::new("预览数据")
         .id(egui::Id::new("data-publish-preview-window"))
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .open(open)
         .collapsible(false)
         .resizable(false)

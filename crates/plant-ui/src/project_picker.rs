@@ -53,6 +53,7 @@ pub fn show(ctx: &egui::Context, t: &Tokens, d: Density, state: &mut State) -> V
     let mut cmds = Vec::new();
     egui::Window::new("选择项目")
         .id(egui::Id::new("plant-project-picker"))
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .collapsible(false)
         .resizable(true)
         .default_size([860.0, 620.0])

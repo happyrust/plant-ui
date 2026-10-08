@@ -91,6 +91,7 @@ pub fn show(ctx: &egui::Context, t: &Tokens, d: Density, state: &mut State) -> O
     let mut cancel = false;
     egui::Window::new("设置")
         .id(egui::Id::new("plant-settings-window"))
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .open(&mut open)
         .collapsible(false)
         .resizable(true)

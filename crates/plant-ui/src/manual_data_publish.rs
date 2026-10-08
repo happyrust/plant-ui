@@ -52,6 +52,7 @@ pub fn show(ctx: &egui::Context, tokens: &Tokens, density: Density, state: &mut 
     let mut window_open = state.open;
     egui::Window::new("手动提资接口")
         .id(egui::Id::new("manual-data-publish-window"))
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .open(&mut window_open)
         .collapsible(false)
         .resizable(false)
