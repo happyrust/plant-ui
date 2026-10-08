@@ -1,0 +1,145 @@
+{
+  "source": "snapshot",
+  "epoch": 1587253893115151355,
+  "session_vector": [
+    {
+      "dbnum": 1112,
+      "sesno": 738
+    },
+    {
+      "dbnum": 6003,
+      "sesno": 4
+    },
+    {
+      "dbnum": 7997,
+      "sesno": 353
+    },
+    {
+      "dbnum": 7998,
+      "sesno": 540
+    },
+    {
+      "dbnum": 7999,
+      "sesno": 200
+    },
+    {
+      "dbnum": 8000,
+      "sesno": 646
+    },
+    {
+      "dbnum": 7027,
+      "sesno": 445
+    },
+    {
+      "dbnum": 7022,
+      "sesno": 254
+    },
+    {
+      "dbnum": 7015,
+      "sesno": 511
+    },
+    {
+      "dbnum": 7048,
+      "sesno": 54
+    },
+    {
+      "dbnum": 250705,
+      "sesno": 9
+    },
+    {
+      "dbnum": 7009,
+      "sesno": 479
+    },
+    {
+      "dbnum": 7011,
+      "sesno": 641
+    },
+    {
+      "dbnum": 7332,
+      "sesno": 22
+    },
+    {
+      "dbnum": 7330,
+      "sesno": 41
+    },
+    {
+      "dbnum": 7331,
+      "sesno": 23
+    },
+    {
+      "dbnum": 7321,
+      "sesno": 77
+    },
+    {
+      "dbnum": 7329,
+      "sesno": 221
+    },
+    {
+      "dbnum": 7353,
+      "sesno": 97
+    },
+    {
+      "dbnum": 7324,
+      "sesno": 1362
+    },
+    {
+      "dbnum": 7352,
+      "sesno": 50
+    },
+    {
+      "dbnum": 7350,
+      "sesno": 207
+    },
+    {
+      "dbnum": 7354,
+      "sesno": 266
+    },
+    {
+      "dbnum": 7327,
+      "sesno": 1470
+    },
+    {
+      "dbnum": 7356,
+      "sesno": 14
+    },
+    {
+      "dbnum": 7333,
+      "sesno": 1724
+    },
+    {
+      "dbnum": 7326,
+      "sesno": 639
+    },
+    {
+      "dbnum": 7334,
+      "sesno": 312
+    },
+    {
+      "dbnum": 7741,
+      "sesno": 90
+    }
+  ],
+  "items": [
+    {
+      "name": "/1RX-RM",
+      "refno": "24381/34110",
+      "dbnum": 7997,
+      "noun": "ZONE"
+    },
+    {
+      "name": "/1RX-RM01",
+      "refno": "24381/1163",
+      "dbnum": 7997,
+      "noun": "STRU"
+    },
+    {
+      "name": "/1RX-RM01-R101",
+      "refno": "24381/1164",
+      "dbnum": 7997,
+      "noun": "FRMW"
+    }
+  ],
+  "total": 533,
+  "truncated": true,
+  "next_cursor": 3
+}
