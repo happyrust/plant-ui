@@ -1831,8 +1831,16 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
             Evt::RetryPendingUnit(root_refno, result)
         }
         Req::DataPublish { request, .. } => {
-            Evt::DataPublish(request, Ok("模拟模式：已受理（未真正提交）".into()))
+            Evt::DataPublish(request, Ok(crate::data_publish_api::SubmitResult {
+                message: "模拟模式：已受理（未真正提交）".into(),
+                login_url: None,
+            }))
         }
+        Req::LookupDataPublishDeletions { .. } => Evt::DataPublishDeletions(Ok(Vec::new())),
+        Req::RoomCodePublish { .. } => Evt::RoomCodePublish(Ok(crate::data_publish_api::SubmitResult {
+            message: "模拟模式：已受理（未真正提交）".into(),
+            login_url: None,
+        })),
         Req::CommandQuery {
             epoch,
             label,

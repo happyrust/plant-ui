@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  一键跑供数模式对拍探针：`plant-ui-app --read-face-parity`（2026-09-07 计划 §5.4 / M4）。
+  一键跑供数模式对拍探针：`rs-plant --read-face-parity`（2026-09-07 计划 §5.4 / M4）。
 
 .DESCRIPTION
   同一进程里各起一份服务供数与库供数的读面，对着同一个接入点把树、属性、三维实例各读一遍，
@@ -21,7 +21,7 @@
 .PARAMETER Out
   报告路径。默认 docs/evidence/<今天>-read-face-parity.md；给 "-" 打到标准输出。
 .PARAMETER Exe
-  现成的 plant-ui-app.exe。不给就 cargo build -p plant-ui-app（-Release 走 release）后用 target 里那一个。
+  现成的 rs-plant.exe。不给就 cargo build -p rs-plant（-Release 走 release）后用 target 里那一个。
 .PARAMETER AssetRoot
   资产根（PLANT_ASSET_ROOT）。默认仓库的 web/public/assets。
 .PARAMETER SettingsFile
@@ -52,16 +52,16 @@ $uiRoot = Split-Path $PSScriptRoot -Parent
 if (-not $Exe) {
   Push-Location $uiRoot
   try {
-    $buildArgs = @("build", "-p", "plant-ui-app")
+    $buildArgs = @("build", "-p", "rs-plant")
     if ($Release) { $buildArgs += "--release" }
     cargo @buildArgs
     if ($LASTEXITCODE) { exit $LASTEXITCODE }
     $targetDir = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).target_directory
   } finally { Pop-Location }
   $profile = if ($Release) { "release" } else { "debug" }
-  $Exe = Join-Path $targetDir "$profile\plant-ui-app.exe"
+  $Exe = Join-Path $targetDir "$profile\rs-plant.exe"
 }
-if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) { throw "找不到 plant-ui-app：$Exe" }
+if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) { throw "找不到 rs-plant：$Exe" }
 
 if (-not $AssetRoot) { $AssetRoot = Join-Path $uiRoot "web\public\assets" }
 if (-not (Test-Path -LiteralPath $AssetRoot -PathType Container)) { throw "资产根不存在：$AssetRoot" }

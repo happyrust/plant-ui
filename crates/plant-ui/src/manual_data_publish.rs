@@ -188,3 +188,28 @@ fn table_header(
     ui.painter()
         .galley(rect.center() - text.size() / 2.0, text, tokens.text_primary);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_trims_fields_and_omits_empty_or_incomplete_rows() {
+        let state = State {
+            title: "  手动提资测试  ".into(),
+            cells: vec![
+                ["  /PUMP-001  ".into(), "  R101  ".into()],
+                ["/PUMP-002".into(), "  ".into()],
+                ["".into(), "R102".into()],
+                ["".into(), "".into()],
+            ],
+            ..State::default()
+        };
+        assert!(state.has_entries());
+        assert_eq!(serde_json::to_value(state.request()).unwrap(), serde_json::json!({
+            "title": "手动提资测试",
+            "room_codes": [{"name": "/PUMP-001", "room_code": "R101"}]
+        }));
+        assert!(!State::default().has_entries());
+    }
+}
