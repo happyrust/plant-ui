@@ -6,8 +6,8 @@
 //! 全部经它，数据线程内不许根据错误自行换面。
 //!
 //! 不在这里的两样：**房间**——它只有库一条路，服务供数下经 `/health.mirror` 门控懒连
-//! （计划 D6）；**命令面**——`ensure` / 手动更新 / 队列 / 提资 / 命令查询永远走模型服务
-//! （计划 D3），所以 `model_instances` 只读、`ensure` 循环留在 `data.rs`。
+//! （计划 D6）；**命令面**——生成（右键「重新生成模型」）/ 手动更新 / 队列 / 提资 / 命令查询
+//! 永远走模型服务（计划 D3），所以 `model_instances` 只读、生成留在 `data.rs` 的命令臂。
 //!
 //! 为什么是 enum 不是 `dyn Trait`：恰好两个变体、穷尽匹配；`async fn` 直接写、不上
 //! `async-trait`；原生端 future 要 `Send`、wasm 端不要（`data.rs` 已为此分了两套
@@ -17,7 +17,7 @@ use std::sync::mpsc;
 
 use plant_ui_data::{Attr, EleTreeNode, NameHit, RefU64};
 
-use crate::data::{Evt, RegenerateCount};
+use crate::data::Evt;
 use crate::model_update_api::ModelRecords;
 use crate::search_index::{Scope, SearchIndex, SubstringHits};
 
@@ -232,18 +232,6 @@ impl ReadFace {
         match self {
             Self::Service(face) => face.subtree_bounds(root, scope).await,
             Self::Store(face) => face.subtree_bounds(root).await,
-        }
-    }
-
-    /// 「重新生成模型」的清点：这些根底下已经生成过多少元素、归成多少个生成单元。
-    pub async fn regeneration_count(
-        &self,
-        targets: &[RefU64],
-        delivery_units: &[String],
-    ) -> anyhow::Result<RegenerateCount> {
-        match self {
-            Self::Service(face) => face.regeneration_count(targets).await,
-            Self::Store(face) => face.regeneration_count(targets, delivery_units).await,
         }
     }
 

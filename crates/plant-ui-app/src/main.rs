@@ -14,7 +14,6 @@ mod model_update_api;
 mod model_update_ws;
 mod nav_history;
 mod read_face;
-mod regenerate;
 mod search_index;
 mod settings_store;
 mod sim;
@@ -47,8 +46,8 @@ use eframe::egui;
 use logs::Retry;
 use plant_ui::data_publish::{self, State as DataPublishState};
 use plant_ui::fonts;
-use plant_ui::model_regenerate::{self, DeliveryUnits};
 use plant_ui::manual_data_publish::{self, State as ManualDataPublishState};
+use plant_ui::model_regenerate;
 use plant_ui::model_update::{
     self, Feed as ModelUpdateFeed, State as ModelUpdateState, Vm as ModelUpdateVm,
 };
@@ -1072,22 +1071,17 @@ struct App {
     /// 只长设计库元素。选中之后下拉多半已经关了、`vm.search` 也清了，所以这份库号
     /// 单独留着，别处不用（计划 §5.5）。
     search_hit_dbs: HashMap<RefU64, u32>,
-    /// 「重新生成模型」的确认框，`None` = 没开。
-    ///
-    /// 这条路**只走到确认为止**：清点是只读的 deep query，按下确认之后的删除与
-    /// 逐根 ensure 还不在本端。
+    /// 「重新生成模型」的确认框，`None` = 没开（ADR-0030 D2：确认 → 一发 generate → 显示）。
     regenerate: Option<model_regenerate::Vm>,
-    /// 清点的帧号。换过目标、或者窗关了之后，上一次的数字不许再贴回来——
-    /// 一片 SITE 数几千个元素要跑几秒，那期间人早就右键了别处。
-    ///
-    /// 确认之后这个号不再变：删除与逐根 ensure 的回执都拿它认帧。
+    /// 这一趟的帧号。确认那一刻钉住，generate 的整批回执拿它认帧；换过目标、关过窗
+    /// 都加一，上一趟的尾巴回来就丢。
     regenerate_epoch: u64,
-    /// 确认之后正在跑的那一趟。`None` = 没在跑。
+    /// 确认框打开到回执落地之间的那一趟：窗上的标题与右键那几行。`None` = 没在跑。
     regenerate_run: Option<RegenerateRun>,
-    /// 这一趟跑完要显示出来的生成根。确认框答应过「跑完会把这些模型全部显示
-    /// 出来，包括本来隐藏的」——取回工作只按重装前的可见性回放，兑现那句话
-    /// 得等场景重装落地之后再显式显示一次。
-    regenerate_show: Vec<RefU64>,
+    /// generate 成功、正等显示回包替换旧几何的目标。右键之前这些目标名下的模型可能已经在
+    /// 场景里（旧产物）；它们的 records 回包到了要先卸掉已加载的同名模型再装，否则
+    /// `claim_unloaded_model_refnos` 会把重算过的几何当成「已经有了」。
+    regenerate_refresh: HashSet<RefU64>,
     /// 任务队列视图的数据。它不跟着任何一次运行走——队列是常驻的，进程活着它就在。
     queue: task_queue::Vm,
     /// 队列的明细长连接：订阅全部任务，逐条带 task_id 回来。
@@ -1224,49 +1218,71 @@ fn hit_row(hit: plant_ui_data::NameHit, desi_dbs: &[u32]) -> SearchHitVm {
     }
 }
 
-/// 确认之后那一趟重新生成：删了什么、还要做哪些、做到哪儿了。
+/// 右键「重新生成模型」从打开确认框到回执落地之间的那一趟（ADR-0030 D2）。
 ///
-/// `roots` 在**清点**那一刻就定死了。它是从 `inst_relate` 上数出来的，删完
-/// 那张表上没有它们了——中途丢掉这份名单，剩下的单元就真的找不回来，
-/// 确认框那句「没重做完的那些找不回来」说的正是这件事。
+/// 只记标题与右键那几行：客户端不清点、不解根、不删产物，没有名单要守。
 struct RegenerateRun {
     label: String,
-    /// 右键那几行。删除按它们整片删，跑完也按它们重查树。
+    /// 右键那几行。各一发 generate，成功之后以它们为祖先发显示。
     targets: Vec<RefU64>,
-    roots: Vec<RefU64>,
-    /// 真删空了几个落点。删除失败时它多半不是零，收尾那句话要照它说。
-    deleted: usize,
-    /// 下一个要派发的下标。它同时是「已经派出去多少」。
-    next: usize,
-    tally: regenerate::Tally,
-    /// 「停在这里」按过了。已经发出去的那一个停不了，停的是下一个。
-    stopping: bool,
 }
 
-/// 一趟重新生成的收尾话，以及它该不该是告警。
+/// 一发 generate 的回执归到哪一档（ADR-0030 D2 第 3 步）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenerateOutcome {
+    /// 服务端做完了（含「范围内本来就没有可画几何」）：对这个目标发显示。
+    Display,
+    /// 120 s 没等到、服务端后台继续：**不显示**，等它跑完再点眼睛。
+    Background,
+    /// 真失败：ERROR，不显示。
+    Failed,
+}
+
+/// 回执 → 三档。`timeout` 是服务端那道 120 s 预算（它回 504 并说明后台继续跑），不是失败。
+fn generate_outcome(result: &anyhow::Result<model_update_api::GenerateReply>) -> GenerateOutcome {
+    match result {
+        Ok(_) => GenerateOutcome::Display,
+        Err(error) => {
+            if model_update_api::failure_of(error).form() == model_update::FailForm::Timeout {
+                GenerateOutcome::Background
+            } else {
+                GenerateOutcome::Failed
+            }
+        }
+    }
+}
+
+/// 一发成功回执的日志摘要：生成根数 / 重算数 / 命中数，加「内存供数」那半句（spec §4.12）。
 ///
-/// **「找不回来」只在真删过的时候说。** 删除自己就失败的那一趟，库里那一片
-/// 还原样立着；把它说成丢了，人就会去做一次不必要的重做。反过来，删过又没
-/// 派完的那些是真没了，这句话正是确认框那条警告兑现的地方。
-fn regenerate_summary(
-    label: &str,
-    tally: &regenerate::Tally,
-    total: usize,
-    dispatched: usize,
-    deleted: usize,
-) -> (String, bool) {
-    let mut line = format!("{label}：{}", tally.summary(total));
-    let undispatched = total.saturating_sub(dispatched);
-    if undispatched > 0 && deleted > 0 {
+/// 两种要点名的自相矛盾：服务端换了新状态名（按「做过了」计，但得说出来）；「已生成」却
+/// 「没有可用模型」——它不是失败，可人会盯着一片空白等一个不会来的模型。
+fn generate_summary(label: &str, reply: &model_update_api::GenerateReply) -> String {
+    let mut line = match reply.status {
+        model_update_api::GenerateStatus::NoRenderableGeometry => format!(
+            "{label}：生成完成，范围内无可渲染几何（{} 个生成根）",
+            reply.generation_root_count
+        ),
+        _ => format!(
+            "{label}：生成完成，{} 个生成根（重算 {}、命中 {}）",
+            reply.generation_root_count, reply.generated_root_count, reply.cached_root_count
+        ),
+    };
+    if reply.status == model_update_api::GenerateStatus::Unknown {
         line.push_str(&format!(
-            "。还有 {undispatched} 个没派发就停了，它们的模型已经删掉、找不回来"
-        ));
-    } else if undispatched > 0 {
-        line.push_str(&format!(
-            "。还有 {undispatched} 个一个都没派发；也没删成东西"
+            "；服务端回了一个不认识的状态（生成根 {}），按「做过了」计",
+            reply.generation_root
         ));
     }
-    (line, tally.failed > 0 || undispatched > 0)
+    if reply.status == model_update_api::GenerateStatus::Generated && !reply.model_available {
+        line.push_str(&format!(
+            "；报「已生成」但没有可用模型（生成根 {}），三维里不会多出东西",
+            reply.generation_root
+        ));
+    }
+    if let Some(note) = reply.source_note() {
+        line.push_str(&note);
+    }
+    line
 }
 
 /// 确认框标题里的那个范围。单选就报那一行，多选点名头一个再报总数——
@@ -1801,7 +1817,7 @@ impl App {
             regenerate: None,
             regenerate_epoch: 0,
             regenerate_run: None,
-            regenerate_show: Vec::new(),
+            regenerate_refresh: HashSet::new(),
             // 队列面板按它决定库行「模型来源」画不画、轮询失败怎么说（计划 §5.5）。
             queue: task_queue::Vm::new(read_face),
             queue_feed: None,
@@ -2305,13 +2321,6 @@ impl App {
                             if !replay_hidden.is_empty() {
                                 self.set_model_visible(replay_hidden, false);
                             }
-                            // 「跑完会把这些模型全部显示出来，包括本来隐藏的」
-                            // ——确认框那句话在这里兑现。回放隐藏是按重装**之前**
-                            // 的可见性走的，刚重做出来的那几个不受它管。
-                            if !self.regenerate_show.is_empty() {
-                                let shown = std::mem::take(&mut self.regenerate_show);
-                                self.set_model_visible(shown, true);
-                            }
                             dirty = true;
                         }
                         Err(error) => {
@@ -2374,6 +2383,22 @@ impl App {
                                 &mut self.model_scope_failures,
                                 target,
                             );
+                            // 重新生成之后查空（范围内已无可画几何）：这个目标上一次显示的旧产物
+                            // 也不该再留在场景里。
+                            if self.regenerate_refresh.remove(&target) {
+                                let stale: Vec<RefU64> = self
+                                    .model_scopes
+                                    .remove(&target)
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .filter(|refno| self.loaded_models.remove(refno))
+                                    .collect();
+                                if !stale.is_empty() {
+                                    self.view3d_commands.push(Cmd::Model(
+                                        plant_ui::ModelAction::Unload { refnos: stale },
+                                    ));
+                                }
+                            }
                             // 查空就是空：树行停「未加载」，一句提示说清出路，不是告警
                             // （ADR-0030 D1）。
                             let element = self.tree.element(target);
@@ -2399,6 +2424,20 @@ impl App {
                                     refs.push(refno);
                                 }
                                 cache_model_scope(&mut self.model_scopes, refno, refno);
+                            }
+                            // 右键重新生成之后的显示（ADR-0030 D2 第 3 步）：这批记录是重算过的
+                            // 产物，场景里同名的旧几何先卸掉，下面才会把它们当新模型装进去。
+                            if self.regenerate_refresh.remove(&target) {
+                                let stale: Vec<RefU64> = refs
+                                    .iter()
+                                    .copied()
+                                    .filter(|refno| self.loaded_models.remove(refno))
+                                    .collect();
+                                if !stale.is_empty() {
+                                    self.view3d_commands.push(Cmd::Model(
+                                        plant_ui::ModelAction::Unload { refnos: stale },
+                                    ));
+                                }
                             }
                             self.model_scopes.insert(target, refs.clone());
                             // 登记成范围目标：取回工作重装时服务供数以它为祖先重查（ADR-0030 D3）。
@@ -2684,63 +2723,12 @@ impl App {
                     self.vm.search.sub_state = next;
                     dirty = true;
                 }
-                // 换过目标、或者窗已经关了：这份数字贴上去就成了另一个范围的账。
-                data::Evt::RegenerateScope { epoch, .. } if epoch != self.regenerate_epoch => {}
-                data::Evt::RegenerateScope { result, .. } => {
-                    // 标题从在途那一份取——清点期间窗上写的就是它。
-                    if let Some(model_regenerate::Vm::Counting { label }) = self.regenerate.take() {
-                        self.regenerate = Some(match result {
-                            Ok(count) => {
-                                let roots = count.roots.len();
-                                // 名单落进这一趟：删完 `inst_relate` 上没有它们了，
-                                // 这是唯一一次算得出来的机会。
-                                if let Some(run) = self.regenerate_run.as_mut() {
-                                    run.roots = count.roots;
-                                }
-                                model_regenerate::Vm::Ready(model_regenerate::Plan {
-                                    label,
-                                    elements: count.elements,
-                                    roots,
-                                })
-                            }
-                            Err(error) => {
-                                self.regenerate_run = None;
-                                model_regenerate::Vm::Failed {
-                                    label,
-                                    reason: logs::error_chain(&error),
-                                }
-                            }
-                        });
-                    }
-                }
-                // 删除与逐根回执都拿确认那一刻钉住的帧号认；对不上的一律不认
+                // generate 的整批回执拿确认那一刻钉住的帧号认；对不上的一律不认
                 // ——这一趟已经收了，回来的是上一趟的尾巴。
-                data::Evt::RegenerateDeleted { epoch, .. } if epoch != self.regenerate_epoch => {}
-                data::Evt::RegenerateDeleted {
-                    deleted, result, ..
-                } => match result {
-                    Ok(()) => {
-                        if let Some(run) = self.regenerate_run.as_mut() {
-                            run.deleted = deleted;
-                        }
-                        self.dispatch_next_regenerate_unit();
-                    }
-                    Err(error) => {
-                        // 删都删不动：往下发 ensure 只会在没删干净的范围上重做，
-                        // 谁也说不清结果。前面已经删空的那几片得当场点名。
-                        let Some(run) = self.regenerate_run.as_mut() else {
-                            continue;
-                        };
-                        run.deleted = deleted;
-                        run.stopping = true;
-                        let what = format!("{} 删除失败（已删掉 {deleted} 个落点）", run.label);
-                        self.logs.error(&mut self.vm.logs, what, &error, None);
-                        self.finish_regenerate();
-                    }
-                },
-                data::Evt::RegenerateUnit { epoch, .. } if epoch != self.regenerate_epoch => {}
-                data::Evt::RegenerateUnit { index, result, .. } => {
-                    self.settle_regenerate_unit(index, result)
+                data::Evt::ModelsGenerated { epoch, .. } if epoch != self.regenerate_epoch => {}
+                data::Evt::ModelsGenerated { outcomes, .. } => {
+                    self.settle_models_generated(outcomes);
+                    dirty = true;
                 }
                 data::Evt::Ancestors(refno, Ok(chain)) => {
                     // 同一条链可能是两件事要的：一次定位，或者一次「新增子树该刷哪一层」
@@ -2920,7 +2908,7 @@ impl App {
                             }
                             // Prune the preserved request/replay snapshot before sending
                             // Models, not only the scene. Otherwise deleted scopes are
-                            // ensured now and reintroduced by Evt::Models every refresh.
+                            // re-queried now and reintroduced by Evt::Models every refresh.
                             if let Some(snapshot) = self.model_reload_restore.as_mut() {
                                 prune_removed_reload_nodes(snapshot, &removed);
                             }
@@ -3716,19 +3704,8 @@ impl App {
                     self.navigate(step);
                     dirty = true;
                 }
-                Cmd::RegenerateModels { targets } => self.begin_regenerate_count(targets),
+                Cmd::RegenerateModels { targets } => self.begin_regenerate(targets),
                 Cmd::RegenerateConfirm { accepted } => self.settle_regenerate_confirm(accepted),
-                // 「停在这里」**只停派发**。已经发出去的那一个停不了——服务端是
-                // `await_background_without_cancelling`，收到回执后才收摊。
-                Cmd::RegenerateStop => {
-                    if let Some(run) = self.regenerate_run.as_mut() {
-                        run.stopping = true;
-                    }
-                    if let Some(model_regenerate::Vm::Running(progress)) = self.regenerate.as_mut()
-                    {
-                        progress.stopping = true;
-                    }
-                }
             }
         }
         if dirty {
@@ -3872,99 +3849,53 @@ impl App {
         self.vm.search.running = Some(SearchRunVm { query });
     }
 
-    /// 「重新生成模型」的第一步：清点。
+    /// 右键「重新生成模型」的第一步：打开确认框（ADR-0030 D2）。
     ///
-    /// 这一步一行都不删——deep query 数出「多少个已生成元素、归成多少个生成
-    /// 单元」，把两个真数字摆进确认框等人拍板。右键换一行就重开一次，上一次
-    /// 在途的清点由 `regenerate_epoch` 认出来丢掉。
-    fn begin_regenerate_count(&mut self, targets: Vec<RefU64>) {
+    /// 不清点、不解根、不删产物——确认框不带数字，人要判断的只有「这个范围要不要重算」。
+    /// 右键换一行就重开一次，上一趟没确认的那份目标随之作废；跑起来的那一趟不会走到这里
+    /// （`regen_busy` 挡着右键菜单）。
+    fn begin_regenerate(&mut self, targets: Vec<RefU64>) {
         let Some(first) = targets.first().copied() else {
             return;
         };
         let label = regenerate_label(self.tree.label(first), targets.len());
         self.regenerate_epoch = self.regenerate_epoch.wrapping_add(1);
-        // 上一次备着的那份名单作废：右键换了一行，它说的是另一个范围。
-        // 跑起来的那一趟不会走到这里——`Vm::Running` 挡着右键菜单（regen_busy）。
-        self.regenerate_run = None;
-        // 名词表是**服务端**此刻的配置，不是那四个默认值：不知道就数不出生成
-        // 单元数，而那正是人拿来判断这一按值不值的数字。删除一步都还没走，
-        // 所以这里只是不往下走。
-        let units = DeliveryUnits::from_health(
-            self.queue
-                .health
-                .as_ref()
-                .map(|health| health.delivery_unit_types.as_slice())
-                .unwrap_or_default(),
-        );
-        let Some(nouns) = units.nouns() else {
-            self.regenerate = Some(model_regenerate::Vm::Failed {
-                label,
-                reason: model_regenerate::UNKNOWN_DELIVERY_UNITS.to_owned(),
-            });
-            return;
-        };
-        let request = data::Req::RegenerateScope {
-            epoch: self.regenerate_epoch,
-            targets: targets.clone(),
-            delivery_units: nouns.iter().cloned().collect(),
-        };
-        if self.bridge.req.send(request).is_err() {
-            self.regenerate = Some(model_regenerate::Vm::Failed {
-                label,
-                reason: "数据线程已关闭".into(),
-            });
-            return;
-        }
         self.regenerate_run = Some(RegenerateRun {
             label: label.clone(),
             targets,
-            roots: Vec::new(),
-            deleted: 0,
-            next: 0,
-            tally: regenerate::Tally::default(),
-            stopping: false,
         });
-        self.regenerate = Some(model_regenerate::Vm::Counting { label });
+        self.regenerate = Some(model_regenerate::Vm::Confirm { label });
     }
 
-    /// 确认框的回执。接受就动手：先整片删一次，再逐根重做。
-    ///
-    /// 跑起来之后这个窗不再关得掉（`Vm::Running` 那一档没有叉），所以取消只可能
-    /// 来自清点阶段——那时一个请求都还没发出去。
+    /// 确认框的回执。接受就对右键那几行**各一发** `generate(force = true)`，整批回执落在
+    /// `Evt::ModelsGenerated`；取消 / 关窗 / 关掉失败态一个请求都不发。
     fn settle_regenerate_confirm(&mut self, accepted: bool) {
         let closed = self.regenerate.take();
-        let Some(model_regenerate::Vm::Ready(plan)) = closed else {
-            // 清点中 / 失败态被关掉：在途那次清点的数字回来也没地方贴。
+        let Some(model_regenerate::Vm::Confirm { .. }) = closed else {
+            // 失败态被关掉（跑起来的那一档没有叉，到不了这里）：收摊。
             self.regenerate_epoch = self.regenerate_epoch.wrapping_add(1);
             self.regenerate_run = None;
             return;
         };
         if !accepted {
             self.regenerate_epoch = self.regenerate_epoch.wrapping_add(1);
-            // 那份根名单跟着这一次决定作废。留着它，下一次确认就会对着上一个
-            // 范围动手，而窗上写的是这一个。
             self.regenerate_run = None;
             return;
         }
         let Some(run) = self.regenerate_run.as_ref() else {
-            // 清点回执里那份根名单没接住。删除一步都还没走，如实说一句就停。
             self.regenerate_epoch = self.regenerate_epoch.wrapping_add(1);
-            self.logs.warn(
-                &mut self.vm.logs,
-                format!("{}：生成根名单没接住，这一趟没有开始", plan.label),
-            );
             return;
         };
-        // 帧号从这里起不再变：删除与逐根回执都拿它认帧。
-        let request = data::Req::RegenerateDelete {
+        let (label, targets) = (run.label.clone(), run.targets.clone());
+        // 帧号从这里起不再变：整批回执拿它认帧。
+        let request = data::Req::GenerateModels {
             epoch: self.regenerate_epoch,
+            refnos: targets.clone(),
             base: self.model_api_url.clone(),
-            targets: run.targets.clone(),
             project: self.vm.project.clone(),
             mdb: self.mdb.clone(),
             namespace: self.namespace.clone(),
         };
-        let (label, total) = (run.label.clone(), run.roots.len());
         if self.bridge.req.send(request).is_err() {
             self.regenerate_run = None;
             self.regenerate_epoch = self.regenerate_epoch.wrapping_add(1);
@@ -3977,151 +3908,82 @@ impl App {
         self.logs.info(
             &mut self.vm.logs,
             format!(
-                "{label}：正在删除 {} 个已生成元素，随后重做最多 {total} 个生成单元…",
-                plan.elements
+                "{label}：正在生成模型（{} 个目标，范围内已有的产物会被重算替换；服务端预算 120 秒，超时后后台继续）…",
+                targets.len()
             ),
         );
         self.vm.regen_busy = true;
-        self.regenerate = Some(model_regenerate::Vm::Running(model_regenerate::Progress {
-            label,
-            settled: 0,
-            total,
-            stopping: false,
-        }));
+        self.regenerate = Some(model_regenerate::Vm::Running { label });
     }
 
-    /// 派发下一个生成根；没有下一个（或者已经喊停）就收尾。
-    fn dispatch_next_regenerate_unit(&mut self) {
-        let Some(run) = self.regenerate_run.as_mut() else {
-            return;
-        };
-        let done = run.stopping || run.next >= run.roots.len();
-        if done {
-            self.finish_regenerate();
-            return;
-        }
-        let refno = run.roots[run.next];
-        let index = run.next;
-        run.next += 1;
-        let request = data::Req::RegenerateUnit {
-            epoch: self.regenerate_epoch,
-            index,
-            base: self.model_api_url.clone(),
-            refno,
-            project: self.vm.project.clone(),
-            mdb: self.mdb.clone(),
-            namespace: self.namespace.clone(),
-        };
-        if self.bridge.req.send(request).is_err() {
-            self.logs
-                .warn(&mut self.vm.logs, "数据线程已关闭：这一趟就停在这里");
-            self.finish_regenerate();
-        }
-    }
-
-    /// 一个生成根的回执落账。
-    ///
-    /// 五档各归各的（见 `regenerate::outcome_of_*`）：`container` 与服务端换过的
-    /// 新状态名都要**当场点名**——它们的意思是客户端归根与服务端策略对不上，
-    /// 静默计数的话这个分歧可以错开好几个月没人发现。
-    fn settle_regenerate_unit(
+    /// generate 的整批回执落地（ADR-0030 D2 第 3 步）：成功的目标**生成完成之后再显示**——
+    /// 以它们为祖先发显示（等于替用户点一次眼睛，旧几何由 `regenerate_refresh` 换掉）；
+    /// `timeout` 的不显示，日志说明服务端后台继续；失败的 ERROR。
+    fn settle_models_generated(
         &mut self,
-        index: usize,
-        result: anyhow::Result<model_update_api::EnsureReply>,
+        outcomes: Vec<(RefU64, anyhow::Result<model_update_api::GenerateReply>)>,
     ) {
-        let Some(run) = self.regenerate_run.as_mut() else {
-            return;
-        };
-        let refno = run.roots.get(index).copied().unwrap_or_default();
-        let outcome = match &result {
-            Ok(reply) => {
-                if reply.status == model_update_api::EnsureStatus::Unknown {
-                    let root = &reply.generation_root;
-                    self.logs.warn(
-                        &mut self.vm.logs,
-                        format!(
-                            "{} 回了一个不认识的状态（生成根 {root}），当成做过了计数",
-                            refno.to_slash_string()
-                        ),
-                    );
-                }
-                // 「做完了」却「没有模型」是自相矛盾的一档。它不是失败——服务端
-                // 认为自己尽到了责任——但人会盯着一片空白等一个不会来的模型。
-                if reply.status == model_update_api::EnsureStatus::Generated
-                    && !reply.model_available
-                {
-                    self.logs.warn(
-                        &mut self.vm.logs,
-                        format!(
-                            "{} 报「已生成」但没有可用模型（生成根 {}），三维里不会多出东西",
-                            refno.to_slash_string(),
-                            reply.generation_root
-                        ),
-                    );
-                }
-                regenerate::outcome_of_status(reply.status)
-            }
-            Err(error) => {
-                let failure = model_update_api::failure_of(error);
-                let outcome = regenerate::outcome_of_failure(&failure);
-                if matches!(
-                    outcome,
-                    regenerate::UnitOutcome::Failed | regenerate::UnitOutcome::Abort
-                ) {
-                    self.logs.error(
-                        &mut self.vm.logs,
-                        format!("{} 重做失败", refno.to_slash_string()),
-                        error,
-                        None,
-                    );
-                }
-                outcome
-            }
-        };
-        let Some(run) = self.regenerate_run.as_mut() else {
-            return;
-        };
-        run.tally.record(outcome);
-        // 中止的那一个不进账，但整趟到此为止：连不上 / 服务没起来的时候，
-        // 剩下几百个只会一个个重复同一次失败。
-        if outcome == regenerate::UnitOutcome::Abort {
-            run.stopping = true;
-        }
-        let settled = run.tally.settled();
-        if let Some(model_regenerate::Vm::Running(progress)) = self.regenerate.as_mut() {
-            progress.settled = settled;
-        }
-        self.dispatch_next_regenerate_unit();
-    }
-
-    /// 收尾：报账、解禁、把重做出来的模型显示出来。
-    ///
-    /// 「取回工作」是这里唯一靠得住的刷新——库里这一片的几何整批换过了，
-    /// 本进程的查询缓存与三维场景都还停在删除之前那个世界。
-    fn finish_regenerate(&mut self) {
         let Some(run) = self.regenerate_run.take() else {
             return;
         };
-        self.regenerate = None;
         self.vm.regen_busy = false;
         self.regenerate_epoch = self.regenerate_epoch.wrapping_add(1);
-        let (line, alarming) = regenerate_summary(
-            &run.label,
-            &run.tally,
-            run.roots.len(),
-            run.next,
-            run.deleted,
-        );
-        if alarming {
-            self.logs.warn(&mut self.vm.logs, line);
-        } else {
-            self.logs.info(&mut self.vm.logs, line);
+        let mut display = Vec::new();
+        let mut failures = Vec::new();
+        let mut legacy_said = false;
+        for (refno, result) in &outcomes {
+            let label = self.tree.label(*refno);
+            match generate_outcome(result) {
+                GenerateOutcome::Display => {
+                    let reply = result.as_ref().expect("Display 只来自 Ok");
+                    if reply.legacy_endpoint && !legacy_said {
+                        legacy_said = true;
+                        self.logs.info(
+                            &mut self.vm.logs,
+                            "模型服务是旧版（没有 /model/generate），已按旧路径生成；请升级 gen-model",
+                        );
+                    }
+                    self.logs
+                        .info(&mut self.vm.logs, generate_summary(&label, reply));
+                    display.push(*refno);
+                }
+                GenerateOutcome::Background => {
+                    self.logs.warn(
+                        &mut self.vm.logs,
+                        format!(
+                            "{label}：服务端 120 秒内没做完，后台继续生成；完成后再点眼睛查看（这次不显示）"
+                        ),
+                    );
+                }
+                GenerateOutcome::Failed => {
+                    let error = result.as_ref().expect_err("Failed 只来自 Err");
+                    self.logs
+                        .error(&mut self.vm.logs, format!("{label}：生成失败"), error, None);
+                    failures.push(format!(
+                        "{label}：{}",
+                        model_update_api::failure_of(error).message
+                    ));
+                }
+            }
         }
-        // 已经派出去过的那些才值得显示；没派发的那几个库里什么都没有。
-        self.regenerate_show = run.roots[..run.next].to_vec();
-        // 元素本体一行没动（删的是产物），但本进程的查询缓存与三维场景都还停在
-        // 删除之前那个世界。取回工作是唯一会把两者一起换掉的那条路。
-        self.get_work_with_models(true);
+        self.regenerate = if failures.is_empty() {
+            None
+        } else {
+            Some(model_regenerate::Vm::Failed {
+                label: run.label.clone(),
+                reason: failures.join("；"),
+            })
+        };
+        if display.is_empty() {
+            return;
+        }
+        // 生成完成之后，再调用显示接口：这几个目标名下的旧几何要换成重算过的，所以先把
+        // 它们从「已知范围」里摘掉，让 `set_model_visible` 走查询那条路，回包时再卸旧装新。
+        for target in &display {
+            self.model_scopes.remove(target);
+            self.regenerate_refresh.insert(*target);
+        }
+        self.set_model_visible(display, true);
     }
 
     /// 树定位：选中目标并让属性跟上，再想办法把它那一行露出来（ADR-0014）。
@@ -5267,16 +5129,16 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{
-        AutoRefresh, EMPTY_SCOPE_HINT, EleTreeNode, ModelVisibility, ModelVisibilityPlan,
-        PanelRoomResolution, RefU64, ReloadSnapshot, RowVisibility, TreeModel, TreeRowVm, Window,
-        auto_refresh, background_models_settled, begin_get_work, cache_model_scope,
-        claim_unloaded_model_refnos, command_reply_is_current, complete_refresh_generation,
-        empty_props_verdict, expand_room_model_targets, finished_after, in_mdb_path, is_panel_noun,
+        AutoRefresh, EMPTY_SCOPE_HINT, EleTreeNode, GenerateOutcome, ModelVisibility,
+        ModelVisibilityPlan, PanelRoomResolution, RefU64, ReloadSnapshot, RowVisibility, TreeModel,
+        TreeRowVm, Window, auto_refresh, background_models_settled, begin_get_work,
+        cache_model_scope, claim_unloaded_model_refnos, command_reply_is_current,
+        complete_refresh_generation, empty_props_verdict, expand_room_model_targets,
+        finished_after, generate_outcome, generate_summary, in_mdb_path, is_panel_noun,
         mark_model_scope_unavailable, model_drains_idle, model_progress_terminal,
         model_source_changed_line, model_visibility_plan, needs_children_query, read_face_switch,
-        refresh_anchor, regenerate_label, regenerate_summary, reload_snapshot,
-        resolve_panel_room_reply, restore_model_reload, scope_not_generated,
-        settle_pending_directions,
+        refresh_anchor, regenerate_label, reload_snapshot, resolve_panel_room_reply,
+        restore_model_reload, scope_not_generated, settle_pending_directions,
         settle_refresh_generation, settled_pending_roots, sync_ime_window, take_hidden_for_replay,
         task_matches_project, task_queue, tree_label,
     };
@@ -5400,7 +5262,7 @@ mod tests {
     }
 
     /// 确认框标题跟着右键落点走，成批时才报数。「/ZONE-A 等 1 项」是废话，
-    /// 而它出现的地方正是那句「将删除 … 范围内 N 个已生成元素」的主语。
+    /// 而它出现的地方正是确认框那句「对 … 重新生成模型？」的主语。
     #[test]
     fn the_regenerate_label_only_counts_a_real_batch() {
         assert_eq!(regenerate_label("ZONE /ZONE-A".into(), 1), "ZONE /ZONE-A");
@@ -5410,41 +5272,164 @@ mod tests {
         );
     }
 
-    /// 「找不回来」是这一趟唯一不可逆的后果，只有真删过才轮得到它说。
-    /// 删除自己就失败的那一趟库里原样立着，把它说成丢了，人会去做一次
-    /// 不必要的重做——而那一次是真会删东西的。
-    #[test]
-    fn only_a_run_that_deleted_something_claims_the_work_is_gone() {
-        let tally = crate::regenerate::Tally {
-            done: 2,
-            ..Default::default()
-        };
-
-        let (stopped, alarming) = regenerate_summary("/ZONE-A", &tally, 10, 2, 1);
-        assert!(stopped.contains("还有 8 个"), "{stopped}");
-        assert!(stopped.contains("找不回来"), "{stopped}");
-        assert!(alarming, "没派完就该是告警：{stopped}");
-
-        let (nothing_deleted, alarming) = regenerate_summary("/ZONE-A", &tally, 10, 0, 0);
-        assert!(!nothing_deleted.contains("找不回来"), "{nothing_deleted}");
-        assert!(
-            nothing_deleted.contains("也没删成东西"),
-            "{nothing_deleted}"
-        );
-        assert!(alarming, "{nothing_deleted}");
+    fn generate_reply(status: model_update_api::GenerateStatus) -> model_update_api::GenerateReply {
+        model_update_api::GenerateReply {
+            status,
+            generation_root: "24381/100677".into(),
+            model_available: true,
+            generation_root_count: 3,
+            cached_root_count: 1,
+            generated_root_count: 2,
+            model_source: None,
+            model_source_reason: None,
+            legacy_endpoint: false,
+        }
     }
 
-    /// 全做完、一个没失败的那一趟不该报警——它也不该在句尾挂一条「还有 0 个」。
+    fn api_failure(code: &str, message: &str) -> anyhow::Error {
+        anyhow::Error::new(model_update_api::ApiError(
+            plant_ui::model_update::Failure::new(code, message),
+        ))
+    }
+
+    /// 右键：确认之后恰好一发 `generate(force = true)`（每个目标一发，不清点、不解根、不删产物），
+    /// 成功回执之后对同一批目标发显示（ADR-0030 实施约束 3）。这里钉三件事：数据线程那一臂
+    /// 只调 `generate_model(.., true, ..)`；确认那一步只发 `Req::GenerateModels`；回执落地后成功的
+    /// 目标进 `regenerate_refresh` 并经 `set_model_visible(.., true)` 走显示那条路。
     #[test]
-    fn a_clean_run_says_nothing_about_leftovers() {
-        let tally = crate::regenerate::Tally {
-            done: 3,
-            skipped: 1,
-            ..Default::default()
+    fn regenerate_generates_once_then_displays_the_targets() {
+        let data = include_str!("data.rs");
+        let lane = data
+            .split_once("Req::GenerateModels {")
+            .expect("生成那一臂")
+            .1
+            .split_once("Req::CheckSearchIndex =>")
+            .expect("下一臂")
+            .0;
+        assert_eq!(lane.matches("generate_model(").count(), 1, "{lane}");
+        assert!(lane.contains("true,"), "force = true：{lane}");
+        for forbidden in [
+            "regeneration_count",
+            "delete_model_subtree",
+            "regeneration_roots",
+        ] {
+            assert!(!data.contains(forbidden), "旧流水还在：{forbidden}");
+        }
+
+        let source = include_str!("main.rs");
+        let confirm = source
+            .split_once("fn settle_regenerate_confirm(&mut self, accepted: bool) {")
+            .expect("确认那一步")
+            .1
+            .split_once("fn settle_models_generated(")
+            .expect("回执那一步")
+            .0;
+        assert_eq!(confirm.matches("data::Req::").count(), 1, "{confirm}");
+        assert!(confirm.contains("data::Req::GenerateModels {"));
+        assert!(
+            !confirm.contains("RegenerateScope") && !confirm.contains("RegenerateDelete"),
+            "清点 / 整片删已退役"
+        );
+
+        let settle = source
+            .split_once("fn settle_models_generated(")
+            .expect("回执那一步")
+            .1
+            .split_once("fn locate(&mut self")
+            .expect("下一个方法")
+            .0;
+        let refresh = settle
+            .find("self.regenerate_refresh.insert(*target);")
+            .expect("成功的目标登记成待替换");
+        let show = settle
+            .find("self.set_model_visible(display, true);")
+            .expect("再调显示接口");
+        assert!(refresh < show, "先登记再显示");
+        assert!(
+            !settle.contains("get_work"),
+            "显示走眼睛那条路，不再整场取回工作重装：{settle}"
+        );
+
+        assert_eq!(
+            generate_outcome(&Ok(generate_reply(
+                model_update_api::GenerateStatus::Generated
+            ))),
+            GenerateOutcome::Display
+        );
+        assert_eq!(
+            generate_outcome(&Ok(generate_reply(
+                model_update_api::GenerateStatus::NoRenderableGeometry
+            ))),
+            GenerateOutcome::Display,
+            "没有可画几何也是做完了：显示回包为空会把旧产物卸掉"
+        );
+        let line = generate_summary(
+            "ZONE /ZONE-A",
+            &generate_reply(model_update_api::GenerateStatus::Generated),
+        );
+        assert!(
+            line.contains("3 个生成根") && line.contains("重算 2") && line.contains("命中 1"),
+            "{line}"
+        );
+        assert!(!line.contains("没有可用模型"), "{line}");
+        let hollow = model_update_api::GenerateReply {
+            model_available: false,
+            ..generate_reply(model_update_api::GenerateStatus::Generated)
         };
-        let (line, alarming) = regenerate_summary("/ZONE-A", &tally, 4, 4, 1);
-        assert!(!line.contains("还有"), "{line}");
-        assert!(!alarming, "{line}");
+        let line = generate_summary("ZONE /ZONE-A", &hollow);
+        assert!(
+            line.contains("没有可用模型") && line.contains("24381/100677"),
+            "{line}"
+        );
+        let line = generate_summary(
+            "ZONE /ZONE-A",
+            &generate_reply(model_update_api::GenerateStatus::Unknown),
+        );
+        assert!(line.contains("不认识的状态"), "{line}");
+    }
+
+    /// `timeout` 回执（服务端 120 s 预算到点、后台继续）不发显示，其余失败也不发（ADR-0030 实施约束 3）。
+    #[test]
+    fn a_timed_out_generate_does_not_display() {
+        assert_eq!(
+            generate_outcome(&Err(api_failure(
+                "timeout",
+                "按需生成超时(120s)，后台继续执行"
+            ))),
+            GenerateOutcome::Background
+        );
+        assert_eq!(
+            generate_outcome(&Err(api_failure(
+                "conflict",
+                "dbnum=7997 已有整库模型任务在运行"
+            ))),
+            GenerateOutcome::Failed
+        );
+        assert_eq!(
+            generate_outcome(&Err(anyhow::anyhow!("connection refused"))),
+            GenerateOutcome::Failed
+        );
+        let source = include_str!("main.rs");
+        let settle = source
+            .split_once("fn settle_models_generated(")
+            .expect("回执那一步")
+            .1
+            .split_once("fn locate(&mut self")
+            .expect("下一个方法")
+            .0;
+        let background = settle
+            .split_once("GenerateOutcome::Background => {")
+            .expect("超时那一档")
+            .1
+            .split_once("GenerateOutcome::Failed => {")
+            .expect("失败那一档")
+            .0;
+        assert!(background.contains("warn("), "超时是 WARN：{background}");
+        assert!(background.contains("后台继续生成"), "{background}");
+        assert!(
+            !background.contains("display.push"),
+            "超时的不进显示名单：{background}"
+        );
     }
 
     fn node(refno: RefU64, noun: &str, children: u16) -> EleTreeNode {
@@ -6570,10 +6555,7 @@ mod tests {
             !empty_branch.contains("warn_of(") && !empty_branch.contains("error_of("),
             "查空不许记 WARN / ERROR：{empty_branch}"
         );
-        assert!(
-            arm.contains("\"已有模型查询失败\""),
-            "其余错误照旧 ERROR"
-        );
+        assert!(arm.contains("\"已有模型查询失败\""), "其余错误照旧 ERROR");
         assert_eq!(
             EMPTY_SCOPE_HINT,
             "范围内没有已生成的模型；右键「重新生成模型」可生成"

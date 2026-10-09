@@ -137,7 +137,7 @@ impl ModelRebuildReceipt {
 
 /// 整库模型重建：把该库全部权威生成根投进模型队列重算（2026-09-10 重新计算计划 R1）。
 ///
-/// 不改数据水位、不预删旧模型；重建期间同库 `model/ensure` 回 409。`watch_scope` 外 400；
+/// 不改数据水位、不预删旧模型；重建期间同库 `model/generate` 回 409。`watch_scope` 外 400；
 /// 服务端 `model_full_rebuild_enabled=false` 时同样是一条失败包封（message 原文带那个键名，
 /// 界面照 `code` 分型、原文进日志，不解析它）。两代并存：老服务端没这条路由 → 404，
 /// 调用方按「这一档服务端没有」处理，不重试。
@@ -617,45 +617,14 @@ pub async fn retry_pending_unit(
     Ok(())
 }
 
-/// 删掉一个 refno **精确子树**下已经生成的模型数据。
+/// `POST /api/v1/model/generate` 的回执状态。
 ///
-/// `confirm` 服务端强制要求等于 `refno`，不等就是 400——这个接口不接受随手一点。
-/// 它删的是产物不是本体：`pe` 一行不动，删完那片元素在三维里就是「未加载」。
-///
-/// 容器也删得动（`WORL / SITE / ZONE` 在这里不受限，那道门只挡生成根），
-/// 所以「整片删一次」只需要对右键那一行调一次。
-pub async fn delete_model_subtree(
-    base: &str,
-    refno: &str,
-    project: &str,
-    mdb: &str,
-    namespace: &str,
-) -> anyhow::Result<()> {
-    let query = format!(
-        "refno={}&confirm={}&project={}&mdb={}&namespace={}",
-        urlencode(refno),
-        urlencode(refno),
-        urlencode(project),
-        urlencode(mdb),
-        urlencode(namespace),
-    );
-    let _: serde_json::Value = delete(
-        base,
-        &format!("/api/v1/model/subtree?{query}"),
-        Duration::from_secs(300),
-    )
-    .await?;
-    Ok(())
-}
-
-/// `POST /api/v1/model/ensure` 的回执状态。
-///
-/// 四档对界面是四件不同的事，别压成一个布尔：`Generated` 是真做了一趟，
-/// `AlreadyAvailable` 是同根的活刚被别的元素触发过（这正是删除之后靠
-/// `force:false` 拿到的免费去重），`NoRenderableGeometry` 是这一片本来就没有
-/// 可画的东西——它不是失败，重试一百遍还是同一个结果。
+/// 三档对界面是三件不同的事，别压成一个布尔：`Generated` 是真做了一趟，
+/// `AlreadyAvailable` 是凭证当前的根直接命中（右键 `force = true` 时不会出现），
+/// `NoRenderableGeometry` 是这一片本来就没有可画的东西——它不是失败，重试一百遍
+/// 还是同一个结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EnsureStatus {
+pub enum GenerateStatus {
     Generated,
     AlreadyAvailable,
     NoRenderableGeometry,
@@ -664,11 +633,11 @@ pub enum EnsureStatus {
 }
 
 #[derive(Debug, Clone)]
-pub struct EnsureReply {
-    pub status: EnsureStatus,
-    /// 服务端解出来的生成根。客户端归根算错时，这一份是唯一的对照物。
+pub struct GenerateReply {
+    pub status: GenerateStatus,
+    /// 服务端解出来的生成根（请求的 refno 自己是生成根时就是它）。只进日志：客户端不拿
+    /// 根清单去查显示——显示按祖先查（ADR-0030 D1），回执里的 `generation_roots[]` 不收。
     pub generation_root: String,
-    pub generation_roots: Vec<String>,
     pub model_available: bool,
     pub generation_root_count: usize,
     pub cached_root_count: usize,
@@ -679,9 +648,12 @@ pub struct EnsureReply {
     pub model_source: Option<ModelSource>,
     /// `memory` 的理由（`initialization_publishing` / `data_watermark_unestablished` / `read-through`）。
     pub model_source_reason: Option<String>,
+    /// 这一发是退回旧路径 `/api/v1/model/ensure` 才成的（服务端还没有 `/model/generate`，
+    /// ADR-0030 后果 7）。日志据此点名一次「模型服务是旧版」。
+    pub legacy_endpoint: bool,
 }
 
-impl EnsureReply {
+impl GenerateReply {
     /// 日志里跟在计数后面的那半句。只有「内存」值得说：人得知道现在看到的是 API 现算的、
     /// 翻面后同一版会从 rocksdb 读出来；「数据库」是常态，不出声。
     pub fn source_note(&self) -> Option<String> {
@@ -698,13 +670,11 @@ impl EnsureReply {
 }
 
 #[derive(Deserialize)]
-struct EnsureBody {
+struct GenerateBody {
     #[serde(default)]
     status: String,
     #[serde(default)]
     generation_root: String,
-    #[serde(default)]
-    generation_roots: Vec<String>,
     #[serde(default)]
     model_available: bool,
     #[serde(default)]
@@ -719,46 +689,59 @@ struct EnsureBody {
     model_source_reason: Option<String>,
 }
 
-/// 让一个 refno 有可渲染模型。`force` 只在人明确要求「无论如何重跑一遍」时为真。
+/// 生成接口的新名（gen-model ADR-086 D4）。老服务端只有旧名，404 时退回它（ADR-0030 后果 7）。
+const GENERATE_PATH: &str = "/api/v1/model/generate";
+/// 旧名。**只在 404 回退分支里出现**——源码钉 `no_ensure_left_outside_the_fallback`。
+const LEGACY_GENERATE_PATH: &str = "/api/v1/model/ensure";
+
+/// 对一个节点范围生成模型（`POST /api/v1/model/generate`，ADR-0030 D2）：服务端自己解根、
+/// 删旧、重算，客户端只说「生成这个范围」。`force = true` 是右键「重新生成模型」——范围内
+/// 已有的产物一律重算替换；`force = false` 时凭证当前的根直接回 `AlreadyAvailable`。
 ///
-/// **重新生成走的是 `force = false`**：删除已经把这一片清空了，第一个元素触发
-/// 真生成，同根后面的元素读到 `renderable > 0` 直接回 `AlreadyAvailable`——
-/// 去重是服务端免费给的，客户端不必自己裁剪嵌套单元。
+/// **显示路径不调它**（ADR-0030 D1）：眼睛 / 聚焦 / 房间模型 / 取回工作都只按祖先查
+/// `/model/records`。生成只有这一个入口。
+///
+/// 新客户端对老服务端：`/model/generate` 还没有（404 / 405）就用同一个请求体退回
+/// `/model/ensure`，回执带 `legacy_endpoint = true` 供日志点名一次。
 ///
 /// 超时给到 125 秒，比服务端那道 120 秒稍长：让服务端的超时语义先生效
 /// （它回 504 并说明后台继续跑），而不是客户端先把连接掐掉、什么都不知道。
-pub async fn ensure_model(
+pub async fn generate_model(
     base: &str,
     refno: &str,
     force: bool,
     project: &str,
     mdb: &str,
     namespace: &str,
-) -> anyhow::Result<EnsureReply> {
+) -> anyhow::Result<GenerateReply> {
     let body = serde_json::json!({
         "refno": refno,
         "force": force,
         "project": project,
         "mdb": mdb,
         "namespace": namespace,
-    });
-    let reply: EnsureBody = post(
-        base,
-        "/api/v1/model/ensure",
-        body.to_string(),
-        Duration::from_secs(125),
-    )
-    .await?;
-    Ok(EnsureReply {
-        status: ensure_status(&reply.status),
+    })
+    .to_string();
+    let timeout = Duration::from_secs(125);
+    let (reply, legacy_endpoint): (GenerateBody, bool) =
+        match post(base, GENERATE_PATH, body.clone(), timeout).await {
+            Ok(reply) => (reply, false),
+            // 老服务端没有这条路由：同一请求体退回旧名（ADR-0030 后果 7）。
+            Err(error) if endpoint_missing(&error) => {
+                (post(base, LEGACY_GENERATE_PATH, body, timeout).await?, true)
+            }
+            Err(error) => return Err(error),
+        };
+    Ok(GenerateReply {
+        status: generate_status(&reply.status),
         generation_root: reply.generation_root,
-        generation_roots: reply.generation_roots,
         model_available: reply.model_available,
         generation_root_count: reply.generation_root_count,
         cached_root_count: reply.cached_root_count,
         generated_root_count: reply.generated_root_count,
         model_source: reply.model_source.as_deref().and_then(ModelSource::parse),
         model_source_reason: reply.model_source_reason,
+        legacy_endpoint,
     })
 }
 
@@ -893,12 +876,12 @@ pub async fn model_records(
     })
 }
 
-fn ensure_status(raw: &str) -> EnsureStatus {
+fn generate_status(raw: &str) -> GenerateStatus {
     match raw {
-        "generated" | "Generated" => EnsureStatus::Generated,
-        "already_available" | "AlreadyAvailable" => EnsureStatus::AlreadyAvailable,
-        "no_renderable_geometry" | "NoRenderableGeometry" => EnsureStatus::NoRenderableGeometry,
-        _ => EnsureStatus::Unknown,
+        "generated" | "Generated" => GenerateStatus::Generated,
+        "already_available" | "AlreadyAvailable" => GenerateStatus::AlreadyAvailable,
+        "no_renderable_geometry" | "NoRenderableGeometry" => GenerateStatus::NoRenderableGeometry,
+        _ => GenerateStatus::Unknown,
     }
 }
 
@@ -920,23 +903,6 @@ fn urlencode(value: &str) -> String {
 async fn get<T: DeserializeOwned>(base: &str, path: &str) -> anyhow::Result<T> {
     let mut req = ehttp::Request::get(format!("{base}{path}"));
     req.timeout = Some(Duration::from_secs(15));
-    let response = ehttp::fetch_async(req)
-        .await
-        .map_err(transport)
-        .context("请求模型服务失败")?;
-    request(response)
-}
-
-/// `ehttp` 只给了 get / post / head 三个构造器，DELETE 自己改 `method`。
-/// 服务端那条路由把参数全放在 query 串里，所以不带请求体。
-async fn delete<T: DeserializeOwned>(
-    base: &str,
-    path: &str,
-    timeout: Duration,
-) -> anyhow::Result<T> {
-    let mut req = ehttp::Request::get(format!("{base}{path}"));
-    req.method = ehttp::Method::DELETE;
-    req.timeout = Some(timeout);
     let response = ehttp::fetch_async(req)
         .await
         .map_err(transport)
@@ -1102,34 +1068,96 @@ mod tests {
         );
     }
 
-    /// `DELETE /model/subtree` 的 `confirm` 必须与 `refno` 逐字相同，且 `/`
-    /// 要转义——服务端拿它当「你确实想删这一个」的凭据，不等就是 400。
+    /// query 串里的 refno 带 `/`、MDB 带 `/`，百分号转义要对——服务端按原文比对。
     #[test]
-    fn the_delete_confirm_matches_the_refno_after_escaping() {
+    fn urlencode_escapes_slashes_and_keeps_plain_names() {
         assert_eq!(urlencode("24381/100677"), "24381%2F100677");
         assert_eq!(urlencode("/ALL"), "%2FALL");
         assert_eq!(urlencode("ProjAMS"), "ProjAMS");
-
-        let refno = "24381/100677";
-        let query = format!("refno={}&confirm={}", urlencode(refno), urlencode(refno));
-        assert_eq!(query, "refno=24381%2F100677&confirm=24381%2F100677");
     }
 
-    /// ensure 的四档状态对界面是四件不同的事，压成布尔就分不出「重做过了」与
-    /// 「同根刚被别人做过」——后者正是删除之后 `force:false` 拿到的免费去重。
+    /// generate 的四档状态对界面是四件不同的事，压成布尔就分不出「重做过了」与
+    /// 「凭证当前直接命中」。
     #[test]
-    fn ensure_status_keeps_the_four_outcomes_apart() {
-        assert_eq!(ensure_status("generated"), EnsureStatus::Generated);
+    fn generate_status_keeps_the_four_outcomes_apart() {
+        assert_eq!(generate_status("generated"), GenerateStatus::Generated);
         assert_eq!(
-            ensure_status("already_available"),
-            EnsureStatus::AlreadyAvailable
+            generate_status("already_available"),
+            GenerateStatus::AlreadyAvailable
         );
         assert_eq!(
-            ensure_status("no_renderable_geometry"),
-            EnsureStatus::NoRenderableGeometry
+            generate_status("no_renderable_geometry"),
+            GenerateStatus::NoRenderableGeometry
         );
         // 服务端换名字不许静默当成成功的那一档：它要能在日志里被点名。
-        assert_eq!(ensure_status("brand_new_state"), EnsureStatus::Unknown);
+        assert_eq!(generate_status("brand_new_state"), GenerateStatus::Unknown);
+    }
+
+    /// ADR-0030 实施约束 6：源码里不再有 ensure——`ensure_model` / `EnsureReply` / `EnsureStatus` 一个不留，
+    /// `/api/v1/model/ensure` 只允许出现在 [`generate_model`] 的 404 回退分支（那一个常量）里。
+    /// 新名 `/api/v1/model/generate` 也只有那一个常量在打，显示路径（`data.rs` / `main.rs`）谁都不打。
+    #[test]
+    fn no_ensure_left_outside_the_fallback() {
+        // 只看非测试部分：测试自己要写这些字面值当禁单。第一处 `mod tests {` 就是测试模块的头
+        // （`rfind` 会撞上本测试里的这个字面值）。
+        fn non_test(source: &str) -> &str {
+            source
+                .find("mod tests {")
+                .map_or(source, |at| &source[..at])
+        }
+        let api_body = non_test(include_str!("model_update_api.rs"));
+        assert_eq!(
+            api_body.matches("\"/api/v1/model/ensure\"").count(),
+            1,
+            "旧路径只许在 LEGACY_GENERATE_PATH 那一个常量里出现"
+        );
+        assert_eq!(api_body.matches("\"/api/v1/model/generate\"").count(), 1);
+        let fallback = api_body
+            .split_once("match post(base, GENERATE_PATH, body.clone(), timeout).await {")
+            .expect("先打新名")
+            .1;
+        assert!(
+            fallback.contains("Err(error) if endpoint_missing(&error) =>")
+                && fallback.contains("LEGACY_GENERATE_PATH"),
+            "404 / 405 才退回旧名，同一请求体"
+        );
+        for (name, source) in [
+            ("model_update_api.rs", api_body),
+            ("data.rs", non_test(include_str!("data.rs"))),
+            ("main.rs", non_test(include_str!("main.rs"))),
+            ("sim.rs", non_test(include_str!("sim.rs"))),
+            (
+                "read_face/mod.rs",
+                non_test(include_str!("read_face/mod.rs")),
+            ),
+            (
+                "read_face/service.rs",
+                non_test(include_str!("read_face/service.rs")),
+            ),
+            (
+                "read_face/store.rs",
+                non_test(include_str!("read_face/store.rs")),
+            ),
+        ] {
+            for forbidden in [
+                "ensure_model",
+                "EnsureReply",
+                "EnsureStatus",
+                "ensure_status",
+            ] {
+                assert!(
+                    !source.contains(forbidden),
+                    "{name} 还在说 ensure：{forbidden}"
+                );
+            }
+            if name != "model_update_api.rs" {
+                assert!(
+                    !source.contains("/api/v1/model/ensure")
+                        && !source.contains("/api/v1/model/generate"),
+                    "{name} 不许直接打生成接口的路径"
+                );
+            }
+        }
     }
 
     /// 欠账端点的三种答案要分得开：取到了、**服务端没有这一档**、暂时取不到。
@@ -1291,7 +1319,13 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["/1RCV-ATTA-1", "ELBOW 1", "ATTACHMENT 2", "WELD 1", "ELBOW 2"]
+            [
+                "/1RCV-ATTA-1",
+                "ELBOW 1",
+                "ATTACHMENT 2",
+                "WELD 1",
+                "ELBOW 2"
+            ]
         );
     }
 
@@ -1328,7 +1362,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             root_dbs(reply.nodes),
-            [(7997, "/1RB-CIVI".to_string()), (7997, "SITE 2".to_string())]
+            [
+                (7997, "/1RB-CIVI".to_string()),
+                (7997, "SITE 2".to_string())
+            ]
         );
     }
 }

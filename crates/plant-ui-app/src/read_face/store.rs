@@ -6,15 +6,14 @@
 //! 改了就没有对拍的参照。服务供数有而它缺的格由 M3 在界面上标出来，这里不猜。
 //!
 //! 它不认识模型服务：这一面从头到尾没有一条打 HTTP 读接口的路，
-//! `store_face_never_touches_the_service` 钉着。命令面（`ensure` 等）本来就不在读面里。
+//! `store_face_never_touches_the_service` 钉着。命令面（生成等）本来就不在读面里。
 
-use std::collections::HashSet;
 use std::sync::mpsc;
 
 use plant_ui_data::{Attr, EleTreeNode, RefU64};
 
 use super::{Identity, Progress, SearchOutcome, SubtreeBounds};
-use crate::data::{Evt, RegenerateCount};
+use crate::data::Evt;
 use crate::model_update_api::ModelRecords;
 use crate::search_index::{Scope, SearchIndex, SubstringHits};
 
@@ -146,51 +145,6 @@ impl StoreReadFace {
         })
     }
 
-    /// 清点一批根底下已经生成过的模型。
-    ///
-    /// **只读，且必须跑在任何删除之前**：`generated_scope` 认的是 `inst_relate`
-    /// 行，删完就查不到了，那时回的空集在调用方那里长得像「这里本来就没模型」。
-    ///
-    /// 多个根合成一份账。右键落在多选上时它们可能互相嵌套（选中一个 ZONE 连同
-    /// 它所在的 SITE），元素与直管支管都按 refno 去重——同一台设备数两遍，
-    /// 确认框上那个数字就是假的。
-    pub async fn regeneration_count(
-        &self,
-        targets: &[RefU64],
-        delivery_units: &[String],
-    ) -> anyhow::Result<RegenerateCount> {
-        let units: HashSet<String> = delivery_units.iter().cloned().collect();
-        let mut merged = plant_ui_data::GeneratedScope::default();
-        let mut seen_elements = HashSet::new();
-        let mut seen_tubing = HashSet::new();
-        for target in targets {
-            let scope = plant_ui_data::generated_scope(*target).await?;
-            for element in scope.elements {
-                if seen_elements.insert(element.refno.refno()) {
-                    merged.elements.push(element);
-                }
-            }
-            for bran in scope.tubing_branches {
-                if seen_tubing.insert(bran) {
-                    merged.tubing_branches.push(bran);
-                }
-            }
-        }
-        // 归根要问 noun 的不止元素自己，还有它们整条祖先链。先去重再问：一条链上
-        // 的祖先被同一根 BRAN 底下几十个管件共用，按元素逐个问就是几十倍的行数。
-        let mut refnos: HashSet<RefU64> = HashSet::new();
-        for element in &merged.elements {
-            refnos.insert(element.refno.refno());
-            refnos.extend(element.anc.iter().copied().map(RefU64));
-        }
-        let refnos: Vec<RefU64> = refnos.into_iter().collect();
-        let nouns = plant_ui_data::nouns_of(&refnos).await?;
-        Ok(RegenerateCount {
-            elements: merged.element_count(),
-            roots: crate::regenerate::regeneration_roots(&merged, &nouns, &units),
-        })
-    }
-
     /// 丢本进程的查询缓存：根层与库编号那两条查询带 memoize，键里没有连接本身，
     /// 不丢就是从内存里读上一次的那份。
     pub async fn invalidate(&self) {
@@ -227,7 +181,8 @@ mod tests {
                 "store.rs 打了模型服务的接口：{forbidden}"
             );
         }
-        // 九条读确实都在，不是把哪一条留给了别人。
+        // 这几条读确实都在，不是把哪一条留给了别人（清点那两条——`generated_scope` /
+        // `nouns_of`——随旧逐根流水退役，ADR-0030 D2）。
         for expected in [
             "plant_ui_data::connect()",
             "plant_ui_data::project_identity()",
@@ -238,8 +193,6 @@ mod tests {
             "plant_ui_data::resolve_name(",
             "plant_ui_data::search_names_by_prefix(",
             "plant_ui_data::model_instances_with_progress(",
-            "plant_ui_data::generated_scope(",
-            "plant_ui_data::nouns_of(",
             "plant_ui_data::invalidate_all()",
         ] {
             assert!(body.contains(expected), "store.rs 少了库读调用：{expected}");

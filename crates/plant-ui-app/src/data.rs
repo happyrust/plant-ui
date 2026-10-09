@@ -36,7 +36,9 @@ pub const SEARCH_LIMIT: usize = 20;
 pub(crate) struct MirrorFeatureUnavailable(pub String);
 
 impl std::fmt::Display for MirrorFeatureUnavailable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 impl std::error::Error for MirrorFeatureUnavailable {}
 
@@ -49,7 +51,8 @@ fn require_direct_mirror_endpoint(
             "镜像不可直连：{feature} 仍使用 SurrealDB 兼容读面，而当前 gen-model 是 \
              store_mode=mem（库在服务进程里，无数据库端口）。请使用服务供数功能，或把 \
              gen-model 的 store_mode 改为 rocksdb 并连一台在跑的 SurrealDB。"
-        )).into());
+        ))
+        .into());
     }
     if !health.mirror.status.eq_ignore_ascii_case("ready") {
         anyhow::bail!(
@@ -76,10 +79,7 @@ async fn require_mirror_feature(feature: &str) -> anyhow::Result<()> {
 pub enum Req {
     /// 树范围聚焦（`Cmd::FocusTreeScope`）要的子树包围盒。只查：范围内没有已生成的模型
     /// 就是没有，相机不动、不悄悄生成（ADR-0030 D1）。
-    SubtreeBounds {
-        epoch: u64,
-        target: RefU64,
-    },
+    SubtreeBounds { epoch: u64, target: RefU64 },
     /// 懒加载某节点的直接子层。
     Children(RefU64),
     /// 选中元素的 UI 属性表。
@@ -128,10 +128,7 @@ pub enum Req {
     ///
     /// 不带搜索范围：子串那一路的范围是**建索引时**定下的，跟着索引走；前缀路
     /// 本来就不限库。
-    SearchElements {
-        epoch: u64,
-        query: String,
-    },
+    SearchElements { epoch: u64, query: String },
     /// 校验子串索引的陈旧戳，该建就建。单飞，重复发不会叠加。
     CheckSearchIndex,
     /// 强制重建子串索引（命令行 `reindex`）：跳过戳比对。
@@ -139,36 +136,14 @@ pub enum Req {
     /// 它是「戳看不见的改动」唯一的门——没有水位的库里发生纯改名，行数与水位
     /// 都不动，自动校验永远发现不了。
     RebuildSearchIndex,
-    /// 「重新生成模型」的清点：这些根底下已经生成过多少元素、归成多少个生成单元。
-    ///
-    /// **只读**，删除不在这条路上。名词表由 UI 侧从 `/health` 取好交下来——
-    /// 数据线程不认识模型服务，也不该为了一个名单去认识它。
-    RegenerateScope {
+    /// 右键「重新生成模型」（ADR-0030 D2）：对选中的每个目标**各一发**
+    /// `POST /model/generate { refno, force: true }`，服务端自己解根、删旧、重算。
+    /// 客户端不清点、不解根、不删产物；一条请求里顺序跑完整批，回执整批回
+    /// （`Evt::ModelsGenerated`），宿主再对成功的目标发显示。
+    GenerateModels {
         epoch: u64,
-        targets: Vec<RefU64>,
-        /// 已折大写的交付单元名词。空表在 UI 侧就被拦下了，到不了这里。
-        delivery_units: Vec<String>,
-    },
-    /// 「整片删一次」：把右键那几行的精确子树下已经生成的模型产物删掉。
-    ///
-    /// 删的是产物不是本体，`pe` 一行不动。一次请求删完全部落点——中途停不下来，
-    /// 也不该停：删了一半的范围既不是旧样子也不是新样子。
-    RegenerateDelete {
-        epoch: u64,
+        refnos: Vec<RefU64>,
         base: String,
-        targets: Vec<RefU64>,
-        project: String,
-        mdb: String,
-        namespace: String,
-    },
-    /// 逐根重做里的一个。**一次一条**，由宿主收到回执后再派下一条——
-    /// 「停在这里」停的正是这个派发动作。
-    RegenerateUnit {
-        epoch: u64,
-        /// 这是根列表里的第几个。回执带回来，宿主据此接着往下走。
-        index: usize,
-        base: String,
-        refno: RefU64,
         project: String,
         mdb: String,
         namespace: String,
@@ -218,14 +193,9 @@ pub enum Req {
         reload_models: bool,
     },
     /// 队列面板的一次轮询（队列快照 + 任务表 + health + 持久欠账）。
-    QueuePoll {
-        base: String,
-    },
+    QueuePoll { base: String },
     /// 暂停 / 恢复出队。
-    QueueSetPaused {
-        base: String,
-        paused: bool,
-    },
+    QueueSetPaused { base: String, paused: bool },
     /// 复活一行死信。它不排新的数据批次，结果一律等下一拍轮询。
     RetryPendingUnit {
         base: String,
@@ -262,21 +232,7 @@ pub enum Req {
     /// 不走读面：尺寸标注只有模型服务这一条路（计划边界「MBD 永远走模型服务，与命令面
     /// 同口径」）——求解器要的成员结点视图只有服务端会拼，库供数下也一样。
     /// `epoch` 认帧：右键换了别的 BRAN、或者已经点了隐藏，晚到的旧结果不许再贴回来。
-    PipeDimensions {
-        epoch: u64,
-        refno: RefU64,
-    },
-}
-
-/// 一次清点的结果：确认框要摆的那两个数字，外加确认之后要逐个重做的那份名单。
-///
-/// 名单**必须在这一刻定死**：它是从 `inst_relate` 上数出来的，删完那张表上
-/// 没有它们了，再也算不回来。
-pub struct RegenerateCount {
-    /// `inst_relate` + `tubi_relate` 上属于这个范围的已生成元素数。
-    pub elements: usize,
-    /// 归并出来的生成根，条数是**上限**（见 `regenerate::regeneration_roots`）。
-    pub roots: Vec<RefU64>,
+    PipeDimensions { epoch: u64, refno: RefU64 },
 }
 
 /// 一次取回工作重新查回来的那部分树。
@@ -368,27 +324,14 @@ pub enum Evt {
     },
     /// 子串索引的状态变化：启动打开、后台重建的每一格进度、失败各一条。
     SearchIndex(SearchIndexState),
-    /// 一次清点的结果。`epoch` 认帧：确认框换过目标之后，旧的那份数字贴上去
-    /// 就成了另一个范围的账。
-    RegenerateScope {
+    /// 右键「重新生成模型」整批回执：每个目标各一份成败，按请求顺序。`epoch` 认帧——
+    /// 确认那一刻钉住的号，对不上的是上一趟的尾巴，丢弃。
+    ModelsGenerated {
         epoch: u64,
-        result: anyhow::Result<RegenerateCount>,
-    },
-    /// 「整片删一次」的回执。失败就整趟停在这里——删都删不动，往下发 ensure
-    /// 只会在没删干净的范围上重做，结果谁也说不清。
-    ///
-    /// `deleted` 是**真删掉了几个落点**。失败时它多半不是零：前面几片已经空了，
-    /// 而那件事必须说出来，不然人以为「失败 = 什么都没动」。
-    RegenerateDeleted {
-        epoch: u64,
-        deleted: usize,
-        result: anyhow::Result<()>,
-    },
-    /// 一个生成根的回执。`index` 原样带回：宿主据此接着派下一个。
-    RegenerateUnit {
-        epoch: u64,
-        index: usize,
-        result: anyhow::Result<crate::model_update_api::EnsureReply>,
+        outcomes: Vec<(
+            RefU64,
+            anyhow::Result<crate::model_update_api::GenerateReply>,
+        )>,
     },
     /// 目标的祖先链，「自己 -> 上级 -> …」序。带上请求时的那个 refno：
     /// 连续定位只算最后一次，晚到的旧链要认得出来才好丢。
@@ -687,71 +630,31 @@ async fn handle_read(
                 substring: outcome.substring,
             });
         }
-        Req::RegenerateScope {
+        Req::GenerateModels {
             epoch,
-            targets,
-            delivery_units,
-        } => {
-            let result = face.regeneration_count(&targets, &delivery_units).await;
-            let _ = evt_tx.send(Evt::RegenerateScope { epoch, result });
-        }
-        Req::RegenerateDelete {
-            epoch,
+            refnos,
             base,
-            targets,
             project,
             mdb,
             namespace,
         } => {
-            let mut result = Ok(());
-            let mut deleted = 0usize;
-            for target in &targets {
-                // 线上一律斜杠形（`24381/100677`）：`RefU64` 的 Display 是下划线
-                // 形，服务端自己吐出来的 root_refno 从来都是斜杠形。
-                let refno = target.to_slash_string();
-                result = crate::model_update_api::delete_model_subtree(
-                    &base, &refno, &project, &mdb, &namespace,
+            // 生成只有这一个入口（ADR-0030 D2）。`force = true`：范围内已有的产物一律重算替换，
+            // 解根 / 删旧 / 重算都在服务端。顺序做：一个目标可能就是整个 ZONE，并发只会让
+            // 服务端的 per-dbnum 锁互相撞。线上一律斜杠形（`24381/100677`）。
+            let mut outcomes = Vec::with_capacity(refnos.len());
+            for refno in refnos {
+                let result = crate::model_update_api::generate_model(
+                    &base,
+                    &refno.to_slash_string(),
+                    true,
+                    &project,
+                    &mdb,
+                    &namespace,
                 )
                 .await;
-                // 一个落点删不动就别再删下一个：整趟本来就要停，多删一片只是
-                // 多毁一片没人会去重做的模型。
-                if result.is_err() {
-                    break;
-                }
-                deleted += 1;
+                outcomes.push((refno, result));
             }
-            let _ = evt_tx.send(Evt::RegenerateDeleted {
-                epoch,
-                deleted,
-                result,
-            });
-        }
-        Req::RegenerateUnit {
-            epoch,
-            index,
-            base,
-            refno,
-            project,
-            mdb,
-            namespace,
-        } => {
-            // `force = false`：删除已经把这一片清空了，第一个元素触发真生成，
-            // 同根后面的读到已有产物直接回 AlreadyAvailable——嵌套单元的去重
-            // 是服务端免费给的，客户端不自己裁剪。
-            let result = crate::model_update_api::ensure_model(
-                &base,
-                &refno.to_slash_string(),
-                false,
-                &project,
-                &mdb,
-                &namespace,
-            )
-            .await;
-            let _ = evt_tx.send(Evt::RegenerateUnit {
-                epoch,
-                index,
-                result,
-            });
+            let _ = evt_tx.send(Evt::ModelsGenerated { epoch, outcomes });
         }
         Req::CheckSearchIndex => {
             face.refresh_search_index(index, scope, false, evt_tx.clone(), ctx.clone())
@@ -1254,11 +1157,19 @@ mod tests {
         health.mirror.status = "ready".into();
         health.mirror.endpoint = Some("embedded:mem".into());
         let error = require_direct_mirror_endpoint(&health, "房间").unwrap_err();
-        assert!(error.downcast_ref::<super::MirrorFeatureUnavailable>().is_some());
+        assert!(
+            error
+                .downcast_ref::<super::MirrorFeatureUnavailable>()
+                .is_some()
+        );
         health.mirror.endpoint = Some("ws://127.0.0.1:8000".into());
         health.mirror.status = "failed".into();
         let error = require_direct_mirror_endpoint(&health, "房间").unwrap_err();
-        assert!(error.downcast_ref::<super::MirrorFeatureUnavailable>().is_none());
+        assert!(
+            error
+                .downcast_ref::<super::MirrorFeatureUnavailable>()
+                .is_none()
+        );
         health.mirror.status = "ready".into();
         assert!(require_direct_mirror_endpoint(&health, "房间").is_ok());
     }
@@ -1332,7 +1243,6 @@ mod tests {
             "face.props(",
             "face.resolve_name(",
             "face.search(",
-            "face.regeneration_count(",
             "face.refresh_search_index(",
             ".model_instances(",
         ] {
@@ -1462,7 +1372,8 @@ mod tests {
             assert!(sleep < check, "{name}：宿主检查要紧跟在睡拍之后");
             let tail = &lane[check..];
             assert!(
-                tail.split_once('}').is_some_and(|(block, _)| block.contains("return;")),
+                tail.split_once('}')
+                    .is_some_and(|(block, _)| block.contains("return;")),
                 "{name}：宿主没了就 return，不许接着 loop"
             );
         }
@@ -1540,7 +1451,12 @@ mod tests {
     #[test]
     fn get_work_reloads_without_generating() {
         let lane = replace_lane();
-        for forbidden in ["generate_model(", "ensure_model(", "/api/v1/model/", "Evt::ReloadEnsured"] {
+        for forbidden in [
+            "generate_model(",
+            "ensure_model(",
+            "/api/v1/model/",
+            "Evt::ReloadEnsured",
+        ] {
             assert!(!lane.contains(forbidden), "重装在生成：{forbidden}");
         }
         assert_eq!(lane.matches(".model_instances(").count(), 1);

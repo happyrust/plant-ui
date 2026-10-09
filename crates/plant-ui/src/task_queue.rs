@@ -216,10 +216,8 @@ pub struct Health {
     #[serde(default)]
     pub data_read_mode: Option<String>,
     /// 本项目此刻生效的最小交付单元名词表（默认 `[BRAN, HANG, SUPPO, EQUI]`，
-    /// 项目配置可整体替换或扩充）。「重新生成模型」按元素归并生成根时只认这一份。
-    ///
-    /// 老服务端不给这个键，解出来是空表——调用方必须把空表当「不知道」而不是
-    /// 「没有交付单元」，见 `model_regenerate::DeliveryUnits`。
+    /// 项目配置可整体替换或扩充）。只作展示：客户端不再按它归根（ADR-0030 D2 起
+    /// 解根全在服务端）。老服务端不给这个键，解出来是空表。
     #[serde(default)]
     pub delivery_unit_types: Vec<String>,
     /// 目录版本核对的最近一次结果（gen-model `/health.catalogue_reconcile`）。老服务端
@@ -936,7 +934,7 @@ impl Vm {
     /// 照常可言。
     pub fn offline_reassurance(&self) -> Option<&'static str> {
         (self.read_face == ReadFaceKind::Store)
-            .then_some("库供数下树 / 属性 / 已生成模型照常；补齐、更新、房间要等它回来")
+            .then_some("库供数下树 / 属性 / 已生成模型照常；生成、更新、房间要等它回来")
     }
 
     /// 库行「模型来源」这一格画不画。`/dbnums` 的 `model_source` 说的是**服务端**此刻从
@@ -1081,7 +1079,7 @@ impl Vm {
     ///
     /// 库供数的工程标识来自库（`project_identity()` 读 `MDB` / `CURD` / `WORL`），命令面
     /// 照旧发往模型服务（计划 D3）——两边接的不是同一个项目 / MDB / ns 时，眼前的树与
-    /// 属性来自这边，点下去的补齐与更新落到那边。上面那条红横幅只在队列页说得出来，
+    /// 属性来自这边，右键的生成与更新落到那边。上面那条红横幅只在队列页说得出来，
     /// 撞上这件事的人多半正对着树，所以再说一句到命令行与日志。
     ///
     /// 服务供数不进这条路：那一面的身份与 `/health` 同源（`ServiceReadFace::identity()`
@@ -1097,7 +1095,7 @@ impl Vm {
         let service = self.health.as_ref()?;
         Some(format!(
             "库与模型服务不是同一套身份——库：{} {} {}；模型服务：{} {} {}。\
-             树 / 属性 / 三维读的是库，补齐、更新与队列发往服务；写操作已禁用",
+             树 / 属性 / 三维读的是库，生成、更新与队列发往服务；写操作已禁用",
             self.project,
             normalize_mdb(&self.mdb),
             self.namespace,
@@ -3063,7 +3061,7 @@ fn early_run_button(
 ///
 /// 图标按钮，挤在「提前执行」右边；判据在 [`model_rebuild`]，这里只管画：可点的带悬停气泡，
 /// 灰的把「为什么按不下去」放在悬停里——与「提前执行」同一条纪律，在按下之前就说完。
-/// 与模型树右键那条「重新生成」（客户端逐根 ensure）不是一回事：这一枚是服务端整库重建
+/// 与模型树右键那条「重新生成」（对选中范围直接调服务端 generate）不是一回事：这一枚是服务端整库重建
 /// （`POST /dbnums/{dbnum}/model/rebuild`），进任务队列一行，不改数据水位。
 #[allow(clippy::too_many_arguments)]
 fn model_rebuild_button(
@@ -4661,7 +4659,7 @@ mod tests {
         assert_eq!(model.offline_title(), "模型服务离线");
         assert_eq!(
             model.offline_reassurance(),
-            Some("库供数下树 / 属性 / 已生成模型照常；补齐、更新、房间要等它回来")
+            Some("库供数下树 / 属性 / 已生成模型照常；生成、更新、房间要等它回来")
         );
         // 构造函数交底的就是这一面：`Default` 那一份是服务供数，库供数拿它开机
         // 会先画一帧库行「模型来源」。

@@ -1777,23 +1777,19 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
             crate::search_index::SearchIndexState::Ready(engine.name_count()),
         ),
         Req::Ancestors(refno) => Evt::Ancestors(refno, Ok(engine.ancestors(refno))),
-        // 剧本里没有 `inst_relate`，「已经生成过多少」无从数起。回一句失败而不是
-        // 零——零在确认框那边长得像「这一片本来就没生成过模型」。
-        Req::RegenerateScope { epoch, .. } => Evt::RegenerateScope {
+        // 剧本里没有模型服务，生成不了。每个目标各回一句失败而不是装作做过了：
+        // 那会让人以为演示模式动过库。
+        Req::GenerateModels { epoch, refnos, .. } => Evt::ModelsGenerated {
             epoch,
-            result: Err(anyhow::anyhow!("演示模式没有模型库，数不出已生成的元素")),
-        },
-        // 清点在剧本里就失败了，这两条到不了这里。真到了也不许装作删过 /
-        // 做过：那会让人以为演示模式动过库。
-        Req::RegenerateDelete { epoch, .. } => Evt::RegenerateDeleted {
-            epoch,
-            deleted: 0,
-            result: Err(anyhow::anyhow!("演示模式没有模型库，删不了模型产物")),
-        },
-        Req::RegenerateUnit { epoch, index, .. } => Evt::RegenerateUnit {
-            epoch,
-            index,
-            result: Err(anyhow::anyhow!("演示模式没有模型服务，生成不了模型")),
+            outcomes: refnos
+                .into_iter()
+                .map(|refno| {
+                    (
+                        refno,
+                        Err(anyhow::anyhow!("演示模式没有模型服务，生成不了模型")),
+                    )
+                })
+                .collect(),
         },
         Req::ModelUpdatePreview { .. } => Evt::ModelUpdatePreview(Ok(engine.preview())),
         Req::ModelUpdateExecute {
@@ -1825,17 +1821,20 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
             let result = engine.retry_pending_unit(&root_refno);
             Evt::RetryPendingUnit(root_refno, result)
         }
-        Req::DataPublish { request, .. } => {
-            Evt::DataPublish(request, Ok(crate::data_publish_api::SubmitResult {
+        Req::DataPublish { request, .. } => Evt::DataPublish(
+            request,
+            Ok(crate::data_publish_api::SubmitResult {
+                message: "模拟模式：已受理（未真正提交）".into(),
+                login_url: None,
+            }),
+        ),
+        Req::LookupDataPublishDeletions { .. } => Evt::DataPublishDeletions(Ok(Vec::new())),
+        Req::RoomCodePublish { .. } => {
+            Evt::RoomCodePublish(Ok(crate::data_publish_api::SubmitResult {
                 message: "模拟模式：已受理（未真正提交）".into(),
                 login_url: None,
             }))
         }
-        Req::LookupDataPublishDeletions { .. } => Evt::DataPublishDeletions(Ok(Vec::new())),
-        Req::RoomCodePublish { .. } => Evt::RoomCodePublish(Ok(crate::data_publish_api::SubmitResult {
-            message: "模拟模式：已受理（未真正提交）".into(),
-            login_url: None,
-        })),
         Req::CommandQuery {
             epoch,
             label,
