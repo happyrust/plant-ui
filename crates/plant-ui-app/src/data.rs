@@ -6,8 +6,12 @@
 //!
 //! 读面（树 / 属性 / 搜索 / 三维实例 / 工程标识）一律经 [`ReadFace`]（ADR-0026）：
 //! 这个文件里不直接打 HTTP 读接口，也不直接查库——`data_rs_reads_only_through_read_face`
-//! 钉着。留在这里直接调的只有命令面（`ensure` / 更新 / 队列 / 提资）、房间的镜像门，
+//! 钉着。留在这里直接调的只有命令面（生成 / 更新 / 队列 / 提资）、房间的镜像门，
 //! 与 MBD 尺寸标注（只有模型服务这一条路，`pipe_dimensions_go_straight_to_the_model_service`）。
+//!
+//! 显示与生成分家（ADR-0030）：模型通道上的两臂（`ModelLoad::Scopes` / `Replace`）**只查**
+//! 已生成的产物——以点下去的节点为祖先问 `/model/records`——从不调生成接口
+//! （`display_never_generates` / `get_work_reloads_without_generating` 钉着）。
 
 use std::future::Future;
 use std::sync::Arc;
@@ -70,11 +74,9 @@ async fn require_mirror_feature(feature: &str) -> anyhow::Result<()> {
 }
 
 pub enum Req {
+    /// 树范围聚焦（`Cmd::FocusTreeScope`）要的子树包围盒。只查：范围内没有已生成的模型
+    /// 就是没有，相机不动、不悄悄生成（ADR-0030 D1）。
     SubtreeBounds {
-        epoch: u64,
-        target: RefU64,
-    },
-    EnsureForFocus {
         epoch: u64,
         target: RefU64,
     },
@@ -94,12 +96,14 @@ pub enum Req {
     /// 房间浏览器的全表（重查询，全库扫描级；只在打开浮窗或手动刷新时发，
     /// 不进启动路径——计划风险 5）。
     RoomsOverview,
-    /// 取回工作的三维重装：先让 `ensure_targets` 这些范围目标的模型追到文件最新
-    /// （与 eye 同一条 `ensure` 路，ADR-0024），再加载 `roots` 这些模型 refno 下已经
-    /// 生成的几何实例。`ensure_targets` 为空 = 跳过 ensure，按上次产物重装。
+    /// 取回工作的三维重装：**只重查**已生成的产物，不先生成（ADR-0030 D3）。
+    ///
+    /// `roots` 是快照里的模型 refno（库供数按它一根一条 `anc CONTAINS` 查）；`scope_targets`
+    /// 是清场前点过眼睛的树目标——服务供数以它们为祖先问 `/model/records`（一个 ZONE 一次往返，
+    /// 不必逐叶子问）。`scope_targets` 为空 = 老快照没有范围记录，服务供数退到按 `roots` 逐个查。
     Models {
         roots: Vec<RefU64>,
-        ensure_targets: Vec<RefU64>,
+        scope_targets: Vec<RefU64>,
         /// 这次重装是不是在清偿「数据已应用、三维欠着」那笔账（`Evt::Models` 原样带回）。
         debt_reload: bool,
         base: String,
@@ -107,7 +111,8 @@ pub enum Req {
         mdb: String,
         namespace: String,
     },
-    /// eye 显示路径：先让 Web API 确保节点范围的全部生成根与最新数据一致，再查模型。
+    /// eye 显示路径：以点下去的每个目标为祖先查已生成的模型（ADR-0030 D1）。只查不生：
+    /// 查空就是空，要生成走右键「重新生成模型」。
     ModelScopes {
         epoch: u64,
         targets: Vec<RefU64>,
@@ -309,11 +314,6 @@ pub enum Evt {
         target: RefU64,
         result: anyhow::Result<crate::read_face::SubtreeBounds>,
     },
-    EnsureForFocus {
-        epoch: u64,
-        target: RefU64,
-        result: anyhow::Result<crate::model_update_api::EnsureReply>,
-    },
     Ready(anyhow::Result<ReadyInfo>),
     Children(RefU64, anyhow::Result<Vec<EleTreeNode>>),
     Props(RefU64, anyhow::Result<Vec<plant_ui_data::Attr>>),
@@ -334,29 +334,21 @@ pub enum Evt {
     /// 取回工作重装的整批模型记录，连同每个库认下的取数源（spec §4.12）：日志据此
     /// 说出哪几个库此刻由 API 从内存供数。
     Models(bool, anyhow::Result<crate::model_update_api::ModelRecords>),
-    /// 取回工作重装前对一个范围目标的 ensure 回执。成败都发；失败不阻断随后的重查。
-    ReloadEnsured {
-        target: RefU64,
-        result: anyhow::Result<crate::model_update_api::EnsureReply>,
-    },
-    /// 取回工作重查模型的进度（每根一步）。
+    /// 取回工作重查模型的进度（库供数每根一步；服务供数整批一次回，只有收尾那一拍）。
     ReloadProgress {
         done: usize,
         total: usize,
     },
+    /// 眼睛那一臂查 records 的进度（库供数每根一步；服务供数只有收尾那一拍）。
     ModelScopeProgress {
         epoch: u64,
         target: RefU64,
         done: usize,
         total: usize,
     },
-    /// 眼睛显示前对一个范围目标的 ensure 回执。与 [`Evt::ReloadEnsured`] 同形：
-    /// 成败都发，失败不阻断随后的实例查询。
-    ModelScopeEnsured {
-        epoch: u64,
-        target: RefU64,
-        result: anyhow::Result<crate::model_update_api::EnsureReply>,
-    },
+    /// 以 `target` 为祖先查到的已生成模型。`Ok` 且为空 = 范围内没有已生成的模型
+    /// （不是失败，ADR-0030 D1）；老服务端对没生成过的范围回 409 `not_generated`，
+    /// 宿主把它当同一件事（ADR-0030 后果 6）。
     ModelScope(
         u64,
         RefU64,
@@ -475,7 +467,7 @@ pub struct Bridge {
 enum ModelLoad {
     Replace {
         roots: Vec<RefU64>,
-        ensure_targets: Vec<RefU64>,
+        scope_targets: Vec<RefU64>,
         debt_reload: bool,
         base: String,
         project: String,
@@ -500,7 +492,7 @@ fn route_model_load(req: Req, tx: &mpsc::Sender<ModelLoad>) -> Result<Option<Req
     match req {
         Req::Models {
             roots,
-            ensure_targets,
+            scope_targets,
             debt_reload,
             base,
             project,
@@ -509,7 +501,7 @@ fn route_model_load(req: Req, tx: &mpsc::Sender<ModelLoad>) -> Result<Option<Req
         } => tx
             .send(ModelLoad::Replace {
                 roots,
-                ensure_targets,
+                scope_targets,
                 debt_reload,
                 base,
                 project,
@@ -628,22 +620,6 @@ async fn handle_read(
         Req::SubtreeBounds { epoch, target } => {
             let r = face.subtree_bounds(target, &scope).await;
             let _ = evt_tx.send(Evt::SubtreeBounds {
-                epoch,
-                target,
-                result: r,
-            });
-        }
-        Req::EnsureForFocus { epoch, target } => {
-            let r = crate::model_update_api::ensure_model(
-                &crate::model_update_api::base_url(),
-                &target.to_string(),
-                false,
-                &scope.project,
-                &scope.mdb,
-                &scope.ns,
-            )
-            .await;
-            let _ = evt_tx.send(Evt::EnsureForFocus {
                 epoch,
                 target,
                 result: r,
@@ -888,7 +864,7 @@ async fn handle_read(
             });
         }
         Req::PipeDimensions { epoch, refno } => {
-            // 服务地址与 `EnsureForFocus` 同源：设置窗那一格「模型服务」，MBD 端点就在
+            // 服务地址与命令面同源：设置窗那一格「模型服务」，MBD 端点就在
             // 同一进程同一端口上（服务端 `web_service/mbd.rs`），不另起一格配置。
             let result =
                 crate::mbd_api::pipe_dimensions(&crate::model_update_api::base_url(), refno).await;
@@ -901,10 +877,7 @@ async fn handle_read(
         Req::Reconnect | Req::SwitchReadFace(_) | Req::GetWork { .. } => {
             unreachable!("全局手术在 worker 循环里独占处理")
         }
-        Req::SubtreeBounds { .. }
-        | Req::EnsureForFocus { .. }
-        | Req::Models { .. }
-        | Req::ModelScopes { .. } => {
+        Req::Models { .. } | Req::ModelScopes { .. } => {
             unreachable!("模型请求已路由到专用任务")
         }
     }
@@ -949,7 +922,7 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>, kind: ReadF
                     }
                     ModelLoad::Replace {
                         roots,
-                        ensure_targets,
+                        scope_targets,
                         debt_reload,
                         base,
                         project,
@@ -961,63 +934,24 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>, kind: ReadF
                         let result = if crate::sim::enabled() {
                             Ok(crate::model_update_api::ModelRecords::default())
                         } else {
-                            // 先让范围目标的模型追到文件最新（ADR-0024）：与 eye 那条
-                            // 路同一个 `ensure_model(force = false)`——凭证当前的根服务端
-                            // 直接算命中，只有被改到的根真重算。顺序做：一个范围可能
-                            // 就是整个 ZONE，并发只会让服务端的 per-dbnum 锁互相撞。
-                            // 失败不中止：空场景比旧几何更坏，重查照跑，回执里说清。
-                            // 服务供数只查 ensure 回执里的生成根；快照是几何叶子，
-                            // 不是 /model/records 的生成根。库供数仍只查快照根
+                            // 只重查，不先生成（ADR-0030 D3）：取回工作重装的是「上次显示过
+                            // 的那片已生成产物」，SAVEWORK 之后三维不自己追新，追新只有右键
+                            // 「重新生成模型」。服务供数以清场前点过眼睛的范围目标为祖先问
+                            // `/model/records`（服务端按祖先回答，ADR-086）；老快照没有范围
+                            // 记录就退到按快照里的模型 refno 逐个问。库供数仍只查快照根
                             // （两份都进 `ModelInstancesReq`，各取各的）。
-                            let mut record_roots = Vec::new();
-                            // Legacy snapshots may have no scope targets. Resolve their
-                            // leaves through ensure instead of calling them generation roots.
-                            let ensure_targets = if ensure_targets.is_empty()
-                                && matches!(model_face.as_ref(), ReadFace::Service(_))
-                            {
+                            let scope_roots = if scope_targets.is_empty() {
                                 roots.clone()
                             } else {
-                                ensure_targets
+                                scope_targets
                             };
-                            for target in &ensure_targets {
-                                let result = crate::model_update_api::ensure_model(
-                                    &base,
-                                    &target.to_slash_string(),
-                                    false,
-                                    &project,
-                                    &mdb,
-                                    &namespace,
-                                )
-                                .await;
-                                if let Ok(reply) = &result {
-                                    record_roots.extend(
-                                        reply
-                                            .generation_roots
-                                            .iter()
-                                            .filter_map(|root| root.parse::<RefU64>().ok()),
-                                    );
-                                } else if result.as_ref().err().is_some_and(reload_failure_keeps_record_root) {
-                                    // Keep a failed scope explicit unless it is confirmed
-                                    // deleted. Querying a non-deletion failure reports a
-                                    // service error rather than falsely succeeding empty.
-                                    // The Store face ignores this roster and still reads roots.
-                                    record_roots.push(*target);
-                                }
-                                let _ = model_evt_tx.send(Evt::ReloadEnsured {
-                                    target: *target,
-                                    result,
-                                });
-                                model_ctx.request_repaint();
-                            }
-                            record_roots.sort_unstable();
-                            record_roots.dedup();
                             let progress_tx = model_evt_tx.clone();
                             let progress_ctx = model_ctx.clone();
                             let result = model_face
                                 .model_instances(
                                     &ModelInstancesReq {
                                         roots: &roots,
-                                        generation_roots: &record_roots,
+                                        scope_roots: &scope_roots,
                                         identity: ServiceIdentity {
                                             base: &base,
                                             project: &project,
@@ -1059,49 +993,16 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>, kind: ReadF
                                 model_ctx.request_repaint();
                                 continue;
                             }
-                            let ensured = crate::model_update_api::ensure_model(
-                                &base,
-                                &target.to_slash_string(),
-                                false,
-                                &project,
-                                &mdb,
-                                &namespace,
-                            )
-                            .await;
-                            // 失败不中止，与上面 `Replace` 臂同一条规矩：ensure 是命令面
-                            // （ADR-0026），够不着它不等于库里没有已经生成的模型。库供数下
-                            // 模型服务离线时，这一步之后的查询照样把已生成的那份读出来；
-                            // 服务在场而这一根撞上 `conflict` 时，装的是上次生成的产物。
-                            let mut generation_roots = ensured
-                                .as_ref()
-                                .map(|reply| {
-                                    reply
-                                        .generation_roots
-                                        .iter()
-                                        .filter_map(|root| root.parse::<RefU64>().ok())
-                                        .collect::<Vec<_>>()
-                                })
-                                .unwrap_or_default();
-                            if generation_roots.is_empty() {
-                                generation_roots.push(target);
-                            }
-                            generation_roots.sort_unstable();
-                            generation_roots.dedup();
-                            let _ = model_evt_tx.send(Evt::ModelScopeEnsured {
-                                epoch,
-                                target,
-                                result: ensured,
-                            });
-                            model_ctx.request_repaint();
+                            // 点下去的节点就是查询范围（ADR-0030 D1）：两面都以它为祖先查
+                            // 已生成的实例——库供数 `anc CONTAINS`，服务供数 `/model/records`
+                            // 按祖先回答（ADR-086）。不持锁、不写模型库；查空就是空。
                             let progress_tx = model_evt_tx.clone();
                             let progress_ctx = model_ctx.clone();
-                            // 服务供数查回执里的生成根（回执空、或这一趟压根没问成，
-                            // 上面已退到目标本身）；库供数只查点下去的那个目标。
                             let result = model_face
                                 .model_instances(
                                     &ModelInstancesReq {
                                         roots: &[target],
-                                        generation_roots: &generation_roots,
+                                        scope_roots: &[target],
                                         identity: ServiceIdentity {
                                             base: &base,
                                             project: &project,
@@ -1123,8 +1024,8 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>, kind: ReadF
                             let _ = model_evt_tx.send(Evt::ModelScopeProgress {
                                 epoch,
                                 target,
-                                done: generation_roots.len(),
-                                total: generation_roots.len(),
+                                done: 1,
+                                total: 1,
                             });
                             let _ = model_evt_tx.send(Evt::ModelScope(epoch, target, result));
                             model_ctx.request_repaint();
@@ -1332,17 +1233,6 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>, kind: ReadF
     }
 }
 
-fn reload_failure_keeps_record_root(error: &anyhow::Error) -> bool {
-    !reload_target_was_removed(error)
-}
-
-/// Reload-only terminal outcome: an existing display target disappeared from
-/// the authoritative source. Share this rule with UI accounting and logging.
-/// Other failures must retain the retry/read path and their warning severity.
-pub(crate) fn reload_target_was_removed(error: &anyhow::Error) -> bool {
-    crate::model_update_api::failure_of(error).code == "not_found"
-}
-
 #[cfg(test)]
 mod tests {
     use super::{ModelLoad, Req, require_direct_mirror_endpoint, route_model_load};
@@ -1405,7 +1295,7 @@ mod tests {
 
     /// 读面（树 / 属性 / 搜索 / 三维实例 / 工程标识）在这个文件里只有一条路：`ReadFace`。
     /// 直接打 HTTP 读接口或直接查库都是绕过供数模式——树是服务、三维是库就是从这儿漏的。
-    /// 命令面（`ensure_model` 等）与房间的镜像门（`service_health`）不在禁单里。
+    /// 命令面（生成 / 更新 / 队列）与房间的镜像门（`service_health`）不在禁单里。
     #[test]
     fn data_rs_reads_only_through_read_face() {
         let body = body();
@@ -1452,7 +1342,7 @@ mod tests {
 
     /// 尺寸标注不进读面（计划边界：MBD 永远走模型服务，与命令面同口径）：求解器要的
     /// 成员结点视图只有服务端会拼，库供数下也没有第二条路。这一臂直接打 `mbd_api`，
-    /// 地址与 `EnsureForFocus` 同源；哪天有人把它「顺手」搬进 `ReadFace`，这里先红。
+    /// 地址与命令面同源；哪天有人把它「顺手」搬进 `ReadFace`，这里先红。
     #[test]
     fn pipe_dimensions_go_straight_to_the_model_service() {
         let arm = body()
@@ -1582,6 +1472,20 @@ mod tests {
         );
     }
 
+    /// 模型通道里取回工作重装那一臂的正文（`ModelLoad::Replace` 的处理，不是枚举定义也不是路由）。
+    fn replace_lane() -> &'static str {
+        body()
+            .split_once("ModelLoad::Switch(kind) => {")
+            .expect("模型通道的换面臂")
+            .1
+            .split_once("ModelLoad::Replace {")
+            .expect("Replace 臂")
+            .1
+            .split_once("let _ = model_evt_tx.send(Evt::Models(debt_reload, result));")
+            .expect("Replace 臂收尾")
+            .0
+    }
+
     /// 模型通道里眼睛那一臂的正文（`ModelLoad::Scopes` 的处理，不是枚举定义也不是路由）：
     /// 从 `Replace` 臂收尾那一行到模型通道循环的睡眠之间。
     fn scopes_lane() -> &'static str {
@@ -1594,61 +1498,60 @@ mod tests {
             .0
     }
 
-    /// 眼睛这条路：`ensure` 够不着模型服务，不等于库里没有已经生成的模型。命令面
-    /// 失败要说出来（`Evt::ModelScopeEnsured` 带 `Err`），但不许把随后的实例查询一起
-    /// 吞掉——ADR-0026「gen-model 不在场时库供数照常出已生成模型」、计划 §七 M6-5。
-    /// `Replace` 臂一直是这条规矩（「失败不中止」），这里钉住 `Scopes` 臂也是。
-    ///
-    /// 2026-09-08 实机：`PLANT_READ_FACE=store` + 模型服务离线，点 ZONE 的眼睛只回一句
-    /// 「已有模型查询失败」、三维空场景，而库里那个 ZONE 底下有 6 行 `inst_relate`。
+    /// 显示 = 按祖先查已生成的产物，所有显示入口都不调生成接口（ADR-0030 D1，实施约束 1）。
+    /// 眼睛那一臂只有一处实例查询、以点下去的目标为祖先，`generate_model` / `ensure_model`
+    /// 一个字都不许出现——查空就是空，要生成走右键。交互通道里也没有「为聚焦先生成」
+    /// 那一臂（`FocusTreeScope` 同样只查包围盒）。
     #[test]
-    fn a_failed_ensure_still_queries_the_models() {
+    fn display_never_generates() {
         let lane = scopes_lane();
-        let ensure = lane.find("ensure_model(").expect("先 ensure");
-        let query = lane.find(".model_instances(").expect("再查实例");
-        assert!(ensure < query, "ensure 要排在实例查询前面");
-        // 回执成败进同一条 Evt、查询只有一处不分岔：分岔回来就是失败那一支又绕过了它。
-        assert!(
-            lane.contains("result: ensured"),
-            "ensure 的成败要原样发出去"
-        );
+        for forbidden in ["generate_model(", "ensure_model(", "/api/v1/model/"] {
+            assert!(!lane.contains(forbidden), "眼睛这一臂在生成：{forbidden}");
+        }
         assert_eq!(
             lane.matches(".model_instances(").count(),
             1,
             "实例查询在这一臂只该有一处"
         );
         assert!(
-            !lane.contains("Err(error) =>"),
-            "眼睛这一臂不许再为 ensure 失败单开一支"
+            lane.contains("roots: &[target],") && lane.contains("scope_roots: &[target],"),
+            "两面都以点下去的目标为祖先查：{lane}"
         );
-    }
-
-    #[test]
-    fn reload_service_records_never_start_with_snapshot_geometry_leaves() {
-        let source = include_str!("data.rs");
-        let lane = source.split("let mut record_roots =").nth(1).unwrap()
-            .split("record_roots.sort_unstable();").next().unwrap();
-        assert!(lane.trim_start().starts_with("Vec::new();"));
-        assert!(lane.contains(".generation_roots"));
-        assert!(!lane.contains("record_roots.extend(roots"));
-        assert!(!lane.contains("record_roots = roots.clone()"));
-    }
-
-    #[test]
-    fn reload_drops_only_confirmed_missing_targets_not_transient_failures() {
-        let error = |code| anyhow::Error::new(crate::model_update_api::ApiError(
-            plant_ui::model_update::Failure::new(code, "fixture"),
-        ));
-        assert!(!super::reload_failure_keeps_record_root(&error("not_found")));
-        for code in ["timeout", "internal", "conflict", "SOURCE_CHANGED"] {
-            assert!(super::reload_failure_keeps_record_root(&error(code)), "{code}");
+        assert!(
+            !body().contains("EnsureForFocus"),
+            "聚焦不许为显示先生成一次"
+        );
+        let bounds = body()
+            .split_once("Req::SubtreeBounds { epoch, target } =>")
+            .expect("聚焦查包围盒那一臂")
+            .1
+            .split_once("Req::Children(refno) =>")
+            .expect("下一臂")
+            .0;
+        assert!(bounds.contains("face.subtree_bounds("));
+        for forbidden in ["generate_model(", "ensure_model("] {
+            assert!(!bounds.contains(forbidden), "聚焦在生成：{forbidden}");
         }
     }
 
-    fn reload(roots: Vec<RefU64>, ensure_targets: Vec<RefU64>, debt_reload: bool) -> Req {
+    /// 取回工作重装只重查、不先生成（ADR-0030 D3，实施约束 4）：服务供数以快照里的范围目标
+    /// 为祖先问 records（一个 ZONE 一次往返），老快照没有范围记录就退到按模型 refno 问；
+    /// 库供数照旧只查 `roots`。
+    #[test]
+    fn get_work_reloads_without_generating() {
+        let lane = replace_lane();
+        for forbidden in ["generate_model(", "ensure_model(", "/api/v1/model/", "Evt::ReloadEnsured"] {
+            assert!(!lane.contains(forbidden), "重装在生成：{forbidden}");
+        }
+        assert_eq!(lane.matches(".model_instances(").count(), 1);
+        assert!(lane.contains("let scope_roots = if scope_targets.is_empty() {"));
+        assert!(lane.contains("roots: &roots,") && lane.contains("scope_roots: &scope_roots,"));
+    }
+
+    fn reload(roots: Vec<RefU64>, scope_targets: Vec<RefU64>, debt_reload: bool) -> Req {
         Req::Models {
             roots,
-            ensure_targets,
+            scope_targets,
             debt_reload,
             base: "http://127.0.0.1:8022".into(),
             project: "SAM".into(),
@@ -1669,8 +1572,8 @@ mod tests {
         ));
         assert!(matches!(
             model_rx.try_recv(),
-            Ok(ModelLoad::Replace { roots, ensure_targets, debt_reload: false, .. })
-                if roots == vec![RefU64::default()] && ensure_targets.is_empty()
+            Ok(ModelLoad::Replace { roots, scope_targets, debt_reload: false, .. })
+                if roots == vec![RefU64::default()] && scope_targets.is_empty()
         ));
         let target = RefU64::from(42);
         assert!(matches!(
@@ -1722,11 +1625,11 @@ mod tests {
         ));
     }
 
-    /// 取回工作的重装请求要把范围目标与服务身份一起带到模型通道上（ADR-0024）：
-    /// ensure 在数据线程里发，它不认识宿主的设置项，四个字段缺一个就打不出请求。
+    /// 取回工作的重装请求要把范围目标与服务身份一起带到模型通道上（ADR-0030 D3）：
+    /// records 在数据线程里发，它不认识宿主的设置项，四个字段缺一个就打不出请求。
     /// 通道停了也要把 `debt_reload` 原样报回去——欠账恢复靠它。
     #[test]
-    fn a_reload_carries_its_ensure_targets_and_identity_to_the_model_lane() {
+    fn a_reload_carries_its_scope_targets_and_identity_to_the_model_lane() {
         let (model_tx, model_rx) = mpsc::channel();
         let zone = RefU64::from(20);
         let bran = RefU64::from(7);
@@ -1739,9 +1642,9 @@ mod tests {
         ));
         assert!(matches!(
             model_rx.try_recv(),
-            Ok(ModelLoad::Replace { roots, ensure_targets, debt_reload: true, base, project, mdb, namespace })
+            Ok(ModelLoad::Replace { roots, scope_targets, debt_reload: true, base, project, mdb, namespace })
                 if roots == vec![RefU64::from(1)]
-                    && ensure_targets == vec![bran, zone]
+                    && scope_targets == vec![bran, zone]
                     && base == "http://127.0.0.1:8022"
                     && project == "SAM"
                     && mdb == "/MDB"

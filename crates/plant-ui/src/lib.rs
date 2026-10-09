@@ -301,7 +301,8 @@ pub enum Cmd {
     ResizeViewport([u32; 2]),
     /// 对模型的显示 / 定位类动作。
     Model(ModelAction),
-    /// Query all published descendants, ensuring missing geometry once.
+    /// 树范围聚焦：查这个节点下已生成产物的包围盒并取景。只查不生（ADR-0030 D1）：
+    /// 范围内没有已生成的模型就相机不动、日志提示右键「重新生成模型」。
     FocusTreeScope(RefU64),
     /// 主题下发的三维视口配色：渐变背景上下两色与地面网格线色。
     ///

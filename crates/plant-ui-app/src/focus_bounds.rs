@@ -1,14 +1,10 @@
-//! One camera request may ensure geometry once. Late replies never move the camera.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Phase {
-    Query,
-    Ensure,
-    Requery,
-}
-
+//! One camera request = one bounds query. Late replies never move the camera.
+//!
+//! 范围内没有已生成的模型就是没有：相机不动、日志提示右键「重新生成模型」，不再为聚焦
+//! 悄悄生成一次（ADR-0030 D1 / 后果 4；此前这里有 Query → Ensure → Requery 三相）。
 pub struct Request<T> {
     epoch: u64,
-    pending: Option<(T, Phase)>,
+    pending: Option<T>,
 }
 
 impl<T: Copy + PartialEq> Default for Request<T> {
@@ -27,27 +23,11 @@ impl<T: Copy + PartialEq> Request<T> {
     }
     pub fn begin(&mut self, target: T) -> u64 {
         self.cancel();
-        self.pending = Some((target, Phase::Query));
+        self.pending = Some(target);
         self.epoch
     }
     pub fn accepts_bounds(&self, epoch: u64, target: T) -> bool {
-        epoch == self.epoch
-            && matches!(self.pending, Some((t, Phase::Query | Phase::Requery)) if t == target)
-    }
-    pub fn ensure_once(&mut self, epoch: u64, target: T) -> bool {
-        if epoch != self.epoch || self.pending != Some((target, Phase::Query)) {
-            return false;
-        }
-        self.pending = Some((target, Phase::Ensure));
-        true
-    }
-    pub fn accepts_ensure(&self, epoch: u64, target: T) -> bool {
-        epoch == self.epoch && self.pending == Some((target, Phase::Ensure))
-    }
-    pub fn requery(&mut self) {
-        if let Some((target, Phase::Ensure)) = self.pending {
-            self.pending = Some((target, Phase::Requery));
-        }
+        epoch == self.epoch && self.pending == Some(target)
     }
 }
 
@@ -55,17 +35,11 @@ impl<T: Copy + PartialEq> Request<T> {
 mod tests {
     use super::*;
     #[test]
-    fn empty_after_generation_is_terminal_not_another_generation() {
+    fn a_request_accepts_exactly_its_own_reply_until_cancelled() {
         let mut request = Request::default();
         let epoch = request.begin(1);
         assert!(request.accepts_bounds(epoch, 1));
-        assert!(request.ensure_once(epoch, 1));
-        assert!(!request.accepts_bounds(epoch, 1));
-        assert!(!request.ensure_once(epoch, 1));
-        assert!(request.accepts_ensure(epoch, 1));
-        request.requery();
-        assert!(request.accepts_bounds(epoch, 1));
-        assert!(!request.ensure_once(epoch, 1));
+        assert!(!request.accepts_bounds(epoch, 2));
         request.cancel();
         assert!(!request.accepts_bounds(epoch, 1));
     }
@@ -77,8 +51,7 @@ mod tests {
         assert!(!request.accepts_bounds(a, 1));
         assert!(!request.accepts_bounds(b, 1));
         assert!(request.accepts_bounds(b, 2));
-        assert!(request.ensure_once(b, 2));
         request.cancel();
-        assert!(!request.accepts_ensure(b, 2));
+        assert!(!request.accepts_bounds(b, 2));
     }
 }

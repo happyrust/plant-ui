@@ -76,18 +76,19 @@ pub struct ServiceIdentity<'a> {
     pub namespace: &'a str,
 }
 
-/// 一次三维实例读取要的东西。两面要的根不一样，所以两份都带，各取各的：
+/// 一次三维实例读取要的东西。两面要的根不一样，所以两份都带，各取各的；两面都是
+/// **按祖先查已生成的产物**（ADR-0030 D1），从不生成：
 ///
 /// - `roots`：调用方自己的根——取回工作重装是快照里的模型 refno，eye 显示是点下去的那个
 ///   树目标。**库供数只查它**（v0.1.9 原样：`inst_relate.anc CONTAINS $root` 一根一条）。
 ///   拿并集去跑的话，嵌套在 `roots` 底下的生成根会把同一批实例数两遍。
-/// - `generation_roots`：**服务供数要查的名单**，调用方按前一步 `ensure` 回执算好——重装
-///   = 回执里的生成根（不能混入快照的几何叶子）；eye 显示 = 回执里的生成根，回执空则退到目标本身
-///   （工作树落地时的形状，`/model/records` 按它分桶）。
+/// - `scope_roots`：**服务供数要问的祖先**，`/model/records` 对每一个按祖先回答（gen-model
+///   ADR-086）——eye 显示 = 点下去的目标本身；重装 = 快照里点过眼睛的范围目标（一个 ZONE
+///   一次往返），老快照没有范围记录时退到 `roots`。
 #[derive(Debug, Clone, Copy)]
 pub struct ModelInstancesReq<'a> {
     pub roots: &'a [RefU64],
-    pub generation_roots: &'a [RefU64],
+    pub scope_roots: &'a [RefU64],
     pub identity: ServiceIdentity<'a>,
 }
 
@@ -209,9 +210,9 @@ impl ReadFace {
         }
     }
 
-    /// 这些根下已经生成的几何实例。**只读**：把范围追到文件最新是 `ensure` 的事
-    /// （ADR-0024），那是命令面，留在调用方；两面各取 `req` 里自己要的那份根（见
-    /// [`ModelInstancesReq`]）。
+    /// 这些根下已经生成的几何实例。**只读**：生成是右键「重新生成模型」直接调
+    /// `/model/generate` 的事（ADR-0030 D2），那是命令面，不在读面上；两面各取 `req` 里
+    /// 自己要的那份根（见 [`ModelInstancesReq`]）。
     pub async fn model_instances(
         &self,
         req: &ModelInstancesReq<'_>,
@@ -274,15 +275,15 @@ mod tests {
     }
 
     /// 两面要的根写在同一份请求里、由各自取，调用方不必知道哪一面在场：
-    /// 服务供数拿 `generation_roots`，库供数拿 `roots`。这里钉的是两份各自独立、
+    /// 服务供数拿 `scope_roots`，库供数拿 `roots`。这里钉的是两份各自独立、
     /// 不会被谁悄悄合成一份。
     #[test]
     fn a_model_request_carries_both_root_sets() {
         let roots = [RefU64::from(20)];
-        let generation_roots = [RefU64::from(7), RefU64::from(20), RefU64::from(42)];
+        let scope_roots = [RefU64::from(7), RefU64::from(20), RefU64::from(42)];
         let req = ModelInstancesReq {
             roots: &roots,
-            generation_roots: &generation_roots,
+            scope_roots: &scope_roots,
             identity: ServiceIdentity {
                 base: "http://127.0.0.1:8022",
                 project: "SAM",
@@ -291,7 +292,7 @@ mod tests {
             },
         };
         assert_eq!(req.roots, &roots);
-        assert_eq!(req.generation_roots, &generation_roots);
+        assert_eq!(req.scope_roots, &scope_roots);
         assert_eq!(req.identity.base, "http://127.0.0.1:8022");
     }
 }

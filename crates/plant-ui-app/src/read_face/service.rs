@@ -146,8 +146,8 @@ impl ServiceReadFace {
         ctx.request_repaint();
     }
 
-    /// 查 `generation_roots`（服务端在 ensure 时把每个范围解到精确的生成根，
-    /// `/model/records` 按它们分桶）。整批一次回，没有逐根进度可报。
+    /// 以 `scope_roots` 里的每一个为祖先问 `/model/records`（服务端按祖先回答子树里已生成
+    /// 的全部实例，gen-model ADR-086；没生成过是 200 空）。整批一次回，没有逐根进度可报。
     pub async fn model_instances(
         &self,
         req: &ModelInstancesReq<'_>,
@@ -155,7 +155,7 @@ impl ServiceReadFace {
         let identity = req.identity;
         model_update_api::model_records(
             identity.base,
-            req.generation_roots,
+            req.scope_roots,
             identity.project,
             identity.mdb,
             identity.namespace,

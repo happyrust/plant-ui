@@ -219,7 +219,7 @@ mod tests {
             "model_update_api::model_records",
             "model_update_api::dbnum_report",
             "model_update_api::service_health",
-            "model_update_api::ensure_model",
+            "model_update_api::generate_model",
             "base_url(",
         ] {
             assert!(
