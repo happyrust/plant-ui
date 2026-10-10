@@ -2,7 +2,8 @@
 
 计划：`docs/plans/2026-10-09-display-reads-products-generation-is-a-context-menu-action.md`。
 工作树与提交：gen-model-refactor `codex/model-roots-and-record-status`（`82e1257b4` S1、`fd5d3ccd9` S2、`392a731f8` S3、
-`4771cbcf1` 别名点名改走控制台）；plant-ui `codex/display-query-only`（`3b895956c` S4、`0dd254ea2` S5、本文随 S6 提交）。
+`4771cbcf1` 别名点名改走控制台）；plant-ui `codex/display-query-only`（`3b895956c` S4、`0dd254ea2` S5、本文随 S6 提交、
+`44e8db68a` GUI 验收时发现的重新生成刷新问题的修复，第 3 节）。
 
 ## 1. 自动化
 
@@ -61,17 +62,37 @@
 第一轮曾把 `generate` 打在服务端还在「初始化房间（常驻房间模型）」时，回 503（`initialization_not_ready`）——这是既有的启动门，
 不是本改动；等门开再打即 200。
 
-## 3. 没做的手工场景（**未验证**）
+## 3. plant-ui GUI 手工验收（本机，2026-10-10 08:31–09:08）
 
-plant-ui GUI 那一半——对着本机 gen-model 点 `ZONE /1WCC-PIPE-RX` 眼睛看「只有一次 records 查询、无 WARN / ERROR」，右键重新生成看
-「一发 generate → 三维出现」，以及 `timeout` 场景——没有在本轮做：要起 GUI 并点击，本会话没有做。建议步骤：
+环境：第 2 节那套 gen-model 起法，`%TEMP%\dqo-gen-run`、`127.0.0.1:18922`、`mem`（build `392a731f8.dirty`，内容等价 `4771cbcf1`）；
+plant-ui 用本分支 debug 版（`cargo build -p rs-plant`，带第 1 节那条 `--config` 指向主工作树的 vendor），程序与独立的
+`plant-ui-settings.ron` 放在 `%TEMP%\dqo-ui-run`，「模型服务」指到 `:18922`。点击与截图走 cua-driver（UIA 树只露出标题栏，
+egui 内容按像素点），截图留在 `%TEMP%\dqo-ui-run\shot-*.png` / `cua-*.png`，不入库。库是 AvevaMarineSample（项目代号 1516）。
 
-1. 起 S1–S3 这版 gen-model（上面那套起法即可，端口随意，设置窗「模型服务」指过去）。
-2. 点 `ZONE /1WCC-PIPE-RX` 眼睛：期望日志只有「开始查询并显示模型：1 个目标」→「查询到 N 个元素…」或
-   INFO「范围内没有已生成的模型；右键「重新生成模型」可生成」；**没有** WARN「范围核对失败」、**没有** ERROR「已有模型查询失败」。
-3. 右键 ZONE →「重新生成模型」→ 确认框只有一句「对 ZONE /1WCC-PIPE-RX 重新生成模型？范围内已有的产物会被重算替换。」→「重新生成」：
-   期望日志「…正在生成模型（1 个目标…）」→「…生成完成，N 个生成根（重算 N、命中 0）」→ 三维出现；118 根 PIPE 很可能撞 120 s：
-   期望 WARN「…服务端 120 秒内没做完，后台继续生成；完成后再点眼睛查看（这次不显示）」，确认框关闭，过一会儿再点眼睛能看到。
-4. 右键一根已经显示的 BRAN 重新生成：期望旧几何被卸掉、新几何装回（`regenerate_refresh` 那条路）。
-5. 取回工作：期望日志「已清空三维场景：按 N 个范围（点过眼睛的目标）重查已生成的模型…；不重新生成…」→「三维模型已就绪…」，
-   没有「核对 N 个范围」那半句。
+| 步 | 操作 | 结果 | 服务端看到的 |
+|---|---|---|---|
+| 1 | 点 `ZONE /1WCC-PIPE-RX` 眼睛（库里什么都没生成） | INFO「范围内没有已生成的模型；右键「重新生成模型」可生成」；WARN 0 / ERROR 0；没有「范围核对失败」「已有模型查询失败」 | 只有 records，没有 generate |
+| 2 | 右键 `BRAN /1WCC1135/B1` →「重新生成模型」 | 确认框只有一句、不带数字；「正在生成模型（1 个目标…）」→「生成完成，1 个生成根（重算 1、命中 0）」→「查询到 2 个元素」→「模型显示完成」；三维出现管身 + CAP | 一次 `[http.model.generate] refno=24383/66459 force=true`，没走 `/model/ensure` 别名 |
+| 3a | 再点 ZONE 眼睛 | 按祖先查到同样 2 个元素，显示完成 | records |
+| 4 | 右键**已经显示的**那根 BRAN 再「重新生成模型」 | **第一轮（`4a914c5d5`）失败**：日志照样「查询到 2 个元素、模型显示完成」，三维里管子消失。根因与修法见下；修复 `44e8db68a` 重编后，同一根 BRAN 连续两次重新生成（08:48:22、08:49:21），第二次之后管子仍在，WARN 0 / ERROR 0 | 每次一发 generate |
+| 3b | 右键 ZONE →「重新生成模型」→「重新生成」（范围里 118 根 PIPE） | 08:50:45「正在生成模型（1 个目标，范围内已有的产物会被重算替换；服务端预算 120 秒，超时后后台继续）」→ 08:51:56「生成完成，193 个生成根（重算 192、命中 1）」→「查询到 1699 个元素，2400 个网格实例」→「模型显示完成」；整个 ZONE 的管系出现 | 一发 `generate refno=24383/66457 force=true`，`elapsed_ms=71091`，`available=true` |
+| 5 | 菜单「项目」→「取回工作」 | 09:08:29「正在取回工作：重查根层与 3 个分支…」→「已清空三维场景：按 2 个范围（点过眼睛的目标）重查已生成的模型，重装 1699 个模型（其中 0 个保持隐藏）；不重新生成，要最新请右键「重新生成模型」」→「取回工作完成：已加载元素 160 → 160」→ 09:08:30「三维模型已就绪：2400 个元素，2400 个网格实例…」；**没有**「核对 N 个范围」；三维整场回来 | 只有 records，没有 generate |
+
+第一程（`4a914c5d5` 编的 plant-ui，第 1、2、3a、4 步）与第二程（`44e8db68a`，08:46 起，第 4、3b、5 步）日志面板都是 WARN 0 / ERROR 0，
+第二程收尾时共 25 条、全 INFO。服务端 `server.log`（stdout 重定向）里 `[http.model.generate]` 恰好 5 条（上表 2、4×3、3b），
+没有一行 deprecated 别名点名。
+
+**没验到的**：`timeout` 那条路。118 根 PIPE 的 ZONE 服务端 71 s 就做完了，没撞 120 s 预算，WARN「服务端 120 秒内没做完…」没出现；
+这条仍只有单测 `a_timed_out_generate_does_not_display` 盖着。另外 3b 的回执是「重算 192、命中 1」而不是「命中 0」：`force:true` 下
+服务端仍报了 1 个命中，是服务端口径，本次没追。
+
+### 第 4 步暴露的问题与修复（`44e8db68a`）
+
+右键重新生成一根**已经显示**的目标，回包落地时旧 refno 的 `Unload` 走 `view3d_commands`、新记录走 `pending_incremental_models`，
+每帧先 `append` 后发 `Unload`，而 `View3d::model(Unload)` 会把待装批里同 refno 的新模型一并滤掉，只剩卸旧；就算对调，Bevy 里
+`load_models` 排在 `apply_commands` 前面，同一帧刚装上的新实体也会被 `Unload` 按 refno 卸掉。原有测试只钉了源码文字，没盖这个次序。
+
+修法：`plant-ui-view3d` 新增 `View3d::refresh(stale, models)`（`ModelBatch::Refresh`），在 `load_models` 里同一步先卸 `stale` 名下的
+旧根、忘掉它们的渲染与交互状态，再装重算过的记录，待装批里 `stale` 的旧副本先滤掉；`main.rs` 的 `regenerate_refresh` 那条路改走
+`pending_refreshes`，不再发 `Unload`。重新生成后查空只卸不装的那条路不变。新增 view3d 用例 `a_refresh_swaps_the_stale_roots_for_the_new_models`、
+`a_refresh_drops_pending_copies_of_the_stale_roots`；`cargo test -p plant-ui-view3d -p rs-plant -p plant-ui` 52 + 167 + 170 全过。
