@@ -74,6 +74,9 @@ pub mod water_calculation;
 
 pub mod noun_graph;
 
+/// E3D 未命名元素的默认全名（伪属性 `FLNM`）：`SITE 10 of WORLD /*XXX`。
+pub mod e3d_full_name;
+
 pub mod data_state;
 pub mod threed_review;
 

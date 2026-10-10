@@ -87,7 +87,8 @@ pub struct RoomOverviewRow {
 pub async fn element_rooms(refno: RefnoEnum) -> Result<Vec<RoomRelation>> {
     let pe_key = refno.to_pe_key();
     let mut response = SUL_DB.query(element_edges_sql(&pe_key)).await?.check()?;
-    let rows: Vec<(RefnoEnum, String, u8, f32, RefnoEnum)> = response.take(1)?;
+    // 槛 0 / 1 是 LET $kids / LET $targets，边表在第 2 槛。
+    let rows: Vec<(RefnoEnum, String, u8, f32, RefnoEnum)> = response.take(2)?;
     if rows.is_empty() {
         return Ok(Vec::new());
     }
@@ -383,11 +384,20 @@ fn valid_room_num(num: &str) -> bool {
         && bytes[1..].iter().all(|b| b.is_ascii_digit())
 }
 
+/// 自身边 ∪ 直接子层边，子层与边都按记录 id 图遍历（`X<-pe_owner`、`<-room_relate`），
+/// 不写 `WHERE out = X`：SurrealDB 2.1 对 `pe_owner` / `room_relate` 的 `out` 不走任何索引，
+/// AMS 两库 332k 条 `pe_owner` + 64k 条 `room_relate` 两次全表扫 1.7–2.6 s（子层为空、
+/// 甚至记录不存在也一样），图遍历三句合计 0.02–0.03 s（2026-09-20 f13 隔离部署，34 个子 /
+/// 79 条边等五组逐行比对一致）。选中元素后「归属加载中…」那 2.4–3.0 s 里 ~2.2 s 就是这两句。
+///
+/// 数组变量不能直接接图边——`$targets<-room_relate` 会少行——要 `SELECT VALUE <-room_relate
+/// FROM $targets` 逐个取再 `array::flatten`。前两槛是 LET，边表在第 2 槛。
 fn element_edges_sql(pe_key: &str) -> String {
     format!(
-        "LET $kids = (SELECT VALUE in FROM pe_owner WHERE out = {pe_key}); \
-         SELECT VALUE [in, room_num, inside_count, center_dist, out] FROM room_relate \
-         WHERE out = {pe_key} OR out IN $kids;"
+        "LET $kids = (SELECT VALUE in FROM {pe_key}<-pe_owner); \
+         LET $targets = array::append($kids, {pe_key}); \
+         SELECT VALUE [in, room_num, inside_count, center_dist, out] \
+         FROM array::flatten(SELECT VALUE <-room_relate FROM $targets);"
     )
 }
 
@@ -420,19 +430,30 @@ fn room_detail_sql(room_key: &str) -> String {
 }
 
 /// 成员预览的名称补齐 + 整间重算在队检查，一趟发两条。
+///
+/// 名称那一句按记录 id 直选（`FROM pe:a, pe:b`），不写 `FROM pe WHERE id IN [...]`：
+/// SurrealDB 2.1 对后者不走主键，把整张 `pe` 扫一遍——AMS 两库 240k 条实测 8 个 key 要
+/// 1.6–1.8 s（空列表也要 1.0 s），直选 0.3 ms（2026-09-20 f13 隔离部署测出）。
+/// 房间详情点开后的 2.2 s 里有 1.7 s 就是这一句。没有预览成员时用 `RETURN []` 占住
+/// 第 0 槛，后面 `take(0)` 的位置不变。
 fn detail_follow_up_sql(ranked: &[(RefU64, u8, f32)], panels: &[RefU64]) -> String {
     let member_keys = ranked
         .iter()
         .map(|(refno, _, _)| refno.to_pe_key())
         .collect::<Vec<_>>()
         .join(", ");
+    let names_stmt = if member_keys.is_empty() {
+        "RETURN [];".to_string()
+    } else {
+        format!("SELECT VALUE [id, name, noun] FROM {member_keys};")
+    };
     let panel_targets = panels
         .iter()
         .map(|panel| format!("'{}'", panel.to_pdms_str()))
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "SELECT VALUE [id, name, noun] FROM pe WHERE id IN [{member_keys}]; \
+        "{names_stmt} \
          SELECT VALUE target_refno FROM model_update_pending WHERE action = 'room_recalc_panel' \
          AND status IN ['pending', 'failed'] AND (attempts?:0) < 5 \
          AND target_refno IN [{panel_targets}];"
@@ -575,9 +596,17 @@ mod tests {
     #[test]
     fn sql_renderers_pin_tables_and_predicates() {
         let edges = element_edges_sql("pe:1_2");
-        assert!(edges.contains("FROM pe_owner WHERE out = pe:1_2"));
-        assert!(edges.contains("FROM room_relate"));
-        assert!(edges.contains("WHERE out = pe:1_2 OR out IN $kids"));
+        // 子层与归属边都按记录 id 图遍历，不许再写 WHERE out = …（SurrealDB 2.1 全表扫
+        // pe_owner / room_relate）；前两槛是 LET，element_rooms() 从第 2 槛取边表。
+        assert!(edges.starts_with("LET $kids = (SELECT VALUE in FROM pe:1_2<-pe_owner);"));
+        assert!(edges.contains("LET $targets = array::append($kids, pe:1_2);"));
+        assert!(edges.contains(
+            "SELECT VALUE [in, room_num, inside_count, center_dist, out] \
+             FROM array::flatten(SELECT VALUE <-room_relate FROM $targets);"
+        ));
+        assert!(!edges.contains("WHERE out ="));
+        assert!(!edges.contains("FROM room_relate WHERE"));
+        assert_eq!(edges.matches("LET ").count(), 2);
 
         let panels = panel_rooms_sql(&["pe:1_10".to_string(), "pe:1_11".to_string()]);
         assert!(panels.contains("FROM room_panel_relate WHERE out IN [pe:1_10, pe:1_11]"));
@@ -590,11 +619,18 @@ mod tests {
         assert!(detail.contains("FROM room_relate WHERE in IN $panels;"));
         assert!(!detail.contains("IN (SELECT"));
 
-        let follow = detail_follow_up_sql(&[(refno(7), 8, 1.0)], &[refno(9)]);
-        assert!(follow.contains("FROM pe WHERE id IN [pe:0_7]"));
+        let follow = detail_follow_up_sql(&[(refno(7), 8, 1.0), (refno(8), 7, 2.0)], &[refno(9)]);
+        // 名称按记录 id 直选，不许再写 WHERE id IN（SurrealDB 2.1 会全表扫 pe）。
+        assert!(follow.starts_with("SELECT VALUE [id, name, noun] FROM pe:0_7, pe:0_8;"));
+        assert!(!follow.contains("WHERE id IN"));
         assert!(follow.contains("action = 'room_recalc_panel'"));
         assert!(follow.contains("(attempts?:0) < 5"));
         assert!(follow.contains("target_refno IN ['0/9']"));
+
+        // 没有预览成员时第 0 槛用 RETURN [] 占位，take(0) 的位置不动，也不会拼出 `FROM ;`。
+        let follow_empty = detail_follow_up_sql(&[], &[refno(9)]);
+        assert!(follow_empty.starts_with("RETURN [];"));
+        assert!(follow_empty.contains("target_refno IN ['0/9']"));
 
         let overview = overview_sql(&["-RM".to_string()]);
         assert!(overview.contains("noun = 'FRMW'"));

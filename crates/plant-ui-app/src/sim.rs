@@ -436,7 +436,7 @@ pub struct Engine {
     /// db7002 排队期间「新到会话并入」的一次性剧本还没演过。
     absorb_pending: bool,
     /// 第一轮房间收敛后「db7001 / db7002 又各存了一次盘」的一次性剧本还没演过。
-    /// 它是库行「立即执行」Ready 态在剧本里唯一的入口（09-08 计划 §七.1 的起点）：
+    /// 它是库行「提前执行」Ready 态在剧本里唯一的入口（09-08 计划 §七.1 的起点）：
     /// 不演这一幕，跑空之后每一行都追平，可点的按钮与粗版气泡就永远摆不出来。
     late_save_pending: bool,
     /// 晚到保存那一刻「服务端判出模型落后」的线：(dbnum, 根数)。`/dbnums` 的
@@ -494,6 +494,9 @@ impl Engine {
             cache_versions: Vec::new(),
             observed_at: Utc::now(),
             sites: self.tree.sites.clone(),
+            // 剧本里的 SITE 不挂库号（`SimTree` 只长树），模型更新面板的 SITE 列
+            // 在演示模式下不画。
+            site_dbs: Vec::new(),
         }
     }
 
@@ -897,7 +900,7 @@ impl Engine {
                 mirror: Default::default(),
                 features: Default::default(),
                 started_at: stamp(self.service_started_at),
-                gen_spatial_tree: true,
+                room_incremental: true,
                 queue_paused: self.paused,
                 worker_alive: self.service.worker_alive(),
                 worker_idle_secs: Some((now - self.last_activity).num_seconds().max(0) as u64),
@@ -1332,7 +1335,7 @@ impl Engine {
     }
 
     /// 一次性剧本：跑空之后 db7001 / db7002 又各存了一次盘。db7001 还让服务端判出
-    /// 12 根模型落后——它的「立即执行」气泡数据段 / 模型段两行都有得看；db7002 那枚
+    /// 12 根模型落后——它的「提前执行」气泡数据段 / 模型段两行都有得看；db7002 那枚
     /// 只有数据段（`model_chasing_roots` 没给就整行不画），两种形状正好都摆出来。
     fn late_saves(&mut self, out: &mut Vec<Evt>) {
         for dbnum in [7001u32, 7002] {
@@ -1373,7 +1376,7 @@ impl Engine {
             }
         }
         // 一次性剧本：第一轮房间收敛的同一拍，db7001 / db7002 又各来一次新保存
-        // ——跑空刚追平的两条历史行，「立即执行」这才有亮起来（Ready）的那一刻。
+        // ——跑空刚追平的两条历史行，「提前执行」这才有亮起来（Ready）的那一刻。
         if converged_now {
             if self.late_save_pending {
                 self.late_save_pending = false;
@@ -1748,11 +1751,6 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
             target,
             result: Err(anyhow::anyhow!("NO_RENDERABLE_GEOMETRY: {}", target)),
         },
-        Req::EnsureForFocus { epoch, target } => Evt::EnsureForFocus {
-            epoch,
-            target,
-            result: Err(anyhow::anyhow!("模型服务不可用: {}", target)),
-        },
         // 剧本里没有房间数据：空归属即「无所属房间」，界面照常走 Ready 空态。
         Req::ElementRooms(refno) => Evt::ElementRooms(refno, Ok(Vec::new())),
         Req::PanelRoom(refno) => Evt::PanelRoom(refno, Ok(None)),
@@ -1779,23 +1777,19 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
             crate::search_index::SearchIndexState::Ready(engine.name_count()),
         ),
         Req::Ancestors(refno) => Evt::Ancestors(refno, Ok(engine.ancestors(refno))),
-        // 剧本里没有 `inst_relate`，「已经生成过多少」无从数起。回一句失败而不是
-        // 零——零在确认框那边长得像「这一片本来就没生成过模型」。
-        Req::RegenerateScope { epoch, .. } => Evt::RegenerateScope {
+        // 剧本里没有模型服务，生成不了。每个目标各回一句失败而不是装作做过了：
+        // 那会让人以为演示模式动过库。
+        Req::GenerateModels { epoch, refnos, .. } => Evt::ModelsGenerated {
             epoch,
-            result: Err(anyhow::anyhow!("演示模式没有模型库，数不出已生成的元素")),
-        },
-        // 清点在剧本里就失败了，这两条到不了这里。真到了也不许装作删过 /
-        // 做过：那会让人以为演示模式动过库。
-        Req::RegenerateDelete { epoch, .. } => Evt::RegenerateDeleted {
-            epoch,
-            deleted: 0,
-            result: Err(anyhow::anyhow!("演示模式没有模型库，删不了模型产物")),
-        },
-        Req::RegenerateUnit { epoch, index, .. } => Evt::RegenerateUnit {
-            epoch,
-            index,
-            result: Err(anyhow::anyhow!("演示模式没有模型服务，生成不了模型")),
+            outcomes: refnos
+                .into_iter()
+                .map(|refno| {
+                    (
+                        refno,
+                        Err(anyhow::anyhow!("演示模式没有模型服务，生成不了模型")),
+                    )
+                })
+                .collect(),
         },
         Req::ModelUpdatePreview { .. } => Evt::ModelUpdatePreview(Ok(engine.preview())),
         Req::ModelUpdateExecute {
@@ -1805,6 +1799,14 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
         } => Evt::ModelUpdateExecute {
             from_wizard,
             result: Ok(engine.execute(dbnums.as_deref())),
+        },
+        // 演示剧本里还没有整库重建那一幕（重新计算计划 R5 补）：先如实说没有，
+        // 别造一个假 task_id 让队列面板等一行永远不出现的任务。
+        Req::ModelRebuild { dbnum, .. } => Evt::ModelRebuild {
+            dbnum,
+            result: Err(anyhow::anyhow!(
+                "演示模式没有模型服务，重算不了 db{dbnum} 的模型"
+            )),
         },
         Req::GetWork {
             branches,
@@ -1819,8 +1821,19 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
             let result = engine.retry_pending_unit(&root_refno);
             Evt::RetryPendingUnit(root_refno, result)
         }
-        Req::DataPublish { request, .. } => {
-            Evt::DataPublish(request, Ok("模拟模式：已受理（未真正提交）".into()))
+        Req::DataPublish { request, .. } => Evt::DataPublish(
+            request,
+            Ok(crate::data_publish_api::SubmitResult {
+                message: "模拟模式：已受理（未真正提交）".into(),
+                login_url: None,
+            }),
+        ),
+        Req::LookupDataPublishDeletions { .. } => Evt::DataPublishDeletions(Ok(Vec::new())),
+        Req::RoomCodePublish { .. } => {
+            Evt::RoomCodePublish(Ok(crate::data_publish_api::SubmitResult {
+                message: "模拟模式：已受理（未真正提交）".into(),
+                login_url: None,
+            }))
         }
         Req::CommandQuery {
             epoch,

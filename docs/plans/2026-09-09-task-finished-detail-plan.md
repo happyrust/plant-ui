@@ -40,6 +40,8 @@
   的原句（`85 项变化（预览时 82）`），三数后的总数句照 §1.5「增删改三数」行改成
   `· 共 N 项变化 · 预览时 M`；两种形态提成纯函数 `change_total`（task_queue.rs）并加一例
   四断言的措辞回归测试。V-D2 配色勘误 accent → warn（代码与 S2 本来就一致，这次改的是文档）。
+- 现状核对（跨仓，2026-09-09）：gen-model S8 / T4 到哪一步、终态房间段 V3 卡在哪，见
+  `docs/evidence/2026-09-09-gen-model-contract-status-for-increment-ui-closure.md`。
 
 ---
 

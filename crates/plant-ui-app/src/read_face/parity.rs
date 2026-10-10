@@ -1374,7 +1374,7 @@ pub async fn run(options: &Options) -> anyhow::Result<Report> {
         let one = [root.refno];
         let req = ModelInstancesReq {
             roots: &one,
-            generation_roots: &one,
+            scope_roots: &one,
             identity,
         };
         let mut quiet_service = |_: usize, _: usize| {};

@@ -101,12 +101,38 @@ pub async fn get_mdb_world_site_ele_nodes(
     }
     for (i, node) in nodes.iter_mut().enumerate() {
         node.order = i as _;
+    }
+    fill_site_default_full_names(&mut nodes).await?;
+    Ok(nodes)
+}
+
+/// 无名 SITE 补 E3D 默认全名（`FLNM`）：`SITE 10 of WORLD /*XXX`。
+///
+/// 序号按**各自的 WORLD** 数，不是按这张跨库拼出来的总表数——一个 MDB 挂着几个设计库
+/// 就有几个 WORLD，从头数到尾会把第二个库的头一个 SITE 编成上一个库末尾的下一号，
+/// 与 E3D 的 `ITYPOS`（沿属主成员链数）对不上。
+async fn fill_site_default_full_names(nodes: &mut [EleTreeNode]) -> anyhow::Result<()> {
+    if nodes.iter().all(|node| !node.name.is_empty()) {
+        return Ok(());
+    }
+    let mut tails: HashMap<RefnoEnum, String> = HashMap::new();
+    let mut ordinals: HashMap<(RefnoEnum, String), usize> = HashMap::new();
+    for node in nodes.iter_mut() {
+        let ordinal = ordinals
+            .entry((node.owner.clone(), node.noun.clone()))
+            .or_default();
+        *ordinal += 1;
         if node.name.is_empty() {
-            node.name = format!("SITE {}", i + 1);
+            if !tails.contains_key(&node.owner) {
+                let tail = super::query::owner_name_tail(node.owner.clone()).await?;
+                tails.insert(node.owner.clone(), tail);
+            }
+            let tail = &tails[&node.owner];
+            node.name = crate::e3d_full_name::with_tail(&node.noun, *ordinal, tail);
+            node.short_name = Some(crate::e3d_full_name::with_tail(&node.noun, *ordinal, ""));
         }
     }
-    //检查名称，如果没有给名字的，需要给上默认值, todo 后续如果是删除了又增加，名称后面的数字可能会继续增加
-    Ok(nodes)
+    Ok(())
 }
 
 pub async fn create_mdb_world_site_pes_table(mdb: String, module: DBType) -> anyhow::Result<bool> {

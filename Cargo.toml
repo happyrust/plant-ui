@@ -10,7 +10,7 @@ members = [
 exclude = ["vendor"]
 
 [workspace.package]
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 
 [workspace.dependencies]
@@ -35,7 +35,7 @@ bevy = { git = "https://gitee.com/happydpc/bevy", default-features = false, feat
 # + navigator.clipboard，配套的快捷键放行见 vendor 里 web_clipboard.rs 的捕获拦截。
 # 所需依赖（arboard / thread_local / image / crossbeam-channel）全在 lock 与 vendor 里，开关不动 Cargo.lock。
 bevy_egui35 = { path = "vendor/bevy_egui35", default-features = false, features = [
-    "render", "default_fonts", "manage_clipboard",
+    "render", "default_fonts", "manage_clipboard", "open_url",
 ] }
 # 双端 spawn：原生走 tokio、浏览器走 spawn_local（view3d-migration.md 决定 5）
 # rev 28b30f8 = 上游 51aabcb + 一处改动：`sleep_updates` 在宿主退出（`UpdateTicks` 连同

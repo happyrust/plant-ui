@@ -6,8 +6,8 @@
 //! 全部经它，数据线程内不许根据错误自行换面。
 //!
 //! 不在这里的两样：**房间**——它只有库一条路，服务供数下经 `/health.mirror` 门控懒连
-//! （计划 D6）；**命令面**——`ensure` / 手动更新 / 队列 / 提资 / 命令查询永远走模型服务
-//! （计划 D3），所以 `model_instances` 只读、`ensure` 循环留在 `data.rs`。
+//! （计划 D6）；**命令面**——生成（右键「重新生成模型」）/ 手动更新 / 队列 / 提资 / 命令查询
+//! 永远走模型服务（计划 D3），所以 `model_instances` 只读、生成留在 `data.rs` 的命令臂。
 //!
 //! 为什么是 enum 不是 `dyn Trait`：恰好两个变体、穷尽匹配；`async fn` 直接写、不上
 //! `async-trait`；原生端 future 要 `Send`、wasm 端不要（`data.rs` 已为此分了两套
@@ -17,7 +17,7 @@ use std::sync::mpsc;
 
 use plant_ui_data::{Attr, EleTreeNode, NameHit, RefU64};
 
-use crate::data::{Evt, RegenerateCount};
+use crate::data::Evt;
 use crate::model_update_api::ModelRecords;
 use crate::search_index::{Scope, SearchIndex, SubstringHits};
 
@@ -76,18 +76,19 @@ pub struct ServiceIdentity<'a> {
     pub namespace: &'a str,
 }
 
-/// 一次三维实例读取要的东西。两面要的根不一样，所以两份都带，各取各的：
+/// 一次三维实例读取要的东西。两面要的根不一样，所以两份都带，各取各的；两面都是
+/// **按祖先查已生成的产物**（ADR-0030 D1），从不生成：
 ///
 /// - `roots`：调用方自己的根——取回工作重装是快照里的模型 refno，eye 显示是点下去的那个
 ///   树目标。**库供数只查它**（v0.1.9 原样：`inst_relate.anc CONTAINS $root` 一根一条）。
 ///   拿并集去跑的话，嵌套在 `roots` 底下的生成根会把同一批实例数两遍。
-/// - `generation_roots`：**服务供数要查的名单**，调用方按前一步 `ensure` 回执算好——重装
-///   = `roots` ∪ 回执里的生成根；eye 显示 = 回执里的生成根，回执空则退到目标本身
-///   （工作树落地时的形状，`/model/records` 按它分桶）。
+/// - `scope_roots`：**服务供数要问的祖先**，`/model/records` 对每一个按祖先回答（gen-model
+///   ADR-086）——eye 显示 = 点下去的目标本身；重装 = 快照里点过眼睛的范围目标（一个 ZONE
+///   一次往返），老快照没有范围记录时退到 `roots`。
 #[derive(Debug, Clone, Copy)]
 pub struct ModelInstancesReq<'a> {
     pub roots: &'a [RefU64],
-    pub generation_roots: &'a [RefU64],
+    pub scope_roots: &'a [RefU64],
     pub identity: ServiceIdentity<'a>,
 }
 
@@ -139,6 +140,15 @@ impl ReadFace {
         match self {
             Self::Service(face) => face.sites().await,
             Self::Store(face) => face.sites().await,
+        }
+    }
+
+    /// 根层每个 SITE 连同它所在的库号（`(库号, SITE 名)`）。模型更新面板的 SITE 列
+    /// 靠它认库；库供数给不出库号，回空表。
+    pub async fn site_dbs(&self) -> anyhow::Result<Vec<(u32, String)>> {
+        match self {
+            Self::Service(face) => face.site_dbs().await,
+            Self::Store(face) => face.site_dbs().await,
         }
     }
 
@@ -200,9 +210,9 @@ impl ReadFace {
         }
     }
 
-    /// 这些根下已经生成的几何实例。**只读**：把范围追到文件最新是 `ensure` 的事
-    /// （ADR-0024），那是命令面，留在调用方；两面各取 `req` 里自己要的那份根（见
-    /// [`ModelInstancesReq`]）。
+    /// 这些根下已经生成的几何实例。**只读**：生成是右键「重新生成模型」直接调
+    /// `/model/generate` 的事（ADR-0030 D2），那是命令面，不在读面上；两面各取 `req` 里
+    /// 自己要的那份根（见 [`ModelInstancesReq`]）。
     pub async fn model_instances(
         &self,
         req: &ModelInstancesReq<'_>,
@@ -222,18 +232,6 @@ impl ReadFace {
         match self {
             Self::Service(face) => face.subtree_bounds(root, scope).await,
             Self::Store(face) => face.subtree_bounds(root).await,
-        }
-    }
-
-    /// 「重新生成模型」的清点：这些根底下已经生成过多少元素、归成多少个生成单元。
-    pub async fn regeneration_count(
-        &self,
-        targets: &[RefU64],
-        delivery_units: &[String],
-    ) -> anyhow::Result<RegenerateCount> {
-        match self {
-            Self::Service(face) => face.regeneration_count(targets).await,
-            Self::Store(face) => face.regeneration_count(targets, delivery_units).await,
         }
     }
 
@@ -265,15 +263,15 @@ mod tests {
     }
 
     /// 两面要的根写在同一份请求里、由各自取，调用方不必知道哪一面在场：
-    /// 服务供数拿 `generation_roots`，库供数拿 `roots`。这里钉的是两份各自独立、
+    /// 服务供数拿 `scope_roots`，库供数拿 `roots`。这里钉的是两份各自独立、
     /// 不会被谁悄悄合成一份。
     #[test]
     fn a_model_request_carries_both_root_sets() {
         let roots = [RefU64::from(20)];
-        let generation_roots = [RefU64::from(7), RefU64::from(20), RefU64::from(42)];
+        let scope_roots = [RefU64::from(7), RefU64::from(20), RefU64::from(42)];
         let req = ModelInstancesReq {
             roots: &roots,
-            generation_roots: &generation_roots,
+            scope_roots: &scope_roots,
             identity: ServiceIdentity {
                 base: "http://127.0.0.1:8022",
                 project: "SAM",
@@ -282,7 +280,7 @@ mod tests {
             },
         };
         assert_eq!(req.roots, &roots);
-        assert_eq!(req.generation_roots, &generation_roots);
+        assert_eq!(req.scope_roots, &scope_roots);
         assert_eq!(req.identity.base, "http://127.0.0.1:8022");
     }
 }

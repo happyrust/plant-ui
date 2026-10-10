@@ -3,6 +3,7 @@
 
 pub mod data_publish;
 pub mod fonts;
+pub mod manual_data_publish;
 pub mod model_regenerate;
 pub mod model_update;
 pub mod project_picker;
@@ -234,8 +235,11 @@ pub enum Cmd {
     OpenSettings,
     /// 打开三维数据发布任务窗。
     OpenDataPublish,
+    OpenManualDataPublish,
+    SubmitRoomCodePublish(manual_data_publish::RoomCodePublishRequest),
     /// 提交三维数据发布请求；实际发送由宿主负责。
     SubmitDataPublish(data_publish::PublishRequest),
+    LookupDataPublishDeletions(data_publish::PublishRequest),
     /// 打开并刷新模型增量更新预览。
     OpenModelUpdate,
     /// 重新读取当前项目的增量范围。
@@ -252,10 +256,17 @@ pub enum Cmd {
     },
     /// 任务队列上的「立刻扫一遍」。它**不插队**，作用只是别等服务端下一个 30 秒轮询。
     ScanNow,
-    /// 库行上的「立即执行」（09-08 计划 D1 A）：对一个 dbnum 提前排一次它的任务，
+    /// 库行上的「提前执行」（09-08 计划 D1 A）：对一个 dbnum 提前排一次它的任务，
     /// 打的还是既有 execute、带单库名单。它不插队、不改本期执行范围；与自动发现
     /// 排出的是同一种任务。
     RunDbnumNow {
+        dbnum: u32,
+    },
+    /// 库行上的「重算模型（整库）」（2026-09-10 重新计算计划 D1 ② / R1）：对一个 dbnum 排一次
+    /// 服务端整库模型重建（`POST /api/v1/dbnums/{dbnum}/model/rebuild`）——该库全部生成根投进
+    /// 模型队列重算，不改数据水位，进任务队列一行；同库已在重建时服务端回同一个任务。
+    /// 与模型树右键那条「重新生成」（对选中范围直接调服务端 generate）是两件事。
+    RebuildDbnumModel {
         dbnum: u32,
     },
     /// 暂停 / 恢复队列出队。暂停**只挡出队**，正在跑的那一批会跑完为止——
@@ -290,7 +301,8 @@ pub enum Cmd {
     ResizeViewport([u32; 2]),
     /// 对模型的显示 / 定位类动作。
     Model(ModelAction),
-    /// Query all published descendants, ensuring missing geometry once.
+    /// 树范围聚焦：查这个节点下已生成产物的包围盒并取景。只查不生（ADR-0030 D1）：
+    /// 范围内没有已生成的模型就相机不动、日志提示右键「重新生成模型」。
     FocusTreeScope(RefU64),
     /// 主题下发的三维视口配色：渐变背景上下两色与地面网格线色。
     ///
@@ -318,14 +330,16 @@ pub enum Cmd {
     /// 只碰失败的那些：网格文件名是内容哈希，已经加载成功的换个目录取到的还是
     /// 同一份内容。由宿主在设置保存之后发出，界面上没有对应的按钮。
     RetryFailedMeshes,
-    /// 模型树右键「重新生成模型」：删掉这几行范围内**已经生成**的模型，再重做一遍。
+    /// 模型树 / 视口右键「重新生成模型」（ADR-0030 D2）：对这几行各一发
+    /// `POST /model/generate { force: true }`，服务端自己解根、删旧、重算；生成完成之后
+    /// 宿主再以同一批目标为祖先查 records 显示出来（等于替用户点一次眼睛）。
     ///
     /// **不进 [`ModelAction`]。** 那个枚举里的每一项改的都是「三维此刻画成什么样」，
-    /// 撤销它只要再下一条相反的命令；这一条改的是模型库里的产物，删掉的几何只能
-    /// 重新算回来。两者混在一个枚举里，宿主那边就只剩注释在提醒这件事。
+    /// 撤销它只要再下一条相反的命令；这一条改的是模型库里的产物，重算替换掉的几何只能
+    /// 再算一遍。两者混在一个枚举里，宿主那边就只剩注释在提醒这件事。
     ///
-    /// 这一条只发起**清点**：宿主先跑 deep query 数出「多少个已生成元素、归成多少个
-    /// 生成单元」，把数字摆进确认框，等 [`Self::RegenerateConfirm`] 才动手。
+    /// 这一条只打开**确认框**（不带数字，客户端不清点、不解根、不删产物），等
+    /// [`Self::RegenerateConfirm`] 才发请求。
     RegenerateModels {
         targets: Vec<aios_core::RefU64>,
     },
@@ -333,10 +347,6 @@ pub enum Cmd {
     RegenerateConfirm {
         accepted: bool,
     },
-    /// 「停在这里」。**只停派发**：已经发出去的那一个停不了——服务端那边是
-    /// `await_background_without_cancelling`，连超时都不杀后台任务。所以按钮文案
-    /// 里不许出现「取消」，见 `model_regenerate::STOP_LABEL`。
-    RegenerateStop,
 }
 
 #[cfg(test)]

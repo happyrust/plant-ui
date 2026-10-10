@@ -1,5 +1,5 @@
 {
-  "version": "2.15",
+  "version": "2.18",
   "children": [
     {
       "type": "frame",
@@ -711,6 +711,62 @@
           ],
           "alignItems": "center",
           "children": [
+            {
+              "type": "frame",
+              "id": "uR6hj",
+              "name": "导航历史",
+              "gap": 2,
+              "alignItems": "center",
+              "children": [
+                {
+                  "id": "ekf3L",
+                  "type": "ref",
+                  "ref": "hB4FY",
+                  "name": "Btn-back",
+                  "descendants": {
+                    "X4AxVR": {
+                      "icon": "arrow-left"
+                    }
+                  }
+                },
+                {
+                  "id": "JuBwa",
+                  "type": "ref",
+                  "ref": "hB4FY",
+                  "name": "Btn-forward",
+                  "descendants": {
+                    "X4AxVR": {
+                      "icon": "arrow-right",
+                      "fill": "$text-muted"
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "JCgx3",
+              "name": "GapNav1",
+              "width": 8,
+              "height": 1,
+              "fill": "#00000000"
+            },
+            {
+              "type": "frame",
+              "id": "m9A2w2",
+              "name": "DivNav",
+              "width": 1,
+              "height": 18,
+              "fill": "$border"
+            },
+            {
+              "type": "frame",
+              "id": "q95tU",
+              "name": "GapNav2",
+              "width": 8,
+              "height": 1,
+              "fill": "#00000000"
+            },
             {
               "type": "frame",
               "id": "B2Lw1",
@@ -5934,6 +5990,62 @@
           ],
           "alignItems": "center",
           "children": [
+            {
+              "type": "frame",
+              "id": "UKc8a",
+              "name": "导航历史",
+              "gap": 2,
+              "alignItems": "center",
+              "children": [
+                {
+                  "id": "HjOkS",
+                  "type": "ref",
+                  "ref": "hB4FY",
+                  "name": "Btn-back",
+                  "descendants": {
+                    "X4AxVR": {
+                      "icon": "arrow-left"
+                    }
+                  }
+                },
+                {
+                  "id": "Q7vmu",
+                  "type": "ref",
+                  "ref": "hB4FY",
+                  "name": "Btn-forward",
+                  "descendants": {
+                    "X4AxVR": {
+                      "icon": "arrow-right",
+                      "fill": "$text-muted"
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "SwvXE",
+              "name": "GapNav1",
+              "width": 8,
+              "height": 1,
+              "fill": "#00000000"
+            },
+            {
+              "type": "frame",
+              "id": "Gplt9",
+              "name": "DivNav",
+              "width": 1,
+              "height": 18,
+              "fill": "$border"
+            },
+            {
+              "type": "frame",
+              "id": "aphtK",
+              "name": "GapNav2",
+              "width": 8,
+              "height": 1,
+              "fill": "#00000000"
+            },
             {
               "type": "frame",
               "id": "ZwrGS",
@@ -36646,6 +36758,1176 @@
                   "fontWeight": "600"
                 }
               }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "oZftZ",
+      "x": 3240,
+      "y": 3460,
+      "name": "S1-D 导航历史 · 前进 / 后退形态表",
+      "theme": {
+        "mode": "light"
+      },
+      "clip": true,
+      "width": 1040,
+      "height": 720,
+      "fill": "$bg-panel",
+      "cornerRadius": "$r-lg",
+      "stroke": "$border-strong",
+      "strokeWidth": 1,
+      "strokeAlignment": "inner",
+      "layout": "vertical",
+      "gap": 22,
+      "padding": [
+        28,
+        32
+      ],
+      "children": [
+        {
+          "type": "frame",
+          "id": "mE4rI",
+          "name": "标题区",
+          "width": "fill_container",
+          "layout": "vertical",
+          "gap": 6,
+          "children": [
+            {
+              "type": "text",
+              "id": "OkPbM",
+              "name": "标题",
+              "fill": "$text-primary",
+              "content": "导航历史 · 前进 / 后退",
+              "fontFamily": "$font-ui",
+              "fontSize": 16,
+              "fontWeight": "600"
+            },
+            {
+              "type": "text",
+              "id": "tsLYZ",
+              "name": "副题",
+              "fill": "$text-muted",
+              "textGrowth": "fixed-width",
+              "width": "fill_container",
+              "content": "命令栏最左两枚 C/ToolBtn · 一条历史 = 选中构件 + 相机位姿 + 激活页签 · Alt+← / Alt+→ · 右键弹历史列表",
+              "fontFamily": "$font-ui",
+              "fontSize": 11,
+              "fontWeight": "normal"
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "h0WVx",
+          "name": "态-四格",
+          "width": "fill_container",
+          "gap": 20,
+          "children": [
+            {
+              "type": "frame",
+              "id": "cl1t4",
+              "name": "态1-常态",
+              "width": "fill_container",
+              "layout": "vertical",
+              "gap": 8,
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "zjg30",
+                  "name": "命令栏片段",
+                  "height": 40,
+                  "fill": "$bg-panel",
+                  "cornerRadius": "$r-sm",
+                  "stroke": "$border",
+                  "strokeWidth": 1,
+                  "strokeAlignment": "inner",
+                  "gap": 2,
+                  "padding": [
+                    0,
+                    8
+                  ],
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "frame",
+                      "id": "pvl36",
+                      "name": "导航历史",
+                      "gap": 2,
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "id": "F6iNGv",
+                          "type": "ref",
+                          "ref": "hB4FY",
+                          "name": "Btn-back",
+                          "fill": "#00000000",
+                          "descendants": {
+                            "X4AxVR": {
+                              "icon": "arrow-left",
+                              "fill": "$text-secondary"
+                            }
+                          }
+                        },
+                        {
+                          "id": "LKYP1",
+                          "type": "ref",
+                          "ref": "hB4FY",
+                          "name": "Btn-forward",
+                          "descendants": {
+                            "X4AxVR": {
+                              "icon": "arrow-right",
+                              "fill": "$text-muted"
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "rZzwn",
+                      "name": "Gap",
+                      "width": 8,
+                      "height": 1,
+                      "fill": "#00000000"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "TCQWY",
+                      "name": "Div",
+                      "width": 1,
+                      "height": 18,
+                      "fill": "$border"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "w1DyX0",
+                      "name": "Gap2",
+                      "width": 8,
+                      "height": 1,
+                      "fill": "#00000000"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "BGRtl",
+                      "name": "菜单-项目",
+                      "height": 26,
+                      "fill": "#00000000",
+                      "cornerRadius": "$r-sm",
+                      "padding": [
+                        0,
+                        10
+                      ],
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "C4rm7",
+                          "name": "Label",
+                          "fill": "$text-secondary",
+                          "content": "项目",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 12,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "TOnXh",
+                      "name": "菜单-创建",
+                      "height": 26,
+                      "fill": "#00000000",
+                      "cornerRadius": "$r-sm",
+                      "padding": [
+                        0,
+                        10
+                      ],
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "ES3h7",
+                          "name": "Label",
+                          "fill": "$text-secondary",
+                          "content": "创建",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 12,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "text",
+                  "id": "Ny46W",
+                  "name": "注",
+                  "fill": "$text-muted",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "常态 · 后退可用、前进禁用（前向栈空是常态）",
+                  "fontFamily": "$font-ui",
+                  "fontSize": 10,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "PIzKi",
+              "name": "态2-双向可用",
+              "width": "fill_container",
+              "layout": "vertical",
+              "gap": 8,
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "W3SqC",
+                  "name": "命令栏片段",
+                  "height": 40,
+                  "fill": "$bg-panel",
+                  "cornerRadius": "$r-sm",
+                  "stroke": "$border",
+                  "strokeWidth": 1,
+                  "strokeAlignment": "inner",
+                  "gap": 2,
+                  "padding": [
+                    0,
+                    8
+                  ],
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "frame",
+                      "id": "mMNu9",
+                      "name": "导航历史",
+                      "gap": 2,
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "id": "dqEeE",
+                          "type": "ref",
+                          "ref": "hB4FY",
+                          "name": "Btn-back",
+                          "fill": "#00000000",
+                          "descendants": {
+                            "X4AxVR": {
+                              "icon": "arrow-left",
+                              "fill": "$text-secondary"
+                            }
+                          }
+                        },
+                        {
+                          "id": "ZlS6q",
+                          "type": "ref",
+                          "ref": "hB4FY",
+                          "name": "Btn-forward",
+                          "descendants": {
+                            "X4AxVR": {
+                              "icon": "arrow-right",
+                              "fill": "$text-secondary"
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "Svn9j",
+                      "name": "Gap",
+                      "width": 8,
+                      "height": 1,
+                      "fill": "#00000000"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "WWb8i",
+                      "name": "Div",
+                      "width": 1,
+                      "height": 18,
+                      "fill": "$border"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "p4Y32",
+                      "name": "Gap2",
+                      "width": 8,
+                      "height": 1,
+                      "fill": "#00000000"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "zEBK6",
+                      "name": "菜单-项目",
+                      "height": 26,
+                      "fill": "#00000000",
+                      "cornerRadius": "$r-sm",
+                      "padding": [
+                        0,
+                        10
+                      ],
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "rWivc",
+                          "name": "Label",
+                          "fill": "$text-secondary",
+                          "content": "项目",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 12,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "dbAmj",
+                      "name": "菜单-创建",
+                      "height": 26,
+                      "fill": "#00000000",
+                      "cornerRadius": "$r-sm",
+                      "padding": [
+                        0,
+                        10
+                      ],
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "Zej8k",
+                          "name": "Label",
+                          "fill": "$text-secondary",
+                          "content": "创建",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 12,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "text",
+                  "id": "fHIEy",
+                  "name": "注",
+                  "fill": "$text-muted",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "后退过之后 · 两枚都可用",
+                  "fontFamily": "$font-ui",
+                  "fontSize": 10,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "M4g17",
+              "name": "态3-悬停",
+              "width": "fill_container",
+              "layout": "vertical",
+              "gap": 8,
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "Zn75B",
+                  "name": "命令栏片段",
+                  "height": 40,
+                  "fill": "$bg-panel",
+                  "cornerRadius": "$r-sm",
+                  "stroke": "$border",
+                  "strokeWidth": 1,
+                  "strokeAlignment": "inner",
+                  "gap": 2,
+                  "padding": [
+                    0,
+                    8
+                  ],
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "frame",
+                      "id": "J4aCfY",
+                      "name": "导航历史",
+                      "gap": 2,
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "id": "R8npm",
+                          "type": "ref",
+                          "ref": "hB4FY",
+                          "name": "Btn-back",
+                          "fill": "$bg-hover",
+                          "descendants": {
+                            "X4AxVR": {
+                              "icon": "arrow-left",
+                              "fill": "$text-primary"
+                            }
+                          }
+                        },
+                        {
+                          "id": "Tmhfw",
+                          "type": "ref",
+                          "ref": "hB4FY",
+                          "name": "Btn-forward",
+                          "descendants": {
+                            "X4AxVR": {
+                              "icon": "arrow-right",
+                              "fill": "$text-muted"
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "O3gxS",
+                      "name": "Gap",
+                      "width": 8,
+                      "height": 1,
+                      "fill": "#00000000"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "Wpoq4",
+                      "name": "Div",
+                      "width": 1,
+                      "height": 18,
+                      "fill": "$border"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "cc9Lh",
+                      "name": "Gap2",
+                      "width": 8,
+                      "height": 1,
+                      "fill": "#00000000"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "ceIlz",
+                      "name": "菜单-项目",
+                      "height": 26,
+                      "fill": "#00000000",
+                      "cornerRadius": "$r-sm",
+                      "padding": [
+                        0,
+                        10
+                      ],
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "ynWum",
+                          "name": "Label",
+                          "fill": "$text-secondary",
+                          "content": "项目",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 12,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "i6nb4",
+                      "name": "菜单-创建",
+                      "height": 26,
+                      "fill": "#00000000",
+                      "cornerRadius": "$r-sm",
+                      "padding": [
+                        0,
+                        10
+                      ],
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "j88tC6",
+                          "name": "Label",
+                          "fill": "$text-secondary",
+                          "content": "创建",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 12,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "DTVhT",
+                  "name": "Hover文案",
+                  "fill": "$bg-elevated",
+                  "cornerRadius": "$r-md",
+                  "stroke": "$border-strong",
+                  "strokeWidth": 1,
+                  "strokeAlignment": "inner",
+                  "gap": 4,
+                  "padding": [
+                    6,
+                    8
+                  ],
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "OOXqH",
+                      "name": "文案",
+                      "fill": "$text-primary",
+                      "content": "后退到",
+                      "fontFamily": "$font-ui",
+                      "fontSize": 11,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "type": "text",
+                      "id": "z3gCfE",
+                      "name": "目标",
+                      "fill": "$text-primary",
+                      "content": "/1RS03TT9204P",
+                      "fontFamily": "$font-mono",
+                      "fontSize": 11,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "type": "text",
+                      "id": "HD5Ji",
+                      "name": "页签",
+                      "fill": "$text-secondary",
+                      "content": "· 属性",
+                      "fontFamily": "$font-ui",
+                      "fontSize": 11,
+                      "fontWeight": "normal"
+                    },
+                    {
+                      "type": "text",
+                      "id": "E8p3v",
+                      "name": "快捷键",
+                      "fill": "$text-muted",
+                      "content": "(Alt+←)",
+                      "fontFamily": "$font-mono",
+                      "fontSize": 10,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "text",
+                  "id": "n0KzH",
+                  "name": "注",
+                  "fill": "$text-muted",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "悬停 · $bg-hover 底 + hover 文案写出目标",
+                  "fontFamily": "$font-ui",
+                  "fontSize": 10,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "t3aSk2",
+              "name": "态4-栈空",
+              "width": "fill_container",
+              "layout": "vertical",
+              "gap": 8,
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "aFIm9",
+                  "name": "命令栏片段",
+                  "height": 40,
+                  "fill": "$bg-panel",
+                  "cornerRadius": "$r-sm",
+                  "stroke": "$border",
+                  "strokeWidth": 1,
+                  "strokeAlignment": "inner",
+                  "gap": 2,
+                  "padding": [
+                    0,
+                    8
+                  ],
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "frame",
+                      "id": "othiT",
+                      "name": "导航历史",
+                      "gap": 2,
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "id": "NyBMQ",
+                          "type": "ref",
+                          "ref": "hB4FY",
+                          "name": "Btn-back",
+                          "fill": "#00000000",
+                          "descendants": {
+                            "X4AxVR": {
+                              "icon": "arrow-left",
+                              "fill": "$text-muted"
+                            }
+                          }
+                        },
+                        {
+                          "id": "iSuL2",
+                          "type": "ref",
+                          "ref": "hB4FY",
+                          "name": "Btn-forward",
+                          "descendants": {
+                            "X4AxVR": {
+                              "icon": "arrow-right",
+                              "fill": "$text-muted"
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "xcbNK",
+                      "name": "Gap",
+                      "width": 8,
+                      "height": 1,
+                      "fill": "#00000000"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "C2Yhl2",
+                      "name": "Div",
+                      "width": 1,
+                      "height": 18,
+                      "fill": "$border"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "bgYk3",
+                      "name": "Gap2",
+                      "width": 8,
+                      "height": 1,
+                      "fill": "#00000000"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "dXpvo",
+                      "name": "菜单-项目",
+                      "height": 26,
+                      "fill": "#00000000",
+                      "cornerRadius": "$r-sm",
+                      "padding": [
+                        0,
+                        10
+                      ],
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "bJLW9",
+                          "name": "Label",
+                          "fill": "$text-secondary",
+                          "content": "项目",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 12,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "SQbAt",
+                      "name": "菜单-创建",
+                      "height": 26,
+                      "fill": "#00000000",
+                      "cornerRadius": "$r-sm",
+                      "padding": [
+                        0,
+                        10
+                      ],
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "egRhe",
+                          "name": "Label",
+                          "fill": "$text-secondary",
+                          "content": "创建",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 12,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "GvyWx",
+                  "name": "Hover文案",
+                  "fill": "$bg-elevated",
+                  "cornerRadius": "$r-md",
+                  "stroke": "$border-strong",
+                  "strokeWidth": 1,
+                  "strokeAlignment": "inner",
+                  "padding": [
+                    6,
+                    10
+                  ],
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "x1INX9",
+                      "name": "文案",
+                      "fill": "$text-muted",
+                      "content": "没有可后退的位置",
+                      "fontFamily": "$font-ui",
+                      "fontSize": 11,
+                      "fontWeight": "normal"
+                    }
+                  ]
+                },
+                {
+                  "type": "text",
+                  "id": "WOuZi",
+                  "name": "注",
+                  "fill": "$text-muted",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "栈空 · 两枚都灰，hover「没有可后退的位置」",
+                  "fontFamily": "$font-ui",
+                  "fontSize": 10,
+                  "fontWeight": "normal"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "UWAVL",
+          "name": "列表与规格",
+          "width": "fill_container",
+          "gap": 32,
+          "children": [
+            {
+              "type": "frame",
+              "id": "Pkv47",
+              "name": "右键历史列表",
+              "width": 320,
+              "layout": "vertical",
+              "gap": 8,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "b0cwb",
+                  "name": "列表题",
+                  "fill": "$text-primary",
+                  "content": "右键任一箭头 → 最近位置列表",
+                  "fontFamily": "$font-ui",
+                  "fontSize": 13,
+                  "fontWeight": "600"
+                },
+                {
+                  "type": "frame",
+                  "id": "b9hga",
+                  "name": "历史菜单",
+                  "width": "fill_container",
+                  "fill": "$bg-elevated",
+                  "cornerRadius": "$r-lg",
+                  "stroke": "$border-strong",
+                  "strokeWidth": 1,
+                  "strokeAlignment": "inner",
+                  "layout": "vertical",
+                  "padding": [
+                    6,
+                    0
+                  ],
+                  "children": [
+                    {
+                      "type": "frame",
+                      "id": "M2ZEXn",
+                      "name": "列头",
+                      "width": "fill_container",
+                      "padding": [
+                        4,
+                        10
+                      ],
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "Y69YmH",
+                          "name": "列头文案",
+                          "fill": "$text-muted",
+                          "content": "最近位置 · 新在上，点一条直接跳",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 10,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    },
+                    {
+                      "id": "R4DpR",
+                      "type": "ref",
+                      "ref": "YGTcD",
+                      "name": "项-/1RS03TT9205P",
+                      "width": "fill_container",
+                      "fill": "#00000000",
+                      "descendants": {
+                        "LF5Gy": {
+                          "icon": "arrow-right",
+                          "fill": "$text-secondary"
+                        },
+                        "JmM2J": {
+                          "content": "/1RS03TT9205P",
+                          "fontFamily": "$font-mono",
+                          "fill": "$text-primary"
+                        },
+                        "yl90F": {
+                          "content": "属性 · 前进",
+                          "fill": "$text-muted"
+                        }
+                      }
+                    },
+                    {
+                      "id": "pRATX",
+                      "type": "ref",
+                      "ref": "YGTcD",
+                      "name": "项-/1RS03TT9204P",
+                      "width": "fill_container",
+                      "fill": "$accent-bg",
+                      "descendants": {
+                        "LF5Gy": {
+                          "icon": "box",
+                          "fill": "$accent"
+                        },
+                        "JmM2J": {
+                          "content": "/1RS03TT9204P",
+                          "fontFamily": "$font-mono",
+                          "fill": "$accent-strong"
+                        },
+                        "yl90F": {
+                          "content": "属性 · 当前",
+                          "fill": "$accent"
+                        }
+                      }
+                    },
+                    {
+                      "id": "OZ85L",
+                      "type": "ref",
+                      "ref": "YGTcD",
+                      "name": "项-/R230",
+                      "width": "fill_container",
+                      "fill": "#00000000",
+                      "descendants": {
+                        "LF5Gy": {
+                          "icon": "door-open",
+                          "fill": "$text-secondary"
+                        },
+                        "JmM2J": {
+                          "content": "/R230",
+                          "fontFamily": "$font-mono",
+                          "fill": "$text-primary"
+                        },
+                        "yl90F": {
+                          "content": "房间",
+                          "fill": "$text-muted"
+                        }
+                      }
+                    },
+                    {
+                      "id": "i1cHt",
+                      "type": "ref",
+                      "ref": "YGTcD",
+                      "name": "项-/1RS03TT9203P",
+                      "width": "fill_container",
+                      "fill": "#00000000",
+                      "descendants": {
+                        "LF5Gy": {
+                          "icon": "box",
+                          "fill": "$text-secondary"
+                        },
+                        "JmM2J": {
+                          "content": "/1RS03TT9203P",
+                          "fontFamily": "$font-mono",
+                          "fill": "$text-primary"
+                        },
+                        "yl90F": {
+                          "content": "属性",
+                          "fill": "$text-muted"
+                        }
+                      }
+                    },
+                    {
+                      "id": "hMIdI",
+                      "type": "ref",
+                      "ref": "YGTcD",
+                      "name": "项-/HVAC-ZONE-03",
+                      "width": "fill_container",
+                      "fill": "#00000000",
+                      "descendants": {
+                        "LF5Gy": {
+                          "icon": "scan",
+                          "fill": "$text-secondary"
+                        },
+                        "JmM2J": {
+                          "content": "/HVAC-ZONE-03",
+                          "fontFamily": "$font-mono",
+                          "fill": "$text-primary"
+                        },
+                        "yl90F": {
+                          "content": "三维视图",
+                          "fill": "$text-muted"
+                        }
+                      }
+                    },
+                    {
+                      "id": "n3F46E",
+                      "type": "ref",
+                      "ref": "YGTcD",
+                      "name": "项-/1RS03-B1",
+                      "width": "fill_container",
+                      "fill": "#00000000",
+                      "descendants": {
+                        "LF5Gy": {
+                          "icon": "git-branch",
+                          "fill": "$text-secondary"
+                        },
+                        "JmM2J": {
+                          "content": "/1RS03-B1",
+                          "fontFamily": "$font-mono",
+                          "fill": "$text-primary"
+                        },
+                        "yl90F": {
+                          "content": "属性",
+                          "fill": "$text-muted"
+                        }
+                      }
+                    },
+                    {
+                      "id": "I3BHkc",
+                      "type": "ref",
+                      "ref": "YGTcD",
+                      "name": "项-/SITE-01",
+                      "width": "fill_container",
+                      "fill": "#00000000",
+                      "descendants": {
+                        "LF5Gy": {
+                          "icon": "factory",
+                          "fill": "$text-secondary"
+                        },
+                        "JmM2J": {
+                          "content": "/SITE-01",
+                          "fontFamily": "$font-mono",
+                          "fill": "$text-primary"
+                        },
+                        "yl90F": {
+                          "content": "三维视图",
+                          "fill": "$text-muted"
+                        }
+                      }
+                    },
+                    {
+                      "id": "nwIMT",
+                      "type": "ref",
+                      "ref": "L8A1HR",
+                      "name": "分隔",
+                      "width": "fill_container"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "Q6k0R0",
+                      "name": "列尾",
+                      "width": "fill_container",
+                      "padding": [
+                        4,
+                        10
+                      ],
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "d54VAq",
+                          "name": "列尾文案",
+                          "fill": "$text-muted",
+                          "content": "最多 12 条 · 栈上限 50 · 换项目重启即清空",
+                          "fontFamily": "$font-ui",
+                          "fontSize": 10,
+                          "fontWeight": "normal"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "text",
+                  "id": "GcJlL",
+                  "name": "列表注",
+                  "fill": "$text-muted",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "当前项 $accent-bg 底。当前之上是前进目标、之下是后退目标；图标用 noun_icon，名称等宽，右侧写所在页签。",
+                  "fontFamily": "$font-ui",
+                  "fontSize": 10,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "FcmyD",
+              "name": "规格",
+              "width": "fill_container",
+              "layout": "vertical",
+              "gap": 7,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "TByNK",
+                  "name": "规格题",
+                  "fill": "$text-primary",
+                  "content": "规格",
+                  "fontFamily": "$font-ui",
+                  "fontSize": 13,
+                  "fontWeight": "600"
+                },
+                {
+                  "type": "text",
+                  "id": "M1gpYN",
+                  "name": "规1",
+                  "fill": "$text-secondary",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "1. 位置：命令栏最左、「项目」之前；两枚 30×30 C/ToolBtn，间距 2；后接 8 / 1×18 $border / 8。",
+                  "fontFamily": "$font-ui",
+                  "fontSize": 11,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "text",
+                  "id": "mZ8Y2",
+                  "name": "规2",
+                  "fill": "$text-secondary",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "2. 图标：phosphor ARROW_LEFT / ARROW_RIGHT 直箭头，与撤销 / 重做的弯箭头拉开。禁用 = $text-muted，无底无描边。",
+                  "fontFamily": "$font-ui",
+                  "fontSize": 11,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "text",
+                  "id": "KCRlB",
+                  "name": "规3",
+                  "fill": "$text-secondary",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "3. 一条历史 = 选择集（含主选中）+ 相机位姿（position / rotation / focus）+ 激活页签 + 房间聚焦。",
+                  "fontFamily": "$font-ui",
+                  "fontSize": 11,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "text",
+                  "id": "n37chH",
+                  "name": "规4",
+                  "fill": "$text-secondary",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "4. 记录时机：主选中变化、聚焦一间房。与栈顶相同不记；纯转视角不记；上限 50。",
+                  "fontFamily": "$font-ui",
+                  "fontSize": 11,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "text",
+                  "id": "Qsnsa",
+                  "name": "规5",
+                  "fill": "$text-secondary",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "5. 相机记「离开那一刻」的位姿：换选中 / 后退 / 前进之前，先把当前相机写回当前条目。",
+                  "fontFamily": "$font-ui",
+                  "fontSize": 11,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "text",
+                  "id": "A0lJF",
+                  "name": "规6",
+                  "fill": "$text-secondary",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "6. 回放顺序：选中 → 树定位（展开祖先 + 滚到行）→ 页签 → 房间 → 相机 0.3s 插值（复用 Snap 动画，手势立即让位）。",
+                  "fontFamily": "$font-ui",
+                  "fontSize": 11,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "text",
+                  "id": "Uyphp",
+                  "name": "规7",
+                  "fill": "$text-secondary",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "7. 浏览器语义：后退后做新操作，前向分支截断；回放期间的选中变化不入栈。",
+                  "fontFamily": "$font-ui",
+                  "fontSize": 11,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "text",
+                  "id": "i4gok",
+                  "name": "规8",
+                  "fill": "$text-secondary",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "8. 快捷键 Alt+← / Alt+→（文本框有焦点时不吃键）；鼠标侧键 Extra1 / Extra2 同义。",
+                  "fontFamily": "$font-ui",
+                  "fontSize": 11,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "text",
+                  "id": "WPsj8",
+                  "name": "规9",
+                  "fill": "$text-secondary",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "9. hover 文案写出目标与快捷键：「后退到 /1RS03TT9204P · 属性 (Alt+←)」；栈空「没有可后退的位置」。",
+                  "fontFamily": "$font-ui",
+                  "fontSize": 11,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "text",
+                  "id": "k2E1wC",
+                  "name": "规10",
+                  "fill": "$text-secondary",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "10. 失效：换项目重启客户端即清空（ADR-0018）；取回工作后 refno 仍有效，树外元素走既有 warn 路径。",
+                  "fontFamily": "$font-ui",
+                  "fontSize": 11,
+                  "fontWeight": "normal"
+                },
+                {
+                  "type": "text",
+                  "id": "LFEHH",
+                  "name": "规11",
+                  "fill": "$text-secondary",
+                  "textGrowth": "fixed-width",
+                  "width": "fill_container",
+                  "content": "11. 代码落点：chrome.rs 按钮 + 右键列表 + 快捷键；vm.rs NavHistoryVm；main.rs 历史栈（set_selection / focus_room 两处记录）；view3d camera_pose 发布 + RestoreCamera。",
+                  "fontFamily": "$font-ui",
+                  "fontSize": 11,
+                  "fontWeight": "normal"
+                }
+              ]
             }
           ]
         }

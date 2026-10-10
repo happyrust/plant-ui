@@ -52,7 +52,7 @@ impl Theme {
 }
 
 /// 供数模式（ADR-0026）：模型树 / 属性 / 搜索 / 三维实例从哪儿读。整个接入点只认一种，
-/// 不按读面混；命令面（补齐 / 更新 / 队列）与它无关，永远走模型服务。
+/// 不按读面混；命令面（生成 / 更新 / 队列）与它无关，永远走模型服务。
 ///
 /// 落盘字面是 `service` / `store`。它住在这个 crate 里是因为设置窗要画它、接入点面板要
 /// 报它；真正按它选读面的是宿主（`plant-ui-app` 的 `read_face`）。
@@ -106,6 +106,9 @@ pub struct Settings {
     /// 绘制层不知道资产根在哪，所以这里存不了一个「默认的绝对路径」——存了也是把
     /// 宿主那一层知识抄进绘制层，换一种部署方式就对不上。
     pub mesh_dir: String,
+    /// 模型树里无名元素显示 E3D 默认全名的整条（`ZONE 4 of SITE 2`）还是短名（`ZONE 4`）。
+    /// 出厂 `false`：E3D 自己的模型树显示的就是短名。老 `settings.ron` 没这一格按出厂值。
+    pub tree_full_names: bool,
 }
 
 impl Default for Settings {
@@ -117,6 +120,7 @@ impl Default for Settings {
             data_api_url: DEFAULT_DATA_API_URL.to_owned(),
             read_face: ReadFaceKind::Service,
             mesh_dir: String::new(),
+            tree_full_names: false,
         }
     }
 }
@@ -180,6 +184,7 @@ pub fn show(ctx: &egui::Context, t: &Tokens, d: Density, state: &mut State) -> O
     let mut cancel = false;
     egui::Window::new("设置")
         .id(egui::Id::new("plant-settings-window"))
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
@@ -229,6 +234,15 @@ pub fn show(ctx: &egui::Context, t: &Tokens, d: Density, state: &mut State) -> O
                             (Density::Relaxed, "宽松 15"),
                         ],
                     );
+                },
+            );
+            setting_row(
+                ui,
+                t,
+                "无名元素显示全称",
+                "模型树里没有名字的元素默认显示 E3D 起的短名（ZONE 4）；勾上显示整条（ZONE 4 of SITE 2）",
+                |ui| {
+                    ui.checkbox(&mut state.draft.tree_full_names, "");
                 },
             );
             setting_row(

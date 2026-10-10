@@ -5,14 +5,13 @@
 //! 它不认识 SurrealDB：这一面从头到尾没有一条打库的路，`service_face_never_touches_the_store`
 //! 钉着。地址每次调用时取 `model_update_api::base_url()`，与设置窗那一格同步。
 
-use std::collections::HashSet;
 use std::sync::mpsc;
 
 use plant_ui::task_queue::DbnumReport;
 use plant_ui_data::{Attr, EleTreeNode, RefU64};
 
 use super::{Identity, ModelInstancesReq, SearchOutcome, SubtreeBounds};
-use crate::data::{Evt, RegenerateCount, SEARCH_LIMIT};
+use crate::data::{Evt, SEARCH_LIMIT};
 use crate::model_update_api::{self, ModelRecords};
 use crate::search_index::{Scope, SearchIndexState, SubstringHits};
 
@@ -96,6 +95,10 @@ impl ServiceReadFace {
         model_update_api::tree_roots(&self.base()).await
     }
 
+    pub async fn site_dbs(&self) -> anyhow::Result<Vec<(u32, String)>> {
+        model_update_api::tree_root_dbs(&self.base()).await
+    }
+
     pub async fn children(&self, refno: RefU64) -> anyhow::Result<Vec<EleTreeNode>> {
         model_update_api::tree_children(&self.base(), refno).await
     }
@@ -142,8 +145,8 @@ impl ServiceReadFace {
         ctx.request_repaint();
     }
 
-    /// 查 `generation_roots`（服务端在 ensure 时把每个范围解到精确的生成根，
-    /// `/model/records` 按它们分桶）。整批一次回，没有逐根进度可报。
+    /// 以 `scope_roots` 里的每一个为祖先问 `/model/records`（服务端按祖先回答子树里已生成
+    /// 的全部实例，gen-model ADR-086；没生成过是 200 空）。整批一次回，没有逐根进度可报。
     pub async fn model_instances(
         &self,
         req: &ModelInstancesReq<'_>,
@@ -151,46 +154,12 @@ impl ServiceReadFace {
         let identity = req.identity;
         model_update_api::model_records(
             identity.base,
-            req.generation_roots,
+            req.scope_roots,
             identity.project,
             identity.mdb,
             identity.namespace,
         )
         .await
-    }
-
-    /// 清点一批根底下已经生成过的模型。
-    ///
-    /// **只读，且必须跑在任何删除之前**：记录是从服务端的模型行数出来的，删完就查不到了，
-    /// 那时回的空集在调用方那里长得像「这里本来就没模型」。
-    ///
-    /// 多个根合成一份账。右键落在多选上时它们可能互相嵌套（选中一个 ZONE 连同它所在的
-    /// SITE），记录按序列化后的身份去重——同一台设备数两遍，确认框上那个数字就是假的。
-    /// 交付单元名词表这一面用不上：归根由服务端在 ensure 时做。
-    pub async fn regeneration_count(&self, targets: &[RefU64]) -> anyhow::Result<RegenerateCount> {
-        let base = self.base();
-        let health = model_update_api::service_health(&base).await?;
-        let mdb = health.mdb.as_deref().unwrap_or_default();
-        let namespace = health.namespace.as_deref().unwrap_or_default();
-        let mut records = HashSet::new();
-        for record in
-            model_update_api::model_records(&base, targets, &health.project, mdb, namespace)
-                .await?
-                .records
-        {
-            if let Ok(identity) = serde_json::to_string(&record) {
-                records.insert(identity);
-            }
-        }
-        let mut roots = targets.to_vec();
-        roots.sort_unstable();
-        roots.dedup();
-        Ok(RegenerateCount {
-            elements: records.len(),
-            // 服务端在 ensure 时把每个范围解到精确的生成根；这里保留选中的范围本身，
-            // 客户端不另养一份 owner / noun 的真值。
-            roots,
-        })
     }
 
     /// 这一面没有进程内缓存：每次读都是一次往返。

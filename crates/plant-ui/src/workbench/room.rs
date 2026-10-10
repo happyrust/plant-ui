@@ -36,6 +36,9 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
         // 上一份数据撑住布局防闪烁；房间是全局对象，点击动作对着房间 refno 走，
         // 不会像属性编辑那样落错元素，所以命令不拦。
         RoomVm::Loading(Some(data)) | RoomVm::Ready(data) => ready(ui, t, d, vm, data, cmds),
+        RoomVm::Unavailable(reason) => {
+            note(ui, t, d, PaneState::Uninit, ph::INFO, reason);
+        }
         RoomVm::Failed(reason) => {
             if note(ui, t, d, PaneState::Error, ph::WARNING, reason)
                 && let Some(refno) = vm.selection.primary()

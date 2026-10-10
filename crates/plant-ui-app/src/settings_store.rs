@@ -243,6 +243,7 @@ mod tests {
             data_api_url: "http://10.0.0.9:9099".into(),
             read_face: ReadFaceKind::Store,
             mesh_dir: "D:/models/meshes".into(),
+            tree_full_names: true,
         };
         let text =
             ron::ser::to_string_pretty(&settings, ron::ser::PrettyConfig::default()).unwrap();

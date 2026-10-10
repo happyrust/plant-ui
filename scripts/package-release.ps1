@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$version = "0.1.11"
+$version = "0.1.12"
 $uiRoot = Split-Path $PSScriptRoot -Parent
 $backendRoot = Join-Path (Split-Path $uiRoot -Parent) "gen-model"
 $releaseRoot = Join-Path $uiRoot "release\plant-suite-$version"
@@ -13,7 +13,7 @@ if (-not (Test-Path $backendRoot)) { throw "未找到后端工程: $backendRoot"
 
 Push-Location $uiRoot
 try {
-  cargo --config 'build.jobs=1' --config 'profile.release.opt-level=0' build -p plant-ui-app --release
+  cargo --config 'build.jobs=1' --config 'profile.release.opt-level=0' build -p rs-plant --release
   if ($LASTEXITCODE) { exit $LASTEXITCODE }
   & (Join-Path $PSScriptRoot "build-wasm.ps1")
   if ($LASTEXITCODE) { exit $LASTEXITCODE }
@@ -38,7 +38,7 @@ Copy-Item (Join-Path $backendRoot "bin") $backendRelease -Recurse
 Copy-Item (Join-Path $backendRoot "resource") $backendRelease -Recurse
 Copy-Item (Join-Path $backendRoot "rs_surreal") $backendRelease -Recurse
 Copy-Item (Join-Path $uiRoot "web\public") (Join-Path $backendRelease "web") -Recurse
-Copy-Item (Join-Path $uiTarget "release\plant-ui-app.exe") $pcRelease
+Copy-Item (Join-Path $uiTarget "release\rs-plant.exe") $pcRelease
 Copy-Item (Join-Path $uiRoot "DbOption.toml") $pcRelease
 Copy-Item (Join-Path $uiRoot "resource") $pcRelease -Recurse
 Copy-Item (Join-Path $uiRoot "web\public\assets") $pcRelease -Recurse
@@ -91,7 +91,7 @@ for ($i = 0; $i -lt 30; $i++) {
 if (-not (Test-NetConnection 127.0.0.1 -Port 8022 -InformationLevel Quiet)) { throw "模型服务未在 8022 启动" }
 
 $env:PLANT_MODEL_API_URL = "http://127.0.0.1:8022"
-Start-Process -FilePath (Join-Path $pc "plant-ui-app.exe") -WorkingDirectory $pc
+Start-Process -FilePath (Join-Path $pc "rs-plant.exe") -WorkingDirectory $pc
 Write-Host "已启动：Web http://127.0.0.1:8022，PC 客户端与本地数据库。"
 '@ | Set-Content -Encoding utf8 (Join-Path $releaseRoot "Start-Plant.ps1")
 

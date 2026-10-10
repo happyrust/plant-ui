@@ -2,6 +2,7 @@ use anyhow::Context;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -103,6 +104,59 @@ pub async fn execute(
     .await
 }
 
+/// `POST /api/v1/dbnums/{dbnum}/model/rebuild` 的 202 回执（gen-model spec §4.5.1；
+/// `model_rebuild.rs::ModelRebuildReceipt`）。同库已有在飞重建时服务端回同一个 `task_id`。
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ModelRebuildReceipt {
+    pub task_id: String,
+    pub dbnum: u32,
+    /// 应重算的生成根数——服务端开工时数出来的，比 `/dbnums` 四格拼的粗和准；界面上以它为准。
+    #[serde(default)]
+    pub expected_roots: usize,
+    /// 开工时作废掉的陈旧增量行数（R6）。老服务端不给，缺省 0。
+    #[serde(default)]
+    pub discarded_pending: u64,
+    #[serde(default)]
+    pub state: String,
+}
+
+impl ModelRebuildReceipt {
+    /// 日志那一行。
+    pub fn summary(&self) -> String {
+        let mut line = format!(
+            "已提交重算模型（整库）db{}：任务 {}，应重算 {} 根",
+            self.dbnum, self.task_id, self.expected_roots
+        );
+        if self.discarded_pending > 0 {
+            line.push_str(&format!("，作废旧增量行 {} 条", self.discarded_pending));
+        }
+        line.push_str("；进度看任务队列里它那一行");
+        line
+    }
+}
+
+/// 整库模型重建：把该库全部权威生成根投进模型队列重算（2026-09-10 重新计算计划 R1）。
+///
+/// 不改数据水位、不预删旧模型；重建期间同库 `model/generate` 回 409。`watch_scope` 外 400；
+/// 服务端 `model_full_rebuild_enabled=false` 时同样是一条失败包封（message 原文带那个键名，
+/// 界面照 `code` 分型、原文进日志，不解析它）。两代并存：老服务端没这条路由 → 404，
+/// 调用方按「这一档服务端没有」处理，不重试。
+pub async fn model_rebuild(
+    base: &str,
+    project: &str,
+    mdb: &str,
+    namespace: &str,
+    dbnum: u32,
+) -> anyhow::Result<ModelRebuildReceipt> {
+    post(
+        base,
+        &format!("/api/v1/dbnums/{dbnum}/model/rebuild"),
+        serde_json::json!({ "project": project, "mdb": mdb, "namespace": namespace }).to_string(),
+        Duration::from_secs(60),
+    )
+    .await
+}
+
 #[derive(Debug, Deserialize)]
 pub struct QueryReply {
     pub tool: String,
@@ -146,6 +200,25 @@ struct TreeAncestorsReply {
     refnos: Vec<aios_core::RefnoEnum>,
 }
 
+/// `/tree/roots` 的另一种读法：节点连同服务端外包的库号，见 [`tree_root_dbs`]。
+#[derive(Debug, Deserialize)]
+struct TreeRootDbReply {
+    source: String,
+    #[serde(default)]
+    nodes: Vec<TreeRootDb>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TreeRootDb {
+    /// 整个节点也要解出来：名字得先过 [`fill_legacy_default_names`]，那一道要 noun 与 owner。
+    #[serde(flatten)]
+    node: aios_core::pdms_types::EleTreeNode,
+    /// 老服务端不注这一格；新服务端答不出库号时给 `null`（spec §4.10）。两种都是
+    /// 「说不出它属于哪个库」，调用方按「没有」处理。
+    #[serde(default)]
+    dbnum: Option<u32>,
+}
+
 fn require_direct(source: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         source == "direct",
@@ -154,10 +227,67 @@ fn require_direct(source: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 2026-09-20 之前的模型服务不给无名元素起名：节点的 `name` 回的是 noun 本身（`SITE`），
+/// 也不带 `short_name`，树上那一行就只剩类型、没有名字（gen-model `web-service-api.md`
+/// §4.10）。对着这一档服务端，客户端按 E3D 的规矩补短名 `<名词全词> <同名词序号>`
+/// （`SITE 10`、`ZONE 4`、`ELBOW 1`）：序号沿同一属主的成员原序数，有名字的兄弟也占号
+/// ——与新服务端（e3d-io `element_name`）、库供数（`aios_core::e3d_full_name`）同一套规则。
+///
+/// 只补得出短形态。整条 `FLNM` 要属主链上各级的名字，这一档 `/tree/*` 一个都不给，所以
+/// `name` 也落短名：「显示全称」对着老服务端显示的就是短名，悬停不挂。根层不受这一限：
+/// SITE 直接挂在 WORLD（库根，不进名字）下，短名就是全名。
+///
+/// `nodes` 必须是服务端回的整批——`/tree/children` 的整张成员表，或 `/tree/roots` 的整张
+/// SITE 表（按 `owner` 分开数，一个 WORLD 一套序号）；少一个兄弟，后面的序号全错一位。
+/// 带 `short_name` 的节点（新服务端）与有名字的节点原样不动。
+fn fill_legacy_default_names(nodes: &mut [aios_core::pdms_types::EleTreeNode]) {
+    let mut ordinals: HashMap<(aios_core::RefnoEnum, String), usize> = HashMap::new();
+    for node in nodes {
+        let ordinal = ordinals.entry((node.owner, node.noun.clone())).or_default();
+        *ordinal += 1;
+        let name = node.name.trim();
+        let unnamed = name.is_empty() || name == node.noun.trim();
+        if node.short_name.is_none() && unnamed {
+            let short = aios_core::e3d_full_name::with_tail(&node.noun, *ordinal, "");
+            node.name.clone_from(&short);
+            node.short_name = Some(short);
+        }
+    }
+}
+
 pub async fn tree_roots(base: &str) -> anyhow::Result<Vec<aios_core::pdms_types::EleTreeNode>> {
-    let reply: TreeNodesReply = get(base, "/api/v1/tree/roots").await?;
+    let mut reply: TreeNodesReply = get(base, "/api/v1/tree/roots").await?;
     require_direct(&reply.source)?;
+    fill_legacy_default_names(&mut reply.nodes);
     Ok(reply.nodes)
+}
+
+/// 根层每个 SITE 连同它所在的库号。
+///
+/// `EleTreeNode` 里没有库号那一格，而 `/tree/roots` 的每个节点上服务端另外注了一个
+/// `dbnum`（gen-model `handlers.rs::tree_nodes_with_dbnum`）——[`tree_roots`] 按
+/// `EleTreeNode` 反序列化，那一格就被丢掉了。模型更新面板要靠它认库，所以这里重解一遍
+/// 同一份回执，最后只交出「库号 + SITE 名」两格。
+pub async fn tree_root_dbs(base: &str) -> anyhow::Result<Vec<(u32, String)>> {
+    let reply: TreeRootDbReply = get(base, "/api/v1/tree/roots").await?;
+    require_direct(&reply.source)?;
+    Ok(root_dbs(reply.nodes))
+}
+
+/// [`tree_root_dbs`] 的纯函数那一半。名字与树上那一行过同一道补名，面板里的 SITE 名
+/// 才与树上一字不差。
+fn root_dbs(rows: Vec<TreeRootDb>) -> Vec<(u32, String)> {
+    let (mut nodes, dbnums): (Vec<_>, Vec<_>) =
+        rows.into_iter().map(|row| (row.node, row.dbnum)).unzip();
+    fill_legacy_default_names(&mut nodes);
+    nodes
+        .into_iter()
+        .zip(dbnums)
+        .filter_map(|(node, dbnum)| match dbnum {
+            Some(dbnum) if dbnum != 0 && !node.name.is_empty() => Some((dbnum, node.name)),
+            _ => None,
+        })
+        .collect()
 }
 
 pub async fn tree_children(
@@ -168,8 +298,9 @@ pub async fn tree_children(
         "/api/v1/tree/children?refno={}",
         urlencode(&refno.to_slash_string())
     );
-    let reply: TreeNodesReply = get(base, &path).await?;
+    let mut reply: TreeNodesReply = get(base, &path).await?;
     require_direct(&reply.source)?;
+    fill_legacy_default_names(&mut reply.nodes);
     Ok(reply.nodes)
 }
 
@@ -423,6 +554,13 @@ pub async fn poll_queue(base: &str) -> anyhow::Result<Poll> {
 /// 超时、500、连不上都不算——那些是「暂时看不见」，界面该沿用上一份快照。
 /// 判据与 `element_attributes` 那条老服务端探测同一把尺子（本文件上方）。
 fn pending_endpoint_retired(error: &anyhow::Error) -> bool {
+    endpoint_missing(error)
+}
+
+/// 「这一档服务端没有这条路由」（404 / 405 / `not_found`）。两代服务端并存的通用判法
+/// （ADR-0027）：欠账表退役、整库重建 / 房间重算 / 重新解析三条新口在老服务端上缺席，
+/// 界面都按「服务端没给」整格降级，不重试、不当成故障。
+pub fn endpoint_missing(error: &anyhow::Error) -> bool {
     let failure = failure_of(error);
     failure.code == "not_found"
         || failure.message.contains("HTTP 404")
@@ -479,45 +617,14 @@ pub async fn retry_pending_unit(
     Ok(())
 }
 
-/// 删掉一个 refno **精确子树**下已经生成的模型数据。
+/// `POST /api/v1/model/generate` 的回执状态。
 ///
-/// `confirm` 服务端强制要求等于 `refno`，不等就是 400——这个接口不接受随手一点。
-/// 它删的是产物不是本体：`pe` 一行不动，删完那片元素在三维里就是「未加载」。
-///
-/// 容器也删得动（`WORL / SITE / ZONE` 在这里不受限，那道门只挡生成根），
-/// 所以「整片删一次」只需要对右键那一行调一次。
-pub async fn delete_model_subtree(
-    base: &str,
-    refno: &str,
-    project: &str,
-    mdb: &str,
-    namespace: &str,
-) -> anyhow::Result<()> {
-    let query = format!(
-        "refno={}&confirm={}&project={}&mdb={}&namespace={}",
-        urlencode(refno),
-        urlencode(refno),
-        urlencode(project),
-        urlencode(mdb),
-        urlencode(namespace),
-    );
-    let _: serde_json::Value = delete(
-        base,
-        &format!("/api/v1/model/subtree?{query}"),
-        Duration::from_secs(300),
-    )
-    .await?;
-    Ok(())
-}
-
-/// `POST /api/v1/model/ensure` 的回执状态。
-///
-/// 四档对界面是四件不同的事，别压成一个布尔：`Generated` 是真做了一趟，
-/// `AlreadyAvailable` 是同根的活刚被别的元素触发过（这正是删除之后靠
-/// `force:false` 拿到的免费去重），`NoRenderableGeometry` 是这一片本来就没有
-/// 可画的东西——它不是失败，重试一百遍还是同一个结果。
+/// 三档对界面是三件不同的事，别压成一个布尔：`Generated` 是真做了一趟，
+/// `AlreadyAvailable` 是凭证当前的根直接命中（右键 `force = true` 时不会出现），
+/// `NoRenderableGeometry` 是这一片本来就没有可画的东西——它不是失败，重试一百遍
+/// 还是同一个结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EnsureStatus {
+pub enum GenerateStatus {
     Generated,
     AlreadyAvailable,
     NoRenderableGeometry,
@@ -526,11 +633,11 @@ pub enum EnsureStatus {
 }
 
 #[derive(Debug, Clone)]
-pub struct EnsureReply {
-    pub status: EnsureStatus,
-    /// 服务端解出来的生成根。客户端归根算错时，这一份是唯一的对照物。
+pub struct GenerateReply {
+    pub status: GenerateStatus,
+    /// 服务端解出来的生成根（请求的 refno 自己是生成根时就是它）。只进日志：客户端不拿
+    /// 根清单去查显示——显示按祖先查（ADR-0030 D1），回执里的 `generation_roots[]` 不收。
     pub generation_root: String,
-    pub generation_roots: Vec<String>,
     pub model_available: bool,
     pub generation_root_count: usize,
     pub cached_root_count: usize,
@@ -541,9 +648,12 @@ pub struct EnsureReply {
     pub model_source: Option<ModelSource>,
     /// `memory` 的理由（`initialization_publishing` / `data_watermark_unestablished` / `read-through`）。
     pub model_source_reason: Option<String>,
+    /// 这一发是退回旧路径 `/api/v1/model/ensure` 才成的（服务端还没有 `/model/generate`，
+    /// ADR-0030 后果 7）。日志据此点名一次「模型服务是旧版」。
+    pub legacy_endpoint: bool,
 }
 
-impl EnsureReply {
+impl GenerateReply {
     /// 日志里跟在计数后面的那半句。只有「内存」值得说：人得知道现在看到的是 API 现算的、
     /// 翻面后同一版会从 rocksdb 读出来；「数据库」是常态，不出声。
     pub fn source_note(&self) -> Option<String> {
@@ -560,13 +670,11 @@ impl EnsureReply {
 }
 
 #[derive(Deserialize)]
-struct EnsureBody {
+struct GenerateBody {
     #[serde(default)]
     status: String,
     #[serde(default)]
     generation_root: String,
-    #[serde(default)]
-    generation_roots: Vec<String>,
     #[serde(default)]
     model_available: bool,
     #[serde(default)]
@@ -581,46 +689,59 @@ struct EnsureBody {
     model_source_reason: Option<String>,
 }
 
-/// 让一个 refno 有可渲染模型。`force` 只在人明确要求「无论如何重跑一遍」时为真。
+/// 生成接口的新名（gen-model ADR-086 D4）。老服务端只有旧名，404 时退回它（ADR-0030 后果 7）。
+const GENERATE_PATH: &str = "/api/v1/model/generate";
+/// 旧名。**只在 404 回退分支里出现**——源码钉 `no_ensure_left_outside_the_fallback`。
+const LEGACY_GENERATE_PATH: &str = "/api/v1/model/ensure";
+
+/// 对一个节点范围生成模型（`POST /api/v1/model/generate`，ADR-0030 D2）：服务端自己解根、
+/// 删旧、重算，客户端只说「生成这个范围」。`force = true` 是右键「重新生成模型」——范围内
+/// 已有的产物一律重算替换；`force = false` 时凭证当前的根直接回 `AlreadyAvailable`。
 ///
-/// **重新生成走的是 `force = false`**：删除已经把这一片清空了，第一个元素触发
-/// 真生成，同根后面的元素读到 `renderable > 0` 直接回 `AlreadyAvailable`——
-/// 去重是服务端免费给的，客户端不必自己裁剪嵌套单元。
+/// **显示路径不调它**（ADR-0030 D1）：眼睛 / 聚焦 / 房间模型 / 取回工作都只按祖先查
+/// `/model/records`。生成只有这一个入口。
+///
+/// 新客户端对老服务端：`/model/generate` 还没有（404 / 405）就用同一个请求体退回
+/// `/model/ensure`，回执带 `legacy_endpoint = true` 供日志点名一次。
 ///
 /// 超时给到 125 秒，比服务端那道 120 秒稍长：让服务端的超时语义先生效
 /// （它回 504 并说明后台继续跑），而不是客户端先把连接掐掉、什么都不知道。
-pub async fn ensure_model(
+pub async fn generate_model(
     base: &str,
     refno: &str,
     force: bool,
     project: &str,
     mdb: &str,
     namespace: &str,
-) -> anyhow::Result<EnsureReply> {
+) -> anyhow::Result<GenerateReply> {
     let body = serde_json::json!({
         "refno": refno,
         "force": force,
         "project": project,
         "mdb": mdb,
         "namespace": namespace,
-    });
-    let reply: EnsureBody = post(
-        base,
-        "/api/v1/model/ensure",
-        body.to_string(),
-        Duration::from_secs(125),
-    )
-    .await?;
-    Ok(EnsureReply {
-        status: ensure_status(&reply.status),
+    })
+    .to_string();
+    let timeout = Duration::from_secs(125);
+    let (reply, legacy_endpoint): (GenerateBody, bool) =
+        match post(base, GENERATE_PATH, body.clone(), timeout).await {
+            Ok(reply) => (reply, false),
+            // 老服务端没有这条路由：同一请求体退回旧名（ADR-0030 后果 7）。
+            Err(error) if endpoint_missing(&error) => {
+                (post(base, LEGACY_GENERATE_PATH, body, timeout).await?, true)
+            }
+            Err(error) => return Err(error),
+        };
+    Ok(GenerateReply {
+        status: generate_status(&reply.status),
         generation_root: reply.generation_root,
-        generation_roots: reply.generation_roots,
         model_available: reply.model_available,
         generation_root_count: reply.generation_root_count,
         cached_root_count: reply.cached_root_count,
         generated_root_count: reply.generated_root_count,
         model_source: reply.model_source.as_deref().and_then(ModelSource::parse),
         model_source_reason: reply.model_source_reason,
+        legacy_endpoint,
     })
 }
 
@@ -755,12 +876,12 @@ pub async fn model_records(
     })
 }
 
-fn ensure_status(raw: &str) -> EnsureStatus {
+fn generate_status(raw: &str) -> GenerateStatus {
     match raw {
-        "generated" | "Generated" => EnsureStatus::Generated,
-        "already_available" | "AlreadyAvailable" => EnsureStatus::AlreadyAvailable,
-        "no_renderable_geometry" | "NoRenderableGeometry" => EnsureStatus::NoRenderableGeometry,
-        _ => EnsureStatus::Unknown,
+        "generated" | "Generated" => GenerateStatus::Generated,
+        "already_available" | "AlreadyAvailable" => GenerateStatus::AlreadyAvailable,
+        "no_renderable_geometry" | "NoRenderableGeometry" => GenerateStatus::NoRenderableGeometry,
+        _ => GenerateStatus::Unknown,
     }
 }
 
@@ -782,23 +903,6 @@ fn urlencode(value: &str) -> String {
 async fn get<T: DeserializeOwned>(base: &str, path: &str) -> anyhow::Result<T> {
     let mut req = ehttp::Request::get(format!("{base}{path}"));
     req.timeout = Some(Duration::from_secs(15));
-    let response = ehttp::fetch_async(req)
-        .await
-        .map_err(transport)
-        .context("请求模型服务失败")?;
-    request(response)
-}
-
-/// `ehttp` 只给了 get / post / head 三个构造器，DELETE 自己改 `method`。
-/// 服务端那条路由把参数全放在 query 串里，所以不带请求体。
-async fn delete<T: DeserializeOwned>(
-    base: &str,
-    path: &str,
-    timeout: Duration,
-) -> anyhow::Result<T> {
-    let mut req = ehttp::Request::get(format!("{base}{path}"));
-    req.method = ehttp::Method::DELETE;
-    req.timeout = Some(timeout);
     let response = ehttp::fetch_async(req)
         .await
         .map_err(transport)
@@ -964,34 +1068,96 @@ mod tests {
         );
     }
 
-    /// `DELETE /model/subtree` 的 `confirm` 必须与 `refno` 逐字相同，且 `/`
-    /// 要转义——服务端拿它当「你确实想删这一个」的凭据，不等就是 400。
+    /// query 串里的 refno 带 `/`、MDB 带 `/`，百分号转义要对——服务端按原文比对。
     #[test]
-    fn the_delete_confirm_matches_the_refno_after_escaping() {
+    fn urlencode_escapes_slashes_and_keeps_plain_names() {
         assert_eq!(urlencode("24381/100677"), "24381%2F100677");
         assert_eq!(urlencode("/ALL"), "%2FALL");
         assert_eq!(urlencode("ProjAMS"), "ProjAMS");
-
-        let refno = "24381/100677";
-        let query = format!("refno={}&confirm={}", urlencode(refno), urlencode(refno));
-        assert_eq!(query, "refno=24381%2F100677&confirm=24381%2F100677");
     }
 
-    /// ensure 的四档状态对界面是四件不同的事，压成布尔就分不出「重做过了」与
-    /// 「同根刚被别人做过」——后者正是删除之后 `force:false` 拿到的免费去重。
+    /// generate 的四档状态对界面是四件不同的事，压成布尔就分不出「重做过了」与
+    /// 「凭证当前直接命中」。
     #[test]
-    fn ensure_status_keeps_the_four_outcomes_apart() {
-        assert_eq!(ensure_status("generated"), EnsureStatus::Generated);
+    fn generate_status_keeps_the_four_outcomes_apart() {
+        assert_eq!(generate_status("generated"), GenerateStatus::Generated);
         assert_eq!(
-            ensure_status("already_available"),
-            EnsureStatus::AlreadyAvailable
+            generate_status("already_available"),
+            GenerateStatus::AlreadyAvailable
         );
         assert_eq!(
-            ensure_status("no_renderable_geometry"),
-            EnsureStatus::NoRenderableGeometry
+            generate_status("no_renderable_geometry"),
+            GenerateStatus::NoRenderableGeometry
         );
         // 服务端换名字不许静默当成成功的那一档：它要能在日志里被点名。
-        assert_eq!(ensure_status("brand_new_state"), EnsureStatus::Unknown);
+        assert_eq!(generate_status("brand_new_state"), GenerateStatus::Unknown);
+    }
+
+    /// ADR-0030 实施约束 6：源码里不再有 ensure——`ensure_model` / `EnsureReply` / `EnsureStatus` 一个不留，
+    /// `/api/v1/model/ensure` 只允许出现在 [`generate_model`] 的 404 回退分支（那一个常量）里。
+    /// 新名 `/api/v1/model/generate` 也只有那一个常量在打，显示路径（`data.rs` / `main.rs`）谁都不打。
+    #[test]
+    fn no_ensure_left_outside_the_fallback() {
+        // 只看非测试部分：测试自己要写这些字面值当禁单。第一处 `mod tests {` 就是测试模块的头
+        // （`rfind` 会撞上本测试里的这个字面值）。
+        fn non_test(source: &str) -> &str {
+            source
+                .find("mod tests {")
+                .map_or(source, |at| &source[..at])
+        }
+        let api_body = non_test(include_str!("model_update_api.rs"));
+        assert_eq!(
+            api_body.matches("\"/api/v1/model/ensure\"").count(),
+            1,
+            "旧路径只许在 LEGACY_GENERATE_PATH 那一个常量里出现"
+        );
+        assert_eq!(api_body.matches("\"/api/v1/model/generate\"").count(), 1);
+        let fallback = api_body
+            .split_once("match post(base, GENERATE_PATH, body.clone(), timeout).await {")
+            .expect("先打新名")
+            .1;
+        assert!(
+            fallback.contains("Err(error) if endpoint_missing(&error) =>")
+                && fallback.contains("LEGACY_GENERATE_PATH"),
+            "404 / 405 才退回旧名，同一请求体"
+        );
+        for (name, source) in [
+            ("model_update_api.rs", api_body),
+            ("data.rs", non_test(include_str!("data.rs"))),
+            ("main.rs", non_test(include_str!("main.rs"))),
+            ("sim.rs", non_test(include_str!("sim.rs"))),
+            (
+                "read_face/mod.rs",
+                non_test(include_str!("read_face/mod.rs")),
+            ),
+            (
+                "read_face/service.rs",
+                non_test(include_str!("read_face/service.rs")),
+            ),
+            (
+                "read_face/store.rs",
+                non_test(include_str!("read_face/store.rs")),
+            ),
+        ] {
+            for forbidden in [
+                "ensure_model",
+                "EnsureReply",
+                "EnsureStatus",
+                "ensure_status",
+            ] {
+                assert!(
+                    !source.contains(forbidden),
+                    "{name} 还在说 ensure：{forbidden}"
+                );
+            }
+            if name != "model_update_api.rs" {
+                assert!(
+                    !source.contains("/api/v1/model/ensure")
+                        && !source.contains("/api/v1/model/generate"),
+                    "{name} 不许直接打生成接口的路径"
+                );
+            }
+        }
     }
 
     /// 欠账端点的三种答案要分得开：取到了、**服务端没有这一档**、暂时取不到。
@@ -1101,5 +1267,105 @@ mod tests {
         // （都并进了既有排队行，或者水位本来就最新），那不是契约缺字段。
         let idle = serde_json::from_str::<Enqueued>("{}").expect("空回执合法");
         assert!(idle.enqueued.is_empty());
+    }
+
+    /// 2026-09-20 之前的模型服务给无名元素的 `name` 是 noun 本身、不带 `short_name`，
+    /// 树上那一行就只剩一个 `SITE`。客户端照 E3D 的规矩补短名：序号按属主分开数、只数
+    /// 同名词、有名字的兄弟也占号；名词印全词（`ELBO` → `ELBOW`）。
+    #[test]
+    fn a_legacy_service_gets_e3d_short_names_for_unnamed_nodes() {
+        let mut roots: TreeNodesReply = serde_json::from_str(
+            r#"{"source":"direct","nodes":[
+                {"refno":"24381_2","noun":"SITE","name":"/1RB-CIVI","owner":"24381_1","children_count":3,"dbnum":7997},
+                {"refno":"24381_5","noun":"SITE","name":"SITE","owner":"24381_1","children_count":1,"dbnum":7997},
+                {"refno":"14195_2","noun":"SITE","name":"SITE","owner":"14195_1","children_count":1,"dbnum":6003},
+                {"refno":"24381_9","noun":"SITE","name":"SITE","owner":"24381_1","children_count":0,"dbnum":7997}
+            ]}"#,
+        )
+        .unwrap();
+        fill_legacy_default_names(&mut roots.nodes);
+        let names: Vec<(&str, Option<&str>)> = roots
+            .nodes
+            .iter()
+            .map(|node| (node.name.as_str(), node.short_name.as_deref()))
+            .collect();
+        // 一个 WORLD 一套序号：6003 那只是它自己 WORLD 下的第一个，不接着 7997 往下数。
+        // 根层短名就是全名（WORLD 不进名字），两格相同。
+        assert_eq!(
+            names,
+            [
+                ("/1RB-CIVI", None),
+                ("SITE 2", Some("SITE 2")),
+                ("SITE 1", Some("SITE 1")),
+                ("SITE 3", Some("SITE 3")),
+            ]
+        );
+
+        let mut children: TreeNodesReply = serde_json::from_str(
+            r#"{"source":"direct","parent":"24383_73930","nodes":[
+                {"refno":"24383_73931","noun":"ATTA","name":"/1RCV-ATTA-1","owner":"24383_73930","children_count":0},
+                {"refno":"24383_73932","noun":"ELBO","name":"ELBO","owner":"24383_73930","children_count":0},
+                {"refno":"24383_73933","noun":"ATTA","name":"ATTA","owner":"24383_73930","children_count":0},
+                {"refno":"24383_73934","noun":"WELD","name":"","owner":"24383_73930","children_count":0},
+                {"refno":"24383_73935","noun":"ELBO","name":"ELBO","owner":"24383_73930","children_count":0}
+            ]}"#,
+        )
+        .unwrap();
+        fill_legacy_default_names(&mut children.nodes);
+        let names: Vec<&str> = children
+            .nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "/1RCV-ATTA-1",
+                "ELBOW 1",
+                "ATTACHMENT 2",
+                "WELD 1",
+                "ELBOW 2"
+            ]
+        );
+    }
+
+    /// 新服务端每个节点都带 `short_name`（有名的与 `name` 相同）：一格都不动，
+    /// 整条 `FLNM` 原样留给「显示全称」和悬停。
+    #[test]
+    fn a_current_service_keeps_its_own_names() {
+        let mut reply: TreeNodesReply = serde_json::from_str(
+            r#"{"source":"direct","nodes":[
+                {"refno":"24381_7","noun":"ZONE","name":"ZONE 4 of SITE 2","short_name":"ZONE 4","stored_name":null,"owner":"24381_5","children_count":2,"dbnum":7997},
+                {"refno":"24381_8","noun":"ZONE","name":"/Z-A","short_name":"/Z-A","stored_name":"/Z-A","owner":"24381_5","children_count":0,"dbnum":7997}
+            ]}"#,
+        )
+        .unwrap();
+        fill_legacy_default_names(&mut reply.nodes);
+        assert_eq!(reply.nodes[0].name, "ZONE 4 of SITE 2");
+        assert_eq!(reply.nodes[0].short_name.as_deref(), Some("ZONE 4"));
+        assert_eq!(reply.nodes[1].name, "/Z-A");
+        assert_eq!(reply.nodes[1].short_name.as_deref(), Some("/Z-A"));
+    }
+
+    /// 模型更新面板的 SITE 名与树上那一行过同一道补名。说不出库号的（老服务端不注、
+    /// 新服务端给 `null`）只是那一行不收——`null` 不许让整份根层回执解不动。
+    #[test]
+    fn root_dbs_share_the_tree_names_and_skip_unknown_databases() {
+        let reply: TreeRootDbReply = serde_json::from_str(
+            r#"{"source":"direct","nodes":[
+                {"refno":"24381_2","noun":"SITE","name":"/1RB-CIVI","owner":"24381_1","children_count":3,"dbnum":7997},
+                {"refno":"24381_5","noun":"SITE","name":"SITE","owner":"24381_1","children_count":1,"dbnum":7997},
+                {"refno":"9304_2","noun":"SITE","name":"/1RS-CIVI","owner":"9304_1","children_count":1,"dbnum":null},
+                {"refno":"15201_535","noun":"SITE","name":"SITE","owner":"15201_1","children_count":1}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            root_dbs(reply.nodes),
+            [
+                (7997, "/1RB-CIVI".to_string()),
+                (7997, "SITE 2".to_string())
+            ]
+        );
     }
 }

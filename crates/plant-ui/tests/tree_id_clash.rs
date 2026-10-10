@@ -41,6 +41,7 @@ fn row(refno: u64, depth: u16, name: &str, noun: &str, expandable: Option<bool>)
         refno: RefU64(refno),
         depth,
         name: name.to_owned(),
+        full_name: name.to_owned(),
         noun: noun.to_owned(),
         expandable,
         loading: false,

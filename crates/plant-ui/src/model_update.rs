@@ -12,7 +12,7 @@
 //! 逐项出处见 `design/MODEL-UPDATE-FIELD-MAP.md`。分组一律按 dbnum——它既是执行边界，
 //! 也是任务队列的键（`docs/adr/0011`）。
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 use web_time::{Duration, Instant};
 
@@ -27,7 +27,7 @@ use crate::style::group_number;
 use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Status, Tokens, radius};
 use crate::style::widgets;
-use crate::task_queue::DbnumStatus;
+use crate::task_queue::{ActiveTask, DbnumStatus, Verdict};
 use crate::{Cmd, RefU64};
 
 // ================================================================ 预览契约
@@ -1428,6 +1428,148 @@ impl Step {
     }
 }
 
+/// 本窗的两页。「增量更新」是原来的两步向导；「库状态」是 `/dbnums` 那张表的逐库
+/// 状态详情——两枚水位、模型来源、一致性判决、异常与范围，一行一库。它只读、不发
+/// 请求：材料就是任务队列每一拍轮询回来的那份，与队列面板库行、读透专态范围行同源。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Tab {
+    #[default]
+    Update,
+    Dbnums,
+}
+
+/// 「库状态」页的筛选档。搜索框在场时不受它限制（与队列面板同一条规矩：搜一个库
+/// 却搜不到，会让人以为它不在表里）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DbnumFilter {
+    #[default]
+    All,
+    /// 本期执行范围之内的设计库（排除 / 够不着 / 阻断都不算）。
+    InScope,
+    /// 范围内有一枚水位没追平文件的：数据水位落后、尚未建立，或服务端判模型水位落后。
+    Behind,
+    /// 带文件异常、阻断，或文件回退到数据水位之下的。
+    Trouble,
+}
+
+impl DbnumFilter {
+    const ALL: [DbnumFilter; 4] = [
+        DbnumFilter::All,
+        DbnumFilter::InScope,
+        DbnumFilter::Behind,
+        DbnumFilter::Trouble,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "全部",
+            Self::InScope => "在范围",
+            Self::Behind => "落后",
+            Self::Trouble => "异常",
+        }
+    }
+
+    fn keeps(self, db: &DbnumStatus, scope: Scope, read_through: bool) -> bool {
+        match self {
+            Self::All => true,
+            Self::InScope => scope == Scope::InScope,
+            Self::Behind => {
+                scope == Scope::InScope
+                    && (data_lag(db, read_through).behind()
+                        || db.verdict() == Some(Verdict::Lagging))
+            }
+            Self::Trouble => {
+                db.anomaly.is_some()
+                    || db.blocked
+                    || data_lag(db, read_through) == DataLag::RolledBack
+            }
+        }
+    }
+}
+
+/// 一个库对本期执行范围的关系。四档互斥，顺序即优先级，与读透专态的范围行
+/// （[`read_through_scope`]）和队列面板「本期不执行」同一套口径：排除（非设计库、或
+/// 不在当前 MDB 声明的名单里）→ 够不着（声明了、当前项目目录里没有文件）→ 阻断 → 在范围。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Scope {
+    InScope,
+    Blocked,
+    NotInProject,
+    Excluded,
+}
+
+impl Scope {
+    fn of(db: &DbnumStatus) -> Self {
+        let design = ["DESI", "ISOD"]
+            .iter()
+            .any(|kind| db.db_type.trim().eq_ignore_ascii_case(kind));
+        if db.excluded || !design {
+            Self::Excluded
+        } else if db.not_in_project {
+            Self::NotInProject
+        } else if db.blocked {
+            Self::Blocked
+        } else {
+            Self::InScope
+        }
+    }
+
+    /// 范围那一格的标签。三个词分开摆：阻断是出事了、排除是本来就不在范围里、
+    /// 够不着是范围里但这次碰不到它。
+    fn tag(self) -> &'static str {
+        match self {
+            Self::InScope => "在范围",
+            Self::Blocked => "阻断",
+            Self::NotInProject => "够不着",
+            Self::Excluded => "排除",
+        }
+    }
+
+    fn tone(self) -> Status {
+        match self {
+            Self::InScope => Status::Info,
+            Self::Blocked => Status::Error,
+            Self::NotInProject | Self::Excluded => Status::Neutral,
+        }
+    }
+}
+
+/// 数据水位对文件最新的关系，按 `/dbnums` 的 `applied_sesno` / `file_latest_sesno` /
+/// `initialized` 算——这是本地可算的量（两枚会话号相减），不是判决；模型水位那一枚
+/// 由服务端三态判，不在这里。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DataLag {
+    /// 读透形态：数据水位**按设计**不建立，不是落后（`task_queue::Vm::watermark_lag` 同一口径）。
+    NotKept,
+    /// 尚无数据水位（从未导入）。`file_latest − applied` 在它身上是整库会话数，不许说成「落后 N 次」。
+    Unestablished,
+    /// 文件比数据水位多出 N 次保存。
+    Behind(i32),
+    UpToDate,
+    /// 文件最新早于数据水位：文件被换回了旧版本。水位只前进不后退。
+    RolledBack,
+}
+
+impl DataLag {
+    fn behind(self) -> bool {
+        matches!(self, Self::Behind(_) | Self::Unestablished)
+    }
+}
+
+fn data_lag(db: &DbnumStatus, read_through: bool) -> DataLag {
+    if read_through {
+        return DataLag::NotKept;
+    }
+    if !db.initialized || db.applied_sesno <= 0 {
+        return DataLag::Unestablished;
+    }
+    match db.file_latest_sesno - db.applied_sesno {
+        0 => DataLag::UpToDate,
+        n if n > 0 => DataLag::Behind(n),
+        _ => DataLag::RolledBack,
+    }
+}
+
 /// 缓存的上一份预览。S2-A 的等待态摆它的过期摘要；标题栏在 Idle / Loading /
 /// Failed 时靠它报项目名。
 struct Cached {
@@ -1468,8 +1610,22 @@ pub struct State {
     /// 两态、没有半选，所以状态天然按库记，不按 SITE 记。
     unchecked: HashSet<u32>,
     only_model_affecting: bool,
+    /// 「显示 SITE」那一档：库行末尾多画一列该库的 SITE 名单。
+    ///
+    /// 库号与文件名认不出人来（`ams7324_0001` 是哪一摊活？），SITE 名认得出——
+    /// 但**不唯一**：AMS 的 MDS 元件家族里四个库都叫 `/MDS/TEMPLATES`。所以它是
+    /// 补一列、不是换掉库号那一格。
+    show_sites: bool,
+    /// 每个库的 SITE 名单（宿主在连库时从根层取回，见 `ReadFace::site_dbs`）。
+    /// 空表 = 这一面说不出库号（库供数），那一列整列不画。
+    pub site_names: BTreeMap<u32, Vec<String>>,
     /// internal 那一类失败的原始 message，默认折起。
     detail_open: bool,
+    /// 当前在哪一页。预览刷新、窗口开合都不动它——人切到「库状态」是为了盯着看，
+    /// 每一拍轮询把他弹回向导等于没法看。
+    pub tab: Tab,
+    dbnum_filter: DbnumFilter,
+    dbnum_search: String,
 }
 
 impl State {
@@ -1516,6 +1672,21 @@ impl State {
         if !self.unchecked.remove(&dbnum) {
             self.unchecked.insert(dbnum);
         }
+    }
+
+    /// 库行上那一列 SITE 名。这一档关着、或这个库说不出 SITE 时是空串，
+    /// 而空串在 [`row`] 里一格宽度都不占。
+    ///
+    /// 「说不出」有三种，这一列不替它们分辨（分辨在别的格上）：文件不在当前项目
+    /// 目录里、库里压根没有 SITE、以及库供数下整面都给不出库号。
+    fn site_column(&self, dbnum: u32) -> String {
+        if !self.show_sites {
+            return String::new();
+        }
+        self.site_names
+            .get(&dbnum)
+            .map(|names| names.join("、"))
+            .unwrap_or_default()
     }
 
     /// 勾选集折算成 execute 请求的 `dbnums[]`（ADR-020）：勾中的可执行库号，
@@ -1584,6 +1755,11 @@ fn selection(preview: &Preview, state: &State) -> Selection {
 /// `execution_blocked` 是「执行请求此刻为什么会白点」（`task_queue::Vm::execution_blocked_reason`）：
 /// `Some` 时「开始更新」与「确认并开始」灰掉并把原因摆在旁边；预览不受影响——
 /// 它不需要 worker 在场。
+///
+/// `dbnums` 与 `active` 是「库状态」页的材料：前者是队列轮询回来的 `/dbnums`（读透专态的
+/// 范围行也从它说），后者是每个库此刻在队列里的活（`task_queue::active_tasks`）。
+/// `data_face` 是 `/health` 报的数据面形态：读透形态下数据水位按设计不建立，那一列要
+/// 说「不建立」而不是「尚未建立」——后者是「需初始化」的意思，在读透下每一行都会说反话。
 #[allow(clippy::too_many_arguments)]
 pub fn show(
     ctx: &egui::Context,
@@ -1593,8 +1769,10 @@ pub fn show(
     applying: usize,
     scope_mdb: &str,
     sync_live: Option<bool>,
+    data_face: Option<&str>,
     execution_blocked: Option<&str>,
     dbnums: &[DbnumStatus],
+    active: &HashMap<u32, ActiveTask>,
     vm: &Vm,
     state: &mut State,
 ) -> Vec<Cmd> {
@@ -1606,6 +1784,7 @@ pub fn show(
     let mut cmds = Vec::new();
     egui::Window::new("模型增量更新")
         .id(egui::Id::new("model-update-window"))
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .title_bar(false)
         .collapsible(false)
         .resizable(true)
@@ -1619,14 +1798,26 @@ pub fn show(
         )
         .show(ctx, |ui| {
             ui.spacing_mut().item_spacing = Vec2::ZERO;
-            header(ui, t, d, scope_mdb, sync_live, vm, state);
-            steps(ui, t, d, state.step);
+            header(ui, t, d, scope_mdb, sync_live, dbnums, vm, state);
+            tabs(ui, t, d, state);
+            if state.tab == Tab::Update {
+                steps(ui, t, d, state.step);
+            }
 
             let footer_h = d.px(56.0);
             let body_h = (ui.available_height() - footer_h).max(d.px(200.0));
             let width = ui.available_width();
             ui.allocate_ui(vec2(width, body_h), |ui| {
                 ui.set_min_size(vec2(width, body_h));
+                if state.tab == Tab::Dbnums {
+                    // 读透形态两处都说得出：`/health` 的数据面，或这份预览自报的。
+                    // 老服务端两处都不给 → 摄入形态解读，与此前逐字相同。
+                    let read_through = data_face
+                        .is_some_and(|face| face.trim().eq_ignore_ascii_case("read-through"))
+                        || matches!(vm, Vm::Ready(preview) | Vm::Starting(preview) if preview.read_through());
+                    dbnums_body(ui, t, d, dbnums, active, read_through, state);
+                    return;
+                }
                 match vm {
                     Vm::Idle => idle_body(ui, t, d),
                     Vm::Loading => previewing_body(ui, t, d, state),
@@ -1642,7 +1833,7 @@ pub fn show(
                     // 读透形态回的是空表 + `up_to_date: true`，必须排在「已是最新」之前判：
                     // 那不是没有变化，是这一形态没有数据批次可预览。
                     Vm::Ready(preview) if preview.read_through() => {
-                        read_through_body(ui, t, d, preview, dbnums)
+                        read_through_body(ui, t, d, preview, dbnums, state)
                     }
                     Vm::Ready(preview) if preview.up_to_date => {
                         up_to_date_body(ui, t, d, preview, state)
@@ -1669,12 +1860,14 @@ pub fn show(
     cmds
 }
 
+#[allow(clippy::too_many_arguments)]
 fn header(
     ui: &mut Ui,
     t: &Tokens,
     d: Density,
     scope_mdb: &str,
     sync_live: Option<bool>,
+    dbnums: &[DbnumStatus],
     vm: &Vm,
     state: &mut State,
 ) {
@@ -1703,8 +1896,21 @@ fn header(
             state.open = false;
         }
         // 「已用」只在预览扫描在途时摆；其余相位摆一句用不着计时的提示。
-        match vm {
-            Vm::Loading => stopwatch(ui, t, d, "已用", state.clock.elapsed()),
+        match (state.tab, vm) {
+            // 「库状态」页不跟着向导走：计时与「关闭窗口不会中断任务」都答非所问，
+            // 摆这张表自己的两个数——表里共几个库、其中几个在本期执行范围里。
+            (Tab::Dbnums, _) => {
+                let in_scope = dbnums
+                    .iter()
+                    .filter(|db| Scope::of(db) == Scope::InScope)
+                    .count();
+                ui.label(
+                    RichText::new(format!("共 {} 个库 · {in_scope} 个在范围", dbnums.len()))
+                        .font(Font::mono_meta(d))
+                        .color(t.text_muted),
+                );
+            }
+            (_, Vm::Loading) => stopwatch(ui, t, d, "已用", state.clock.elapsed()),
             _ => {
                 ui.label(
                     RichText::new("关闭窗口不会中断任务")
@@ -1714,6 +1920,26 @@ fn header(
             }
         }
     });
+}
+
+/// 窗口头底下的两页页签。切页只动 [`State::tab`]：预览刷新、窗口开合都不碰它——
+/// 人切到「库状态」是为了盯着看，每一拍轮询把他弹回向导等于没法看。
+fn tabs(ui: &mut Ui, t: &Tokens, d: Density, state: &mut State) {
+    let rect = bar(ui, d.tab_h(), t.bg_header, Corner::None);
+    hairline(ui.painter(), rect, t.border);
+    let mut ui = child(ui, rect, Align::Center);
+    ui.spacing_mut().item_spacing.x = 0.0;
+    for (tab, label, icon) in [
+        (Tab::Update, "增量更新", ph::LIGHTNING),
+        (Tab::Dbnums, "库状态", ph::DATABASE),
+    ] {
+        if ui
+            .add(widgets::tab(t, d, label, Some(icon), state.tab == tab))
+            .clicked()
+        {
+            state.tab = tab;
+        }
+    }
 }
 
 fn header_text(
@@ -2255,6 +2481,7 @@ fn read_through_body(
     d: Density,
     preview: &Preview,
     dbnums: &[DbnumStatus],
+    state: &mut State,
 ) {
     let scope = read_through_scope(dbnums);
     scroll_pad(ui, d, "model-update-read-through", |ui| {
@@ -2277,6 +2504,18 @@ fn read_through_body(
             format!("本期执行范围 · {} 个设计库", scope.rows.len())
         };
         section(ui, t, d, &title);
+        // 与预览树同一档开关：读透形态下同样是「库号认不出人来」。
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui
+                .add(widgets::chip(t, d, "显示 SITE", state.show_sites))
+                .on_hover_text(
+                    "每个库行末尾列出它的 SITE 名。同名 SITE 可以分处几个库，认库仍以库号为准。",
+                )
+                .clicked()
+            {
+                state.show_sites = !state.show_sites;
+            }
+        });
         if dbnums.is_empty() {
             ui.label(
                 RichText::new("范围名单尚未取到：等任务队列下一拍轮询（忙 1 s / 闲 5 s）")
@@ -2318,6 +2557,7 @@ fn read_through_body(
                     },
                     note: &note,
                     note_color: t.text_secondary,
+                    sites: state.site_column(db.dbnum),
                     ..Row::default()
                 },
             );
@@ -2346,6 +2586,240 @@ fn read_through_body(
         shadowed_card(ui, t, d, &preview.shadowed);
         server_says(ui, t, d, preview);
     });
+}
+
+// ================================================================ 库状态页
+
+/// 这一页此刻要画的行。搜索在场时只认搜索、不受筛选档限制（与队列面板同一条规矩：
+/// 搜一个库却搜不到，会让人以为它不在表里）。排序按「范围 → 库号」：在范围的排在
+/// 前面，阻断 / 够不着 / 排除依次沉底，同一档里库号从小到大。
+fn visible_dbnums<'a>(
+    dbnums: &'a [DbnumStatus],
+    read_through: bool,
+    state: &State,
+) -> Vec<&'a DbnumStatus> {
+    let needle = state.dbnum_search.trim().to_ascii_lowercase();
+    let mut rows: Vec<&DbnumStatus> = dbnums
+        .iter()
+        .filter(|db| {
+            if needle.is_empty() {
+                state.dbnum_filter.keeps(db, Scope::of(db), read_through)
+            } else {
+                db.dbnum.to_string().contains(&needle)
+                    || db.file_name.to_ascii_lowercase().contains(&needle)
+            }
+        })
+        .collect();
+    rows.sort_by_key(|db| (Scope::of(db), db.dbnum));
+    rows
+}
+
+/// 行中段：两枚水位对文件最新的关系。文件最新是共同基准，所以它总是跟着一起说。
+fn dbnum_row_meta(db: &DbnumStatus, read_through: bool) -> String {
+    let mut parts = vec![match data_lag(db, read_through) {
+        // 读透形态下数据水位按设计不建立，说「尚未建立」就成了「需初始化」的反话。
+        DataLag::NotKept => "数据水位：按设计不建立".to_owned(),
+        DataLag::Unestablished => "数据水位：尚未建立".to_owned(),
+        DataLag::Behind(n) => format!("数据水位落后 {n} 次保存"),
+        DataLag::UpToDate => "数据水位已追平文件".to_owned(),
+        DataLag::RolledBack => "文件已回退到数据水位之下".to_owned(),
+    }];
+    if db.file_latest_sesno > 0 {
+        parts.push(format!(
+            "文件最新：第 {} 次保存",
+            group_number(db.file_latest_sesno.into())
+        ));
+    }
+    if let Some(sesno) = db.model_sesno.filter(|n| *n > 0) {
+        parts.push(format!(
+            "模型水位：第 {} 次保存",
+            group_number(sesno.into())
+        ));
+    }
+    parts.join(" · ")
+}
+
+/// 行尾那一句：出事的先说（异常 / 阻断），再说队列里此刻有没有它的活，
+/// 最后是服务端给的模型来源与判决。说不出的格一个字都不摆。
+fn dbnum_row_note(db: &DbnumStatus, active: Option<ActiveTask>) -> String {
+    let mut parts = Vec::new();
+    if let Some(anomaly) = &db.anomaly {
+        parts.push(anomaly_copy(anomaly, db.blocked).0.to_owned());
+    } else if db.blocked {
+        parts.push("阻断：不入队、不应用，水位不动".to_owned());
+    }
+    match active {
+        Some(ActiveTask::Running) => parts.push("队列里正在执行".to_owned()),
+        Some(ActiveTask::Queued(Some(position))) => parts.push(format!("已在队列第 {position} 位")),
+        Some(ActiveTask::Queued(None)) => parts.push("已在队列".to_owned()),
+        None => {}
+    }
+    if let Some(source) = db.model_source {
+        parts.push(source.label(db.model_source_reason.as_deref()));
+    }
+    if let Some(verdict) = db.verdict_label() {
+        parts.push(verdict);
+    }
+    parts.join(" · ")
+}
+
+fn dbnum_row(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    db: &DbnumStatus,
+    active: Option<ActiveTask>,
+    read_through: bool,
+    state: &State,
+) {
+    let scope = Scope::of(db);
+    let troubled = db.blocked || db.anomaly.is_some();
+    // 库号是执行边界与队列的键，所以它永远在；文件名认得出是哪一摊活，有就摆前面。
+    let label = if db.file_name.is_empty() {
+        format!("db{} · {}", db.dbnum, db.db_type)
+    } else {
+        format!("{} · db{} · {}", db.file_name, db.dbnum, db.db_type)
+    };
+    let note = dbnum_row_note(db, active);
+    let (tag_fg, _) = t.status(scope.tone());
+    let (error_fg, _) = t.status(Status::Error);
+    let _ = row(
+        ui,
+        t,
+        d,
+        Row {
+            icon: if troubled { ph::WARNING } else { ph::FILE },
+            icon_color: if troubled { error_fg } else { t.text_muted },
+            label: &label,
+            label_color: t.text_primary,
+            strong: true,
+            tag: scope.tag(),
+            tag_color: tag_fg,
+            meta: dbnum_row_meta(db, read_through),
+            note: &note,
+            note_color: if troubled { error_fg } else { t.text_secondary },
+            sites: state.site_column(db.dbnum),
+            ..Row::default()
+        },
+    );
+}
+
+/// 工具行：搜索框 + 筛选芯片 + 「显示 SITE」+ 右侧「显示 N / 共 M」。
+fn dbnums_toolbar(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    dbnums: &[DbnumStatus],
+    read_through: bool,
+    state: &mut State,
+) {
+    let rect = bar(ui, d.px(34.0), t.bg_panel, Corner::None);
+    hairline(ui.painter(), rect, t.border);
+    let mut ui = child(ui, rect.shrink2(vec2(d.px(14.0), 0.0)), Align::Center);
+    ui.spacing_mut().item_spacing.x = d.px(4.0);
+
+    ui.add(
+        egui::TextEdit::singleline(&mut state.dbnum_search)
+            .desired_width(d.px(190.0))
+            .font(Font::mono_meta(d))
+            .hint_text("搜 dbnum / 文件名"),
+    );
+    ui.add_space(d.px(6.0));
+    for filter in DbnumFilter::ALL {
+        if ui
+            .add(widgets::chip(
+                t,
+                d,
+                filter.label(),
+                state.dbnum_filter == filter && state.dbnum_search.trim().is_empty(),
+            ))
+            .clicked()
+        {
+            state.dbnum_filter = filter;
+            state.dbnum_search.clear();
+        }
+    }
+
+    let shown = visible_dbnums(dbnums, read_through, state).len();
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        if ui
+            .add(widgets::chip(t, d, "显示 SITE", state.show_sites))
+            .on_hover_text(
+                "每个库行末尾列出它的 SITE 名。同名 SITE 可以分处几个库，认库仍以库号为准。",
+            )
+            .clicked()
+        {
+            state.show_sites = !state.show_sites;
+        }
+        ui.label(
+            RichText::new(format!("显示 {shown} / 共 {} 个库", dbnums.len()))
+                .font(Font::mono_micro(d))
+                .color(t.text_muted),
+        );
+    });
+}
+
+/// 「库状态」页：`/dbnums` 那张表的逐库详情，一行一库。
+///
+/// **只读**——材料就是任务队列每一拍轮询回来的那份（`task_queue::active_tasks` 一起进来），
+/// 与队列面板库行、读透专态范围行同源；这一页自己一个请求都不发，也不改任何水位。
+fn dbnums_body(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    dbnums: &[DbnumStatus],
+    active: &HashMap<u32, ActiveTask>,
+    read_through: bool,
+    state: &mut State,
+) {
+    dbnums_toolbar(ui, t, d, dbnums, read_through, state);
+    if dbnums.is_empty() {
+        center_note(
+            ui,
+            t,
+            d,
+            Some(ph::DATABASE),
+            "库状态尚未取到",
+            "等任务队列下一拍轮询（忙 1 s / 闲 5 s）。本页自己不发请求。",
+        );
+        return;
+    }
+    let rows = visible_dbnums(dbnums, read_through, state);
+    if rows.is_empty() {
+        let search = state.dbnum_search.trim();
+        let detail = if search.is_empty() {
+            format!("「{}」这一档下没有库。", state.dbnum_filter.label())
+        } else {
+            format!("没有库号或文件名含「{search}」的行。")
+        };
+        center_note(
+            ui,
+            t,
+            d,
+            Some(ph::MAGNIFYING_GLASS),
+            "没有匹配的库",
+            &detail,
+        );
+        return;
+    }
+    ScrollArea::vertical()
+        .id_salt("model-update-dbnums")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.add_space(d.px(2.0));
+            for db in rows {
+                dbnum_row(
+                    ui,
+                    t,
+                    d,
+                    db,
+                    active.get(&db.dbnum).copied(),
+                    read_through,
+                    state,
+                );
+            }
+            ui.add_space(d.px(8.0));
+        });
 }
 
 /// S2 预览结果：左边变化树，右边 360 宽的汇总列。
@@ -2401,7 +2875,7 @@ fn preview_body(
                 if !parked.is_empty() {
                     section_sep(ui, t, d, "本期不执行");
                     for db in parked {
-                        parked_row(ui, t, d, db);
+                        parked_row(ui, t, d, db, &state.site_column(db.dbnum));
                     }
                 }
                 ui.add_space(d.px(8.0));
@@ -2471,6 +2945,18 @@ fn tree_toolbar(
             .clicked()
         {
             state.only_model_affecting = !state.only_model_affecting;
+        }
+        // 库号与文件名认不出人来，SITE 名认得出。默认关着：开着时每行多一列，
+        // 7997 那种十几个 SITE 的库会把行挤满。
+        if ui
+            .add(widgets::chip(t, d, "显示 SITE", state.show_sites))
+            .on_hover_text(
+                "每个库行末尾列出它的 SITE 名。\
+                 同名 SITE 可以分处几个库（AMS 的 /MDS/TEMPLATES 就有四个），认库仍以库号为准。",
+            )
+            .clicked()
+        {
+            state.show_sites = !state.show_sites;
         }
         // 已勾选计数（§2-G 工具行）：人对着 SITE 做选择，机器按批次执行，
         // 桥在这里搭——两个数都给。
@@ -2647,6 +3133,7 @@ fn legacy_db_rows(ui: &mut Ui, t: &Tokens, d: Density, db: &DbPreview, state: &m
             meta: db.window(),
             note: form.note(),
             note_color: t.text_muted,
+            sites: state.site_column(db.dbnum),
             fill: t.bg_header,
             ..Row::default()
         },
@@ -2721,6 +3208,7 @@ fn init_row(ui: &mut Ui, t: &Tokens, d: Density, db: &DbPreview, state: &mut Sta
                 "首次导入 · 整库生成 · 会执行"
             },
             note_color: tone_fg,
+            sites: state.site_column(db.dbnum),
             fill: t.bg_header,
             ..Row::default()
         },
@@ -2732,7 +3220,7 @@ fn init_row(ui: &mut Ui, t: &Tokens, d: Density, db: &DbPreview, state: &mut Sta
 
 /// 本期不执行的行（阻断 / 够不着）：无勾选框，行形态照 S2-E / S2-F 不变。
 /// 这两类也是文件级身份——没有 SITE 可说时才许露文件名。
-fn parked_row(ui: &mut Ui, t: &Tokens, d: Density, db: &DbPreview) {
+fn parked_row(ui: &mut Ui, t: &Tokens, d: Density, db: &DbPreview, sites: &str) {
     let form = db.form();
     let (tone_fg, tone_bg) = t.status(form.tone());
     let head_label = if db.file_name.is_empty() {
@@ -2768,6 +3256,7 @@ fn parked_row(ui: &mut Ui, t: &Tokens, d: Density, db: &DbPreview) {
             } else {
                 t.text_muted
             },
+            sites: sites.to_owned(),
             fill: if form.blocks() { tone_bg } else { t.bg_header },
             ..Row::default()
         },
@@ -3931,6 +4420,8 @@ struct Row<'a> {
     meta: String,
     note: &'a str,
     note_color: Color32,
+    /// 「显示 SITE」那一列（[`State::site_column`]）。空串 = 不画，一格宽度都不占。
+    sites: String,
     fill: Color32,
 }
 
@@ -3951,6 +4442,7 @@ impl Default for Row<'_> {
             meta: String::new(),
             note: "",
             note_color: Color32::PLACEHOLDER,
+            sites: String::new(),
             fill: Color32::TRANSPARENT,
         }
     }
@@ -4086,6 +4578,25 @@ fn row(ui: &mut Ui, t: &Tokens, d: Density, r: Row<'_>) -> RowResponse {
         right -= gap;
     }
 
+    // SITE 列（「显示 SITE」那一档）。摆在计数与 meta 之内、标识之外：右边那几格是
+    // 这一行的判决，SITE 只是身份的补充说明，不该把它们挤走。十几个 SITE 的库
+    // （AMS 的 7997 就有 13 个）会把整行吃光，所以给一个上限，超出的收成省略号，
+    // 全名挂在整行悬停上——截断而不留出路，等于把认库这件事又做没了。
+    let mut elided_sites = None;
+    if !r.sites.is_empty() {
+        let (g, elided) = elide(ui, &r.sites, Font::meta(d), rect.width() * 0.42);
+        right -= g.size().x;
+        ui.painter().galley(
+            pos2(right, rect.center().y - g.size().y / 2.0),
+            g,
+            t.text_muted,
+        );
+        right -= gap * 2.0;
+        if elided {
+            elided_sites = Some(r.sites.clone());
+        }
+    }
+
     let font = if r.strong {
         Font::strong(d)
     } else {
@@ -4109,7 +4620,10 @@ fn row(ui: &mut Ui, t: &Tokens, d: Density, r: Row<'_>) -> RowResponse {
         );
     }
     RowResponse {
-        resp,
+        resp: match elided_sites {
+            Some(full) => resp.on_hover_text(full),
+            None => resp,
+        },
         check_clicked,
     }
 }
@@ -4127,6 +4641,33 @@ fn stopwatch(ui: &mut Ui, t: &Tokens, d: Density, label: &str, elapsed: Duration
 fn layout(ui: &Ui, text: &str, font: FontId) -> std::sync::Arc<egui::Galley> {
     ui.painter()
         .layout_no_wrap(text.to_owned(), font, Color32::PLACEHOLDER)
+}
+
+/// 量好的一段文字，宽度不超过 `max_w`；超了就按字符截断、省略号收尾。
+/// 第二格说的是「这一份被截过」，调用方据此决定要不要把全文挂到悬停上。
+///
+/// 先按宽度比例猜一刀再逐字回退：每次回退都是一次 `layout_no_wrap`，从尾巴一个字
+/// 一个字试的话，一行十几个 SITE 名要量上百次。
+fn elide(ui: &Ui, text: &str, font: FontId, max_w: f32) -> (std::sync::Arc<egui::Galley>, bool) {
+    let full = layout(ui, text, font.clone());
+    if full.size().x <= max_w {
+        return (full, false);
+    }
+    let total = text.chars().count();
+    let mut keep = ((total as f32) * max_w / full.size().x.max(1.0)) as usize;
+    keep = keep.min(total.saturating_sub(1));
+    loop {
+        let cut: String = text
+            .chars()
+            .take(keep)
+            .chain(std::iter::once('…'))
+            .collect();
+        let g = layout(ui, &cut, font.clone());
+        if g.size().x <= max_w || keep == 0 {
+            return (g, true);
+        }
+        keep -= 1;
+    }
 }
 
 fn glyph(ui: &Ui, center: egui::Pos2, text: &str, size: f32, color: Color32) {
