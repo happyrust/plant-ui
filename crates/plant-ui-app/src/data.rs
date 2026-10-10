@@ -203,6 +203,14 @@ pub enum Req {
         namespace: String,
         dbnum: u32,
     },
+    /// 库行「清理模型（整库）」：`DELETE /api/v1/dbnums/{dbnum}/model?confirm={dbnum}`。
+    CleanupDbnumModel {
+        base: String,
+        project: String,
+        mdb: String,
+        namespace: String,
+        dbnum: u32,
+    },
     /// 取回工作：丢缓存，重查 SITE 根层与这些已展开分支的子层。
     ///
     /// 分支由 App 侧算好交下来。数据线程不认识展开状态，也不该认识——它只是
@@ -380,6 +388,11 @@ pub enum Evt {
     ModelRebuild {
         dbnum: u32,
         result: anyhow::Result<crate::model_update_api::ModelRebuildReceipt>,
+    },
+    /// 「清理模型（整库）」的回执。成功之后宿主按 `ref0s` 卸三维；缺席则只记日志。
+    DbnumModelCleaned {
+        dbnum: u32,
+        result: anyhow::Result<crate::model_update_api::DbnumModelCleanupReceipt>,
     },
     /// 取回工作的整批结果。根层查不动就是整次失败——根层没了树无从谈起。
     GetWork(anyhow::Result<GetWork>),
@@ -819,6 +832,19 @@ async fn handle_read(
                 crate::model_update_api::model_rebuild(&base, &project, &mdb, &namespace, dbnum)
                     .await;
             let _ = evt_tx.send(Evt::ModelRebuild { dbnum, result });
+        }
+        Req::CleanupDbnumModel {
+            base,
+            project,
+            mdb,
+            namespace,
+            dbnum,
+        } => {
+            let result = crate::model_update_api::delete_dbnum_model(
+                &base, &project, &mdb, &namespace, dbnum,
+            )
+            .await;
+            let _ = evt_tx.send(Evt::DbnumModelCleaned { dbnum, result });
         }
         Req::QueuePoll { base } => {
             let result = crate::model_update_api::poll_queue(&base).await;

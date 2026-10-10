@@ -396,6 +396,9 @@ pub struct DbnumStatus {
     pub model_chasing_roots: Option<u32>,
     #[serde(default)]
     pub model_dead_roots: Option<u32>,
+    /// 该库全部 Ref0（`/dbnums` 行，升序）。老服务端不给 → 空，不能据此判断叶子属于哪个库。
+    #[serde(default)]
+    pub ref0s: Vec<u32>,
 }
 
 /// 库一致性判决三态（gen-model ADR-060 / C2 `dbnum_consistency`）：模型水位对数据水位。
@@ -659,6 +662,53 @@ pub fn model_rebuild(db: &DbnumStatus, active_rebuild: Option<&str>) -> ModelReb
         chasing_roots: db.model_chasing_roots.filter(|n| *n > 0),
         dead_roots: db.model_dead_roots.filter(|n| *n > 0),
     })
+}
+
+/// 库行「清理模型（整库）」的五档（2026-10-10 清理模型计划 E1）。
+///
+/// 材料只吃 `/dbnums` 一行，加上同库在飞的整库重建、同库排队或运行中的数据任务。
+/// 破坏性，所以可点之后还要过确认框，这里只决定这一枚画不画、灰不灰。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelCleanup {
+    /// 排除 / 够不着：不画。
+    Hidden,
+    /// 阻断：灰，悬停给原因原文。
+    Blocked(String),
+    /// 尚未初始化：没有模型可清。
+    NeedsInit,
+    /// 同库有整库重建或数据任务在跑：灰，「等它跑完」。
+    Busy { task_id: String },
+    /// 可点。按下只打开确认框。
+    Ready(u32),
+}
+
+/// `active_rebuild` / `active_data_task` 是同库此刻在飞的任务号（[`Vm::active_model_rebuild`] /
+/// [`Vm::active_data_task`]）。未初始化先于「在忙」：没有数据就没有模型可清。
+pub fn model_cleanup(
+    db: &DbnumStatus,
+    active_rebuild: Option<&str>,
+    active_data_task: Option<&str>,
+) -> ModelCleanup {
+    if db.excluded || db.not_in_project {
+        return ModelCleanup::Hidden;
+    }
+    if db.blocked {
+        return ModelCleanup::Blocked(
+            db.anomaly
+                .as_ref()
+                .map(|anomaly| anomaly.to_string())
+                .unwrap_or_else(|| "阻断，原因未随契约给出".to_owned()),
+        );
+    }
+    if !db.initialized {
+        return ModelCleanup::NeedsInit;
+    }
+    if let Some(task_id) = active_rebuild.or(active_data_task) {
+        return ModelCleanup::Busy {
+            task_id: task_id.to_owned(),
+        };
+    }
+    ModelCleanup::Ready(db.dbnum)
 }
 
 /// RFC3339 → 「MM-DD HH:MM」（本地时区），与 `model_update::e3d_time` 同一口径：
@@ -1212,6 +1262,19 @@ impl Vm {
             .iter()
             .find(|t| {
                 t.kind == KIND_MODEL_REBUILD
+                    && t.dbnum == Some(dbnum)
+                    && matches!(t.state.as_str(), "running" | "queued")
+            })
+            .map(|t| t.task_id.as_str())
+    }
+
+    /// 这个库此刻排队或运行中的数据批次任务号。「清理模型（整库）」据它判灰：
+    /// 服务端同库有任务在跑会回 409，不让人先点出一个拒绝来。
+    pub fn active_data_task(&self, dbnum: u32) -> Option<&str> {
+        self.tasks
+            .iter()
+            .find(|t| {
+                t.kind == KIND_DATA_BATCH
                     && t.dbnum == Some(dbnum)
                     && matches!(t.state.as_str(), "running" | "queued")
             })
@@ -1961,6 +2024,16 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, state: &mut State, cmd
                         .get(&row.dbnum)
                         .map(|db| model_rebuild(db, vm.active_model_rebuild(row.dbnum)))
                         .unwrap_or(ModelRebuild::Hidden);
+                    let cleanup = dbs
+                        .get(&row.dbnum)
+                        .map(|db| {
+                            model_cleanup(
+                                db,
+                                vm.active_model_rebuild(row.dbnum),
+                                vm.active_data_task(row.dbnum),
+                            )
+                        })
+                        .unwrap_or(ModelCleanup::Hidden);
                     let (resp, note_fits) = queue_row(
                         ui,
                         t,
@@ -1971,6 +2044,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, state: &mut State, cmd
                         actions,
                         &gate,
                         &rebuild,
+                        &cleanup,
                         vm,
                         cmds,
                     );
@@ -2689,9 +2763,11 @@ struct Cols {
     /// `/dbnums` 一行都没有时不留这一列（老服务端不给就整列不画，D7）。
     action: f32,
     action_right: f32,
-    /// 「操作」列里第二枚：「重算模型（整库）」图标按钮的左缘（2026-09-10 重新计算计划 D1 ②）；
-    /// `right` 是它的右缘。与「提前执行」互补：一个管「数据变了」，一个管「模型要重算」。
+    /// 「操作」列里第二枚：「重算模型（整库）」图标按钮的左缘（2026-09-10 重新计算计划 D1 ②）。
+    /// 与「提前执行」互补：一个管「数据变了」，一个管「模型要重算」。
     rebuild: f32,
+    /// 第三枚：「清理模型（整库）」左缘。`right` 是它的右缘。
+    cleanup: f32,
     right: f32,
 }
 
@@ -2709,9 +2785,15 @@ fn cols(rect: Rect, d: Density, actions: bool) -> Cols {
     let right = rect.right() - pad;
     let window = rect.left() + d.px(168.0);
     // 操作列只在 `/dbnums` 给了行的时候存在：判据全部来自那张表，没有它
-    // 按钮一颗都画不出来，留一列空白只会让人以为坏了。两枚按钮：「提前执行」
-    // 74 点 + 「重算模型（整库）」图标按钮 44 点（`Btn` 空标签 = 两侧内边距 + 图标），中间 4 点。
-    let rebuild = if actions { right - d.px(44.0) } else { right };
+    // 按钮一颗都画不出来，留一列空白只会让人以为坏了。三枚按钮：「提前执行」
+    // 74 点 + 「重算模型（整库）」44 点 + 「清理模型（整库）」44 点（`Btn` 空标签 =
+    // 两侧内边距 + 图标），中间各 4 点。
+    let cleanup = if actions { right - d.px(44.0) } else { right };
+    let rebuild = if actions {
+        cleanup - d.px(4.0) - d.px(44.0)
+    } else {
+        right
+    };
     let action_right = if actions { rebuild - d.px(4.0) } else { right };
     let action = if actions {
         action_right - d.px(74.0)
@@ -2737,6 +2819,7 @@ fn cols(rect: Rect, d: Density, actions: bool) -> Cols {
         action,
         action_right,
         rebuild,
+        cleanup,
         right,
     }
 }
@@ -2761,8 +2844,9 @@ fn row_id(task_id: &str) -> egui::Id {
 ///
 /// `actions` = 面板这一帧画不画操作列（`/dbnums` 空表就整列不画，D7）；`gate` 是这个库
 /// 「提前执行」的判据（[`early_run`]），`rebuild` 是「重算模型（整库）」的判据
-/// （[`model_rebuild`]），`Hidden` 与「没这一行」都不画按钮。
-/// 按下分别推 [`Cmd::RunDbnumNow`] / [`Cmd::RebuildDbnumModel`]。
+/// （[`model_rebuild`]），`cleanup` 是「清理模型（整库）」的判据（[`model_cleanup`]）。
+/// `Hidden` 与「没这一行」都不画按钮。按下分别推 [`Cmd::RunDbnumNow`] /
+/// [`Cmd::RebuildDbnumModel`] / [`Cmd::CleanupDbnumModel`]。
 #[allow(clippy::too_many_arguments)]
 fn queue_row(
     ui: &mut Ui,
@@ -2774,6 +2858,7 @@ fn queue_row(
     actions: bool,
     gate: &EarlyRun,
     rebuild: &ModelRebuild,
+    cleanup: &ModelCleanup,
     vm: &Vm,
     cmds: &mut Vec<Cmd>,
 ) -> (egui::Response, bool) {
@@ -2797,6 +2882,9 @@ fn queue_row(
     }
     if actions && *rebuild != ModelRebuild::Hidden {
         model_rebuild_button(ui, t, d, rect, &c, row.task_id.as_str(), rebuild, vm, cmds);
+    }
+    if actions && *cleanup != ModelCleanup::Hidden {
+        model_cleanup_button(ui, t, d, rect, &c, row.task_id.as_str(), cleanup, vm, cmds);
     }
 
     ui.painter()
@@ -3127,6 +3215,62 @@ fn model_rebuild_button(
                     });
                     if resp.clicked() {
                         cmds.push(Cmd::RebuildDbnumModel { dbnum: plan.dbnum });
+                    }
+                }
+            }
+        },
+    );
+}
+
+/// 库行第三枚：「清理模型（整库）」，紧挨「重算模型（整库）」右侧（清理模型计划 E1）。
+///
+/// 按下只推 [`Cmd::CleanupDbnumModel`]，确认框在宿主那边。灰的把原因放在悬停里。
+#[allow(clippy::too_many_arguments)]
+fn model_cleanup_button(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    row_rect: Rect,
+    c: &Cols,
+    task_id: &str,
+    gate: &ModelCleanup,
+    vm: &Vm,
+    cmds: &mut Vec<Cmd>,
+) {
+    let zone = Rect::from_min_max(
+        pos2(c.cleanup, row_rect.center().y - d.px(12.0)),
+        pos2(c.right, row_rect.center().y + d.px(12.0)),
+    );
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(zone)
+            .id(egui::Id::new(("model-cleanup", task_id))),
+        |ui| {
+            let button = || widgets::button(t, d, "").icon(ph::BROOM);
+            match gate {
+                ModelCleanup::Hidden => {}
+                ModelCleanup::Blocked(reason) => {
+                    ui.add_enabled(false, button())
+                        .on_disabled_hover_text(format!("清理模型（整库）：{reason}"));
+                }
+                ModelCleanup::NeedsInit => {
+                    ui.add_enabled(false, button())
+                        .on_disabled_hover_text("清理模型（整库）：没有模型可清");
+                }
+                ModelCleanup::Busy { task_id } => {
+                    ui.add_enabled(false, button()).on_disabled_hover_text(format!(
+                        "清理模型（整库）：等它跑完（{task_id}）"
+                    ));
+                }
+                ModelCleanup::Ready(dbnum) => {
+                    let resp = ui
+                        .add_enabled(vm.can_execute(), button())
+                        .on_disabled_hover_text(execution_disabled_hint(vm))
+                        .on_hover_text(format!(
+                            "清理模型（整库）db{dbnum}：删掉该库全部已生成的模型产物并把模型水位归零；不自动重算"
+                        ));
+                    if resp.clicked() {
+                        cmds.push(Cmd::CleanupDbnumModel { dbnum: *dbnum });
                     }
                 }
             }
@@ -5437,6 +5581,89 @@ mod tests {
             }
             other => panic!("追平的库也该可重算，得到 {other:?}"),
         }
+    }
+
+    /// 「清理模型（整库）」五档（E1）：排除不画、阻断灰原文、未初始化灰、同库有任务灰、其余可点。
+    #[test]
+    fn model_cleanup_has_five_states() {
+        let excluded = DbnumStatus {
+            dbnum: 1,
+            excluded: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            model_cleanup(&excluded, None, None),
+            ModelCleanup::Hidden
+        );
+        let blocked = DbnumStatus {
+            dbnum: 2,
+            blocked: true,
+            initialized: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            model_cleanup(&blocked, None, None),
+            ModelCleanup::Blocked("阻断，原因未随契约给出".to_owned())
+        );
+        let fresh = DbnumStatus {
+            dbnum: 3,
+            initialized: false,
+            ..Default::default()
+        };
+        assert_eq!(model_cleanup(&fresh, None, None), ModelCleanup::NeedsInit);
+        let ready = lagging_db(8000, 4, 4);
+        assert_eq!(
+            model_cleanup(&ready, Some("model-rebuild-8000-1"), None),
+            ModelCleanup::Busy {
+                task_id: "model-rebuild-8000-1".into()
+            }
+        );
+        assert_eq!(
+            model_cleanup(&ready, None, Some("data-8000-1")),
+            ModelCleanup::Busy {
+                task_id: "data-8000-1".into()
+            }
+        );
+        assert_eq!(model_cleanup(&ready, None, None), ModelCleanup::Ready(8000));
+    }
+
+    /// 第三枚在「重算模型（整库）」右侧：列位从右往左是清理 44、间隙 4、重算 44。
+    #[test]
+    fn the_cleanup_button_sits_to_the_right_of_rebuild() {
+        let source = include_str!("task_queue.rs");
+        let body = source.split_once("mod tests {").expect("正文").0;
+        let cols = body
+            .split_once("fn cols(")
+            .expect("cols")
+            .1
+            .split_once("fn row_id(")
+            .expect("下一个函数")
+            .0;
+        let cleanup = cols.find("let cleanup = ").expect("cleanup 列");
+        let rebuild = cols.find("let rebuild = ").expect("rebuild 列");
+        assert!(cleanup < rebuild, "先从右缘留出清理，再往左留出重算：{cols}");
+        assert!(cols.contains("cleanup - d.px(4.0) - d.px(44.0)"));
+        let button = body
+            .split_once("fn model_cleanup_button(")
+            .expect("按钮")
+            .1
+            .split_once("fn model_source_glyph(")
+            .expect("下一个函数")
+            .0;
+        assert!(button.contains("ph::BROOM"), "{button}");
+        assert!(button.contains("Cmd::CleanupDbnumModel {"));
+        assert!(button.contains("c.cleanup"));
+        assert!(button.contains("c.right"));
+        let row = body
+            .split_once("fn queue_row(")
+            .expect("行")
+            .1
+            .split_once("fn early_run_button(")
+            .expect("下一个函数")
+            .0;
+        let rebuild_at = row.find("model_rebuild_button(").expect("重算按钮");
+        let cleanup_at = row.find("model_cleanup_button(").expect("清理按钮");
+        assert!(rebuild_at < cleanup_at, "清理画在重算之后（更靠右）");
     }
 
     /// 尚无数据水位：灰。没有数据就没有模型可重算，重算不替初始化（D3；与「提前执行」

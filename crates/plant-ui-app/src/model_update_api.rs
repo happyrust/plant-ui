@@ -157,6 +157,50 @@ pub async fn model_rebuild(
     .await
 }
 
+/// `DELETE /api/v1/dbnums/{dbnum}/model` 的 200 回执（gen-model spec §4.5.1D）。
+///
+/// `ref0s` 缺席 = 老服务端没给这一格，不能据此卸载三维；空数组是「这个库没有 Ref0」。
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct DbnumModelCleanupReceipt {
+    pub dbnum: u32,
+    #[serde(default)]
+    pub scope: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub ref0s: Option<Vec<u32>>,
+    #[serde(default)]
+    pub range_statements: usize,
+    #[serde(default)]
+    pub elapsed_ms: u64,
+    #[serde(default)]
+    pub model_source_after: Option<String>,
+}
+
+/// 整库模型清理：只删这个库的模型面，不重算（清理模型计划 C5）。
+///
+/// 复用 [`delete`]：无 body、超时 125 秒。`confirm` 填路径上的同一个 dbnum。老服务端没有
+/// 这条路由时是 404，调用方按 [`endpoint_missing`] 降级成一句 INFO。
+pub async fn delete_dbnum_model(
+    base: &str,
+    project: &str,
+    mdb: &str,
+    namespace: &str,
+    dbnum: u32,
+) -> anyhow::Result<DbnumModelCleanupReceipt> {
+    let path = dbnum_model_path(dbnum, project, mdb, namespace);
+    delete(base, &path, Duration::from_secs(125)).await
+}
+
+fn dbnum_model_path(dbnum: u32, project: &str, mdb: &str, namespace: &str) -> String {
+    format!(
+        "/api/v1/dbnums/{dbnum}/model?confirm={dbnum}&project={}&mdb={}&namespace={}",
+        urlencode(project),
+        urlencode(mdb),
+        urlencode(namespace)
+    )
+}
+
 #[derive(Debug, Deserialize)]
 pub struct QueryReply {
     pub tool: String,
@@ -1205,6 +1249,26 @@ mod tests {
             1,
             "{source}"
         );
+    }
+
+    /// 整库清理的请求行：`confirm` 等于路径 dbnum，身份三件套转义。`ref0s` 缺席与空数组不是一回事。
+    #[test]
+    fn dbnum_model_cleanup_confirms_the_path_dbnum_and_keeps_absent_ref0s() {
+        assert_eq!(
+            dbnum_model_path(8000, "ProjAMS", "/ALL", "aios"),
+            "/api/v1/dbnums/8000/model?confirm=8000&project=ProjAMS&mdb=%2FALL&namespace=aios"
+        );
+        let absent: DbnumModelCleanupReceipt = serde_json::from_str(
+            r#"{"dbnum":8000,"scope":"model_face","status":"deleted","range_statements":3,"elapsed_ms":12}"#,
+        )
+        .unwrap();
+        assert!(absent.ref0s.is_none(), "缺席不能当成空数组");
+        let present: DbnumModelCleanupReceipt =
+            serde_json::from_str(r#"{"dbnum":8000,"ref0s":[24381,31909]}"#).unwrap();
+        assert_eq!(present.ref0s, Some(vec![24381, 31909]));
+        let empty: DbnumModelCleanupReceipt =
+            serde_json::from_str(r#"{"dbnum":8000,"ref0s":[]}"#).unwrap();
+        assert_eq!(empty.ref0s, Some(vec![]));
     }
 
     /// generate 的四档状态对界面是四件不同的事，压成布尔就分不出「重做过了」与

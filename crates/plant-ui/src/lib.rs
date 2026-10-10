@@ -293,6 +293,11 @@ pub enum Cmd {
     RebuildDbnumModel {
         dbnum: u32,
     },
+    /// 库行「清理模型（整库）」（2026-10-10 清理模型计划 E1 / C5）：只打开确认框。
+    /// 确认之后才发 `DELETE /api/v1/dbnums/{dbnum}/model`。不自动重算。
+    CleanupDbnumModel {
+        dbnum: u32,
+    },
     /// 暂停 / 恢复队列出队。暂停**只挡出队**，正在跑的那一批会跑完为止——
     /// 服务端没有中止接口，所以这条命令也不该被当成「停下来」。
     SetQueuePaused(bool),

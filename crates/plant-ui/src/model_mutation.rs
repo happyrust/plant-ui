@@ -86,8 +86,12 @@ impl Kind {
 /// 确认框此刻在说什么。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Vm {
-    /// 等人按。还什么都没发。
-    Confirm { kind: Kind, label: String },
+    /// 等人按。还什么都没发。`dbnum` 有值时这一框问的是整库清理，不是右键那几行。
+    Confirm {
+        kind: Kind,
+        label: String,
+        dbnum: Option<u32>,
+    },
     /// 那一发在途。**这一档没有回头路**，所以窗口右上角那个叉也不给：服务端是
     /// `await_background_without_cancelling`（生成）/ 同步删到底（清理），关窗关不掉任何东西。
     Running { kind: Kind, label: String },
@@ -103,9 +107,9 @@ impl Vm {
     /// 窗上写的那个范围（右键落点的显示名，多选时形如 `/VESSEL-01 等 3 项`）。
     pub fn label(&self) -> &str {
         match self {
-            Self::Confirm { label, .. } | Self::Running { label, .. } | Self::Failed { label, .. } => {
-                label
-            }
+            Self::Confirm { label, .. }
+            | Self::Running { label, .. }
+            | Self::Failed { label, .. } => label,
         }
     }
 
@@ -120,6 +124,13 @@ impl Vm {
 
 /// 确认框正文。不带数字：数字要靠清点，而清点那条路已经退役；人要判断的只有
 /// 「这个范围要不要重算 / 清掉」。
+/// 库行「清理模型（整库）」的正文。与右键那一句不是同一件事：这一按清的是整个库的模型面。
+pub fn dbnum_cleanup_prompt(dbnum: u32) -> String {
+    format!(
+        "清理 db{dbnum} 的全部模型？该库已生成的模型产物会被删除、模型水位归零，三维里该库的模型会卸载；之后请点「重算模型（整库）」重新生成。"
+    )
+}
+
 pub fn confirm_prompt(kind: Kind, label: &str) -> String {
     match kind {
         Kind::Regenerate => format!("对 {label} 重新生成模型？范围内已有的产物会被重算替换。"),
@@ -159,10 +170,19 @@ pub fn show(ctx: &egui::Context, t: &Tokens, d: Density, vm: Option<&Vm>) -> Vec
 
 fn body(ui: &mut egui::Ui, t: &Tokens, d: Density, vm: &Vm, cmds: &mut Vec<Cmd>) {
     match vm {
-        Vm::Confirm { kind, label } => {
-            ui.label(RichText::new(confirm_prompt(*kind, label)).color(t.text_primary));
+        Vm::Confirm { kind, label, dbnum } => {
+            let prompt = match (kind, dbnum) {
+                (Kind::Cleanup, Some(dbnum)) => dbnum_cleanup_prompt(*dbnum),
+                _ => confirm_prompt(*kind, label),
+            };
+            let note = if dbnum.is_some() {
+                "不自动重算。同库有任务在跑或有生成在飞时服务端会拒绝，稍后再试。"
+            } else {
+                kind.note()
+            };
+            ui.label(RichText::new(prompt).color(t.text_primary));
             ui.add_space(d.px(6.0));
-            ui.label(RichText::new(kind.note()).small().color(t.text_muted));
+            ui.label(RichText::new(note).small().color(t.text_muted));
             ui.separator();
             ui.horizontal(|ui| {
                 if ui
@@ -297,7 +317,8 @@ mod tests {
             assert_eq!(
                 tone(&Vm::Confirm {
                     kind,
-                    label: label()
+                    label: label(),
+                    dbnum: None,
                 }),
                 Status::Warn
             );

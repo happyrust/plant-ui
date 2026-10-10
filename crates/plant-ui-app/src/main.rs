@@ -1313,8 +1313,10 @@ struct MutationRun {
     kind: model_mutation::Kind,
     label: String,
     /// 右键那几行。各一发 generate / DELETE；成功之后重新生成以它们为祖先发显示，清理把它们
-    /// 名下已加载的模型卸掉。
+    /// 名下已加载的模型卸掉。整库清理时为空。
     targets: Vec<RefU64>,
+    /// 库行「清理模型（整库）」的库号。有值时这一趟不走右键那几行。
+    dbnum: Option<u32>,
 }
 
 /// 一发 generate 的回执归到哪一档（ADR-0030 D2 第 3 步）。
@@ -1371,6 +1373,18 @@ fn cleanup_outcome(result: &anyhow::Result<model_update_api::CleanupReply>) -> C
             }
         }
     }
+}
+
+/// 整库清理要卸的叶子：已加载、且高位 Ref0 落在回执 `ref0s` 里（E7）。
+fn dbnum_unload_set(loaded: &HashSet<RefU64>, ref0s: &[u32]) -> Vec<RefU64> {
+    let owned: HashSet<u32> = ref0s.iter().copied().collect();
+    let mut gone: Vec<RefU64> = loaded
+        .iter()
+        .copied()
+        .filter(|refno| owned.contains(&refno.get_0()))
+        .collect();
+    gone.sort_by_key(|refno| refno.0);
+    gone
 }
 
 /// 清理成功之后三维里该卸哪些模型、本端「已知范围」里该摘哪些键（清理模型计划 D3）。
@@ -3069,6 +3083,9 @@ impl App {
                         self.logs.error(&mut self.vm.logs, &title, &error, None);
                     }
                 },
+                data::Evt::DbnumModelCleaned { dbnum, result } => {
+                    self.settle_dbnum_model_cleaned(dbnum, result);
+                }
                 data::Evt::GetWork(result) => {
                     match result {
                         Ok(fresh) => {
@@ -3788,6 +3805,8 @@ impl App {
                         dbnum,
                     });
                 }
+                // 库行「清理模型（整库）」只打开确认框。真正的 DELETE 等确认（C5）。
+                Cmd::CleanupDbnumModel { dbnum } => self.begin_dbnum_model_cleanup(dbnum),
                 Cmd::SetQueuePaused(paused) => {
                     if !self.model_service_writable() {
                         continue;
@@ -4079,8 +4098,37 @@ impl App {
             kind,
             label: label.clone(),
             targets,
+            dbnum: None,
         });
-        self.mutation = Some(model_mutation::Vm::Confirm { kind, label });
+        self.mutation = Some(model_mutation::Vm::Confirm {
+            kind,
+            label,
+            dbnum: None,
+        });
+    }
+
+    /// 库行「清理模型（整库）」的确认框。已有一趟模型变更在跑或正等确认时不重开。
+    fn begin_dbnum_model_cleanup(&mut self, dbnum: u32) {
+        if self.vm.regen_busy || self.mutation.is_some() {
+            self.logs.info(
+                &mut self.vm.logs,
+                format!("清理模型（整库）db{dbnum}：已经有一趟重新生成 / 清理在进行"),
+            );
+            return;
+        }
+        let label = format!("db{dbnum}");
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+        self.mutation_run = Some(MutationRun {
+            kind: model_mutation::Kind::Cleanup,
+            label: label.clone(),
+            targets: Vec::new(),
+            dbnum: Some(dbnum),
+        });
+        self.mutation = Some(model_mutation::Vm::Confirm {
+            kind: model_mutation::Kind::Cleanup,
+            label,
+            dbnum: Some(dbnum),
+        });
     }
 
     /// 确认框的回执。接受就对右键那几行**各一发**——重新生成是 `generate(force = true)`，整批
@@ -4103,10 +4151,22 @@ impl App {
             self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
             return;
         };
-        let (kind, label, targets) = (run.kind, run.label.clone(), run.targets.clone());
-        // 帧号从这里起不再变：整批回执拿它认帧。
-        let request = match kind {
-            model_mutation::Kind::Regenerate => data::Req::GenerateModels {
+        let (kind, label, targets, dbnum) = (
+            run.kind,
+            run.label.clone(),
+            run.targets.clone(),
+            run.dbnum,
+        );
+        // 帧号从这里起不再变：整批回执拿它认帧。整库清理没有右键那几行，单独一发。
+        let request = match (kind, dbnum) {
+            (_, Some(dbnum)) => data::Req::CleanupDbnumModel {
+                base: self.model_api_url.clone(),
+                project: self.vm.project.clone(),
+                mdb: self.mdb.clone(),
+                namespace: self.namespace.clone(),
+                dbnum,
+            },
+            (model_mutation::Kind::Regenerate, None) => data::Req::GenerateModels {
                 epoch: self.mutation_epoch,
                 refnos: targets.clone(),
                 base: self.model_api_url.clone(),
@@ -4114,7 +4174,7 @@ impl App {
                 mdb: self.mdb.clone(),
                 namespace: self.namespace.clone(),
             },
-            model_mutation::Kind::Cleanup => data::Req::CleanupModels {
+            (model_mutation::Kind::Cleanup, None) => data::Req::CleanupModels {
                 epoch: self.mutation_epoch,
                 refnos: targets.clone(),
                 base: self.model_api_url.clone(),
@@ -4132,12 +4192,15 @@ impl App {
             );
             return;
         }
-        let started = match kind {
-            model_mutation::Kind::Regenerate => format!(
+        let started = match (kind, dbnum) {
+            (_, Some(dbnum)) => format!(
+                "db{dbnum}：正在清理全部模型产物（只删产物、水位归零，不自动重算）…"
+            ),
+            (model_mutation::Kind::Regenerate, None) => format!(
                 "{label}：正在生成模型（{} 个目标，范围内已有的产物会被重算替换；服务端预算 120 秒，超时后后台继续）…",
                 targets.len()
             ),
-            model_mutation::Kind::Cleanup => format!(
+            (model_mutation::Kind::Cleanup, None) => format!(
                 "{label}：正在清理模型产物（{} 个目标，服务端按子树删已生成的产物、不重算；只删产物，不删设计元素）…",
                 targets.len()
             ),
@@ -4299,6 +4362,108 @@ impl App {
                 reason: failures.join("；"),
             })
         };
+    }
+
+    /// `DELETE /dbnums/{n}/model` 的回执（C5 / E7）。成功按回执里的 `ref0s` 卸已加载叶子；
+    /// 缺席则只记日志。409 原文进 ERROR，老服务端没有这条路由是一句 INFO。
+    fn settle_dbnum_model_cleaned(
+        &mut self,
+        dbnum: u32,
+        result: anyhow::Result<model_update_api::DbnumModelCleanupReceipt>,
+    ) {
+        if self
+            .mutation_run
+            .as_ref()
+            .is_some_and(|run| run.dbnum != Some(dbnum))
+        {
+            return;
+        }
+        self.mutation_run = None;
+        self.vm.regen_busy = false;
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+        match result {
+            Ok(receipt) => {
+                let unloaded = match receipt.ref0s.as_deref() {
+                    Some(ref0s) => self.forget_cleaned_dbnum(ref0s),
+                    None => Vec::new(),
+                };
+                let tail = if receipt.ref0s.is_none() {
+                    "老服务端不给 ref0s，请点眼睛重查".to_owned()
+                } else {
+                    format!(
+                        "三维卸载 {} 个模型；点「重算模型（整库）」重新生成（服务重启也会自动补）",
+                        unloaded.len()
+                    )
+                };
+                self.logs.info(
+                    &mut self.vm.logs,
+                    format!(
+                        "已清理 db{dbnum} 全部模型产物（{} 条语句 / {} ms）；{tail}",
+                        receipt.range_statements, receipt.elapsed_ms
+                    ),
+                );
+                if !unloaded.is_empty() {
+                    self.view3d_commands
+                        .push(Cmd::Model(plant_ui::ModelAction::Unload { refnos: unloaded }));
+                }
+                self.mutation = None;
+                self.poll_queue_now();
+            }
+            Err(error) => {
+                if model_update_api::endpoint_missing(&error) {
+                    self.logs.info(
+                        &mut self.vm.logs,
+                        format!("清理模型（整库）db{dbnum}：这一档服务端没有整库清理接口"),
+                    );
+                    self.mutation = None;
+                    return;
+                }
+                let failure = model_update_api::failure_of(&error);
+                let title = if failure.code == "conflict" {
+                    format!("清理模型（整库）db{dbnum}：该库有任务在跑或有生成在飞")
+                } else {
+                    format!("清理模型（整库）db{dbnum} 失败")
+                };
+                self.logs.error(&mut self.vm.logs, &title, &error, None);
+                self.mutation = Some(model_mutation::Vm::Failed {
+                    kind: model_mutation::Kind::Cleanup,
+                    label: format!("db{dbnum}"),
+                    reason: failure.message,
+                });
+            }
+        }
+    }
+
+    /// 整库清理之后，把属于这些 Ref0 的已加载叶子从本端账上抹掉（E7）。
+    fn forget_cleaned_dbnum(&mut self, ref0s: &[u32]) -> Vec<RefU64> {
+        let gone = dbnum_unload_set(&self.loaded_models, ref0s);
+        let gone_set: HashSet<RefU64> = gone.iter().copied().collect();
+        let drop_keys: Vec<RefU64> = self
+            .model_scopes
+            .iter()
+            .filter(|(_, members)| members.iter().any(|member| gone_set.contains(member)))
+            .map(|(key, _)| *key)
+            .collect();
+        for key in drop_keys {
+            self.model_scopes.remove(&key);
+            self.scope_targets.remove(&key);
+            self.regenerate_refresh.remove(&key);
+            self.tree.pending_direction.remove(&key);
+            self.tree.pending_visibility.remove(&key);
+        }
+        for refno in &gone_set {
+            self.loaded_models.remove(refno);
+            self.tree.visibility.remove(refno);
+            self.model_show_waiting.remove(refno);
+            self.tree.pending_direction.remove(refno);
+            self.tree.pending_visibility.remove(refno);
+            self.tree.visibility_unavailable.insert(*refno);
+        }
+        self.model_scopes.retain(|_, members| {
+            members.retain(|member| !gone_set.contains(member));
+            !members.is_empty()
+        });
+        gone
     }
 
     /// 清理成功之后把一个目标名下的模型从本端账上抹掉（D3），回要卸载的那批叶子。
@@ -5769,8 +5934,9 @@ mod tests {
         AutoRefresh, CleanupOutcome, CleanupUnload, EMPTY_SCOPE_HINT, EleTreeNode, GenerateOutcome,
         ModelVisibility, ModelVisibilityPlan, PanelRoomResolution, RefU64, ReloadSnapshot,
         RowVisibility, TreeModel, TreeRowVm, Window, auto_refresh, background_models_settled,
-        begin_get_work, cache_model_scope, claim_unloaded_model_refnos, cleanup_outcome,
-        cleanup_unload_plan, command_reply_is_current, complete_refresh_generation,
+        begin_get_work, cache_model_scope, claim_unloaded_model_refnos,         cleanup_outcome,
+        cleanup_unload_plan,
+        dbnum_unload_set, command_reply_is_current, complete_refresh_generation,
         empty_props_verdict, expand_room_model_targets,
         finished_after, generate_outcome, generate_summary, in_mdb_path, is_panel_noun,
         mark_model_scope_unavailable, model_drains_idle, model_progress_terminal,
@@ -6110,10 +6276,11 @@ mod tests {
             .split_once("fn settle_models_generated(")
             .expect("回执那一步")
             .0;
-        // 两件事一个确认步：按 kind 各发一种请求，别无其他。
-        assert_eq!(confirm.matches("data::Req::").count(), 2, "{confirm}");
-        assert!(confirm.contains("Kind::Regenerate => data::Req::GenerateModels {"));
-        assert!(confirm.contains("Kind::Cleanup => data::Req::CleanupModels {"));
+        // 确认步三种请求：右键生成、右键清理、整库清理。
+        assert_eq!(confirm.matches("data::Req::").count(), 3, "{confirm}");
+        assert!(confirm.contains("data::Req::GenerateModels {"));
+        assert!(confirm.contains("data::Req::CleanupModels {"));
+        assert!(confirm.contains("data::Req::CleanupDbnumModel {"));
         assert!(
             !confirm.contains("RegenerateScope") && !confirm.contains("RegenerateDelete"),
             "清点 / 整片删已退役"
@@ -6326,6 +6493,18 @@ mod tests {
     }
 
     /// 清理范围只按本端缓存圈（D3）：目标自己 + 祖先链含目标的范围键整条成员 + 链含目标的叶子；
+    /// 整库清理只卸回执 `ref0s` 里的已加载叶子，别的库的叶子留着（E7）。
+    #[test]
+    fn dbnum_unload_set_keeps_only_leaves_in_the_receipt_ref0s() {
+        let leaf = |ref0: u32, seq: u32| RefU64(((ref0 as u64) << 32) | seq as u64);
+        let here = leaf(24381, 10);
+        let also = leaf(24381, 20);
+        let other = leaf(31909, 1);
+        let loaded = HashSet::from([other, here, also]);
+        assert_eq!(dbnum_unload_set(&loaded, &[24381]), vec![here, also]);
+        assert!(dbnum_unload_set(&loaded, &[]).is_empty());
+    }
+
     /// 链不在缓存里、又不属于范围内键的叶子不动——猜成在范围内会把别处正看着的模型一并卸掉。
     #[test]
     fn cleanup_unload_plan_covers_the_subtree_and_leaves_strangers_alone() {
