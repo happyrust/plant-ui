@@ -593,6 +593,9 @@ fn show_app(
     for models in app.pending_incremental_models.drain(..) {
         view3d.append(models);
     }
+    for (stale, models) in app.pending_refreshes.drain(..) {
+        view3d.refresh(stale, models);
+    }
     match app.pending_dimensions.take() {
         Some(DimensionLayerUpdate::Set(batch)) => view3d.set_dimensions(batch),
         Some(DimensionLayerUpdate::Clear) => view3d.clear_dimensions(),
@@ -1168,6 +1171,9 @@ struct App {
     logs: logs::LogBuffer,
     pending_models: Option<Vec<aios_core::GeomInstQuery>>,
     pending_incremental_models: Vec<Vec<aios_core::GeomInstQuery>>,
+    /// 重新生成之后的换装：（场景里要卸掉的旧 refno，重算过的记录），交给 `View3d::refresh`
+    /// 同一批先卸后装（ADR-0030 D2 第 3 步）。
+    pending_refreshes: Vec<(Vec<RefU64>, Vec<aios_core::GeomInstQuery>)>,
     /// tree/container refno -> 实际可见 ModelRoot refno。
     model_scopes: HashMap<RefU64, Vec<RefU64>>,
     model_scope_pending: HashSet<RefU64>,
@@ -1862,6 +1868,7 @@ impl App {
             logs: logs::LogBuffer::default(),
             pending_models: None,
             pending_incremental_models: Vec::new(),
+            pending_refreshes: Vec::new(),
             model_scopes: HashMap::new(),
             model_scope_pending: HashSet::new(),
             model_scope_epoch: 0,
@@ -2274,6 +2281,7 @@ impl App {
                                 models.iter().map(|model| model.insts.len()).sum::<usize>();
                             self.refresh_generation_pending |= debt_reload;
                             self.pending_incremental_models.clear();
+                            self.pending_refreshes.clear();
                             self.model_show_waiting.clear();
                             self.latest_mesh_progress = None;
                             self.model_scope_failures = 0;
@@ -2426,19 +2434,16 @@ impl App {
                                 cache_model_scope(&mut self.model_scopes, refno, refno);
                             }
                             // 右键重新生成之后的显示（ADR-0030 D2 第 3 步）：这批记录是重算过的
-                            // 产物，场景里同名的旧几何先卸掉，下面才会把它们当新模型装进去。
-                            if self.regenerate_refresh.remove(&target) {
-                                let stale: Vec<RefU64> = refs
-                                    .iter()
+                            // 产物，场景里同名的旧几何要换掉。先从已装账上摘下来，下面才会把它们
+                            // 当新模型认领；卸旧装新交给 `View3d::refresh` 在同一批里做。
+                            let stale: Vec<RefU64> = if self.regenerate_refresh.remove(&target) {
+                                refs.iter()
                                     .copied()
                                     .filter(|refno| self.loaded_models.remove(refno))
-                                    .collect();
-                                if !stale.is_empty() {
-                                    self.view3d_commands.push(Cmd::Model(
-                                        plant_ui::ModelAction::Unload { refnos: stale },
-                                    ));
-                                }
-                            }
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
                             self.model_scopes.insert(target, refs.clone());
                             // 登记成范围目标：取回工作重装时服务供数以它为祖先重查（ADR-0030 D3）。
                             self.scope_targets.insert(target);
@@ -2475,7 +2480,11 @@ impl App {
                                 }
                             }
                             if !new_models.is_empty() {
-                                self.pending_incremental_models.push(new_models);
+                                if stale.is_empty() {
+                                    self.pending_incremental_models.push(new_models);
+                                } else {
+                                    self.pending_refreshes.push((stale, new_models));
+                                }
                                 if new_meshes > 0 {
                                     self.model_show_waiting.insert(target);
                                     self.model_progress_until = None;
@@ -2504,6 +2513,7 @@ impl App {
                                 if visible
                                     && (self.pending_models.is_some()
                                         || !self.pending_incremental_models.is_empty()
+                                        || !self.pending_refreshes.is_empty()
                                         || self.latest_mesh_progress.is_some())
                                 {
                                     let (done, total) = self
@@ -4481,6 +4491,7 @@ impl App {
             if visible
                 && (self.pending_models.is_some()
                     || !self.pending_incremental_models.is_empty()
+                    || !self.pending_refreshes.is_empty()
                     || self.latest_mesh_progress.is_some())
             {
                 let (done, total) = self
@@ -4657,6 +4668,7 @@ impl App {
         self.scope_targets.clear();
         self.pending_models = Some(Vec::new());
         self.pending_incremental_models.clear();
+        self.pending_refreshes.clear();
         self.model_show_waiting.clear();
         self.latest_mesh_progress = None;
         self.model_scope_failures = 0;
@@ -4899,6 +4911,7 @@ impl App {
         self.loaded_models.clear();
         self.model_show_waiting.clear();
         self.pending_incremental_models.clear();
+        self.pending_refreshes.clear();
         self.latest_mesh_progress = None;
         self.model_scope_failures = 0;
         self.model_progress_until = None;

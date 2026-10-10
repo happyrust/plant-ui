@@ -377,6 +377,28 @@ impl View3d {
         }
     }
 
+    /// 重算过的产物换掉场景里的旧几何：`stale` 名下的旧根与 `models` 在同一批里先卸后装。
+    ///
+    /// 不能拆成 `model(Unload)` 加 `append`：`Unload` 会把待装批里同 refno 的新模型一并滤掉；
+    /// 反过来先卸后追加也不行，`apply_commands` 排在 `load_models` 之后，同一帧刚装上的
+    /// 新实体会被它按 refno 一起卸掉。两种次序都是旧的卸了、新的没上。
+    pub fn refresh(&mut self, stale: Vec<RefU64>, models: Vec<GeomInstQuery>) {
+        let stale: HashSet<_> = stale.into_iter().collect();
+        if stale.is_empty() {
+            self.append(models);
+            return;
+        }
+        for batch in &mut self.pending_models {
+            batch.retain(|model| {
+                !stale.contains(&model.refno.refno()) && !stale.contains(&model.owner.refno())
+            });
+        }
+        self.desired_visibility
+            .retain(|refno, _| !stale.contains(refno));
+        self.pending_models
+            .push_back(ModelBatch::Refresh { stale, models });
+    }
+
     pub fn resize(&mut self, size: [u32; 2]) {
         let wanted = UVec2::new(size[0].max(16), size[1].max(16));
         let prepared = self.prepared_resize.as_ref().map(|resize| resize.size);
@@ -657,6 +679,11 @@ impl RetryingMesh {
 enum ModelBatch {
     Replace(Vec<GeomInstQuery>),
     Append(Vec<GeomInstQuery>),
+    /// 先卸场景里 `stale` 名下的根，再装 `models`，见 [`View3d::refresh`]。
+    Refresh {
+        stale: HashSet<RefU64>,
+        models: Vec<GeomInstQuery>,
+    },
 }
 
 impl ModelBatch {
@@ -664,15 +691,25 @@ impl ModelBatch {
         matches!(self, Self::Replace(_))
     }
 
+    /// 装这一批之前要从场景里卸掉的根；只有 `Refresh` 有。
+    fn take_stale(&mut self) -> HashSet<RefU64> {
+        match self {
+            Self::Refresh { stale, .. } => std::mem::take(stale),
+            Self::Replace(_) | Self::Append(_) => HashSet::new(),
+        }
+    }
+
     fn into_models(self) -> Vec<GeomInstQuery> {
         match self {
-            Self::Replace(models) | Self::Append(models) => models,
+            Self::Replace(models) | Self::Append(models) | Self::Refresh { models, .. } => models,
         }
     }
 
     fn retain(&mut self, keep: impl FnMut(&GeomInstQuery) -> bool) {
         match self {
-            Self::Replace(models) | Self::Append(models) => models.retain(keep),
+            Self::Replace(models) | Self::Append(models) | Self::Refresh { models, .. } => {
+                models.retain(keep)
+            }
         }
     }
 }
@@ -1565,6 +1602,7 @@ fn load_models(
     mut orbit: ResMut<OrbitCamera>,
     mut camera: Query<(&mut Transform, &mut Projection), With<ViewCamera>>,
     roots: Query<Entity, With<SceneRoot>>,
+    scene_models: Query<(Entity, &ModelRoot)>,
     assets: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -1575,10 +1613,22 @@ fn load_models(
     invalid_line_mesh: Res<InvalidTubiLineMesh>,
     invalid_line_state: Res<InvalidTubiLineStateMaterials>,
 ) {
-    let Some(batch) = view.pending_models.pop_front() else {
+    let Some(mut batch) = view.pending_models.pop_front() else {
         return;
     };
     let replace = batch.clears_scene();
+    let stale = batch.take_stale();
+    if !stale.is_empty() {
+        let mut removed = HashSet::new();
+        for (entity, root) in &scene_models {
+            if stale.contains(&root.refno) || stale.contains(&root.owner) {
+                removed.insert(root.refno);
+                commands.entity(entity).despawn();
+            }
+        }
+        removed.extend(stale);
+        forget_model_state(&mut view, &removed);
+    }
     let frame = should_frame_batch(roots.is_empty());
     let models = batch.into_models();
     if replace {
@@ -3178,11 +3228,111 @@ mod tests {
         assert!(!should_frame_batch(false));
     }
 
+    fn test_model(refno: RefU64, owner: RefU64) -> GeomInstQuery {
+        GeomInstQuery {
+            refno: refno.into(),
+            old_refno: None,
+            owner: owner.into(),
+            world_aabb: aios_core::basic::aabb::ParryAabb::default().0,
+            world_trans: Transform::IDENTITY,
+            insts: Vec::new(),
+            has_neg: false,
+            generic: "PIPE".into(),
+            pts: None,
+            date: None,
+        }
+    }
+
+    fn spawn_model_root(app: &mut App, refno: RefU64, owner: RefU64) -> Entity {
+        app.world_mut()
+            .spawn((
+                Transform::default(),
+                Visibility::Visible,
+                ModelRoot { refno, owner },
+            ))
+            .id()
+    }
+
+    fn model_roots(app: &mut App, refno: RefU64) -> Vec<Entity> {
+        let world = app.world_mut();
+        world
+            .query::<(Entity, &ModelRoot)>()
+            .iter(world)
+            .filter(|(_, root)| root.refno == refno)
+            .map(|(entity, _)| entity)
+            .collect()
+    }
+
+    #[test]
+    fn a_refresh_drops_pending_copies_of_the_stale_roots() {
+        let branch = RefU64::from(66459);
+        let cap = RefU64::from(66460);
+        let other = RefU64::from(1);
+        let mut view = test_view();
+        view.append(vec![test_model(cap, branch), test_model(other, other)]);
+        view.refresh(vec![branch, cap], vec![test_model(cap, branch)]);
+
+        let batches: Vec<Vec<RefU64>> = view
+            .pending_models
+            .drain(..)
+            .map(|batch| {
+                batch
+                    .into_models()
+                    .iter()
+                    .map(|model| model.refno.refno())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(batches, vec![vec![other], vec![cap]]);
+    }
+
+    /// 重新生成之后的换装：旧根卸掉、新根装上，不相干的根不动。拆成 `Unload` 加 `append`
+    /// 时旧的卸了、新的没上，三维里整根 BRAN 消失（2026-10-10 本机验收）。
+    #[test]
+    fn a_refresh_swaps_the_stale_roots_for_the_new_models() {
+        let branch = RefU64::from(66459);
+        let cap = RefU64::from(66460);
+        let other = RefU64::from(1);
+        let mut view = test_view();
+        view.refresh(
+            vec![branch, cap],
+            vec![test_model(branch, branch), test_model(cap, branch)],
+        );
+        let mut app = load_models_app(view);
+        app.world_mut()
+            .spawn((Transform::default(), Visibility::Visible, SceneRoot));
+        let old_branch = spawn_model_root(&mut app, branch, branch);
+        let old_cap = spawn_model_root(&mut app, cap, branch);
+        let kept = spawn_model_root(&mut app, other, other);
+
+        app.update();
+
+        for (refno, old) in [(branch, old_branch), (cap, old_cap)] {
+            let roots = model_roots(&mut app, refno);
+            assert_eq!(roots.len(), 1, "{refno:?} 应只剩重算后的那一根：{roots:?}");
+            assert_ne!(roots[0], old, "{refno:?} 的旧根应已卸掉");
+        }
+        assert_eq!(model_roots(&mut app, other), vec![kept]);
+    }
+
     #[test]
     fn incremental_load_system_keeps_the_existing_scene_root() {
         let mut view = test_view();
         view.pending_models
             .push_back(ModelBatch::Append(Vec::new()));
+        let mut app = load_models_app(view);
+        let existing = app
+            .world_mut()
+            .spawn((Transform::default(), Visibility::Visible, SceneRoot))
+            .id();
+
+        app.update();
+
+        assert!(app.world().entity(existing).contains::<SceneRoot>());
+    }
+
+    /// 只挂 `load_models` 的最小应用，外加取景要用的那台相机。
+    fn load_models_app(view: View3d) -> App {
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, AssetPlugin::default()))
             .init_asset::<Mesh>()
@@ -3201,14 +3351,7 @@ mod tests {
             Projection::Perspective(PerspectiveProjection::default()),
             ViewCamera,
         ));
-        let existing = app
-            .world_mut()
-            .spawn((Transform::default(), Visibility::Visible, SceneRoot))
-            .id();
-
-        app.update();
-
-        assert!(app.world().entity(existing).contains::<SceneRoot>());
+        app
     }
 
     #[test]
