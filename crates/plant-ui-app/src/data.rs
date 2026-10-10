@@ -93,6 +93,15 @@ pub enum Req {
     RoomPanels(RefU64),
     /// 一间房的详情。`Cmd::FocusRoom` 的展开靠它拿全量成员集。
     RoomDetail(RefU64),
+    /// 房间视图的房间体（2026-09-29 直段截断计划 M1）：这间房在册面板的模型记录。
+    ///
+    /// 与眼睛同一条路：先 `ensure` 房间 FRMW，再经读面取实例，只留 `panels` 里那些面板的记录。
+    /// `epoch` 原样带回：连点两间房时，晚到的旧房间体靠它认出来丢掉。
+    RoomVolume {
+        epoch: u64,
+        room: RefU64,
+        panels: Vec<RefU64>,
+    },
     /// 房间浏览器的全表（重查询，全库扫描级；只在打开浮窗或手动刷新时发，
     /// 不进启动路径——计划风险 5）。
     RoomsOverview,
@@ -285,6 +294,12 @@ pub enum Evt {
         RefU64,
         anyhow::Result<Option<plant_ui_data::room::RoomDetail>>,
     ),
+    /// 房间体的面板记录，只含在册面板。`Err` = 读面没走通；空表 = 在册面板都还没有模型。
+    RoomVolume {
+        epoch: u64,
+        room: RefU64,
+        result: anyhow::Result<Vec<aios_core::GeomInstQuery>>,
+    },
     /// 房间浏览器全表。
     RoomsOverview(anyhow::Result<Vec<plant_ui_data::room::RoomOverviewRow>>),
     /// 取回工作重装的整批模型记录，连同每个库认下的取数源（spec §4.12）：日志据此
@@ -544,6 +559,46 @@ fn boxed_query(fut: impl Future<Output = ()> + 'static) -> InflightQuery {
     Box::pin(fut)
 }
 
+/// 房间体的取材与眼睛显示同一条只读路径（ADR-0030）：查询房间范围内已生成的几何，
+/// 只留在册面板的记录。生成仍由右键发起。
+async fn room_volume_records(
+    face: &ReadFace,
+    scope: &Scope,
+    room: RefU64,
+    panels: &[RefU64],
+) -> anyhow::Result<Vec<aios_core::GeomInstQuery>> {
+    let base = crate::model_update_api::base_url();
+    let mut progress = |_: usize, _: usize| {};
+    let loaded = face
+        .model_instances(
+            &ModelInstancesReq {
+                roots: &[room],
+                scope_roots: &[room],
+                identity: ServiceIdentity {
+                    base: &base,
+                    project: &scope.project,
+                    mdb: &scope.mdb,
+                    namespace: &scope.ns,
+                },
+            },
+            &mut progress,
+        )
+        .await?;
+    Ok(panel_records(loaded.records, panels))
+}
+
+/// 只留在册面板的记录。房间 FRMW 底下未必只有面板，不在册的面板也不参与归属计算。
+fn panel_records(
+    records: Vec<aios_core::GeomInstQuery>,
+    panels: &[RefU64],
+) -> Vec<aios_core::GeomInstQuery> {
+    let wanted: std::collections::HashSet<RefU64> = panels.iter().copied().collect();
+    records
+        .into_iter()
+        .filter(|record| wanted.contains(&record.refno.refno()))
+        .collect()
+}
+
 /// 并发通道里的一次交互读：查询、回执、叫醒 UI，整段自包含。
 ///
 /// 这里只放**互相独立**的读与 HTTP 往返——它们在 [`FuturesUnordered`] 里并发
@@ -605,6 +660,18 @@ async fn handle_read(
                 Err(error) => Err(error),
             };
             let _ = evt_tx.send(Evt::RoomDetail(refno, r));
+        }
+        Req::RoomVolume {
+            epoch,
+            room,
+            panels,
+        } => {
+            let result = room_volume_records(&face, &scope, room, &panels).await;
+            let _ = evt_tx.send(Evt::RoomVolume {
+                epoch,
+                room,
+                result,
+            });
         }
         Req::RoomsOverview => {
             let r = match require_mirror_feature("房间").await {
@@ -1138,9 +1205,48 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>, kind: ReadF
 
 #[cfg(test)]
 mod tests {
-    use super::{ModelLoad, Req, require_direct_mirror_endpoint, route_model_load};
+    use super::{ModelLoad, Req, panel_records, require_direct_mirror_endpoint, route_model_load};
     use plant_ui::RefU64;
     use std::sync::mpsc;
+
+    /// 房间体只留在册面板的记录：房间 FRMW 底下别的几何（与不在册的面板）不进房间体。
+    #[test]
+    fn a_room_volume_keeps_only_registered_panels() {
+        let page: serde_json::Value = serde_json::from_str(include_str!(
+            "fixtures/pipe26229-deleted-records.json"
+        ))
+        .unwrap();
+        let records: Vec<aios_core::GeomInstQuery> =
+            serde_json::from_value(page["items"].clone()).unwrap();
+        let first = records[0].refno.refno();
+        let expected = records
+            .iter()
+            .filter(|record| record.refno.refno() == first)
+            .count();
+        assert!(expected > 0 && expected < records.len(), "夹具里要有别的元素");
+
+        let kept = panel_records(records, &[first]);
+        assert_eq!(kept.len(), expected);
+        assert!(kept.iter().all(|record| record.refno.refno() == first));
+        assert!(panel_records(Vec::new(), &[first]).is_empty());
+    }
+
+    /// 房间体的读面：只经 `face.model_instances(`，与眼睛同一条路；房间体这一臂不绕开读面。
+    #[test]
+    fn the_room_volume_reads_through_the_read_face() {
+        let helper = body()
+            .split_once("async fn room_volume_records(")
+            .expect("房间体取材")
+            .1
+            .split_once("fn panel_records(")
+            .expect("取材之后是过滤")
+            .0;
+        assert!(helper.contains(".model_instances("), "{helper}");
+        assert!(!helper.contains("ensure_model("), "{helper}");
+        assert!(!helper.contains("generate_model("), "{helper}");
+        assert!(helper.contains("scope_roots: &[room]"), "{helper}");
+        assert!(!helper.contains("plant_ui_data::"), "{helper}");
+    }
 
     /// 本文件的非测试部分。源码钉都只看这一半，免得禁单里的字面值被测试自己撞上。
     fn body() -> &'static str {

@@ -5,6 +5,8 @@ edition.workspace = true
 
 [dependencies]
 plant-ui.workspace = true
+# 房间体判定（ADR-0029）：直段截断问的「这一截在不在房间里」与 gen-model 归属计算同一份口径。
+plant-room.workspace = true
 aios_core.workspace = true
 anyhow.workspace = true
 bevy.workspace = true

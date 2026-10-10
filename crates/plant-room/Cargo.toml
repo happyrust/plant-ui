@@ -1,0 +1,10 @@
+[package]
+name = "plant-room"
+version.workspace = true
+edition.workspace = true
+description = "房间体判定：gen-model 房间归属与 plant-ui 直段截断共用的一份口径（ADR-0029）。纯库，不读库、不走 HTTP。"
+publish = false
+
+[dependencies]
+glam.workspace = true
+parry3d.workspace = true

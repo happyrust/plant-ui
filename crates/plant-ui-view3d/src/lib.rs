@@ -43,9 +43,12 @@ use bevy::render::view::RenderLayers;
 use bevy::render::{Render, RenderApp, RenderSystems, renderer::render_system};
 use bevy::transform::TransformSystems;
 use bevy_egui35::{EguiUserTextures, egui};
-use plant_ui::{CameraGesture, CameraMotion, CameraPose, ModelAction};
+use plant_ui::{CameraGesture, CameraMotion, CameraPose, IsolateMatching, ModelAction};
 
 pub mod mesh_source;
+mod room_clip;
+
+pub use room_clip::{RoomClipPhase, RoomClipStatus, RoomVolumeBatch, panel_bounds_mm};
 
 const INITIAL_SIZE: UVec2 = UVec2::new(1200, 700);
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(120);
@@ -166,6 +169,7 @@ impl Plugin for View3dPlugin {
         );
         app.init_resource::<ViewportResizeSync>()
             .init_resource::<WorldAxesEnabled>()
+            .init_resource::<room_clip::RoomClip>()
             .add_plugins(MaterialPlugin::<InvalidTubiLineMaterial> {
                 prepass_enabled: false,
                 shadows_enabled: false,
@@ -173,7 +177,7 @@ impl Plugin for View3dPlugin {
             })
             .add_plugins(ExtractResourcePlugin::<ViewportResizeSync>::default())
             .init_asset_loader::<MeshLoader>()
-            .add_systems(Startup, setup)
+            .add_systems(Startup, (setup, room_clip::setup_room_clip))
             .add_systems(
                 Update,
                 (
@@ -182,6 +186,10 @@ impl Plugin for View3dPlugin {
                     retry_meshes,
                     apply_resize,
                     apply_commands,
+                    // 房间体与直段截断排在可见性 / 隔离落地之后、材质刷新之前：补出来的兄弟段
+                    // 抄的是这一拍的材质，选中高亮随后照常刷到它们身上。
+                    room_clip::apply_room_clip_ops,
+                    room_clip::advance_room_clip,
                     apply_selection,
                     animate_snap,
                     update_grid,
@@ -356,6 +364,12 @@ pub struct View3d {
     /// 上一帧把每条文字锚点投影到纹理上的结果，与 `dimension_labels` 同长同序；
     /// 出画或在相机身后为 None。由 `publish_camera` 在变换传播之后写。
     dimension_label_uvs: Vec<Option<[f32; 2]>>,
+    /// 房间体图层的待办（直段截断计划 M2）：宿主经 `set_room_volume` 等交来，`room_clip` 按序执行。
+    room_clip_ops: VecDeque<room_clip::RoomClipOp>,
+    /// 房间体图层上一拍的回执；没有房间体时为 `None`。
+    room_clip_status: Option<RoomClipStatus>,
+    /// 房间视图里「视图适应」与 Home 对准的房间体包围盒（场景世界系）。没有房间体时为 `None`。
+    room_frame_bounds: Option<(Vec3, Vec3)>,
 }
 
 impl View3d {
@@ -1048,6 +1062,9 @@ fn setup(
         isolate_restore: None,
         dimension_labels: Vec::new(),
         dimension_label_uvs: Vec::new(),
+        room_clip_ops: VecDeque::new(),
+        room_clip_status: None,
+        room_frame_bounds: None,
     });
     commands.insert_resource(OrbitCamera::default());
 
@@ -1720,6 +1737,9 @@ fn load_models(
                 .filter(|inst| inst.is_invalid_tubi)
                 .count();
             spawned.push((refno, visible, mesh_total, mesh_immediate));
+            // 整条记录就是一段直段（e3d-model 派生行 / 服务供数的 `generic = TUBI`）。旧的
+            // `tubi_relate` 路径 generic 缺省成 PIPE，那一路靠实例上的 `is_tubi`。
+            let tube_record = model.generic.eq_ignore_ascii_case("TUBI");
             // 只有真挂着无效 TUBI 的模型才建线材质。
             let line_material = (mesh_immediate > 0).then(|| {
                 line_material_cache
@@ -1753,6 +1773,12 @@ fn load_models(
                                     meshes.add(invalid_tubi_fallback_line_mesh(axis_length_mm))
                                 })
                                 .clone();
+                            // 房间视图截断直段时从这里记下的原样出发（直段截断计划 M3）。
+                            let tube = room_clip::TubeBody::invalid(
+                                inst.transform,
+                                model.world_trans,
+                                mesh.clone(),
+                            );
                             element.spawn((
                                 Mesh3d(mesh),
                                 MeshMaterial3d(shown),
@@ -1766,6 +1792,7 @@ fn load_models(
                                 ModelPickTarget { refno },
                                 NotShadowCaster,
                                 NotShadowReceiver,
+                                tube,
                             ));
                         } else {
                             let path = mesh_source::asset_path(&inst.geo_hash);
@@ -1776,7 +1803,7 @@ fn load_models(
                                 handle: handle.clone(),
                             });
                             let shown = state.choose(&material, &highlight.0, &xray_material.0);
-                            element.spawn((
+                            let mut mesh_entity = element.spawn((
                                 Mesh3d(handle),
                                 MeshMaterial3d(shown),
                                 inst.transform,
@@ -1788,6 +1815,13 @@ fn load_models(
                                 },
                                 ModelPickTarget { refno },
                             ));
+                            // 直段：房间视图截断时从这里记下的原样出发（直段截断计划 M3）。
+                            if inst.is_tubi || tube_record {
+                                mesh_entity.insert(room_clip::TubeBody::solid(
+                                    inst.transform,
+                                    model.world_trans,
+                                ));
+                            }
                         }
                     }
                 });
@@ -2109,16 +2143,21 @@ fn apply_commands(
                 let mut focus = orbit.focus;
                 let mut dist = camera_transform.translation.distance(focus).max(0.1);
                 if fit {
-                    // Home 键的「拉回全景」：与 FitAll 同一套可见包围盒。
+                    // Home 键的「拉回全景」：与 FitAll 同一套可见包围盒；房间视图里是房间体。
                     let mut min = Vec3::splat(f32::INFINITY);
                     let mut max = Vec3::splat(f32::NEG_INFINITY);
-                    for (_, root, visibility) in &roots {
-                        if *visibility == Visibility::Hidden {
-                            continue;
-                        }
-                        if let Some(&(model_min, model_max)) = view.bounds.get(&root.refno) {
-                            min = min.min(model_min);
-                            max = max.max(model_max);
+                    if let Some((room_min, room_max)) = view.room_frame_bounds {
+                        min = room_min;
+                        max = room_max;
+                    } else {
+                        for (_, root, visibility) in &roots {
+                            if *visibility == Visibility::Hidden {
+                                continue;
+                            }
+                            if let Some(&(model_min, model_max)) = view.bounds.get(&root.refno) {
+                                min = min.min(model_min);
+                                max = max.max(model_max);
+                            }
                         }
                     }
                     if min.is_finite() && max.is_finite() {
@@ -2222,7 +2261,9 @@ fn apply_commands(
                         frame_bounds(min, max, &mut orbit, &mut camera_transform, &mut projection);
                     }
                 }
-                ModelAction::Isolate { refnos } => {
+                ModelAction::Isolate { refnos, matching } => {
+                    let targets: HashSet<RefU64> = refnos.into_iter().collect();
+                    let by_owner = matching == IsolateMatching::RefnoOrOwner;
                     if view.isolate_restore.is_none() {
                         view.isolate_restore = Some(
                             roots
@@ -2236,7 +2277,8 @@ fn apply_commands(
                     let mut shown = Vec::new();
                     let mut hidden = Vec::new();
                     for (_, root, mut visibility) in &mut roots {
-                        let keep = refnos.contains(&root.refno) || refnos.contains(&root.owner);
+                        let keep = targets.contains(&root.refno)
+                            || (by_owner && targets.contains(&root.owner));
                         *visibility = if keep {
                             Visibility::Visible
                         } else {
@@ -2274,6 +2316,13 @@ fn apply_commands(
                     }
                 }
                 ModelAction::FitAll => {
+                    // 房间视图里「视图适应」对准房间体（直段截断计划 R3），不是可见模型的并集：
+                    // 截断关着时一根分支能伸出好几间房。
+                    if let Some((min, max)) = view.room_frame_bounds {
+                        orbit.anim = None;
+                        frame_bounds(min, max, &mut orbit, &mut camera_transform, &mut projection);
+                        continue;
+                    }
                     let mut min = Vec3::splat(f32::INFINITY);
                     let mut max = Vec3::splat(f32::NEG_INFINITY);
                     for (_, root, visibility) in &roots {
@@ -2539,6 +2588,50 @@ fn surface_hit(
     ));
     let (entity, hit) = hits.first()?;
     Some((meshes.get(*entity).ok()?.refno, hit.point))
+}
+
+/// 测试用的空视口状态：没有纹理、没有模型、没有待办。各模块的测试共用这一份，
+/// 字段一加就只改这一处。
+#[cfg(test)]
+pub(crate) fn blank_view() -> View3d {
+    View3d {
+        texture: egui::TextureId::Managed(0),
+        size: UVec2::new(16, 16),
+        camera_rot: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        camera_pose: CameraPose {
+            position: [0.0; 3],
+            rotation: Quat::IDENTITY.to_array(),
+            focus: [0.0; 3],
+        },
+        axis_labels: [None; 3],
+        grid_cell_mm: INITIAL_GRID_LEVEL * MM_PER_WORLD,
+        image: Handle::default(),
+        commands: VecDeque::new(),
+        pending_models: VecDeque::new(),
+        loading_meshes: Vec::new(),
+        failed_meshes: Vec::new(),
+        retrying_meshes: Vec::new(),
+        retry_requested: false,
+        mesh_progress: None,
+        desired_visibility: HashMap::new(),
+        render_states: HashMap::new(),
+        render_dirty: HashSet::new(),
+        pending_resize: None,
+        prepared_resize: None,
+        retired_resize: VecDeque::new(),
+        picked: None,
+        selected: HashSet::new(),
+        selection_dirty: false,
+        xray: HashSet::new(),
+        material_dirty: false,
+        bounds: HashMap::new(),
+        isolate_restore: None,
+        dimension_labels: Vec::new(),
+        dimension_label_uvs: Vec::new(),
+        room_clip_ops: VecDeque::new(),
+        room_clip_status: None,
+        room_frame_bounds: None,
+    }
 }
 
 #[cfg(test)]
@@ -2810,41 +2903,7 @@ mod tests {
     }
 
     fn test_view() -> View3d {
-        View3d {
-            texture: egui::TextureId::Managed(0),
-            size: UVec2::new(16, 16),
-            camera_rot: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-            camera_pose: CameraPose {
-                position: [0.0; 3],
-                rotation: Quat::IDENTITY.to_array(),
-                focus: [0.0; 3],
-            },
-            axis_labels: [None; 3],
-            grid_cell_mm: INITIAL_GRID_LEVEL * MM_PER_WORLD,
-            image: Handle::default(),
-            commands: VecDeque::new(),
-            pending_models: VecDeque::new(),
-            loading_meshes: Vec::new(),
-            failed_meshes: Vec::new(),
-            retrying_meshes: Vec::new(),
-            retry_requested: false,
-            mesh_progress: None,
-            desired_visibility: HashMap::new(),
-            render_states: HashMap::new(),
-            render_dirty: HashSet::new(),
-            pending_resize: None,
-            prepared_resize: None,
-            retired_resize: VecDeque::new(),
-            picked: None,
-            selected: HashSet::new(),
-            selection_dirty: false,
-            xray: HashSet::new(),
-            material_dirty: false,
-            bounds: HashMap::new(),
-            isolate_restore: None,
-            dimension_labels: Vec::new(),
-            dimension_label_uvs: Vec::new(),
-        }
+        super::blank_view()
     }
 
     /// egui 正在采样的离屏纹理不能原地改尺寸：`Image::resize` 会让 wgpu 重建 GPU

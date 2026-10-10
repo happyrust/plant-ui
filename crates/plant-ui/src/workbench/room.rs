@@ -16,7 +16,7 @@ use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Tokens, space};
 use crate::style::widgets::{self, PaneNote, PaneState, PropRow, prop_row_ui};
 use crate::vm::{RoomDetailDataVm, RoomDetailVm, RoomVm, RoomsDataVm, WorkbenchVm};
-use crate::{Cmd, ModelAction};
+use crate::{Cmd, IsolateMatching, ModelAction};
 
 pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Vec<Cmd>) {
     match &vm.rooms {
@@ -232,7 +232,11 @@ fn summary(
                                 }));
                             }
                             if ui.add(widgets::chip(t, d, "隔离成员", false)).clicked() {
-                                cmds.push(Cmd::Model(ModelAction::Isolate { refnos: targets }));
+                                // 不是房间视图：没有房间体可截，按 owner 展开留下成员底下的件。
+                                cmds.push(Cmd::Model(ModelAction::Isolate {
+                                    refnos: targets,
+                                    matching: IsolateMatching::RefnoOrOwner,
+                                }));
                             }
                         });
                     }

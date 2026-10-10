@@ -22,7 +22,7 @@ use super::viewcube;
 use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Tokens, radius};
 use crate::style::widgets;
-use crate::vm::{RoomViewVm, Selection, View3dVm, WorkbenchVm};
+use crate::vm::{RoomViewVm, Selection, TruncationVm, View3dVm, WorkbenchVm};
 use crate::{CameraGesture, CameraMotion, Cmd, ModelAction, RefU64};
 
 /// 占位纹理的不透明度，取自 S1 的「模型场景」矩形。压这么一点让渐变底透上来，
@@ -645,6 +645,14 @@ fn hud(
                         .font(Font::mono_meta(d))
                         .color(t.accent_strong),
                     );
+                    let chip = truncation_chip(room);
+                    if ui
+                        .add(widgets::chip(t, d, &chip.label, chip.active))
+                        .on_hover_text(chip.hint)
+                        .clicked()
+                    {
+                        cmds.push(Cmd::SetTubeTruncation(!room.truncate));
+                    }
                     if ui
                         .add(widgets::chip(t, d, "退出", false))
                         .on_hover_text("退出房间视图，恢复隔离前的可见性")
@@ -656,6 +664,76 @@ fn hud(
             });
         });
     frame.response.rect
+}
+
+/// 房间视图 HUD 上那枚「截断直段」芯片：字、激活态与悬停说明（2026-09-29 直段截断计划 §4.6）。
+struct TruncationChip {
+    label: String,
+    active: bool,
+    hint: String,
+}
+
+/// 状态写在字上，不只靠颜色：开 / 算着 / 关 / 不可用四态一眼分得出，悬停说清这一刻的段数与原因。
+/// 点一下总是把开关拨到另一边；不可用时也照拨，下一次进房间视图生效。
+fn truncation_chip(room: &RoomViewVm) -> TruncationChip {
+    let (label, active, hint) = match (&room.truncation, room.truncate) {
+        (TruncationVm::Unavailable(reason), on) => (
+            "截断直段 不可用".to_owned(),
+            false,
+            format!(
+                "{reason}，这次房间视图不截断直段。\n开关记为「{}」，点击切换。",
+                if on { "开" } else { "关" }
+            ),
+        ),
+        (_, false) => (
+            "截断直段 关".to_owned(),
+            false,
+            "整根分支显示。\n点击开启：直段只画房间体内的那一截，房间外的管件不显示。".to_owned(),
+        ),
+        (TruncationVm::Loading { done, total }, true) => (
+            "截断直段 开 …".to_owned(),
+            true,
+            if *total == 0 {
+                "正在取房间体。".to_owned()
+            } else {
+                format!("正在装载房间体（{done} / {total}）。")
+            },
+        ),
+        (TruncationVm::Computing { done, total }, true) => (
+            "截断直段 开 …".to_owned(),
+            true,
+            format!("正在截断直段（{done} / {total}）。"),
+        ),
+        (
+            TruncationVm::Ready {
+                cut,
+                hidden,
+                whole,
+                skipped,
+            },
+            true,
+        ) => {
+            let skipped = if *skipped > 0 {
+                format!(" · 未能截断 {skipped} 段")
+            } else {
+                String::new()
+            };
+            (
+                "截断直段 开".to_owned(),
+                true,
+                format!(
+                    "只画直段在房间体内的那一截，房间外的管件不显示。\n\
+                     截断 {cut} 段 · 房间外 {hidden} 段不画 · 整段在内 {whole} 段{skipped}。\n\
+                     点击关闭：整根分支显示。"
+                ),
+            )
+        }
+    };
+    TruncationChip {
+        label,
+        active,
+        hint,
+    }
 }
 
 /// 没有纹理时的错误态。
@@ -895,14 +973,100 @@ mod tests {
 
     /// 房间视图徽章带着「退出」按钮，HUD 从此是控件不是模型——点在它上面
     /// 不该穿成拾取（与工具栏、立方体同一条规矩）。
-    #[test]
-    fn clicking_the_hud_does_not_pick_through_it() {
-        let mut vm = live_vm(vec2(1600.0, 900.0));
-        vm.room_view = Some(RoomViewVm {
+    fn room_view(truncate: bool, truncation: TruncationVm) -> RoomViewVm {
+        RoomViewVm {
             room: RefU64(7),
             room_num: "R301".into(),
             member_count: 128,
-        });
+            truncate,
+            truncation,
+        }
+    }
+
+    fn ready(cut: usize, hidden: usize, whole: usize, skipped: usize) -> TruncationVm {
+        TruncationVm::Ready {
+            cut,
+            hidden,
+            whole,
+            skipped,
+        }
+    }
+
+    /// 「截断直段」四态写在字上：开 / 算着 / 关 / 不可用，悬停说清这一刻的段数与原因。
+    #[test]
+    fn the_truncation_chip_says_its_state_in_words() {
+        let on = truncation_chip(&room_view(true, ready(3, 5, 7, 0)));
+        assert_eq!((on.label.as_str(), on.active), ("截断直段 开", true));
+        assert!(
+            on.hint
+                .contains("截断 3 段 · 房间外 5 段不画 · 整段在内 7 段"),
+            "{}",
+            on.hint
+        );
+        assert!(!on.hint.contains("未能截断"), "{}", on.hint);
+        let skipped = truncation_chip(&room_view(true, ready(1, 0, 0, 2)));
+        assert!(skipped.hint.contains("未能截断 2 段"), "{}", skipped.hint);
+
+        let busy = truncation_chip(&room_view(
+            true,
+            TruncationVm::Computing {
+                done: 40,
+                total: 120,
+            },
+        ));
+        assert_eq!((busy.label.as_str(), busy.active), ("截断直段 开 …", true));
+        assert!(busy.hint.contains("40 / 120"), "{}", busy.hint);
+        let loading = truncation_chip(&room_view(
+            true,
+            TruncationVm::Loading { done: 0, total: 0 },
+        ));
+        assert_eq!(loading.label, "截断直段 开 …");
+
+        let off = truncation_chip(&room_view(false, ready(0, 0, 0, 0)));
+        assert_eq!((off.label.as_str(), off.active), ("截断直段 关", false));
+
+        let broken = truncation_chip(&room_view(
+            true,
+            TruncationVm::Unavailable("房间体缺 2 块面板网格".into()),
+        ));
+        assert_eq!(
+            (broken.label.as_str(), broken.active),
+            ("截断直段 不可用", false)
+        );
+        assert!(broken.hint.contains("房间体缺 2 块面板网格"), "{}", broken.hint);
+        assert!(broken.hint.contains("「开」"), "{}", broken.hint);
+    }
+
+    /// 点「截断直段」芯片是把开关拨到另一边：开着时点出来的是「关」，不是拾取，也不是退出。
+    /// HUD 里各段的宽度随字体走，所以沿着 HUD 那一行扫一遍，看有没有一处点得到它。
+    #[test]
+    fn clicking_the_truncation_chip_flips_the_switch() {
+        let clicks: Vec<Vec<Cmd>> = (20..1100)
+            .step_by(16)
+            .map(|x| {
+                let mut vm = live_vm(vec2(1600.0, 900.0));
+                vm.room_view = Some(room_view(true, ready(1, 1, 1, 0)));
+                viewport_cmds_on(vm, click_at(pos2(x as f32, 27.0)))
+            })
+            .collect();
+        assert!(
+            clicks
+                .iter()
+                .any(|cmds| cmds.contains(&Cmd::SetTubeTruncation(false))),
+            "HUD 那一行上没有一处点得到「截断直段」"
+        );
+        assert!(
+            clicks
+                .iter()
+                .all(|cmds| !cmds.contains(&Cmd::SetTubeTruncation(true))),
+            "开着时点它不该发「开」"
+        );
+    }
+
+    #[test]
+    fn clicking_the_hud_does_not_pick_through_it() {
+        let mut vm = live_vm(vec2(1600.0, 900.0));
+        vm.room_view = Some(room_view(true, ready(0, 0, 0, 0)));
         // HUD 距边 14、高 26，(20, 27) 落在它的框里。
         let cmds = viewport_cmds_on(vm, click_at(pos2(20.0, 27.0)));
         assert!(

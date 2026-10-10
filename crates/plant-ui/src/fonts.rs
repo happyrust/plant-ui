@@ -11,6 +11,14 @@ const REGULAR_KEY: &str = "puhui-regular";
 
 #[cfg(not(target_arch = "wasm32"))]
 fn font_dir() -> std::path::PathBuf {
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(directory) = executable.parent() {
+            let packaged = directory.join("assets/fonts");
+            if packaged.is_dir() {
+                return packaged;
+            }
+        }
+    }
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web/public/assets/fonts")
 }
 

@@ -244,6 +244,7 @@ mod tests {
             read_face: ReadFaceKind::Store,
             mesh_dir: "D:/models/meshes".into(),
             tree_full_names: true,
+            room_view_truncate_tubes: false,
         };
         let text =
             ron::ser::to_string_pretty(&settings, ron::ser::PrettyConfig::default()).unwrap();
@@ -326,6 +327,8 @@ mod tests {
         let settings = ron::from_str::<Settings>(text).unwrap();
         assert_eq!(settings.read_face, ReadFaceKind::Service);
         assert_eq!(settings.mesh_dir, "D:/models/meshes");
+        // 「截断直段」是后加的一格：老文件没有它就按出厂值开着。
+        assert!(settings.room_view_truncate_tubes);
     }
 
     #[test]

@@ -109,6 +109,10 @@ pub struct Settings {
     /// 模型树里无名元素显示 E3D 默认全名的整条（`ZONE 4 of SITE 2`）还是短名（`ZONE 4`）。
     /// 出厂 `false`：E3D 自己的模型树显示的就是短名。老 `settings.ron` 没这一格按出厂值。
     pub tree_full_names: bool,
+    /// 房间视图里「截断直段」开没开（`CONTEXT.md`「直段截断」）。出厂 `true`；老 `settings.ron`
+    /// 没这一格按出厂值。开关只在房间视图的 HUD 上，设置窗不另摆一行；「恢复默认值」会把它一起
+    /// 恢复。
+    pub room_view_truncate_tubes: bool,
 }
 
 impl Default for Settings {
@@ -121,6 +125,7 @@ impl Default for Settings {
             read_face: ReadFaceKind::Service,
             mesh_dir: String::new(),
             tree_full_names: false,
+            room_view_truncate_tubes: true,
         }
     }
 }
@@ -150,6 +155,13 @@ impl State {
     pub fn adopt(&mut self, settings: Settings) {
         self.draft = settings.clone();
         self.saved = settings;
+    }
+
+    /// 房间视图 HUD 上拨了「截断直段」。已存与草稿一起改：设置窗正开着时，别的没存的改动留着，
+    /// 这一格也不会在按「保存」时被草稿里的旧值盖回去。落盘归宿主。
+    pub fn set_room_view_truncate_tubes(&mut self, on: bool) {
+        self.saved.room_view_truncate_tubes = on;
+        self.draft.room_view_truncate_tubes = on;
     }
 
     /// 草稿里此刻的网格目录。宿主拿它去校验。
@@ -504,6 +516,21 @@ mod tests {
             "D:\\models\\meshes"
         );
         assert_eq!(normalize_mesh_dir("   "), "");
+    }
+
+    /// 出厂开着截断；HUD 上拨一下，已存与草稿一起改：设置窗开着时按「保存」不会把它盖回去，
+    /// 草稿里别的没存的改动也还在。
+    #[test]
+    fn the_hud_truncation_switch_updates_saved_and_draft_together() {
+        assert!(Settings::default().room_view_truncate_tubes);
+        let mut state = State::default();
+        state.open();
+        state.draft.tree_full_names = true;
+        state.set_room_view_truncate_tubes(false);
+        assert!(!state.saved.room_view_truncate_tubes);
+        assert!(!state.draft.room_view_truncate_tubes);
+        assert!(state.draft.tree_full_names, "草稿里别的改动留着");
+        assert!(!state.saved.tree_full_names, "没存的改动不跟着落盘");
     }
 
     #[test]

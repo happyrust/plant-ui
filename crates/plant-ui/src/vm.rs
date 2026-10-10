@@ -741,7 +741,7 @@ impl RoomVm {
     }
 }
 
-/// 一次房间视图（隔离 + 取景）的身份牌：HUD 徽章与退出入口的数据源。
+/// 一次房间视图的身份牌：HUD 徽章、「截断直段」芯片与退出入口的数据源。
 #[derive(Debug, Clone, PartialEq)]
 pub struct RoomViewVm {
     /// 房间 FRMW。
@@ -750,6 +750,32 @@ pub struct RoomViewVm {
     pub room_num: String,
     /// 去重后的成员总数。
     pub member_count: usize,
+    /// 「截断直段」开关此刻的值（设置里那一格）。
+    pub truncate: bool,
+    /// 房间体与截断走到哪一步了。截断关着时也照样走，房间体照样画成半透明。
+    pub truncation: TruncationVm,
+}
+
+/// 房间视图里房间体与直段截断的进度（2026-09-29 直段截断计划 §4.6）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum TruncationVm {
+    /// 在取房间体：面板记录还在路上（`total == 0`），或面板网格在加载。
+    Loading { done: usize, total: usize },
+    /// 房间体就绪，直段在逐段截。
+    Computing { done: usize, total: usize },
+    /// 算完。截断关着时计数全零。
+    Ready {
+        /// 截断的段数（留下一截或几截，截断处有断口）。
+        cut: usize,
+        /// 整段在房间外、不画的段数。
+        hidden: usize,
+        /// 整段在房间内、原样画的段数。
+        whole: usize,
+        /// 网格不是沿局部 Z 的棱柱、截不了的段数（原样画）。
+        skipped: usize,
+    },
+    /// 房间体取不全，这次不截断。带原因，HUD 与日志照原样说。
+    Unavailable(String),
 }
 
 /// 一个元素的房间归属数据。

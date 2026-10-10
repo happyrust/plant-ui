@@ -5,18 +5,22 @@ members = [
     "crates/plant-ui-data",
     "crates/plant-ui-view3d",
     "crates/plant-ui-app",
+    "crates/plant-room",
 ]
 # vendor path deps must NOT be auto-absorbed as workspace members (would build with their own default features)
 exclude = ["vendor"]
 
 [workspace.package]
-version = "0.1.12"
+version = "0.1.13"
 edition = "2024"
 
 [workspace.dependencies]
 plant-ui = { path = "crates/plant-ui" }
 plant-ui-data = { path = "crates/plant-ui-data" }
 plant-ui-view3d = { path = "crates/plant-ui-view3d" }
+plant-room = { path = "crates/plant-room" }
+parry3d = { path = "vendor/forks/parry/crates/parry3d" }
+glam = "0.29"
 # vendored from rs-core-pin (= git rev 5667b70 + get_world fallthrough fix), editable
 # `render` 开着 bevy_render：三维搬进来之后几何侧要它（view3d-migration.md 决定 1）
 aios_core = { path = "vendor/rs-core", default-features = false, features = ["render"] }

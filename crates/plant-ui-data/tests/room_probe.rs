@@ -53,6 +53,33 @@ async fn probe_room_queries_round_trip() {
     );
     assert!(detail.members.len() <= 5, "预览超出上限");
 
+    // 直段截断计划 M5：点名的几间房逐间量 `room_detail`（含截断候选那一趟成员直选）的耗时，
+    // 记下候选数。`PLANT_ROOM_PROBE_ROOMS=R320,R731` 这样给房号；不给就跳过。
+    if let Ok(names) = std::env::var("PLANT_ROOM_PROBE_ROOMS") {
+        for room_num in names.split(',').map(str::trim).filter(|name| !name.is_empty()) {
+            let Some(row) = overview.iter().find(|r| r.room_num == room_num) else {
+                println!("room_detail {room_num}: 总览里没有这间房");
+                continue;
+            };
+            let started = std::time::Instant::now();
+            let detail = room::room_detail(row.room.into(), 5)
+                .await
+                .expect("room_detail 失败")
+                .expect("总览里的房间在 detail 侧查不到");
+            let elapsed = started.elapsed();
+            println!(
+                "room_detail {room_num}: 面板 {} / 成员 {} / 截断候选 {} / {:.0} ms",
+                detail.panels.len(),
+                detail.member_count,
+                detail.tube_carriers.len(),
+                elapsed.as_secs_f64() * 1000.0,
+            );
+            // 候选按成员强度序去重，一个都不许重复。
+            let unique: std::collections::HashSet<_> = detail.tube_carriers.iter().collect();
+            assert_eq!(unique.len(), detail.tube_carriers.len(), "{room_num} 的截断候选有重复");
+        }
+    }
+
     // 拿预览里最强的成员反查它的房间，必须能查到这间房，且排序键一致。
     let Some(member) = detail.members.first() else {
         return;

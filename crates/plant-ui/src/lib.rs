@@ -64,13 +64,30 @@ pub enum ModelAction {
     /// 隔离显示：目标可见、其余全部隐藏。首次隔离时视口记下隔离前的可见性
     /// 快照，供 [`Self::ExitIsolate`] 恢复；连续隔离（房间 A -> 房间 B）不覆盖
     /// 快照——退出回到隔离前的世界，而不是上一间房。
-    Isolate { refnos: Vec<aios_core::RefU64> },
+    ///
+    /// `matching` 决定一个模型怎样才算「在目标里」，见 [`IsolateMatching`]。
+    Isolate {
+        refnos: Vec<aios_core::RefU64>,
+        matching: IsolateMatching,
+    },
     /// 退出隔离，恢复隔离前的可见性快照；没有快照时是无操作。
     ExitIsolate,
     /// 相机拉远到覆盖当前所有可见模型。
     FitAll,
     /// 进入 / 退出距离测量。
     ToggleMeasure,
+}
+
+/// 隔离时一个模型怎样才算「在目标里」（[`ModelAction::Isolate`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolateMatching {
+    /// 模型自己的 refno 或它的 owner 命中目标都算。目标是容器时，底下的构件跟着一起留下。
+    /// 「房间」页签的「隔离成员」与截断关着的房间视图用它。
+    RefnoOrOwner,
+    /// 只认模型自己的 refno。截断开着的房间视图用它（2026-09-29 直段截断计划 §4.4）：直段以所属
+    /// 分支的 refno 渲染，分支进了目标只说明它的直段是截断候选。按 owner 展开的话，整根分支连同墙外
+    /// 的阀门都会亮起来。
+    Exact,
 }
 
 /// 三维视口里的一次相机运动。键位见 `view3d::camera`：左键 / 中键平移、
@@ -167,11 +184,18 @@ pub enum Cmd {
     Reconnect,
     RetryProps(aios_core::RefU64),
     RetryRooms(aios_core::RefU64),
-    /// 房间视图：隔离该房间（面板 + 成员）并取景到它，同时把这间房的详情
-    /// 填进「房间」页签。宿主先经数据层解析成员集（一拍往返），再展开为
-    /// `Model(Isolate)` + `Model(FocusGroup)`；没有实时渲染器时视口那一半
-    /// 自然缺席，详情照常。
+    /// 房间视图（`CONTEXT.md`「房间视图」）：隔离这间房的成员，把房间体画成半透明，相机对准
+    /// 房间体，同时把这间房的详情填进「房间」页签。
+    ///
+    /// 宿主先经数据层解析成员集（一拍往返），再展开为 `Model(Isolate)`，同时去取房间体（在册面板
+    /// 的模型），回来后取景并交给视口。直段截断开着时，直段只画房间体内的那一截（2026-09-29
+    /// 直段截断计划）。没有实时渲染器时视口那一半自然缺席，详情照常。
     FocusRoom(aios_core::RefU64),
+    /// 房间视图 HUD 上的「截断直段」开关（`CONTEXT.md`「直段截断」）。
+    ///
+    /// 这是一项显示偏好，宿主记进设置（桌面端落盘），并对正在进行的房间视图立即生效：按新口径
+    /// 重新隔离，视口复原或截断直段。不在房间视图里时只记设置。
+    SetTubeTruncation(bool),
     /// 把这间房自己的模型（墙面板那些几何）取回来显示，再取景到它。
     ///
     /// 与 [`Self::FocusRoom`] 分成两条：那条是「只看这间房」——隔离既有场景再

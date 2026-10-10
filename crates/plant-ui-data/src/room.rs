@@ -61,6 +61,73 @@ pub struct RoomDetail {
     /// 整间重算是否在队（只查 `room_recalc_panel` 的面板目标；元素目标反查
     /// 归属间接且清单可能上千，一期不做，见计划第六节）。
     pub pending_recalc: bool,
+    /// 直段截断的候选分支（2026-09-29 直段截断计划 §4.5），按成员强度序去重。
+    ///
+    /// 由两部分组成：成员本身是 BRAN / HANG 的，加上成员的父是 BRAN / HANG 的那个父。直段没有自己的
+    /// 参考号，以所属分支的 refno 渲染，所以截断只动这些分支名下的直段。第二部分不能省：旧的全量
+    /// 重建路径不测直段，一根只有管件在册的分支得靠成员的父才认得出来。
+    pub tube_carriers: Vec<RefU64>,
+}
+
+/// 一个成员往上一层的身份：自己的 noun、父的 refno 与 noun（截断候选的归并材料）。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Lineage {
+    pub noun: Option<String>,
+    pub owner: Option<RefU64>,
+    pub owner_noun: Option<String>,
+}
+
+/// 直段挂在谁名下：E3D 里带隐含直管的只有管道分支与支吊架分支。
+fn is_tube_carrier(noun: Option<&str>) -> bool {
+    noun.map(str::trim)
+        .is_some_and(|noun| noun.eq_ignore_ascii_case("BRAN") || noun.eq_ignore_ascii_case("HANG"))
+}
+
+/// 截断候选的归并（[`RoomDetail::tube_carriers`] 的口径）。按 `members` 的顺序走、首见去重：
+/// 成员本身是 BRAN / HANG 的收自己，成员的父是 BRAN / HANG 的收那个父。`lineage` 里没有的成员
+/// （库里查不到的陈旧边）跳过。
+pub fn tube_carriers_of(members: &[RefU64], lineage: &HashMap<RefU64, Lineage>) -> Vec<RefU64> {
+    let mut seen = HashSet::new();
+    let mut carriers = Vec::new();
+    for member in members {
+        let Some(line) = lineage.get(member) else {
+            continue;
+        };
+        if is_tube_carrier(line.noun.as_deref()) && seen.insert(*member) {
+            carriers.push(*member);
+        }
+        if let Some(owner) = line.owner
+            && is_tube_carrier(line.owner_noun.as_deref())
+            && seen.insert(owner)
+        {
+            carriers.push(owner);
+        }
+    }
+    carriers
+}
+
+/// 一次直选多少个成员。大房间的成员上千，一条语句里塞几千个记录 id 既难读也难排查，按块走。
+const LINEAGE_CHUNK: usize = 1000;
+
+/// 全部成员往上一层的身份（[`Lineage`]），按记录 id 直选，理由同 [`detail_follow_up_sql`]。
+async fn member_lineage(members: &[RefU64]) -> Result<HashMap<RefU64, Lineage>> {
+    let mut lineage = HashMap::with_capacity(members.len());
+    for chunk in members.chunks(LINEAGE_CHUNK) {
+        let mut response = SUL_DB.query(lineage_sql(chunk)).await?.check()?;
+        let rows: Vec<(RefnoEnum, Option<String>, Option<RefnoEnum>, Option<String>)> =
+            response.take(0)?;
+        for (refno, noun, owner, owner_noun) in rows {
+            lineage.insert(
+                refno.refno(),
+                Lineage {
+                    noun,
+                    owner: owner.map(|owner| owner.refno()),
+                    owner_noun,
+                },
+            );
+        }
+    }
+    Ok(lineage)
 }
 
 /// 房间浏览器的一行（S14）。
@@ -215,6 +282,12 @@ pub async fn room_detail(room: RefnoEnum, preview: usize) -> Result<Option<RoomD
         })
         .collect();
 
+    let tube_carriers = if member_refnos.is_empty() {
+        Vec::new()
+    } else {
+        tube_carriers_of(&member_refnos, &member_lineage(&member_refnos).await?)
+    };
+
     let room_num = room_num_of_name(&name);
     Ok(Some(RoomDetail {
         room: room.refno(),
@@ -226,6 +299,7 @@ pub async fn room_detail(room: RefnoEnum, preview: usize) -> Result<Option<RoomD
         member_refnos,
         members,
         pending_recalc,
+        tube_carriers,
     }))
 }
 
@@ -460,6 +534,17 @@ fn detail_follow_up_sql(ranked: &[(RefU64, u8, f32)], panels: &[RefU64]) -> Stri
     )
 }
 
+/// 一块成员往上一层的身份：自己的 noun、父、父的 noun。按记录 id 直选（`FROM pe:a, pe:b`），
+/// 不写 `FROM pe WHERE id IN [...]`，理由见 [`detail_follow_up_sql`]。调用方保证 `members` 非空。
+fn lineage_sql(members: &[RefU64]) -> String {
+    let keys = members
+        .iter()
+        .map(|refno| refno.to_pe_key())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("SELECT VALUE [id, noun, owner, owner.noun] FROM {keys};")
+}
+
 fn overview_sql(keywords: &[String]) -> String {
     let filter = keywords
         .iter()
@@ -644,6 +729,56 @@ mod tests {
         assert!(sql.contains("SELECT VALUE in FROM room_panel_relate"));
         assert!(sql.contains("WHERE out = pe:1_10"));
         assert!(sql.contains("LIMIT 1"));
+    }
+
+    fn lineage(noun: &str, owner: Option<(u64, &str)>) -> Lineage {
+        Lineage {
+            noun: Some(noun.to_string()),
+            owner: owner.map(|(refno_of_owner, _)| refno(refno_of_owner)),
+            owner_noun: owner.map(|(_, owner_noun)| owner_noun.to_string()),
+        }
+    }
+
+    /// 截断候选 = 成员里的 BRAN / HANG ∪ 成员的 BRAN / HANG 父，按成员强度序首见去重。
+    /// 设备零件的父是 EQUI，不进来；库里查不到的成员跳过。
+    #[test]
+    fn tube_carriers_are_pipe_members_and_pipe_parents_in_rank_order() {
+        let (bran_member, bran, elbo, atta) = (refno(40), refno(11), refno(10), refno(12));
+        let (hang, clamp, equi_part, stale) = (refno(20), refno(21), refno(30), refno(99));
+        let members = vec![bran_member, elbo, atta, clamp, equi_part, stale];
+        let lineage = HashMap::from([
+            (bran_member, lineage("BRAN", Some((41, "PIPE")))),
+            (elbo, lineage("ELBO", Some((11, "BRAN")))),
+            (atta, lineage("ATTA", Some((11, "BRAN")))),
+            (clamp, lineage("PCLA", Some((20, "hang")))),
+            (equi_part, lineage("CYLI", Some((31, "EQUI")))),
+        ]);
+
+        assert_eq!(
+            tube_carriers_of(&members, &lineage),
+            vec![bran_member, bran, hang]
+        );
+    }
+
+    /// 成员本身是分支、它的父又是分支（HANG 挂在 BRAN 下之类）：两个都收，各一次。
+    #[test]
+    fn a_carrier_member_and_its_carrier_parent_both_count_once() {
+        let (hang, bran) = (refno(1), refno(2));
+        let lineage = HashMap::from([
+            (hang, lineage("HANG", Some((2, "BRAN")))),
+            (bran, lineage("BRAN", Some((3, "PIPE")))),
+        ]);
+        assert_eq!(tube_carriers_of(&[hang, bran], &lineage), vec![hang, bran]);
+        assert!(tube_carriers_of(&[], &lineage).is_empty());
+    }
+
+    /// 直选按记录 id，不回退成整表扫；四格顺序就是反序列化的元组顺序。
+    #[test]
+    fn lineage_sql_selects_members_by_record_id() {
+        let sql = lineage_sql(&[refno(0x1_0000_0002), refno(0x3_0000_0004)]);
+        assert!(sql.starts_with("SELECT VALUE [id, noun, owner, owner.noun] FROM "), "{sql}");
+        assert!(!sql.contains("WHERE"), "{sql}");
+        assert_eq!(sql.matches("pe:").count(), 2, "{sql}");
     }
 
     #[test]

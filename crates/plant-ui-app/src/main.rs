@@ -62,10 +62,10 @@ use plant_ui::vm::{
     DimensionsVm, LogElement, ModelLoadVm, NavEntryVm, NavHistoryVm, PropKind, PropRowVm,
     PropsDataVm, PropsVm, RoomDetailDataVm, RoomDetailVm, RoomMemberVm, RoomRelationVm, RoomViewVm,
     RoomVm, RoomsDataVm, RowVisibility, SearchHitVm, SearchRunVm, SearchVm, Selection, SubIndexVm,
-    TreeRowVm, TreeVm, View3dVm, WorkbenchVm,
+    TreeRowVm, TreeVm, TruncationVm, View3dVm, WorkbenchVm,
 };
 use plant_ui::workbench::{self, Pane, WorkbenchState};
-use plant_ui::{CameraPose, Cmd, NavStep};
+use plant_ui::{CameraPose, Cmd, IsolateMatching, NavStep};
 use plant_ui_data::{EleTreeNode, RefU64};
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -558,6 +558,8 @@ fn show_app(
     if !render_states.is_empty() {
         app.sync_render_states(render_states);
     }
+    // 房间视图的截断回执（直段截断计划 M4）：视口上一拍的进度抄给 HUD。
+    app.sync_room_clip(view3d.room_clip_status());
     // 导航历史抄的相机：这一帧的位姿，与下面 `camera_rot` 同拍。
     app.camera_pose = Some(view3d.camera_pose);
     app.vm.view3d = Some(View3dVm {
@@ -601,6 +603,14 @@ fn show_app(
         Some(DimensionLayerUpdate::Clear) => view3d.clear_dimensions(),
         None => {}
     }
+    // 房间体图层按序交：换房间是「先撤旧的、再挂新的」两条，顺序不能乱。
+    for update in app.pending_room_volume.drain(..) {
+        match update {
+            RoomVolumeUpdate::Set(batch) => view3d.set_room_volume(batch),
+            RoomVolumeUpdate::Truncate(on) => view3d.set_room_truncation(on),
+            RoomVolumeUpdate::Clear => view3d.clear_room_volume(),
+        }
+    }
     let mut retried = 0;
     for command in app.view3d_commands.drain(..) {
         match command {
@@ -630,6 +640,66 @@ fn show_app(
 enum DimensionLayerUpdate {
     Set(plant_ui_view3d::DimensionBatch),
     Clear,
+}
+
+/// 交给视口的房间体图层指令（2026-09-29 直段截断计划 M4）：挂上一间房、拨开关、撤掉。
+enum RoomVolumeUpdate {
+    Set(plant_ui_view3d::RoomVolumeBatch),
+    Truncate(bool),
+    Clear,
+}
+
+/// 一次房间视图的编排账（直段截断计划 §4.4）。
+struct RoomViewCtx {
+    room: RefU64,
+    /// 进房间视图时的详情：拨开关、重装之后重新隔离都照它来。
+    detail: plant_ui_data::room::RoomDetail,
+    /// 这一次房间体请求的帧号（发出时 `room_view_epoch` 的值）。
+    epoch: u64,
+    /// 房间体没取到：面板照旧进隔离，取景退回面板与成员的并集，不截断。
+    volume_failed: bool,
+    /// 截断结果那一句日志已经为哪个开关值说过了。拨一下开关就再说一次。
+    announced: Option<bool>,
+}
+
+/// 房间体回包是不是这一次房间视图要的：帧号与房间都得对上，连点两间房只认最后一间。
+fn room_volume_is_current(ctx: &RoomViewCtx, epoch: u64, room: RefU64) -> bool {
+    ctx.epoch == epoch && ctx.room == room
+}
+
+/// 视口的截断回执 → HUD 芯片那一格。
+fn truncation_vm(status: &plant_ui_view3d::RoomClipStatus) -> TruncationVm {
+    use plant_ui_view3d::RoomClipPhase;
+    match &status.phase {
+        RoomClipPhase::Loading { done, total } => TruncationVm::Loading {
+            done: *done,
+            total: *total,
+        },
+        RoomClipPhase::Computing { done, total } => TruncationVm::Computing {
+            done: *done,
+            total: *total,
+        },
+        RoomClipPhase::Ready => TruncationVm::Ready {
+            cut: status.cut,
+            hidden: status.hidden,
+            whole: status.whole,
+            skipped: status.skipped,
+        },
+        RoomClipPhase::Unavailable(reason) => TruncationVm::Unavailable(reason.clone()),
+    }
+}
+
+/// 截断做完那一句日志的正文。
+fn truncation_summary(status: &plant_ui_view3d::RoomClipStatus) -> String {
+    let skipped = if status.skipped > 0 {
+        format!(" · 未能截断 {} 段", status.skipped)
+    } else {
+        String::new()
+    };
+    format!(
+        "截断 {} 段 · 房间外 {} 段不画 · 整段在内 {} 段{skipped}",
+        status.cut, status.hidden, status.whole
+    )
 }
 
 /// 一次还没落地的树定位（ADR-0014）。
@@ -1164,6 +1234,15 @@ struct App {
     /// `plant_ui::Cmd`，而这份线段批次是视口自己的类型，绘制层 crate 不该认识它。同一帧
     /// 只留最后一条——换目标 / 清层都是整层替换，前一条还没交出去就已经作废。
     pending_dimensions: Option<DimensionLayerUpdate>,
+    /// 正在进行的房间视图的编排账（2026-09-29 直段截断计划 M4）：详情、房间体的帧号与来龙去脉。
+    /// `vm.room_view` 是它画给 HUD 的那一面，两者同生同灭。
+    room_view: Option<RoomViewCtx>,
+    /// 房间体请求的帧号。每进一次房间视图、每退一次、每次重装后重取都进一帧：晚到的房间体与
+    /// 视口回执都拿它认，连点两间房只认最后一间。
+    room_view_epoch: u64,
+    /// 等着交给视口的房间体图层指令。与 `pending_dimensions` 同理：批次是视口自己的类型；
+    /// 按序排着交（先撤旧的再挂新的），不是只留最后一条。
+    pending_room_volume: Vec<RoomVolumeUpdate>,
     bridge: data::Bridge,
     tree: TreeModel,
     /// 还没落地的那一次树定位。同时只留一个：连续定位只完成最后一次。
@@ -1658,6 +1737,68 @@ fn expand_room_model_targets(
     expanded
 }
 
+/// 房间视图的隔离指令（直段截断计划 §4.4）。
+///
+/// - 截断开：只认 refno。成员与截断候选（BRAN / HANG）进来，不按 owner 展开，也不并已加载范围。
+///   墙外的管件因此不再跟着整根分支亮起来，候选分支的直段交给视口截断。
+/// - 截断关：原来的口径，成员经已加载范围展开，refno 或 owner 命中都留。
+///
+/// 面板默认不进来：房间体图层已经把墙画成半透明，场景里的实体面板再亮，就是米色墙叠着蓝色墙。
+/// 房间体取不到时（`with_panels`）面板照旧进来，至少看得见墙。
+fn room_view_isolate(
+    detail: &plant_ui_data::room::RoomDetail,
+    truncate: bool,
+    scopes: &HashMap<RefU64, Vec<RefU64>>,
+    with_panels: bool,
+) -> plant_ui::ModelAction {
+    let panels: HashSet<RefU64> = detail.panels.iter().copied().collect();
+    let wanted = |refno: &RefU64| with_panels || !panels.contains(refno);
+    let mut seen = HashSet::new();
+    let panel_seed = detail.panels.iter().filter(|_| with_panels);
+    if truncate {
+        let refnos = panel_seed
+            .chain(&detail.member_refnos)
+            .chain(&detail.tube_carriers)
+            .copied()
+            .filter(|refno| wanted(refno) && seen.insert(*refno))
+            .collect();
+        plant_ui::ModelAction::Isolate {
+            refnos,
+            matching: IsolateMatching::Exact,
+        }
+    } else {
+        let seed: Vec<RefU64> = panel_seed
+            .chain(&detail.member_refnos)
+            .copied()
+            .filter(|refno| seen.insert(*refno))
+            .collect();
+        let refnos = expand_room_model_targets(seed, scopes)
+            .into_iter()
+            .filter(|refno| wanted(refno))
+            .collect();
+        plant_ui::ModelAction::Isolate {
+            refnos,
+            matching: IsolateMatching::RefnoOrOwner,
+        }
+    }
+}
+
+/// 房间体取不到时的兜底取景目标：原来的口径，面板在前、成员在后，经已加载范围展开。
+fn room_view_fallback_focus(
+    detail: &plant_ui_data::room::RoomDetail,
+    scopes: &HashMap<RefU64, Vec<RefU64>>,
+) -> Vec<RefU64> {
+    let mut seen = HashSet::new();
+    let targets = detail
+        .panels
+        .iter()
+        .chain(&detail.member_refnos)
+        .copied()
+        .filter(|refno| seen.insert(*refno))
+        .collect();
+    expand_room_model_targets(targets, scopes)
+}
+
 fn cache_model_scope(scopes: &mut HashMap<RefU64, Vec<RefU64>>, target: RefU64, model: RefU64) {
     let models = scopes.entry(target).or_default();
     if !models.contains(&model) {
@@ -1858,6 +1999,9 @@ impl App {
             camera_pose: None,
             dimensions_epoch: 0,
             pending_dimensions: None,
+            room_view: None,
+            room_view_epoch: 0,
+            pending_room_volume: Vec::new(),
             // 交互通道与模型通道都按这一个供数模式造读面（ADR-0026）。
             bridge: data::spawn(ctx.clone(), tasks, read_face),
             tree: TreeModel {
@@ -2171,49 +2315,8 @@ impl App {
                             // 消费者，塞进去只会越攒越多；数据那半已经交给页签。
                             let live = self.vm.view3d.as_ref().is_some_and(|v| v.live);
                             if for_viewport && live {
-                                // 面板在前成员在后；同一个 refno 两边都出现时只留一份。
-                                let mut seen: HashSet<RefU64> = HashSet::new();
-                                let targets: Vec<RefU64> = detail
-                                    .panels
-                                    .iter()
-                                    .chain(&detail.member_refnos)
-                                    .copied()
-                                    .filter(|refno| seen.insert(*refno))
-                                    .collect();
-                                let targets =
-                                    expand_room_model_targets(targets, &self.model_scopes);
-                                if targets.is_empty() {
-                                    self.logs.warn(
-                                        &mut self.vm.logs,
-                                        format!(
-                                            "房间 {} 没有面板也没有成员，无处取景",
-                                            detail.room_num
-                                        ),
-                                    );
-                                } else {
-                                    self.view3d_commands.push(Cmd::Model(
-                                        plant_ui::ModelAction::Isolate {
-                                            refnos: targets.clone(),
-                                        },
-                                    ));
-                                    self.view3d_commands.push(Cmd::Model(
-                                        plant_ui::ModelAction::FocusGroup { refnos: targets },
-                                    ));
-                                    self.logs.info(
-                                        &mut self.vm.logs,
-                                        format!(
-                                            "房间视图：{} · 面板 {} · 成员 {}（已加载的关联直段一并显示）",
-                                            detail.room_num,
-                                            detail.panels.len(),
-                                            detail.member_count,
-                                        ),
-                                    );
-                                    self.vm.room_view = Some(RoomViewVm {
-                                        room,
-                                        room_num: detail.room_num.clone(),
-                                        member_count: detail.member_count,
-                                    });
-                                }
+                                // 隔离、取房间体、挂 HUD（直段截断计划 §4.1）。取景等房间体回来再做。
+                                self.enter_room_view(room, detail);
                             }
                         }
                         Ok(None) => {
@@ -2246,6 +2349,11 @@ impl App {
                     }
                 }
                 data::Evt::RoomDetail(..) => {}
+                data::Evt::RoomVolume {
+                    epoch,
+                    room,
+                    result,
+                } => self.settle_room_volume(epoch, room, result),
                 data::Evt::RoomsOverview(result) => {
                     self.rooms_overview = match result {
                         Ok(rows) => {
@@ -2329,6 +2437,8 @@ impl App {
                             if !replay_hidden.is_empty() {
                                 self.set_model_visible(replay_hidden, false);
                             }
+                            // 还在房间视图里：隔离随整场重装冲掉了，房间体也可能刚重算过。
+                            self.reapply_room_view_after_reload();
                             dirty = true;
                         }
                         Err(error) => {
@@ -3636,6 +3746,7 @@ impl App {
                 // 在绘制层的靶子字段里做完了，这里不再判 noun。
                 Cmd::ShowPipeDimensions(refno) => self.show_pipe_dimensions(refno),
                 Cmd::ClearPipeDimensions => self.clear_pipe_dimensions(),
+                Cmd::SetTubeTruncation(on) => self.set_tube_truncation(on),
                 Cmd::FocusPane(pane) => self.state.focus(pane),
                 Cmd::ToggleDock(side) => self.state.toggle_dock(side),
                 Cmd::OpenRoomBrowser => {
@@ -3694,8 +3805,7 @@ impl App {
                         // 隔离/恢复不写树的 pending 方向账——真实可见性会沿
                         // render_dirty 那条既有链路流回眼睛（ADR-0016）。
                         plant_ui::ModelAction::ExitIsolate => {
-                            self.vm.room_view = None;
-                            self.focus_room_pending = None;
+                            self.leave_room_view();
                             self.view3d_commands
                                 .push(Cmd::Model(plant_ui::ModelAction::ExitIsolate));
                         }
@@ -4359,6 +4469,282 @@ impl App {
         self.record_nav();
     }
 
+    // ------------------------------------------------ 房间视图 · 房间体与直段截断（2026-09-29 计划 M4）
+
+    /// 「截断直段」开关此刻的值（设置里那一格）。
+    fn truncate_tubes(&self) -> bool {
+        self.settings_state.saved.room_view_truncate_tubes
+    }
+
+    /// 房间视图的下半程（详情回来之后）：按开关隔离、去取房间体、挂 HUD。
+    ///
+    /// 取景不在这里做：对准的是房间体，而它要等在册面板的模型记录回来（`Evt::RoomVolume`）。
+    fn enter_room_view(&mut self, room: RefU64, detail: plant_ui_data::room::RoomDetail) {
+        if detail.panels.is_empty() && detail.member_refnos.is_empty() {
+            self.logs.warn(
+                &mut self.vm.logs,
+                format!("房间 {} 没有面板也没有成员，无处取景", detail.room_num),
+            );
+            return;
+        }
+        let truncate = self.truncate_tubes();
+        // 换一间房：上一间的房间体整层撤掉，直段先复原，再按这一间截。
+        self.pending_room_volume.push(RoomVolumeUpdate::Clear);
+        self.room_view_epoch = self.room_view_epoch.wrapping_add(1);
+        let epoch = self.room_view_epoch;
+        self.view3d_commands.push(Cmd::Model(room_view_isolate(
+            &detail,
+            truncate,
+            &self.model_scopes,
+            false,
+        )));
+        self.logs.info(
+            &mut self.vm.logs,
+            format!(
+                "房间视图：{} · 面板 {} · 成员 {} · 截断直段 {}",
+                detail.room_num,
+                detail.panels.len(),
+                detail.member_count,
+                if truncate { "开" } else { "关" },
+            ),
+        );
+        self.vm.room_view = Some(RoomViewVm {
+            room,
+            room_num: detail.room_num.clone(),
+            member_count: detail.member_count,
+            truncate,
+            truncation: TruncationVm::Loading { done: 0, total: 0 },
+        });
+        let unsent = if detail.panels.is_empty() {
+            Some("房间没有在册面板".to_owned())
+        } else if self
+            .bridge
+            .req
+            .send(data::Req::RoomVolume {
+                epoch,
+                room,
+                panels: detail.panels.clone(),
+            })
+            .is_err()
+        {
+            Some("数据线程已断开，取不到房间体".to_owned())
+        } else {
+            None
+        };
+        self.room_view = Some(RoomViewCtx {
+            room,
+            detail,
+            epoch,
+            volume_failed: false,
+            announced: None,
+        });
+        if let Some(reason) = unsent {
+            self.room_volume_fallback(reason);
+        }
+    }
+
+    /// 房间体回来了：对准它取景，交给视口画成半透明并截断直段。取不到就走兜底。
+    fn settle_room_volume(
+        &mut self,
+        epoch: u64,
+        room: RefU64,
+        result: anyhow::Result<Vec<aios_core::GeomInstQuery>>,
+    ) {
+        if !self
+            .room_view
+            .as_ref()
+            .is_some_and(|ctx| room_volume_is_current(ctx, epoch, room))
+        {
+            return;
+        }
+        let records = match result {
+            Ok(records) if !records.is_empty() => records,
+            Ok(_) => return self.room_volume_fallback("在册面板都还没有模型".to_owned()),
+            Err(error) => {
+                return self.room_volume_fallback(format!(
+                    "房间体取不到：{}",
+                    logs::error_chain(&error)
+                ));
+            }
+        };
+        let truncate = self.truncate_tubes();
+        let Some(ctx) = self.room_view.as_mut() else {
+            return;
+        };
+        let found: HashSet<RefU64> = records.iter().map(|record| record.refno.refno()).collect();
+        let missing = ctx
+            .detail
+            .panels
+            .iter()
+            .filter(|panel| !found.contains(panel))
+            .count();
+        // 缺面板就不截：宁可不截，也不按半个房间截。半透明照样画，看得见缺在哪。
+        let unavailable = (missing > 0).then(|| format!("{missing} 块在册面板没有模型，房间体不全"));
+        // 上一次房间体没取到、兜底把面板放进了隔离：这次取到了，按正常口径重新隔离。
+        if std::mem::take(&mut ctx.volume_failed) {
+            self.view3d_commands.push(Cmd::Model(room_view_isolate(
+                &ctx.detail,
+                truncate,
+                &self.model_scopes,
+                false,
+            )));
+        }
+        if let Some((min_mm, max_mm)) = plant_ui_view3d::panel_bounds_mm(&records) {
+            self.view3d_commands
+                .push(Cmd::Model(plant_ui::ModelAction::FocusBounds { min_mm, max_mm }));
+        }
+        self.pending_room_volume
+            .push(RoomVolumeUpdate::Set(plant_ui_view3d::RoomVolumeBatch {
+                generation: epoch,
+                panels: records,
+                carriers: ctx.detail.tube_carriers.clone(),
+                truncate,
+                unavailable,
+            }));
+    }
+
+    /// 房间体取不到时的兜底：面板照旧进隔离，取景退回面板与成员的并集，HUD 与日志说「不可用」，
+    /// 不装作截断过。
+    fn room_volume_fallback(&mut self, reason: String) {
+        let truncate = self.truncate_tubes();
+        let Some(ctx) = self.room_view.as_mut() else {
+            return;
+        };
+        ctx.volume_failed = true;
+        // 下面这句告警就是这一次的交代，视口那边不会再有回执。
+        ctx.announced = Some(truncate);
+        self.view3d_commands.push(Cmd::Model(room_view_isolate(
+            &ctx.detail,
+            truncate,
+            &self.model_scopes,
+            true,
+        )));
+        let focus = room_view_fallback_focus(&ctx.detail, &self.model_scopes);
+        let room_num = ctx.detail.room_num.clone();
+        if !focus.is_empty() {
+            self.view3d_commands
+                .push(Cmd::Model(plant_ui::ModelAction::FocusGroup { refnos: focus }));
+        }
+        // 半截的旧房间体（重装后重取失败的那种）不能留着冒充这一次的。
+        self.pending_room_volume.push(RoomVolumeUpdate::Clear);
+        if let Some(view) = self.vm.room_view.as_mut() {
+            view.truncation = TruncationVm::Unavailable(reason.clone());
+        }
+        self.logs.warn(
+            &mut self.vm.logs,
+            format!("房间 {room_num} 的房间体不可用：{reason}；这次不截断直段"),
+        );
+    }
+
+    /// HUD 上拨了「截断直段」：记进设置（桌面端落盘），正在进行的房间视图按新口径重新隔离，
+    /// 视口复原或截断。
+    fn set_tube_truncation(&mut self, on: bool) {
+        self.settings_state.set_room_view_truncate_tubes(on);
+        let saved = self.settings_state.saved.clone();
+        self.persist_settings(&saved);
+        let Some(ctx) = self.room_view.as_mut() else {
+            return;
+        };
+        ctx.announced = None;
+        let volume_failed = ctx.volume_failed;
+        self.view3d_commands.push(Cmd::Model(room_view_isolate(
+            &ctx.detail,
+            on,
+            &self.model_scopes,
+            volume_failed,
+        )));
+        if !volume_failed {
+            self.pending_room_volume.push(RoomVolumeUpdate::Truncate(on));
+        }
+        if let Some(view) = self.vm.room_view.as_mut() {
+            view.truncate = on;
+        }
+        self.logs.info(
+            &mut self.vm.logs,
+            if on {
+                "直段截断已开：直段只画房间体内的那一截，房间外的管件不显示"
+            } else {
+                "直段截断已关：整根分支显示"
+            },
+        );
+    }
+
+    /// 视口上一拍的截断回执抄进 HUD；做完（或不可用）那一刻说一句日志。
+    fn sync_room_clip(&mut self, status: Option<plant_ui_view3d::RoomClipStatus>) {
+        let (Some(ctx), Some(status)) = (self.room_view.as_mut(), status) else {
+            return;
+        };
+        // 兜底之后的「不可用」是宿主定的；帧号不对的是上一间房（或重装前）的回执。
+        if ctx.volume_failed || status.generation != ctx.epoch {
+            return;
+        }
+        let settled = matches!(
+            status.phase,
+            plant_ui_view3d::RoomClipPhase::Ready | plant_ui_view3d::RoomClipPhase::Unavailable(_)
+        );
+        let announce = settled && ctx.announced != Some(status.truncate);
+        if announce {
+            ctx.announced = Some(status.truncate);
+        }
+        let room_num = ctx.detail.room_num.clone();
+        if let Some(view) = self.vm.room_view.as_mut() {
+            view.truncation = truncation_vm(&status);
+        }
+        if !announce {
+            return;
+        }
+        match &status.phase {
+            plant_ui_view3d::RoomClipPhase::Unavailable(reason) => self.logs.warn(
+                &mut self.vm.logs,
+                format!("房间 {room_num} 的房间体不可用：{reason}；这次不截断直段"),
+            ),
+            _ if status.truncate => self.logs.info(
+                &mut self.vm.logs,
+                format!("直段截断：{room_num} · {}", truncation_summary(&status)),
+            ),
+            _ => {}
+        }
+    }
+
+    /// 退出房间视图：摘徽章、撤房间体（直段整批复原）。可见性由随后的 `ExitIsolate` 按快照恢复。
+    fn leave_room_view(&mut self) {
+        self.vm.room_view = None;
+        self.focus_room_pending = None;
+        if self.room_view.take().is_some() {
+            self.pending_room_volume.push(RoomVolumeUpdate::Clear);
+        }
+        self.room_view_epoch = self.room_view_epoch.wrapping_add(1);
+    }
+
+    /// 整场重装之后还在房间视图里：隔离被冲掉了，按同一口径再隔离一次（快照只记第一次，退出照旧
+    /// 回到进房间之前）；房间体也重取一次。新装进来的直段在新房间体到之前，照旧按旧的那层截。
+    fn reapply_room_view_after_reload(&mut self) {
+        let truncate = self.truncate_tubes();
+        let Some(ctx) = self.room_view.as_mut() else {
+            return;
+        };
+        self.view3d_commands.push(Cmd::Model(room_view_isolate(
+            &ctx.detail,
+            truncate,
+            &self.model_scopes,
+            ctx.volume_failed,
+        )));
+        if ctx.detail.panels.is_empty() {
+            return;
+        }
+        self.room_view_epoch = self.room_view_epoch.wrapping_add(1);
+        ctx.epoch = self.room_view_epoch;
+        ctx.announced = None;
+        let request = data::Req::RoomVolume {
+            epoch: ctx.epoch,
+            room: ctx.room,
+            panels: ctx.detail.panels.clone(),
+        };
+        if self.bridge.req.send(request).is_err() {
+            self.room_volume_fallback("数据线程已断开，取不到房间体".to_owned());
+        }
+    }
+
     // ---------------------------------------------------------------- 导航历史（S1-D）
 
     /// 把此刻当成一个「地方」记进导航历史：选择集 + 有焦点的页签 + 房间聚焦 + 相机。
@@ -4953,6 +5339,11 @@ impl App {
         self.vm.room_detail = RoomDetailVm::Uninit;
         self.vm.room_view = None;
         self.focus_room_pending = None;
+        // 房间体属于旧连接：撤层，在途的房间体回包凭帧号作废。
+        if self.room_view.take().is_some() {
+            self.pending_room_volume.push(RoomVolumeUpdate::Clear);
+        }
+        self.room_view_epoch = self.room_view_epoch.wrapping_add(1);
         self.pending_room_frame = None;
         self.room_pane_focus = None;
         // 历史栈上的 refno 属于旧接入点：同一个号未必还是同一个元素，整栈作废。
@@ -5155,6 +5546,11 @@ mod tests {
         settle_refresh_generation, settled_pending_roots, sync_ime_window, take_hidden_for_replay,
         task_matches_project, task_queue, tree_label,
     };
+    // 房间视图 · 直段截断（2026-09-29 计划 M4）的纯函数与编排账。
+    use super::{
+        IsolateMatching, RoomViewCtx, TruncationVm, room_view_fallback_focus, room_view_isolate,
+        room_volume_is_current, truncation_summary, truncation_vm,
+    };
     use crate::model_update_api;
     use chrono::{TimeZone, Utc};
     use plant_ui::model_update::PendingModelUnit;
@@ -5272,6 +5668,151 @@ mod tests {
             expand_room_model_targets(vec![member], &scopes),
             vec![member, branch]
         );
+    }
+
+    fn room_detail(panels: &[u64], members: &[u64], carriers: &[u64]) -> plant_ui_data::room::RoomDetail {
+        let refnos = |ids: &[u64]| ids.iter().map(|id| RefU64(*id)).collect::<Vec<_>>();
+        plant_ui_data::room::RoomDetail {
+            room: RefU64(1),
+            name: "/1RX-RM03-R301".into(),
+            room_num: "R301".into(),
+            room_code: None,
+            panels: refnos(panels),
+            member_count: members.len(),
+            member_refnos: refnos(members),
+            members: Vec::new(),
+            pending_recalc: false,
+            tube_carriers: refnos(carriers),
+        }
+    }
+
+    /// 截断开：只认 refno，成员 + 截断候选；同一根分支上墙外的阀门不跟进来，面板也不进
+    /// （房间体图层画墙）。截断关：原来的口径，经已加载范围展开、owner 命中也算。
+    /// 房间体取不到时面板照旧进来。
+    #[test]
+    fn a_truncating_room_view_isolates_exactly_its_members_and_carriers() {
+        let (panel, elbo, bran, valve) = (RefU64(20), RefU64(10), RefU64(11), RefU64(12));
+        let detail = room_detail(&[20], &[10], &[11]);
+        let scopes = HashMap::from([(bran, vec![elbo, bran, valve])]);
+
+        assert_eq!(
+            room_view_isolate(&detail, true, &scopes, false),
+            plant_ui::ModelAction::Isolate {
+                refnos: vec![elbo, bran],
+                matching: IsolateMatching::Exact,
+            }
+        );
+        assert_eq!(
+            room_view_isolate(&detail, false, &scopes, false),
+            plant_ui::ModelAction::Isolate {
+                refnos: vec![elbo, bran, valve],
+                matching: IsolateMatching::RefnoOrOwner,
+            }
+        );
+        let plant_ui::ModelAction::Isolate { refnos, .. } =
+            room_view_isolate(&detail, true, &scopes, true)
+        else {
+            panic!("房间视图发的是隔离");
+        };
+        assert_eq!(refnos, vec![panel, elbo, bran]);
+        // 兜底取景：面板在前、成员在后，经已加载范围展开。
+        assert_eq!(
+            room_view_fallback_focus(&detail, &scopes),
+            vec![panel, elbo, bran, valve]
+        );
+    }
+
+    /// 房间体回包帧号与房间都对上才认：连点两间房只认最后一间，重装后重取的旧回包也丢。
+    #[test]
+    fn room_volume_replies_must_match_epoch_and_room() {
+        let ctx = RoomViewCtx {
+            room: RefU64(1),
+            detail: room_detail(&[20], &[10], &[]),
+            epoch: 5,
+            volume_failed: false,
+            announced: None,
+        };
+        assert!(room_volume_is_current(&ctx, 5, RefU64(1)));
+        assert!(!room_volume_is_current(&ctx, 4, RefU64(1)));
+        assert!(!room_volume_is_current(&ctx, 5, RefU64(2)));
+    }
+
+    /// 视口回执照原样进 HUD；做完那一句日志说清各几段，「未能截断」只在有的时候说。
+    #[test]
+    fn truncation_receipts_map_onto_the_hud_and_the_log() {
+        use plant_ui_view3d::{RoomClipPhase, RoomClipStatus};
+        let status = |phase, skipped| RoomClipStatus {
+            generation: 1,
+            truncate: true,
+            phase,
+            cut: 3,
+            hidden: 5,
+            whole: 7,
+            skipped,
+        };
+        assert_eq!(
+            truncation_vm(&status(RoomClipPhase::Ready, 0)),
+            TruncationVm::Ready {
+                cut: 3,
+                hidden: 5,
+                whole: 7,
+                skipped: 0
+            }
+        );
+        assert_eq!(
+            truncation_vm(&status(RoomClipPhase::Computing { done: 2, total: 9 }, 0)),
+            TruncationVm::Computing { done: 2, total: 9 }
+        );
+        assert_eq!(
+            truncation_vm(&status(RoomClipPhase::Unavailable("缺网格".into()), 0)),
+            TruncationVm::Unavailable("缺网格".into())
+        );
+        assert_eq!(
+            truncation_summary(&status(RoomClipPhase::Ready, 0)),
+            "截断 3 段 · 房间外 5 段不画 · 整段在内 7 段"
+        );
+        assert!(truncation_summary(&status(RoomClipPhase::Ready, 2)).ends_with(" · 未能截断 2 段"));
+    }
+
+    /// 房间体图层有三处必须撤（计划 M4 验收）：退出房间视图、重连 / 换面的复位、房间体兜底
+    /// （重装后重取失败时，半截的旧房间体不能冒充这一次的）。漏一处，直段就停在截断的样子，
+    /// 半透明房间体也留在画面上。宿主只经 `pending_room_volume` 交给视口，桥上 `Clear` 对到
+    /// `clear_room_volume`。
+    #[test]
+    fn leaving_reconnecting_and_falling_back_all_clear_the_room_volume() {
+        let source = include_str!("main.rs");
+        let body_of = |head: &str| {
+            source
+                .split(head)
+                .nth(1)
+                .unwrap_or_else(|| panic!("找不到 {head}"))
+                .split("\n    fn ")
+                .next()
+                .unwrap()
+        };
+        for head in [
+            "fn leave_room_view(",
+            "fn reset_for_reconnect(",
+            "fn room_volume_fallback(",
+        ] {
+            assert!(
+                body_of(head).contains("self.pending_room_volume.push(RoomVolumeUpdate::Clear)"),
+                "{head} 没有撤房间体"
+            );
+        }
+        let exit = source
+            .split("plant_ui::ModelAction::ExitIsolate => {")
+            .nth(1)
+            .unwrap()
+            .split("Cmd::Model(plant_ui::ModelAction::ExitIsolate)")
+            .next()
+            .unwrap();
+        assert!(
+            exit.contains("self.leave_room_view()"),
+            "退出隔离之前先退出房间视图"
+        );
+        let (code, _) = source.split_once("\nmod tests {").unwrap();
+        assert!(code.contains("RoomVolumeUpdate::Clear => view3d.clear_room_volume()"));
     }
 
     /// 确认框标题跟着右键落点走，成批时才报数。「/ZONE-A 等 1 项」是废话，

@@ -1757,6 +1757,12 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
         Req::RoomPanels(refno) => Evt::RoomPanels(refno, Ok(Vec::new())),
         // 同理，任何房间在剧本里都查不到。
         Req::RoomDetail(refno) => Evt::RoomDetail(refno, Ok(None)),
+        // 剧本里没有房间，也就没有房间体。回空表：宿主据此说「不可用」，不装作截断过。
+        Req::RoomVolume { epoch, room, .. } => Evt::RoomVolume {
+            epoch,
+            room,
+            result: Ok(Vec::new()),
+        },
         // 剧本里没有房间：浏览器打开就是一张空表。
         Req::RoomsOverview => Evt::RoomsOverview(Ok(Vec::new())),
         Req::ResolveName(name) => {
