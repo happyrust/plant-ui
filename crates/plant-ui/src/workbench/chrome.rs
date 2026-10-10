@@ -131,7 +131,7 @@ pub fn command_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: 
                     // 没连上库时取回工作无从谈起：没有树可重查，也没有
                     // 模型可重载。禁用而不是隐藏——菜单项换位置比灰着更难找。
                     //
-                    // 重新生成跑着的时候也灰。那一趟正在逐个删掉并重做库里的产物，
+                    // 重新生成 / 清理跑着的时候也灰。那一趟正在逐个删掉（并重做）库里的产物，
                     // 中间插一次清场重装，重装的是一份删了一半的模型。
                     let busy = vm.get_work_busy;
                     let regen = vm.regen_busy;
@@ -157,7 +157,7 @@ pub fn command_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: 
                         .on_disabled_hover_text(if busy {
                             "取回工作正在进行"
                         } else if regen {
-                            "重新生成模型正在进行"
+                            "重新生成 / 清理模型正在进行"
                         } else {
                             "连接数据源后可用"
                         });

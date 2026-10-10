@@ -4,7 +4,7 @@
 pub mod data_publish;
 pub mod fonts;
 pub mod manual_data_publish;
-pub mod model_regenerate;
+pub mod model_mutation;
 pub mod model_update;
 pub mod project_picker;
 pub mod room_browser;
@@ -363,23 +363,35 @@ pub enum Cmd {
     /// 再算一遍。两者混在一个枚举里，宿主那边就只剩注释在提醒这件事。
     ///
     /// 这一条只打开**确认框**（不带数字，客户端不清点、不解根、不删产物），等
-    /// [`Self::RegenerateConfirm`] 才发请求。
+    /// [`Self::ModelMutationConfirm`] 才发请求。
     RegenerateModels {
         targets: Vec<aios_core::RefU64>,
     },
-    /// 确认框的回执。`false`（取消 / 关窗）时一个请求都不发。
-    RegenerateConfirm {
+    /// 模型树 / 视口右键「清理模型」（2026-10-10 清理模型计划）：对这几行各一发
+    /// `DELETE /model/subtree?refno&confirm`，服务端按子树删已生成的产物、不重算（与右键
+    /// 重新生成里的「先删」是服务端同一份实现）；成功之后宿主把这些目标名下已加载的模型卸掉。
+    /// 「特殊情况」用：算错了要清掉再看、或只想清掉不想立刻重算。
+    ///
+    /// 与 [`Self::RegenerateModels`] 同理**不进 [`ModelAction`]**：删掉的产物只能再算回来。
+    /// 这一条同样只打开确认框（与重新生成共用同一个框，文案按 kind 查表），等
+    /// [`Self::ModelMutationConfirm`] 才发请求。
+    CleanupModels {
+        targets: Vec<aios_core::RefU64>,
+    },
+    /// 「重新生成模型」/「清理模型」确认框的回执。`false`（取消 / 关窗）时一个请求都不发。
+    /// 一个框一条回执：框自己知道此刻开的是哪一件事。
+    ModelMutationConfirm {
         accepted: bool,
     },
 }
 
 #[cfg(test)]
 mod tests {
-    /// 重新生成是对**模型库**的动作，不是对三维场景的动作。混进 `ModelAction`
+    /// 重新生成与清理是对**模型库**的动作，不是对三维场景的动作。混进 `ModelAction`
     /// 之后，宿主那边处理可见性的那一路会顺手把它也接了，而那条路上没有确认框、
     /// 没有互斥、没有账本——删除会变成一次没人拦得住的点击。
     #[test]
-    fn regeneration_is_not_a_scene_action() {
+    fn regeneration_and_cleanup_are_not_scene_actions() {
         let source = include_str!("lib.rs");
         let model_action = source
             .split_once("pub enum ModelAction {")
@@ -391,6 +403,24 @@ mod tests {
         assert!(
             !model_action.contains("Regenerate"),
             "重新生成不该是三维动作: {model_action}"
+        );
+        assert!(
+            !model_action.contains("Cleanup") && !model_action.contains("Delete"),
+            "清理不该是三维动作: {model_action}"
+        );
+        let cmd = source
+            .split_once("pub enum Cmd {")
+            .expect("Cmd exists")
+            .1
+            .split_once("\n}")
+            .expect("Cmd ends")
+            .0;
+        for required in ["RegenerateModels {", "CleanupModels {", "ModelMutationConfirm {"] {
+            assert!(cmd.contains(required), "{required}: {cmd}");
+        }
+        assert!(
+            !cmd.contains("CleanupConfirm") && !cmd.contains("RegenerateConfirm"),
+            "两件事一个确认框、一条回执: {cmd}"
         );
     }
 }

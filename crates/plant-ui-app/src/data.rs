@@ -157,6 +157,17 @@ pub enum Req {
         mdb: String,
         namespace: String,
     },
+    /// 右键「清理模型」（2026-10-10 清理模型计划）：对选中的每个目标**各一发**
+    /// `DELETE /model/subtree?refno&confirm`，服务端按子树删产物行、不重算。与生成同形：
+    /// 顺序跑完整批，回执整批回（`Evt::ModelsCleaned`），宿主再把成功目标名下的模型卸掉。
+    CleanupModels {
+        epoch: u64,
+        refnos: Vec<RefU64>,
+        base: String,
+        project: String,
+        mdb: String,
+        namespace: String,
+    },
     /// 树定位目标的祖先链。目标不在已加载的树里时才发，见 ADR-0014。
     Ancestors(RefU64),
     /// 丢查询缓存并重跑启动序列。连库失败后命令行上的「重试」走这条，结果仍走
@@ -346,6 +357,14 @@ pub enum Evt {
         outcomes: Vec<(
             RefU64,
             anyhow::Result<crate::model_update_api::GenerateReply>,
+        )>,
+    },
+    /// 右键「清理模型」整批回执：每个目标各一份成败，按请求顺序。`epoch` 认帧，与生成同一套。
+    ModelsCleaned {
+        epoch: u64,
+        outcomes: Vec<(
+            RefU64,
+            anyhow::Result<crate::model_update_api::CleanupReply>,
         )>,
     },
     /// 目标的祖先链，「自己 -> 上级 -> …」序。带上请求时的那个 refno：
@@ -722,6 +741,30 @@ async fn handle_read(
                 outcomes.push((refno, result));
             }
             let _ = evt_tx.send(Evt::ModelsGenerated { epoch, outcomes });
+        }
+        Req::CleanupModels {
+            epoch,
+            refnos,
+            base,
+            project,
+            mdb,
+            namespace,
+        } => {
+            // 清理只有这一个入口。顺序做，理由同生成：一个目标可能就是整个 ZONE，并发只会让
+            // 服务端的 per-dbnum 锁互相撞。线上一律斜杠形。
+            let mut outcomes = Vec::with_capacity(refnos.len());
+            for refno in refnos {
+                let result = crate::model_update_api::delete_model_subtree(
+                    &base,
+                    &refno.to_slash_string(),
+                    &project,
+                    &mdb,
+                    &namespace,
+                )
+                .await;
+                outcomes.push((refno, result));
+            }
+            let _ = evt_tx.send(Evt::ModelsCleaned { epoch, outcomes });
         }
         Req::CheckSearchIndex => {
             face.refresh_search_index(index, scope, false, evt_tx.clone(), ctx.clone())

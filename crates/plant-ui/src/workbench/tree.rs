@@ -367,20 +367,37 @@ pub(super) fn element_menu(
     if live && let Some(branch) = dimensions.branch {
         dimension_menu_item(ui, refno, branch, dimensions.layer, cmds);
     }
-    // 自成一组。上面那几项改的是「我看不看得见」，这一项改的是模型库里的产物
+    // 自成一组。上面那几项改的是「我看不看得见」，这两项改的是模型库里的产物
     // ——删掉的几何只能重新算回来。挤进同一组里，手滑的代价差得太远。
     //
-    // 吃 `live` 门禁：跑完要把结果显示出来，没有渲染器的壳里点了只能改库、
-    // 看不见结果，而现有约定是「不接线就不显示」，不摆灰色占位。
+    // 吃 `live` 门禁：跑完要把结果显示出来（重新生成）/ 卸掉（清理），没有渲染器的壳里
+    // 点了只能改库、看不见结果，而现有约定是「不接线就不显示」，不摆灰色占位。
+    //
+    // 「清理模型」紧挨「重新生成模型」正下方（2026-10-10 清理模型计划 D1）：只删产物、不重算，
+    // 给「算错了要清掉再看」「只想清掉不想立刻重算」这类特殊情况用。两项共用一个忙碌位：
+    // 都改模型库，服务端对重叠的根本来就回 409，没必要让人先点出一个 409 来。
     if live {
         ui.separator();
+        let busy_hint = "已经有一趟重新生成 / 清理在跑了";
         let label = format!("{}  重新生成模型{suffix}", ph::ARROWS_CLOCKWISE);
         if ui
             .add_enabled(!regen_busy, egui::Button::new(label))
-            .on_disabled_hover_text("已经有一趟重新生成在跑了")
+            .on_disabled_hover_text(busy_hint)
             .clicked()
         {
             cmds.push(Cmd::RegenerateModels {
+                targets: targets.to_vec(),
+            });
+            ui.close();
+        }
+        let label = format!("{}  清理模型{suffix}", ph::BROOM);
+        if ui
+            .add_enabled(!regen_busy, egui::Button::new(label))
+            .on_disabled_hover_text(busy_hint)
+            .on_hover_text("只删这个范围已生成的模型产物，不重算；需要时再右键「重新生成模型」")
+            .clicked()
+        {
+            cmds.push(Cmd::CleanupModels {
                 targets: targets.to_vec(),
             });
             ui.close();
@@ -690,6 +707,41 @@ mod tests {
             1,
             "菜单里只该有一处画这一项"
         );
+    }
+
+    /// 「清理模型」紧挨「重新生成模型」正下方、同一组、同一 live 门禁、同一个忙碌位
+    /// （2026-10-10 清理模型计划 D1）；两项各推自己的 `Cmd`，都不进 `ModelAction`。
+    #[test]
+    fn the_cleanup_item_sits_right_below_regenerate_in_the_same_group() {
+        let source = include_str!("tree.rs");
+        let body = source.split_once("#[cfg(test)]").expect("正文").0;
+        let menu = body
+            .split_once("pub(super) fn element_menu(")
+            .expect("element_menu")
+            .1
+            .split_once("fn dimension_menu_item(")
+            .expect("下一个函数")
+            .0;
+        let regenerate = menu.find("重新生成模型{suffix}").expect("重新生成项");
+        let cleanup = menu.find("清理模型{suffix}").expect("清理项");
+        let copy = menu.find("复制 REFNO{suffix}").expect("复制项");
+        assert!(
+            regenerate < cleanup && cleanup < copy,
+            "清理在重新生成之下、复制之上：{menu}"
+        );
+        assert!(
+            !menu[regenerate..cleanup].contains("ui.separator()"),
+            "两项同一组，中间不许再隔一条线：{}",
+            &menu[regenerate..cleanup]
+        );
+        let group = &menu[regenerate..copy];
+        assert_eq!(
+            group.matches("add_enabled(!regen_busy,").count(),
+            2,
+            "两项共用同一个忙碌位：{group}"
+        );
+        assert!(group.contains("Cmd::RegenerateModels {") && group.contains("Cmd::CleanupModels {"));
+        assert!(!group.contains("Cmd::Model("), "改模型库的动作不走 ModelAction：{group}");
     }
 
     #[test]

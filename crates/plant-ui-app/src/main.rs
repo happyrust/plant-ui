@@ -47,7 +47,7 @@ use logs::Retry;
 use plant_ui::data_publish::{self, State as DataPublishState};
 use plant_ui::fonts;
 use plant_ui::manual_data_publish::{self, State as ManualDataPublishState};
-use plant_ui::model_regenerate;
+use plant_ui::model_mutation;
 use plant_ui::model_update::{
     self, Feed as ModelUpdateFeed, State as ModelUpdateState, Vm as ModelUpdateVm,
 };
@@ -1144,16 +1144,18 @@ struct App {
     /// 只长设计库元素。选中之后下拉多半已经关了、`vm.search` 也清了，所以这份库号
     /// 单独留着，别处不用（计划 §5.5）。
     search_hit_dbs: HashMap<RefU64, u32>,
-    /// 「重新生成模型」的确认框，`None` = 没开（ADR-0030 D2：确认 → 一发 generate → 显示）。
-    regenerate: Option<model_regenerate::Vm>,
-    /// 这一趟的帧号。确认那一刻钉住，generate 的整批回执拿它认帧；换过目标、关过窗
-    /// 都加一，上一趟的尾巴回来就丢。
-    regenerate_epoch: u64,
-    /// 确认框打开到回执落地之间的那一趟：窗上的标题与右键那几行。`None` = 没在跑。
-    regenerate_run: Option<RegenerateRun>,
+    /// 「重新生成模型」/「清理模型」共用的确认框，`None` = 没开（ADR-0030 D2：确认 → 一发
+    /// generate → 显示；清理：确认 → 一发 DELETE → 卸载）。一次只开一件事。
+    mutation: Option<model_mutation::Vm>,
+    /// 这一趟的帧号。确认那一刻钉住，generate / DELETE 的整批回执拿它认帧；换过目标、关过窗
+    /// 都加一，上一趟的尾巴回来就丢。两种动作共用一个帧号：同时只会有一趟在跑。
+    mutation_epoch: u64,
+    /// 确认框打开到回执落地之间的那一趟：是哪件事、窗上的标题与右键那几行。`None` = 没在跑。
+    mutation_run: Option<MutationRun>,
     /// generate 成功、正等显示回包替换旧几何的目标。右键之前这些目标名下的模型可能已经在
     /// 场景里（旧产物）；它们的 records 回包到了要先卸掉已加载的同名模型再装，否则
     /// `claim_unloaded_model_refnos` 会把重算过的几何当成「已经有了」。
+    /// 清理请求超时的目标也进这里（服务端可能删了一半）：下次点眼睛重查，空了就把残留卸掉。
     regenerate_refresh: HashSet<RefU64>,
     /// 任务队列视图的数据。它不跟着任何一次运行走——队列是常驻的，进程活着它就在。
     queue: task_queue::Vm,
@@ -1303,12 +1305,15 @@ fn hit_row(hit: plant_ui_data::NameHit, desi_dbs: &[u32]) -> SearchHitVm {
     }
 }
 
-/// 右键「重新生成模型」从打开确认框到回执落地之间的那一趟（ADR-0030 D2）。
+/// 右键「重新生成模型」/「清理模型」从打开确认框到回执落地之间的那一趟（ADR-0030 D2；
+/// 2026-10-10 清理模型计划）。
 ///
-/// 只记标题与右键那几行：客户端不清点、不解根、不删产物，没有名单要守。
-struct RegenerateRun {
+/// 只记是哪件事、标题与右键那几行：客户端不清点、不解根，没有名单要守。
+struct MutationRun {
+    kind: model_mutation::Kind,
     label: String,
-    /// 右键那几行。各一发 generate，成功之后以它们为祖先发显示。
+    /// 右键那几行。各一发 generate / DELETE；成功之后重新生成以它们为祖先发显示，清理把它们
+    /// 名下已加载的模型卸掉。
     targets: Vec<RefU64>,
 }
 
@@ -1334,6 +1339,86 @@ fn generate_outcome(result: &anyhow::Result<model_update_api::GenerateReply>) ->
                 GenerateOutcome::Failed
             }
         }
+    }
+}
+
+/// 一发 `DELETE /model/subtree` 的回执归到哪一档（清理模型计划 C3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupOutcome {
+    /// 服务端删完了：卸载这个目标名下已加载的模型。
+    Cleaned,
+    /// 409：范围内有根正在生成、或同库有整库任务在跑。服务端一行没删，三维不动，稍后再试。
+    Rejected,
+    /// 连不上 / 超时：这条没有预算包装、同步删到底，客户端等不到**不等于没删**。三维不动，
+    /// 这一行标成待重查，人点眼睛确认。
+    Unknown,
+    /// 其他失败：ERROR 原文，三维不动。
+    Failed,
+}
+
+/// 回执 → 四档。`conflict` 就是 spec §4.5.1 的 409；`timeout` 在客户端这一侧还包括连不上。
+fn cleanup_outcome(result: &anyhow::Result<model_update_api::CleanupReply>) -> CleanupOutcome {
+    match result {
+        Ok(_) => CleanupOutcome::Cleaned,
+        Err(error) => {
+            let failure = model_update_api::failure_of(error);
+            if failure.code == "conflict" {
+                CleanupOutcome::Rejected
+            } else if failure.form() == model_update::FailForm::Timeout {
+                CleanupOutcome::Unknown
+            } else {
+                CleanupOutcome::Failed
+            }
+        }
+    }
+}
+
+/// 清理成功之后三维里该卸哪些模型、本端「已知范围」里该摘哪些键（清理模型计划 D3）。
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CleanupUnload {
+    /// 要发 `ModelAction::Unload` 的叶子（只含此刻真在场景里的），按 refno 排序。
+    refnos: Vec<RefU64>,
+    /// 范围内的「已知范围」键：目标自己、以及祖先链含目标的键（含叶子的自映射）。
+    dropped_scopes: Vec<RefU64>,
+}
+
+/// 只看本端缓存、不发请求地圈出一个目标的清理范围。
+///
+/// 范围 = 目标自身 + 它子树下的一切。两类材料：
+/// - `scopes` 里键等于目标、或祖先链含目标的键，**整条成员**都算在范围内——成员自己的链在不在
+///   缓存里无所谓：范围键既然在目标之下，它名下的模型就都在目标之下（这是「保守」的那一半）；
+/// - `loaded` 里自己就是目标、或祖先链含目标的叶子。
+///
+/// 链不在缓存里、又不属于任何范围内键的叶子**不动**：本端分不清它在哪个 ZONE 底下，猜成
+/// 「在范围内」会把别处正看着的模型一并卸掉——取回工作之后 `scopes` 只剩叶子的自映射，这种
+/// 叶子满场都是。漏掉的残留由下一次取回工作纠正（records 已空的不再装回来），不静默：
+/// 清理那一行日志报的就是实际卸载数。
+fn cleanup_unload_plan(
+    target: RefU64,
+    scopes: &HashMap<RefU64, Vec<RefU64>>,
+    loaded: &HashSet<RefU64>,
+    ancestors: impl Fn(RefU64) -> Option<Vec<RefU64>>,
+) -> CleanupUnload {
+    let in_range = |refno: RefU64| {
+        refno == target || ancestors(refno).is_some_and(|chain| chain.contains(&target))
+    };
+    let mut dropped_scopes: Vec<RefU64> = scopes
+        .keys()
+        .copied()
+        .filter(|key| in_range(*key))
+        .collect();
+    dropped_scopes.sort_by_key(|refno| refno.0);
+    let mut refnos: HashSet<RefU64> = dropped_scopes
+        .iter()
+        .flat_map(|key| scopes[key].iter().copied())
+        .filter(|refno| loaded.contains(refno))
+        .collect();
+    refnos.extend(loaded.iter().copied().filter(|leaf| in_range(*leaf)));
+    let mut refnos: Vec<RefU64> = refnos.into_iter().collect();
+    refnos.sort_by_key(|refno| refno.0);
+    CleanupUnload {
+        refnos,
+        dropped_scopes,
     }
 }
 
@@ -1961,9 +2046,9 @@ impl App {
             desi_dbs: Vec::new(),
             search_epoch: 0,
             search_hit_dbs: HashMap::new(),
-            regenerate: None,
-            regenerate_epoch: 0,
-            regenerate_run: None,
+            mutation: None,
+            mutation_epoch: 0,
+            mutation_run: None,
             regenerate_refresh: HashSet::new(),
             // 队列面板按它决定库行「模型来源」画不画、轮询失败怎么说（计划 §5.5）。
             queue: task_queue::Vm::new(read_face),
@@ -2845,9 +2930,14 @@ impl App {
                 }
                 // generate 的整批回执拿确认那一刻钉住的帧号认；对不上的一律不认
                 // ——这一趟已经收了，回来的是上一趟的尾巴。
-                data::Evt::ModelsGenerated { epoch, .. } if epoch != self.regenerate_epoch => {}
+                data::Evt::ModelsGenerated { epoch, .. } if epoch != self.mutation_epoch => {}
                 data::Evt::ModelsGenerated { outcomes, .. } => {
                     self.settle_models_generated(outcomes);
+                    dirty = true;
+                }
+                data::Evt::ModelsCleaned { epoch, .. } if epoch != self.mutation_epoch => {}
+                data::Evt::ModelsCleaned { outcomes, .. } => {
+                    self.settle_models_cleaned(outcomes);
                     dirty = true;
                 }
                 data::Evt::Ancestors(refno, Ok(chain)) => {
@@ -3824,8 +3914,13 @@ impl App {
                     self.navigate(step);
                     dirty = true;
                 }
-                Cmd::RegenerateModels { targets } => self.begin_regenerate(targets),
-                Cmd::RegenerateConfirm { accepted } => self.settle_regenerate_confirm(accepted),
+                Cmd::RegenerateModels { targets } => {
+                    self.begin_mutation(model_mutation::Kind::Regenerate, targets)
+                }
+                Cmd::CleanupModels { targets } => {
+                    self.begin_mutation(model_mutation::Kind::Cleanup, targets)
+                }
+                Cmd::ModelMutationConfirm { accepted } => self.settle_mutation_confirm(accepted),
             }
         }
         if dirty {
@@ -3969,71 +4064,87 @@ impl App {
         self.vm.search.running = Some(SearchRunVm { query });
     }
 
-    /// 右键「重新生成模型」的第一步：打开确认框（ADR-0030 D2）。
+    /// 右键「重新生成模型」/「清理模型」的第一步：打开确认框（ADR-0030 D2；清理模型计划 D2）。
     ///
-    /// 不清点、不解根、不删产物——确认框不带数字，人要判断的只有「这个范围要不要重算」。
+    /// 不清点、不解根、不删产物——确认框不带数字，人要判断的只有「这个范围要不要重算 / 清掉」。
     /// 右键换一行就重开一次，上一趟没确认的那份目标随之作废；跑起来的那一趟不会走到这里
-    /// （`regen_busy` 挡着右键菜单）。
-    fn begin_regenerate(&mut self, targets: Vec<RefU64>) {
+    /// （`regen_busy` 挡着右键菜单的这两项）。
+    fn begin_mutation(&mut self, kind: model_mutation::Kind, targets: Vec<RefU64>) {
         let Some(first) = targets.first().copied() else {
             return;
         };
         let label = regenerate_label(self.tree.label(first), targets.len());
-        self.regenerate_epoch = self.regenerate_epoch.wrapping_add(1);
-        self.regenerate_run = Some(RegenerateRun {
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+        self.mutation_run = Some(MutationRun {
+            kind,
             label: label.clone(),
             targets,
         });
-        self.regenerate = Some(model_regenerate::Vm::Confirm { label });
+        self.mutation = Some(model_mutation::Vm::Confirm { kind, label });
     }
 
-    /// 确认框的回执。接受就对右键那几行**各一发** `generate(force = true)`，整批回执落在
-    /// `Evt::ModelsGenerated`；取消 / 关窗 / 关掉失败态一个请求都不发。
-    fn settle_regenerate_confirm(&mut self, accepted: bool) {
-        let closed = self.regenerate.take();
-        let Some(model_regenerate::Vm::Confirm { .. }) = closed else {
+    /// 确认框的回执。接受就对右键那几行**各一发**——重新生成是 `generate(force = true)`，整批
+    /// 回执落在 `Evt::ModelsGenerated`；清理是 `DELETE /model/subtree`，整批回执落在
+    /// `Evt::ModelsCleaned`。取消 / 关窗 / 关掉失败态一个请求都不发。
+    fn settle_mutation_confirm(&mut self, accepted: bool) {
+        let closed = self.mutation.take();
+        let Some(model_mutation::Vm::Confirm { .. }) = closed else {
             // 失败态被关掉（跑起来的那一档没有叉，到不了这里）：收摊。
-            self.regenerate_epoch = self.regenerate_epoch.wrapping_add(1);
-            self.regenerate_run = None;
+            self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+            self.mutation_run = None;
             return;
         };
         if !accepted {
-            self.regenerate_epoch = self.regenerate_epoch.wrapping_add(1);
-            self.regenerate_run = None;
+            self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+            self.mutation_run = None;
             return;
         }
-        let Some(run) = self.regenerate_run.as_ref() else {
-            self.regenerate_epoch = self.regenerate_epoch.wrapping_add(1);
+        let Some(run) = self.mutation_run.as_ref() else {
+            self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
             return;
         };
-        let (label, targets) = (run.label.clone(), run.targets.clone());
+        let (kind, label, targets) = (run.kind, run.label.clone(), run.targets.clone());
         // 帧号从这里起不再变：整批回执拿它认帧。
-        let request = data::Req::GenerateModels {
-            epoch: self.regenerate_epoch,
-            refnos: targets.clone(),
-            base: self.model_api_url.clone(),
-            project: self.vm.project.clone(),
-            mdb: self.mdb.clone(),
-            namespace: self.namespace.clone(),
+        let request = match kind {
+            model_mutation::Kind::Regenerate => data::Req::GenerateModels {
+                epoch: self.mutation_epoch,
+                refnos: targets.clone(),
+                base: self.model_api_url.clone(),
+                project: self.vm.project.clone(),
+                mdb: self.mdb.clone(),
+                namespace: self.namespace.clone(),
+            },
+            model_mutation::Kind::Cleanup => data::Req::CleanupModels {
+                epoch: self.mutation_epoch,
+                refnos: targets.clone(),
+                base: self.model_api_url.clone(),
+                project: self.vm.project.clone(),
+                mdb: self.mdb.clone(),
+                namespace: self.namespace.clone(),
+            },
         };
         if self.bridge.req.send(request).is_err() {
-            self.regenerate_run = None;
-            self.regenerate_epoch = self.regenerate_epoch.wrapping_add(1);
+            self.mutation_run = None;
+            self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
             self.logs.warn(
                 &mut self.vm.logs,
                 format!("{label}：数据线程已关闭，这一趟没有开始"),
             );
             return;
         }
-        self.logs.info(
-            &mut self.vm.logs,
-            format!(
+        let started = match kind {
+            model_mutation::Kind::Regenerate => format!(
                 "{label}：正在生成模型（{} 个目标，范围内已有的产物会被重算替换；服务端预算 120 秒，超时后后台继续）…",
                 targets.len()
             ),
-        );
+            model_mutation::Kind::Cleanup => format!(
+                "{label}：正在清理模型产物（{} 个目标，服务端按子树删已生成的产物、不重算；只删产物，不删设计元素）…",
+                targets.len()
+            ),
+        };
+        self.logs.info(&mut self.vm.logs, started);
         self.vm.regen_busy = true;
-        self.regenerate = Some(model_regenerate::Vm::Running { label });
+        self.mutation = Some(model_mutation::Vm::Running { kind, label });
     }
 
     /// generate 的整批回执落地（ADR-0030 D2 第 3 步）：成功的目标**生成完成之后再显示**——
@@ -4043,11 +4154,11 @@ impl App {
         &mut self,
         outcomes: Vec<(RefU64, anyhow::Result<model_update_api::GenerateReply>)>,
     ) {
-        let Some(run) = self.regenerate_run.take() else {
+        let Some(run) = self.mutation_run.take() else {
             return;
         };
         self.vm.regen_busy = false;
-        self.regenerate_epoch = self.regenerate_epoch.wrapping_add(1);
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         let mut display = Vec::new();
         let mut failures = Vec::new();
         let mut legacy_said = false;
@@ -4086,10 +4197,11 @@ impl App {
                 }
             }
         }
-        self.regenerate = if failures.is_empty() {
+        self.mutation = if failures.is_empty() {
             None
         } else {
-            Some(model_regenerate::Vm::Failed {
+            Some(model_mutation::Vm::Failed {
+                kind: model_mutation::Kind::Regenerate,
                 label: run.label.clone(),
                 reason: failures.join("；"),
             })
@@ -4104,6 +4216,127 @@ impl App {
             self.regenerate_refresh.insert(*target);
         }
         self.set_model_visible(display, true);
+    }
+
+    /// `DELETE /model/subtree` 的整批回执落地（清理模型计划 C3 / D3）：成功的目标把它名下
+    /// 已加载的模型从三维卸掉、树行回「未加载」——产物已经在服务端删了，这是已知结论，
+    /// 不值一次 records 往返；409 / 超时 / 其他失败逐目标点名，各归各。
+    fn settle_models_cleaned(
+        &mut self,
+        outcomes: Vec<(RefU64, anyhow::Result<model_update_api::CleanupReply>)>,
+    ) {
+        let Some(run) = self.mutation_run.take() else {
+            return;
+        };
+        self.vm.regen_busy = false;
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+        let mut failures = Vec::new();
+        let mut unload = Vec::new();
+        for (refno, result) in &outcomes {
+            let label = self.tree.label(*refno);
+            match cleanup_outcome(result) {
+                CleanupOutcome::Cleaned => {
+                    let reply = result.as_ref().expect("Cleaned 只来自 Ok");
+                    let removed = self.forget_cleaned_scope(*refno);
+                    let count = removed.len();
+                    unload.extend(removed);
+                    self.logs.info(
+                        &mut self.vm.logs,
+                        format!(
+                            "{label}：已清理模型产物（{}）；三维卸载 {count} 个模型；需要时右键「重新生成模型」",
+                            reply.server_note()
+                        ),
+                    );
+                }
+                CleanupOutcome::Rejected => {
+                    let error = result.as_ref().expect_err("Rejected 只来自 Err");
+                    self.logs.error(
+                        &mut self.vm.logs,
+                        format!("{label}：范围内有根正在生成或同库有整库任务在跑，稍后再试"),
+                        error,
+                        None,
+                    );
+                    failures.push(format!(
+                        "{label}：{}",
+                        model_update_api::failure_of(error).message
+                    ));
+                }
+                CleanupOutcome::Unknown => {
+                    // 服务端这条没有预算包装、同步删到底：客户端等不到不等于它没删。本端的
+                    // 范围缓存作废、这一行标成「待重查」，人点眼睛就会重查一次 records——
+                    // 空了就把残留卸掉，还在就照常显示。
+                    self.model_scopes.remove(refno);
+                    self.regenerate_refresh.insert(*refno);
+                    self.tree.pending_direction.remove(refno);
+                    self.tree.visibility_unavailable.insert(*refno);
+                    self.logs.warn(
+                        &mut self.vm.logs,
+                        format!("{label}：清理请求超时，服务端可能已删一部分；点眼睛重查确认"),
+                    );
+                    failures.push(format!("{label}：清理请求超时，服务端可能已删一部分；点眼睛重查确认"));
+                }
+                CleanupOutcome::Failed => {
+                    let error = result.as_ref().expect_err("Failed 只来自 Err");
+                    self.logs
+                        .error(&mut self.vm.logs, format!("{label}：清理失败"), error, None);
+                    failures.push(format!(
+                        "{label}：{}",
+                        model_update_api::failure_of(error).message
+                    ));
+                }
+            }
+        }
+        if !unload.is_empty() {
+            self.view3d_commands
+                .push(Cmd::Model(plant_ui::ModelAction::Unload { refnos: unload }));
+        }
+        self.mutation = if failures.is_empty() {
+            None
+        } else {
+            Some(model_mutation::Vm::Failed {
+                kind: model_mutation::Kind::Cleanup,
+                label: run.label.clone(),
+                reason: failures.join("；"),
+            })
+        };
+    }
+
+    /// 清理成功之后把一个目标名下的模型从本端账上抹掉（D3），回要卸载的那批叶子。
+    ///
+    /// 范围由 [`cleanup_unload_plan`] 只按本端缓存算；这里只负责把结论落到各本账上：范围内的
+    /// 「已知范围」键整条摘掉（连同它作为范围目标 / 待替换目标的登记），卸掉的叶子从已装账、
+    /// 实际渲染状态与别的范围键的成员表里拿走，目标自己标成「明确没有」——不然树行会从还显示着
+    /// 的祖先那里把 eye 继承过来，看着像没清。
+    fn forget_cleaned_scope(&mut self, target: RefU64) -> Vec<RefU64> {
+        let plan = cleanup_unload_plan(
+            target,
+            &self.model_scopes,
+            &self.loaded_models,
+            |refno| self.tree.ancestors(refno),
+        );
+        for key in &plan.dropped_scopes {
+            self.model_scopes.remove(key);
+            self.scope_targets.remove(key);
+            self.regenerate_refresh.remove(key);
+            self.tree.pending_direction.remove(key);
+            self.tree.pending_visibility.remove(key);
+        }
+        let gone: HashSet<RefU64> = plan.refnos.iter().copied().collect();
+        for refno in &gone {
+            self.loaded_models.remove(refno);
+            self.tree.visibility.remove(refno);
+            self.model_show_waiting.remove(refno);
+        }
+        // 别的范围键（比如目标所在的 ZONE）成员表里还记着这些叶子：摘掉，空了的键一起退场，
+        // 下次点那一行眼睛就重查而不是对着一张空名单下指令。
+        self.model_scopes.retain(|_, members| {
+            members.retain(|member| !gone.contains(member));
+            !members.is_empty()
+        });
+        self.tree.pending_direction.remove(&target);
+        self.tree.pending_visibility.remove(&target);
+        self.tree.visibility_unavailable.insert(target);
+        plan.refnos
     }
 
     /// 树定位：选中目标并让属性跟上，再想办法把它那一行露出来（ADR-0014）。
@@ -5533,11 +5766,12 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{
-        AutoRefresh, EMPTY_SCOPE_HINT, EleTreeNode, GenerateOutcome, ModelVisibility,
-        ModelVisibilityPlan, PanelRoomResolution, RefU64, ReloadSnapshot, RowVisibility, TreeModel,
-        TreeRowVm, Window, auto_refresh, background_models_settled, begin_get_work,
-        cache_model_scope, claim_unloaded_model_refnos, command_reply_is_current,
-        complete_refresh_generation, empty_props_verdict, expand_room_model_targets,
+        AutoRefresh, CleanupOutcome, CleanupUnload, EMPTY_SCOPE_HINT, EleTreeNode, GenerateOutcome,
+        ModelVisibility, ModelVisibilityPlan, PanelRoomResolution, RefU64, ReloadSnapshot,
+        RowVisibility, TreeModel, TreeRowVm, Window, auto_refresh, background_models_settled,
+        begin_get_work, cache_model_scope, claim_unloaded_model_refnos, cleanup_outcome,
+        cleanup_unload_plan, command_reply_is_current, complete_refresh_generation,
+        empty_props_verdict, expand_room_model_targets,
         finished_after, generate_outcome, generate_summary, in_mdb_path, is_panel_noun,
         mark_model_scope_unavailable, model_drains_idle, model_progress_terminal,
         model_source_changed_line, model_visibility_plan, needs_children_query, read_face_switch,
@@ -5857,29 +6091,29 @@ mod tests {
             .split_once("Req::GenerateModels {")
             .expect("生成那一臂")
             .1
-            .split_once("Req::CheckSearchIndex =>")
-            .expect("下一臂")
+            .split_once("Req::CleanupModels {")
+            .expect("清理那一臂紧随其后")
             .0;
         assert_eq!(lane.matches("generate_model(").count(), 1, "{lane}");
         assert!(lane.contains("true,"), "force = true：{lane}");
-        for forbidden in [
-            "regeneration_count",
-            "delete_model_subtree",
-            "regeneration_roots",
-        ] {
+        // 生成那一臂不删：删旧是服务端 `force = true` 里的事，客户端的 DELETE 只属于清理那一臂。
+        assert!(!lane.contains("delete_model_subtree"), "{lane}");
+        for forbidden in ["regeneration_count", "regeneration_roots"] {
             assert!(!data.contains(forbidden), "旧流水还在：{forbidden}");
         }
 
         let source = include_str!("main.rs");
         let confirm = source
-            .split_once("fn settle_regenerate_confirm(&mut self, accepted: bool) {")
+            .split_once("fn settle_mutation_confirm(&mut self, accepted: bool) {")
             .expect("确认那一步")
             .1
             .split_once("fn settle_models_generated(")
             .expect("回执那一步")
             .0;
-        assert_eq!(confirm.matches("data::Req::").count(), 1, "{confirm}");
-        assert!(confirm.contains("data::Req::GenerateModels {"));
+        // 两件事一个确认步：按 kind 各发一种请求，别无其他。
+        assert_eq!(confirm.matches("data::Req::").count(), 2, "{confirm}");
+        assert!(confirm.contains("Kind::Regenerate => data::Req::GenerateModels {"));
+        assert!(confirm.contains("Kind::Cleanup => data::Req::CleanupModels {"));
         assert!(
             !confirm.contains("RegenerateScope") && !confirm.contains("RegenerateDelete"),
             "清点 / 整片删已退役"
@@ -5889,7 +6123,7 @@ mod tests {
             .split_once("fn settle_models_generated(")
             .expect("回执那一步")
             .1
-            .split_once("fn locate(&mut self")
+            .split_once("fn settle_models_cleaned(")
             .expect("下一个方法")
             .0;
         let refresh = settle
@@ -5968,7 +6202,7 @@ mod tests {
             .split_once("fn settle_models_generated(")
             .expect("回执那一步")
             .1
-            .split_once("fn locate(&mut self")
+            .split_once("fn settle_models_cleaned(")
             .expect("下一个方法")
             .0;
         let background = settle
@@ -5984,6 +6218,193 @@ mod tests {
             !background.contains("display.push"),
             "超时的不进显示名单：{background}"
         );
+    }
+
+    /// 右键「清理模型」：确认之后恰好一发 `DELETE /model/subtree`（每个目标一发），回执落地后
+    /// 成功的目标**本地卸载**、不重查 records（清理模型计划 D3 / V6：整个流程只有 DELETE）。
+    /// 这里钉：数据线程那一臂只调 `delete_model_subtree`；回执那一步不发任何请求、不走显示；
+    /// 409 那一档不卸载；超时那一档是 WARN、把目标标成待重查。
+    #[test]
+    fn cleanup_deletes_once_then_unloads_locally() {
+        let data = include_str!("data.rs");
+        let lane = data
+            .split_once("Req::CleanupModels {")
+            .expect("清理那一臂")
+            .1
+            .split_once("Req::CheckSearchIndex =>")
+            .expect("下一臂")
+            .0;
+        assert_eq!(lane.matches("delete_model_subtree(").count(), 1, "{lane}");
+        assert!(!lane.contains("generate_model("), "清理不生成：{lane}");
+        assert!(lane.contains("Evt::ModelsCleaned {"), "整批回执：{lane}");
+
+        let source = include_str!("main.rs");
+        let settle = source
+            .split_once("fn settle_models_cleaned(")
+            .expect("回执那一步")
+            .1
+            .split_once("fn forget_cleaned_scope(")
+            .expect("下一个方法")
+            .0;
+        assert!(!settle.contains("data::Req::"), "清理回执不再发请求：{settle}");
+        assert!(
+            !settle.contains("set_model_visible"),
+            "清理后不走显示那条路：{settle}"
+        );
+        assert!(settle.contains("ModelAction::Unload {"), "{settle}");
+        assert!(!settle.contains("get_work"), "{settle}");
+        let cleaned = settle
+            .split_once("CleanupOutcome::Cleaned => {")
+            .expect("成功那一档")
+            .1
+            .split_once("CleanupOutcome::Rejected => {")
+            .expect("409 那一档")
+            .0;
+        assert!(cleaned.contains("forget_cleaned_scope("), "{cleaned}");
+        assert!(cleaned.contains("重新生成模型"), "日志指路：{cleaned}");
+        let rejected = settle
+            .split_once("CleanupOutcome::Rejected => {")
+            .expect("409 那一档")
+            .1
+            .split_once("CleanupOutcome::Unknown => {")
+            .expect("超时那一档")
+            .0;
+        assert!(!rejected.contains("forget_cleaned_scope("), "409 不卸载：{rejected}");
+        assert!(rejected.contains("error("), "409 是 ERROR：{rejected}");
+        let unknown = settle
+            .split_once("CleanupOutcome::Unknown => {")
+            .expect("超时那一档")
+            .1
+            .split_once("CleanupOutcome::Failed => {")
+            .expect("失败那一档")
+            .0;
+        assert!(!unknown.contains("forget_cleaned_scope("), "超时不卸载：{unknown}");
+        assert!(unknown.contains("warn("), "超时是 WARN：{unknown}");
+        assert!(
+            unknown.contains("regenerate_refresh.insert("),
+            "超时的目标标成待重查：{unknown}"
+        );
+        assert!(unknown.contains("可能已删一部分"), "{unknown}");
+
+        let reply = model_update_api::CleanupReply {
+            scope: "exact_subtree".into(),
+            status: "deleted".into(),
+            model_source: None,
+            model_source_reason: None,
+        };
+        assert_eq!(cleanup_outcome(&Ok(reply.clone())), CleanupOutcome::Cleaned);
+        assert_eq!(reply.server_note(), "服务端 exact_subtree");
+        // 服务端换了状态名、或只清了内存投影：按「删过了」计，但要说出来（宪法 III）。
+        let odd = model_update_api::CleanupReply {
+            status: "purged".into(),
+            model_source: Some(plant_ui::task_queue::ModelSource::Memory),
+            model_source_reason: Some("initializing".into()),
+            ..reply
+        };
+        let note = odd.server_note();
+        assert!(note.contains("不认识的状态「purged」"), "{note}");
+        assert!(note.contains("API 内存里的投影"), "{note}");
+        assert_eq!(
+            cleanup_outcome(&Err(api_failure(
+                "conflict",
+                "generation root 24381/100677 is being generated"
+            ))),
+            CleanupOutcome::Rejected
+        );
+        assert_eq!(
+            cleanup_outcome(&Err(api_failure("timeout", "请求超时"))),
+            CleanupOutcome::Unknown
+        );
+        assert_eq!(
+            cleanup_outcome(&Err(api_failure("internal", "boom"))),
+            CleanupOutcome::Failed
+        );
+        assert_eq!(
+            cleanup_outcome(&Err(anyhow::anyhow!("connection refused"))),
+            CleanupOutcome::Failed
+        );
+    }
+
+    /// 清理范围只按本端缓存圈（D3）：目标自己 + 祖先链含目标的范围键整条成员 + 链含目标的叶子；
+    /// 链不在缓存里、又不属于范围内键的叶子不动——猜成在范围内会把别处正看着的模型一并卸掉。
+    #[test]
+    fn cleanup_unload_plan_covers_the_subtree_and_leaves_strangers_alone() {
+        let site = RefU64(1);
+        let zone_a = RefU64(2);
+        let pipe = RefU64(3);
+        let bran_1 = RefU64(4);
+        let bran_2 = RefU64(5);
+        let zone_b = RefU64(6);
+        let bran_3 = RefU64(7);
+        // 不在树缓存里的叶子：取回工作之后只剩自映射、父链未知的那种。
+        let stranger = RefU64(8);
+        // 范围键成员表里记着、但此刻不在场景里（隐藏后被别的路卸了）的叶子。
+        let not_loaded = RefU64(9);
+        let mut tree = TreeModel {
+            roots: vec![node(site, "SITE", 2)],
+            ..Default::default()
+        };
+        tree.parent.extend([
+            (zone_a, site),
+            (pipe, zone_a),
+            (bran_1, pipe),
+            (bran_2, pipe),
+            (zone_b, site),
+            (bran_3, zone_b),
+        ]);
+        let scopes: HashMap<RefU64, Vec<RefU64>> = [
+            (zone_a, vec![bran_1, bran_2, not_loaded]),
+            (bran_1, vec![bran_1]),
+            (bran_2, vec![bran_2]),
+            (zone_b, vec![bran_3]),
+            (bran_3, vec![bran_3]),
+            (stranger, vec![stranger]),
+        ]
+        .into_iter()
+        .collect();
+        let loaded: HashSet<RefU64> = [bran_1, bran_2, bran_3, stranger].into_iter().collect();
+        let plan = |target| cleanup_unload_plan(target, &scopes, &loaded, |r| tree.ancestors(r));
+
+        // 单根：只有它自己。
+        assert_eq!(
+            plan(bran_1),
+            CleanupUnload {
+                refnos: vec![bran_1],
+                dropped_scopes: vec![bran_1],
+            }
+        );
+        // 容器：名下两根都卸，自映射键一并摘；没在场景里的成员不进 Unload。
+        assert_eq!(
+            plan(zone_a),
+            CleanupUnload {
+                refnos: vec![bran_1, bran_2],
+                dropped_scopes: vec![zone_a, bran_1, bran_2],
+            }
+        );
+        // 中间层（自己没有范围键）：靠叶子与子键的祖先链圈出来。
+        assert_eq!(
+            plan(pipe),
+            CleanupUnload {
+                refnos: vec![bran_1, bran_2],
+                dropped_scopes: vec![bran_1, bran_2],
+            }
+        );
+        // 别的 ZONE 与父链未知的叶子不动。
+        for target in [bran_1, zone_a, pipe] {
+            let plan = plan(target);
+            assert!(!plan.refnos.contains(&bran_3), "{target}: {plan:?}");
+            assert!(!plan.refnos.contains(&stranger), "{target}: {plan:?}");
+        }
+        // 直接清那个父链未知的叶子：它自己当然在范围内。
+        assert_eq!(
+            plan(stranger),
+            CleanupUnload {
+                refnos: vec![stranger],
+                dropped_scopes: vec![stranger],
+            }
+        );
+        // 整个 SITE：全场。
+        assert_eq!(plan(site).refnos, vec![bran_1, bran_2, bran_3]);
     }
 
     fn node(refno: RefU64, noun: &str, children: u16) -> EleTreeNode {
@@ -7448,11 +7869,11 @@ impl App {
             &self.model_update,
             &mut self.model_update_state,
         ));
-        cmds.extend(model_regenerate::show(
+        cmds.extend(model_mutation::show(
             ui.ctx(),
             &t,
             d,
-            self.regenerate.as_ref(),
+            self.mutation.as_ref(),
         ));
         cmds.extend(room_browser::show(
             ui.ctx(),

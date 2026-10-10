@@ -745,6 +745,98 @@ pub async fn generate_model(
     })
 }
 
+#[derive(Deserialize)]
+struct CleanupBody {
+    #[serde(default)]
+    scope: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    model_source: Option<String>,
+    #[serde(default)]
+    model_source_reason: Option<String>,
+}
+
+/// `DELETE /api/v1/model/subtree` 的回执（gen-model spec §4.5.1）。`requested_refno` 不收：
+/// 回执按请求顺序整批回来，目标是哪一个本端自己知道。
+#[derive(Debug, Clone)]
+pub struct CleanupReply {
+    /// 服务端的删除口径，今天恒为 `exact_subtree`；只进日志。
+    pub scope: String,
+    /// 今天恒为 `deleted`；只进日志，认不出的要说出来。
+    pub status: String,
+    /// 清的是哪一面（spec §4.12 口径）：`Memory` = 只清了进程内投影（读透另进 spool 墓碑），
+    /// `Database` = 库 + 投影 + 账本。老服务端不给 → `None`。
+    pub model_source: Option<ModelSource>,
+    pub model_source_reason: Option<String>,
+}
+
+impl CleanupReply {
+    /// 成功那一行日志的服务端半句：口径 + 认不出的状态 + 内存供数。常态只有 `exact_subtree`。
+    ///
+    /// 清的是内存投影就要说出来——库里那一面（若有）没动，服务端重启后这次清理不复存在；
+    /// 状态不是 `deleted` 也要说出来：按「删过了」计，但人得知道服务端换了说法。
+    pub fn server_note(&self) -> String {
+        let mut note = format!("服务端 {}", self.scope);
+        if self.status != "deleted" {
+            note.push_str(&format!(
+                "，回了一个不认识的状态「{}」，按「删过了」计",
+                self.status
+            ));
+        }
+        if self.model_source == Some(ModelSource::Memory) {
+            note.push_str(&format!(
+                "；{}，清的是 API 内存里的投影",
+                ModelSource::Memory
+                    .label(self.model_source_reason.as_deref())
+                    .trim_start_matches("模型来源：")
+            ));
+        }
+        note
+    }
+}
+
+const CLEANUP_PATH: &str = "/api/v1/model/subtree";
+
+/// 对一个节点范围清理已生成的模型产物（`DELETE /api/v1/model/subtree?refno&confirm`，spec §4.5.1）：
+/// 服务端按子树删产物行——不删设计元素、不删共享单位网格、不重算；与右键重新生成里的「先删」是
+/// 服务端同一份实现。`confirm` 必须与 `refno` 原文一致，这里替调用方填同一个值：确认在界面上
+/// 已经做过了（确认框），不在这里再问一遍。
+///
+/// 右键「清理模型」是唯一调用方。显示路径不调它（ADR-0030 D1），重新生成也不调它（服务端在
+/// `force = true` 里自己清）。
+///
+/// 超时给到 125 秒：服务端这条没有 120 s 预算包装，大范围同步删到底；客户端超时时服务端可能已删
+/// 一部分，日志要把这一点说出来，让人点眼睛重查。
+pub async fn delete_model_subtree(
+    base: &str,
+    refno: &str,
+    project: &str,
+    mdb: &str,
+    namespace: &str,
+) -> anyhow::Result<CleanupReply> {
+    let path = cleanup_path(refno, project, mdb, namespace);
+    let reply: CleanupBody = delete(base, &path, Duration::from_secs(125)).await?;
+    Ok(CleanupReply {
+        scope: reply.scope,
+        status: reply.status,
+        model_source: reply.model_source.as_deref().and_then(ModelSource::parse),
+        model_source_reason: reply.model_source_reason,
+    })
+}
+
+/// `DELETE /model/subtree` 的请求行。抽出来是为了让测试不必起网络就能钉住两件事：
+/// `confirm` 与 `refno` 是同一个值、斜杠形 refno 编码过。
+fn cleanup_path(refno: &str, project: &str, mdb: &str, namespace: &str) -> String {
+    let refno = urlencode(refno);
+    format!(
+        "{CLEANUP_PATH}?refno={refno}&confirm={refno}&project={}&mdb={}&namespace={}",
+        urlencode(project),
+        urlencode(mdb),
+        urlencode(namespace)
+    )
+}
+
 #[derive(Debug, Deserialize)]
 struct ModelRecordsPage {
     #[serde(default)]
@@ -932,6 +1024,23 @@ async fn post<T: DeserializeOwned>(
     request(response)
 }
 
+/// 无 body 的 DELETE。`ehttp` 没有现成的构造器，拿 `get()` 的壳换方法名——其余
+/// （url、无 body、默认头）与 GET 完全一样。
+async fn delete<T: DeserializeOwned>(
+    base: &str,
+    path: &str,
+    timeout: Duration,
+) -> anyhow::Result<T> {
+    let mut req = ehttp::Request::get(format!("{base}{path}"));
+    req.method = ehttp::Method::DELETE;
+    req.timeout = Some(timeout);
+    let response = ehttp::fetch_async(req)
+        .await
+        .map_err(transport)
+        .context("请求模型服务失败")?;
+    request(response)
+}
+
 /// 传输层失败：连不上、超时、握手不成。对用的人来说这些是同一件事——服务够不着，
 /// 没有任何数据被改动，直接重试即可，所以统一归 `timeout`。
 fn transport(error: String) -> anyhow::Error {
@@ -1074,6 +1183,28 @@ mod tests {
         assert_eq!(urlencode("24381/100677"), "24381%2F100677");
         assert_eq!(urlencode("/ALL"), "%2FALL");
         assert_eq!(urlencode("ProjAMS"), "ProjAMS");
+    }
+
+    /// 清理一发的请求行（spec §4.5.1）：`confirm` 必须与 `refno` 原文一致——确认在界面上做过了，
+    /// 这里替调用方填同一个值；斜杠形 refno 与 MDB 都要转义；身份三件套随行。
+    #[test]
+    fn cleanup_request_confirms_the_same_refno_and_encodes_it() {
+        let path = cleanup_path("24381/100677", "ProjAMS", "/ALL", "aios");
+        assert_eq!(
+            path,
+            "/api/v1/model/subtree?refno=24381%2F100677&confirm=24381%2F100677&project=ProjAMS&mdb=%2FALL&namespace=aios"
+        );
+        // 清理只有这一条路由，不像 generate 还有旧名可退：字符串常量只许出现一次。
+        // 文档注释可以点名同一条路径，不计入。
+        let source = include_str!("model_update_api.rs")
+            .split_once("#[cfg(test)]")
+            .expect("tests follow")
+            .0;
+        assert_eq!(
+            source.matches("\"/api/v1/model/subtree\"").count(),
+            1,
+            "{source}"
+        );
     }
 
     /// generate 的四档状态对界面是四件不同的事，压成布尔就分不出「重做过了」与

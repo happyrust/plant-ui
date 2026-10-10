@@ -1797,6 +1797,19 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
                 })
                 .collect(),
         },
+        // 同理，清理也清不了：没有模型服务就没有产物可删，照实回失败（清理模型计划 C1）。
+        Req::CleanupModels { epoch, refnos, .. } => Evt::ModelsCleaned {
+            epoch,
+            outcomes: refnos
+                .into_iter()
+                .map(|refno| {
+                    (
+                        refno,
+                        Err(anyhow::anyhow!("演示模式没有模型服务，清理不了模型产物")),
+                    )
+                })
+                .collect(),
+        },
         Req::ModelUpdatePreview { .. } => Evt::ModelUpdatePreview(Ok(engine.preview())),
         Req::ModelUpdateExecute {
             dbnums,
