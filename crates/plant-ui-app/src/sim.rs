@@ -967,7 +967,6 @@ impl Engine {
                             .late_chasing
                             .and_then(|(n, roots)| (n == db.dbnum).then_some(roots)),
                         model_dead_roots: None,
-                        ref0s: Vec::new(),
                     }
                 })
                 .collect(),
@@ -1828,7 +1827,8 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
                 "演示模式没有模型服务，重算不了 db{dbnum} 的模型"
             )),
         },
-        Req::CleanupDbnumModel { dbnum, .. } => Evt::DbnumModelCleaned {
+        Req::CleanupDbnumModel { epoch, dbnum, .. } => Evt::DbnumModelCleaned {
+            epoch,
             dbnum,
             result: Err(anyhow::anyhow!(
                 "演示模式没有模型服务，清理不了 db{dbnum} 的模型"

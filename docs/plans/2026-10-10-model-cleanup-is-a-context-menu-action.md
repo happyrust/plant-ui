@@ -1,7 +1,7 @@
 # 「清理模型」：范围清理在右键、整库清理在库行 · 只删产物、不重算 · 开发计划
 
 > 日期：2026-10-10（第 2 稿：plannotator 第 1 稿 approved 后，用户补「整库清理也要」，加 §1C / E 组决策 / G3 / C5）
-> 状态：**计划，未实施。** 本文与 gen-model `docs/plans/2026-10-10-regeneration-leaves-no-stale-artifacts-dev-plan.md`（S0 已提交 `a63fa2f57`，S1 在工作树）同一条线：那份管「重新生成 = 先删后生成」，这份管「只删不生成」的两个手动入口。
+> 状态：**客户端已落地**（2026-10-12，`codex/increment-ui-closure`）。C1–C3、C5 在 plant-ui；C4 的 plant-ui 半边已写入 `CONTEXT.md`、ADR-0030 修订 D4、`CHANGELOG.md`「未发布」。G1 / G3 在 gen-model，本仓没有，没核。本文与 gen-model `docs/plans/2026-10-10-regeneration-leaves-no-stale-artifacts-dev-plan.md`（S0 已提交 `a63fa2f57`，S1 在工作树）同一条线：那份管「重新生成 = 先删后生成」，这份管「只删不生成」的两个手动入口。
 > 起因：用户要「一个模型清理的功能，在重新生成模型下方，方便特殊情况下使用」；随后补「整库清理也要」。
 > 术语（拟进 `CONTEXT.md`「模型显示与生成」）：**清理模型 (Model Cleanup)** = 把**已生成的产物行**删掉、三维里对应的模型卸载，不重算、不删共享单位网格。两个口径：**范围清理**（右键，一个节点子树，§4.5.1）与**整库清理**（库行，一个 dbnum 的全部模型面 + 模型水位归零）。_Avoid_：删除模型（会被理解成删设计元素）、深度删除（d-8 已否决）、清库（那是数据面的 `DELETE /dbnums/{n}/data`）。
 > 涉及：plant-ui `crates/plant-ui/src/{lib,workbench/tree,model_regenerate,task_queue}.rs`、`crates/plant-ui-app/src/{main,data,model_update_api}.rs`、`CONTEXT.md`、`docs/adr/0030-…`、`CHANGELOG.md`；gen-model `src/data_interface/{on_demand_model,fast_delete}.rs`、`src/web_service/{handlers,mod}.rs`、`docs/specs/web-service-api.md`、`changelog.md`。

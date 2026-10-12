@@ -204,7 +204,9 @@ pub enum Req {
         dbnum: u32,
     },
     /// 库行「清理模型（整库）」：`DELETE /api/v1/dbnums/{dbnum}/model?confirm={dbnum}`。
+    /// `epoch` 认帧，与右键清理同一套：晚到的回执对不上就丢掉。
     CleanupDbnumModel {
+        epoch: u64,
         base: String,
         project: String,
         mdb: String,
@@ -390,7 +392,9 @@ pub enum Evt {
         result: anyhow::Result<crate::model_update_api::ModelRebuildReceipt>,
     },
     /// 「清理模型（整库）」的回执。成功之后宿主按 `ref0s` 卸三维；缺席则只记日志。
+    /// `epoch` 对不上当前确认框的那一帧就丢掉。
     DbnumModelCleaned {
+        epoch: u64,
         dbnum: u32,
         result: anyhow::Result<crate::model_update_api::DbnumModelCleanupReceipt>,
     },
@@ -834,6 +838,7 @@ async fn handle_read(
             let _ = evt_tx.send(Evt::ModelRebuild { dbnum, result });
         }
         Req::CleanupDbnumModel {
+            epoch,
             base,
             project,
             mdb,
@@ -844,7 +849,11 @@ async fn handle_read(
                 &base, &project, &mdb, &namespace, dbnum,
             )
             .await;
-            let _ = evt_tx.send(Evt::DbnumModelCleaned { dbnum, result });
+            let _ = evt_tx.send(Evt::DbnumModelCleaned {
+                epoch,
+                dbnum,
+                result,
+            });
         }
         Req::QueuePoll { base } => {
             let result = crate::model_update_api::poll_queue(&base).await;

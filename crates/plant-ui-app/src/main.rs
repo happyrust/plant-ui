@@ -1263,6 +1263,8 @@ struct App {
     /// `clear` bumps this generation so replies from the cleared session are ignored.
     command_epoch: u64,
     loaded_models: HashSet<RefU64>,
+    /// 几何行的 owner。清理范围沿它补树上没展开的那一跳（P1-1）。
+    model_owner: HashMap<RefU64, RefU64>,
     model_show_waiting: HashSet<RefU64>,
     latest_mesh_progress: Option<plant_ui_view3d::MeshLoadProgress>,
     model_scope_failures: usize,
@@ -1396,26 +1398,54 @@ struct CleanupUnload {
     dropped_scopes: Vec<RefU64>,
 }
 
+/// 沿 `tree.parent`，缺的那一跳用几何装进来时记下的 `model_owner` 补。
+/// 走到目标就算在范围内，不必走到 SITE；链在碰到目标之前断了就停，不当成在范围内。
+fn chain_hits_target(
+    start: RefU64,
+    target: RefU64,
+    parent_of: &impl Fn(RefU64) -> Option<RefU64>,
+) -> bool {
+    if start == target {
+        return true;
+    }
+    let mut cur = start;
+    let mut seen = HashSet::from([start]);
+    for _ in 0..64 {
+        let Some(parent) = parent_of(cur) else {
+            return false;
+        };
+        if parent == target {
+            return true;
+        }
+        if !seen.insert(parent) {
+            return false;
+        }
+        cur = parent;
+    }
+    false
+}
+
 /// 只看本端缓存、不发请求地圈出一个目标的清理范围。
 ///
 /// 范围 = 目标自身 + 它子树下的一切。两类材料：
-/// - `scopes` 里键等于目标、或祖先链含目标的键，**整条成员**都算在范围内——成员自己的链在不在
+/// - `scopes` 里键等于目标、或半链碰到目标的键，**整条成员**都算在范围内——成员自己的链在不在
 ///   缓存里无所谓：范围键既然在目标之下，它名下的模型就都在目标之下（这是「保守」的那一半）；
-/// - `loaded` 里自己就是目标、或祖先链含目标的叶子。
+/// - `loaded` 里自己就是目标、或半链碰到目标的叶子。
 ///
-/// 链不在缓存里、又不属于任何范围内键的叶子**不动**：本端分不清它在哪个 ZONE 底下，猜成
-/// 「在范围内」会把别处正看着的模型一并卸掉——取回工作之后 `scopes` 只剩叶子的自映射，这种
-/// 叶子满场都是。漏掉的残留由下一次取回工作纠正（records 已空的不再装回来），不静默：
-/// 清理那一行日志报的就是实际卸载数。
+/// 半链：先走 `tree_parent`，这一跳没有再用 `model_owner`（几何行的 owner）。碰到目标即算在
+/// 范围内，不必走到 SITE 根。链在碰到目标之前断了的叶子**不动**：本端分不清它在哪个 ZONE
+/// 底下，猜成「在范围内」会把别处正看着的模型一并卸掉。漏掉的残留由下一次取回工作纠正。
 fn cleanup_unload_plan(
     target: RefU64,
     scopes: &HashMap<RefU64, Vec<RefU64>>,
     loaded: &HashSet<RefU64>,
-    ancestors: impl Fn(RefU64) -> Option<Vec<RefU64>>,
+    tree_parent: impl Fn(RefU64) -> Option<RefU64>,
+    model_owner: &HashMap<RefU64, RefU64>,
 ) -> CleanupUnload {
-    let in_range = |refno: RefU64| {
-        refno == target || ancestors(refno).is_some_and(|chain| chain.contains(&target))
+    let parent_of = |refno: RefU64| {
+        tree_parent(refno).or_else(|| model_owner.get(&refno).copied())
     };
+    let in_range = |refno: RefU64| chain_hits_target(refno, target, &parent_of);
     let mut dropped_scopes: Vec<RefU64> = scopes
         .keys()
         .copied()
@@ -1905,6 +1935,15 @@ fn cache_model_scope(scopes: &mut HashMap<RefU64, Vec<RefU64>>, target: RefU64, 
     }
 }
 
+/// 几何行装进来时记下 owner，给清理范围补 `tree.parent` 上缺的那一跳。自己指向自己的不记。
+fn remember_model_owner(owners: &mut HashMap<RefU64, RefU64>, model: &aios_core::GeomInstQuery) {
+    let leaf = model.refno.refno();
+    let owner = model.owner.refno();
+    if owner != leaf {
+        owners.insert(leaf, owner);
+    }
+}
+
 fn claim_unloaded_model_refnos(
     loaded: &mut HashSet<RefU64>,
     incoming: impl IntoIterator<Item = RefU64>,
@@ -2118,6 +2157,7 @@ impl App {
             focus_bounds_request: Default::default(),
             command_epoch: 0,
             loaded_models: HashSet::new(),
+            model_owner: HashMap::new(),
             model_show_waiting: HashSet::new(),
             latest_mesh_progress: None,
             model_scope_failures: 0,
@@ -2495,10 +2535,12 @@ impl App {
                             self.model_scopes.clear();
                             self.tree.visibility_unavailable.clear();
                             self.loaded_models.clear();
+                            self.model_owner.clear();
                             for model in &models {
                                 let refno = model.refno.refno();
                                 self.loaded_models.insert(refno);
                                 cache_model_scope(&mut self.model_scopes, refno, refno);
+                                remember_model_owner(&mut self.model_owner, model);
                             }
                             // 清场重装：旧的实际状态全作废，新的等 View3d 装完
                             // 网格再回执上来。这中间 eye 停在未加载而不是抢先
@@ -2610,6 +2652,9 @@ impl App {
                                     .into_iter()
                                     .filter(|refno| self.loaded_models.remove(refno))
                                     .collect();
+                                for refno in &stale {
+                                    self.model_owner.remove(refno);
+                                }
                                 if !stale.is_empty() {
                                     self.view3d_commands.push(Cmd::Model(
                                         plant_ui::ModelAction::Unload { refnos: stale },
@@ -2641,6 +2686,7 @@ impl App {
                                     refs.push(refno);
                                 }
                                 cache_model_scope(&mut self.model_scopes, refno, refno);
+                                remember_model_owner(&mut self.model_owner, model);
                             }
                             // 右键重新生成之后的显示（ADR-0030 D2 第 3 步）：这批记录是重算过的
                             // 产物，场景里同名的旧几何要换掉。先从已装账上摘下来，下面才会把它们
@@ -3083,7 +3129,8 @@ impl App {
                         self.logs.error(&mut self.vm.logs, &title, &error, None);
                     }
                 },
-                data::Evt::DbnumModelCleaned { dbnum, result } => {
+                data::Evt::DbnumModelCleaned { epoch, .. } if epoch != self.mutation_epoch => {}
+                data::Evt::DbnumModelCleaned { dbnum, result, .. } => {
                     self.settle_dbnum_model_cleaned(dbnum, result);
                 }
                 data::Evt::GetWork(result) => {
@@ -4109,6 +4156,9 @@ impl App {
 
     /// 库行「清理模型（整库）」的确认框。已有一趟模型变更在跑或正等确认时不重开。
     fn begin_dbnum_model_cleanup(&mut self, dbnum: u32) {
+        if !self.model_service_executable() {
+            return;
+        }
         if self.vm.regen_busy || self.mutation.is_some() {
             self.logs.info(
                 &mut self.vm.logs,
@@ -4157,9 +4207,17 @@ impl App {
             run.targets.clone(),
             run.dbnum,
         );
+        // 整库清理是三条库行命令里唯一破坏性的那条，确认发出去之前再过一次执行闸门。
+        // 按钮灰着挡不住已经开着的确认框，也不挡绕过按钮的入口。
+        if dbnum.is_some() && !self.model_service_executable() {
+            self.mutation_run = None;
+            self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+            return;
+        }
         // 帧号从这里起不再变：整批回执拿它认帧。整库清理没有右键那几行，单独一发。
         let request = match (kind, dbnum) {
             (_, Some(dbnum)) => data::Req::CleanupDbnumModel {
+                epoch: self.mutation_epoch,
                 base: self.model_api_url.clone(),
                 project: self.vm.project.clone(),
                 mdb: self.mdb.clone(),
@@ -4325,13 +4383,12 @@ impl App {
                     ));
                 }
                 CleanupOutcome::Unknown => {
-                    // 服务端这条没有预算包装、同步删到底：客户端等不到不等于它没删。本端的
-                    // 范围缓存作废、这一行标成「待重查」，人点眼睛就会重查一次 records——
-                    // 空了就把残留卸掉，还在就照常显示。
+                    // 服务端这条没有预算包装、同步删到底：客户端等不到不等于它没删。摘掉
+                    // 范围缓存并标成待重查，人点眼睛就会重查一次 records——空了就把残留卸掉，
+                    // 还在就照常显示。不动 eye：超时并不知道删没删成，eye 只读渲染回执
+                    // （ADR-0016），标成「未加载」会和还画着的三维对不上。
                     self.model_scopes.remove(refno);
                     self.regenerate_refresh.insert(*refno);
-                    self.tree.pending_direction.remove(refno);
-                    self.tree.visibility_unavailable.insert(*refno);
                     self.logs.warn(
                         &mut self.vm.logs,
                         format!("{label}：清理请求超时，服务端可能已删一部分；点眼睛重查确认"),
@@ -4371,14 +4428,15 @@ impl App {
         dbnum: u32,
         result: anyhow::Result<model_update_api::DbnumModelCleanupReceipt>,
     ) {
+        // 没有对得上的这一趟就原样留下：晚到的回执不许关掉此刻新开的确认框，也不许把
+        // regen_busy 清掉。认帧靠事件上的 epoch，这里再对一下库号。
         if self
             .mutation_run
-            .as_ref()
-            .is_some_and(|run| run.dbnum != Some(dbnum))
+            .take_if(|run| run.dbnum == Some(dbnum))
+            .is_none()
         {
             return;
         }
-        self.mutation_run = None;
         self.vm.regen_busy = false;
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         match result {
@@ -4458,11 +4516,8 @@ impl App {
             self.tree.pending_direction.remove(refno);
             self.tree.pending_visibility.remove(refno);
             self.tree.visibility_unavailable.insert(*refno);
+            self.model_owner.remove(refno);
         }
-        self.model_scopes.retain(|_, members| {
-            members.retain(|member| !gone_set.contains(member));
-            !members.is_empty()
-        });
         gone
     }
 
@@ -4473,11 +4528,13 @@ impl App {
     /// 实际渲染状态与别的范围键的成员表里拿走，目标自己标成「明确没有」——不然树行会从还显示着
     /// 的祖先那里把 eye 继承过来，看着像没清。
     fn forget_cleaned_scope(&mut self, target: RefU64) -> Vec<RefU64> {
+        let parents = &self.tree.parent;
         let plan = cleanup_unload_plan(
             target,
             &self.model_scopes,
             &self.loaded_models,
-            |refno| self.tree.ancestors(refno),
+            |refno| parents.get(&refno).copied(),
+            &self.model_owner,
         );
         for key in &plan.dropped_scopes {
             self.model_scopes.remove(key);
@@ -4491,6 +4548,9 @@ impl App {
             self.loaded_models.remove(refno);
             self.tree.visibility.remove(refno);
             self.model_show_waiting.remove(refno);
+            self.tree.pending_direction.remove(refno);
+            self.tree.pending_visibility.remove(refno);
+            self.model_owner.remove(refno);
         }
         // 别的范围键（比如目标所在的 ZONE）成员表里还记着这些叶子：摘掉，空了的键一起退场，
         // 下次点那一行眼睛就重查而不是对着一张空名单下指令。
@@ -5465,6 +5525,7 @@ impl App {
         // 换场景清层）。要看就再右键一次。
         self.clear_pipe_dimensions();
         self.loaded_models.clear();
+        self.model_owner.clear();
         self.tree.visibility.clear();
         self.tree.pending_direction.clear();
         self.tree.pending_visibility.clear();
@@ -5693,6 +5754,7 @@ impl App {
         self.tree.visibility_unavailable.clear();
         self.model_scope_pending.clear();
         self.loaded_models.clear();
+        self.model_owner.clear();
         self.model_show_waiting.clear();
         self.pending_incremental_models.clear();
         self.pending_refreshes.clear();
@@ -6542,7 +6604,16 @@ mod tests {
         .into_iter()
         .collect();
         let loaded: HashSet<RefU64> = [bran_1, bran_2, bran_3, stranger].into_iter().collect();
-        let plan = |target| cleanup_unload_plan(target, &scopes, &loaded, |r| tree.ancestors(r));
+        let owners = HashMap::<RefU64, RefU64>::new();
+        let plan = |target| {
+            cleanup_unload_plan(
+                target,
+                &scopes,
+                &loaded,
+                |r| tree.parent.get(&r).copied(),
+                &owners,
+            )
+        };
 
         // 单根：只有它自己。
         assert_eq!(
@@ -6584,6 +6655,52 @@ mod tests {
         );
         // 整个 SITE：全场。
         assert_eq!(plan(site).refnos, vec![bran_1, bran_2, bran_3]);
+    }
+
+    /// BRAN 没展开时 tree.parent 没有那两跳，几何装进来记下的 owner 补上。
+    /// 链碰到目标即在范围内；在碰到之前断了的不当成在范围内。
+    /// 这里的范围键只有叶子自映射，避免「范围键整条成员」把半链的结论盖掉。
+    #[test]
+    fn cleanup_unload_plan_follows_a_partial_owner_chain() {
+        let site = RefU64(1);
+        let zone_a = RefU64(2);
+        let pipe = RefU64(3);
+        let bran_1 = RefU64(4);
+        let bran_2 = RefU64(5);
+        let zone_b = RefU64(6);
+        let stranger = RefU64(8);
+        let mut parent = HashMap::from([(zone_a, site), (pipe, zone_a), (zone_b, site)]);
+        let owners = HashMap::from([(bran_1, pipe), (bran_2, pipe)]);
+        let scopes: HashMap<RefU64, Vec<RefU64>> = [
+            (bran_1, vec![bran_1]),
+            (bran_2, vec![bran_2]),
+            (stranger, vec![stranger]),
+        ]
+        .into_iter()
+        .collect();
+        let loaded: HashSet<RefU64> = [bran_1, bran_2, stranger].into_iter().collect();
+        let plan = |target, parent: &HashMap<RefU64, RefU64>| {
+            cleanup_unload_plan(
+                target,
+                &scopes,
+                &loaded,
+                |r| parent.get(&r).copied(),
+                &owners,
+            )
+        };
+
+        let pipe_plan = plan(pipe, &parent);
+        assert_eq!(pipe_plan.refnos, vec![bran_1, bran_2]);
+        assert!(!pipe_plan.refnos.contains(&stranger));
+        assert!(plan(zone_a, &parent).refnos.contains(&bran_1));
+        assert!(!plan(zone_b, &parent).refnos.contains(&bran_1));
+
+        parent.remove(&pipe);
+        let stopped = plan(zone_a, &parent);
+        assert!(
+            !stopped.refnos.contains(&bran_1),
+            "链在 PIPE 断了、还没碰到 ZONE，不能猜成在范围内：{stopped:?}"
+        );
     }
 
     fn node(refno: RefU64, noun: &str, children: u16) -> EleTreeNode {

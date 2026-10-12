@@ -123,7 +123,15 @@ impl TabViewer for Viewer<'_> {
             Pane::Logs => super::logs::show(ui, self.t, self.d, self.vm, self.cmds),
             Pane::View3d => super::view3d::show(ui, self.t, self.d, self.vm, self.cmds),
             Pane::TaskQueue => {
-                crate::task_queue::show(ui, self.t, self.d, self.queue, self.queue_state, self.cmds)
+                crate::task_queue::show(
+                    ui,
+                    self.t,
+                    self.d,
+                    self.queue,
+                    self.queue_state,
+                    self.vm.regen_busy,
+                    self.cmds,
+                )
             }
         }
     }

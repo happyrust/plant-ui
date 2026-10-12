@@ -98,6 +98,7 @@ fn render(ctx: &Context, state: &mut State, model: &Vm, frames: usize) -> Vec<Op
                 Density::Standard,
                 model,
                 state,
+                false,
                 &mut cmds,
             );
         });

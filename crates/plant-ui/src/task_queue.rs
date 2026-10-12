@@ -396,9 +396,6 @@ pub struct DbnumStatus {
     pub model_chasing_roots: Option<u32>,
     #[serde(default)]
     pub model_dead_roots: Option<u32>,
-    /// 该库全部 Ref0（`/dbnums` 行，升序）。老服务端不给 → 空，不能据此判断叶子属于哪个库。
-    #[serde(default)]
-    pub ref0s: Vec<u32>,
 }
 
 /// 库一致性判决三态（gen-model ADR-060 / C2 `dbnum_consistency`）：模型水位对数据水位。
@@ -678,6 +675,8 @@ pub enum ModelCleanup {
     NeedsInit,
     /// 同库有整库重建或数据任务在跑：灰，「等它跑完」。
     Busy { task_id: String },
+    /// 本机已经有一趟重新生成或清理在跑。灰，悬停与宿主那句 INFO 同一句。
+    LocalBusy,
     /// 可点。按下只打开确认框。
     Ready(u32),
 }
@@ -688,6 +687,7 @@ pub fn model_cleanup(
     db: &DbnumStatus,
     active_rebuild: Option<&str>,
     active_data_task: Option<&str>,
+    client_busy: bool,
 ) -> ModelCleanup {
     if db.excluded || db.not_in_project {
         return ModelCleanup::Hidden;
@@ -707,6 +707,9 @@ pub fn model_cleanup(
         return ModelCleanup::Busy {
             task_id: task_id.to_owned(),
         };
+    }
+    if client_busy {
+        return ModelCleanup::LocalBusy;
     }
     ModelCleanup::Ready(db.dbnum)
 }
@@ -1949,7 +1952,15 @@ impl State {
 
 // ================================================================ 视图
 
-pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, state: &mut State, cmds: &mut Vec<Cmd>) {
+pub fn show(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    vm: &Vm,
+    state: &mut State,
+    regen_busy: bool,
+    cmds: &mut Vec<Cmd>,
+) {
     egui::Frame::new().fill(t.bg_panel).show(ui, |ui| {
         ui.set_min_size(ui.available_size());
         ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
@@ -2031,6 +2042,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, state: &mut State, cmd
                                 db,
                                 vm.active_model_rebuild(row.dbnum),
                                 vm.active_data_task(row.dbnum),
+                                regen_busy,
                             )
                         })
                         .unwrap_or(ModelCleanup::Hidden);
@@ -3261,6 +3273,10 @@ fn model_cleanup_button(
                     ui.add_enabled(false, button()).on_disabled_hover_text(format!(
                         "清理模型（整库）：等它跑完（{task_id}）"
                     ));
+                }
+                ModelCleanup::LocalBusy => {
+                    ui.add_enabled(false, button())
+                        .on_disabled_hover_text("已经有一趟重新生成 / 清理在进行");
                 }
                 ModelCleanup::Ready(dbnum) => {
                     let resp = ui
@@ -5592,7 +5608,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            model_cleanup(&excluded, None, None),
+            model_cleanup(&excluded, None, None, false),
             ModelCleanup::Hidden
         );
         let blocked = DbnumStatus {
@@ -5602,7 +5618,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            model_cleanup(&blocked, None, None),
+            model_cleanup(&blocked, None, None, false),
             ModelCleanup::Blocked("阻断，原因未随契约给出".to_owned())
         );
         let fresh = DbnumStatus {
@@ -5610,21 +5626,31 @@ mod tests {
             initialized: false,
             ..Default::default()
         };
-        assert_eq!(model_cleanup(&fresh, None, None), ModelCleanup::NeedsInit);
+        assert_eq!(
+            model_cleanup(&fresh, None, None, false),
+            ModelCleanup::NeedsInit
+        );
         let ready = lagging_db(8000, 4, 4);
         assert_eq!(
-            model_cleanup(&ready, Some("model-rebuild-8000-1"), None),
+            model_cleanup(&ready, Some("model-rebuild-8000-1"), None, false),
             ModelCleanup::Busy {
                 task_id: "model-rebuild-8000-1".into()
             }
         );
         assert_eq!(
-            model_cleanup(&ready, None, Some("data-8000-1")),
+            model_cleanup(&ready, None, Some("data-8000-1"), false),
             ModelCleanup::Busy {
                 task_id: "data-8000-1".into()
             }
         );
-        assert_eq!(model_cleanup(&ready, None, None), ModelCleanup::Ready(8000));
+        assert_eq!(
+            model_cleanup(&ready, None, None, true),
+            ModelCleanup::LocalBusy
+        );
+        assert_eq!(
+            model_cleanup(&ready, None, None, false),
+            ModelCleanup::Ready(8000)
+        );
     }
 
     /// 第三枚在「重算模型（整库）」右侧：列位从右往左是清理 44、间隙 4、重算 44。
