@@ -298,6 +298,10 @@ pub enum Cmd {
     CleanupDbnumModel {
         dbnum: u32,
     },
+    /// 顶栏「重新生成房间」（全库）：只打开确认框。确认之后才发
+    /// `POST /api/v1/rooms/rebuild`——服务端清掉全部房间归属数据、换代重建常驻
+    /// 参照模型、逐库整库重算房间关系；进度屏挂 `/health` 的 resident 读数。
+    RebuildRooms,
     /// 暂停 / 恢复队列出队。暂停**只挡出队**，正在跑的那一批会跑完为止——
     /// 服务端没有中止接口，所以这条命令也不该被当成「停下来」。
     SetQueuePaused(bool),

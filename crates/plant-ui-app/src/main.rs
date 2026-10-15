@@ -1319,6 +1319,9 @@ struct MutationRun {
     targets: Vec<RefU64>,
     /// 库行「清理模型（整库）」的库号。有值时这一趟不走右键那几行。
     dbnum: Option<u32>,
+    /// 「等房间参照模型」档的开关（`Req::RebuildRooms` 在用）：重建已发出、服务端
+    /// 收不回——置位只是让数据线程停止轮询（「后台继续」），重建照跑到底。
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// 一发 generate 的回执归到哪一档（ADR-0030 D2 第 3 步）。
@@ -2995,6 +2998,90 @@ impl App {
                     self.settle_models_generated(outcomes);
                     dirty = true;
                 }
+                // 「等房间参照模型」进度：只认本帧——就绪回 Running（那一发随之发出），
+                // 建中进 WaitingResident。「重新生成房间」那趟就绪后不换挡：紧随的
+                // `Evt::RoomsRebuilt` 会替它收摊。
+                data::Evt::ResidentWait { epoch, .. } if epoch != self.mutation_epoch => {}
+                data::Evt::ResidentWait { status, .. } => match status {
+                    model_update_api::ResidentStatus::Building { phase, progress } => {
+                        // 只在「在跑 / 在等」那一趟上换档；还停在确认框时不越位。
+                        let waiting = matches!(
+                            self.mutation,
+                            Some(model_mutation::Vm::Running { .. })
+                                | Some(model_mutation::Vm::WaitingResident { .. })
+                        );
+                        if waiting && let Some(run) = self.mutation_run.as_ref() {
+                            let files = progress
+                                .as_ref()
+                                .filter(|p| p.files_total > 0)
+                                .map(|p| (p.files_done, p.files_total));
+                            let meshes = progress
+                                .as_ref()
+                                .filter(|p| p.meshes_total > 0)
+                                .map(|p| (p.meshes_done, p.meshes_total, p.meshes_failed));
+                            let dbnums = progress
+                                .as_ref()
+                                .filter(|p| p.dbnums_total > 0)
+                                .map(|p| (p.dbnums_done, p.dbnums_total));
+                            self.mutation = Some(model_mutation::Vm::WaitingResident {
+                                kind: run.kind,
+                                label: run.label.clone(),
+                                phase: phase.unwrap_or_else(|| "装载中".into()),
+                                files,
+                                meshes,
+                                dbnums,
+                            });
+                            dirty = true;
+                        }
+                    }
+                    model_update_api::ResidentStatus::Ready => {
+                        // 房间重建的「就绪」只是换代装上——逐库重算的回执还没来，
+                        // 留在等待档不动：`RoomsRebuilt` 紧跟其后替它收摊。
+                        let rebuild_pending = matches!(
+                            self.mutation_run.as_ref(),
+                            Some(run) if run.kind == model_mutation::Kind::RoomRebuild
+                        );
+                        if !rebuild_pending
+                            && let Some(model_mutation::Vm::WaitingResident {
+                                kind, label, ..
+                            }) = self.mutation.take()
+                        {
+                            self.mutation =
+                                Some(model_mutation::Vm::Running { kind, label });
+                            dirty = true;
+                        }
+                    }
+                    _ => {}
+                },
+                // 「重新生成房间」的收摊回执：跑完关屏记日志；失败进 Failed 档。
+                data::Evt::RoomsRebuilt { epoch, .. } if epoch != self.mutation_epoch => {}
+                data::Evt::RoomsRebuilt { result, .. } => {
+                    self.vm.regen_busy = false;
+                    let label = self
+                        .mutation_run
+                        .as_ref()
+                        .map(|run| run.label.clone())
+                        .unwrap_or_else(|| "全部库".to_string());
+                    match result {
+                        Ok(()) => {
+                            self.mutation = None;
+                            self.mutation_run = None;
+                            self.logs.info(
+                                &mut self.vm.logs,
+                                "重新生成房间完成：房间参照模型已重建，各库房间关系已重算"
+                                    .to_string(),
+                            );
+                        }
+                        Err(error) => {
+                            self.mutation = Some(model_mutation::Vm::Failed {
+                                kind: model_mutation::Kind::RoomRebuild,
+                                label,
+                                reason: format!("{error:#}"),
+                            });
+                        }
+                    }
+                    dirty = true;
+                }
                 data::Evt::ModelsCleaned { epoch, .. } if epoch != self.mutation_epoch => {}
                 data::Evt::ModelsCleaned { outcomes, .. } => {
                     self.settle_models_cleaned(outcomes);
@@ -3854,6 +3941,9 @@ impl App {
                 }
                 // 库行「清理模型（整库）」只打开确认框。真正的 DELETE 等确认（C5）。
                 Cmd::CleanupDbnumModel { dbnum } => self.begin_dbnum_model_cleanup(dbnum),
+                // 顶栏「重新生成房间」（全库）只打开确认框。真正的 POST 等确认——
+                // 确认之后服务端清边表、换代重建、逐库重算，收不回来。
+                Cmd::RebuildRooms => self.begin_room_rebuild(),
                 Cmd::SetQueuePaused(paused) => {
                     if !self.model_service_writable() {
                         continue;
@@ -4146,6 +4236,7 @@ impl App {
             label: label.clone(),
             targets,
             dbnum: None,
+            cancel: Default::default(),
         });
         self.mutation = Some(model_mutation::Vm::Confirm {
             kind,
@@ -4173,6 +4264,7 @@ impl App {
             label: label.clone(),
             targets: Vec::new(),
             dbnum: Some(dbnum),
+            cancel: Default::default(),
         });
         self.mutation = Some(model_mutation::Vm::Confirm {
             kind: model_mutation::Kind::Cleanup,
@@ -4181,12 +4273,65 @@ impl App {
         });
     }
 
+    /// 顶栏「重新生成房间」（全库）的确认框。已有一趟模型变更在跑或正等确认时不重开——
+    /// 重建会拒掉在跑的生成（409），不该与它并发。
+    fn begin_room_rebuild(&mut self) {
+        if !self.model_service_executable() {
+            return;
+        }
+        if self.vm.regen_busy || self.mutation.is_some() {
+            self.logs.info(
+                &mut self.vm.logs,
+                "重新生成房间：已经有一趟重新生成 / 清理 / 重建在进行".to_string(),
+            );
+            return;
+        }
+        let label = "全部库".to_string();
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+        self.mutation_run = Some(MutationRun {
+            kind: model_mutation::Kind::RoomRebuild,
+            label: label.clone(),
+            targets: Vec::new(),
+            dbnum: None,
+            cancel: Default::default(),
+        });
+        self.mutation = Some(model_mutation::Vm::Confirm {
+            kind: model_mutation::Kind::RoomRebuild,
+            label,
+            dbnum: None,
+        });
+    }
+
     /// 确认框的回执。接受就对右键那几行**各一发**——重新生成是 `generate(force = true)`，整批
     /// 回执落在 `Evt::ModelsGenerated`；清理是 `DELETE /model/subtree`，整批回执落在
     /// `Evt::ModelsCleaned`。取消 / 关窗 / 关掉失败态一个请求都不发。
     fn settle_mutation_confirm(&mut self, accepted: bool) {
         let closed = self.mutation.take();
+        // 「等房间参照模型」那一档的叉 /「取消等待」走到这里：生成请求还没发，置位开关
+        // 让数据线程放弃余下目标（已发出的照常跑完——那一档没有叉，走不到这里）。
+        let waiting_cancelled = matches!(
+            closed,
+            Some(model_mutation::Vm::WaitingResident { .. })
+        );
         let Some(model_mutation::Vm::Confirm { .. }) = closed else {
+            if waiting_cancelled {
+                if let Some(run) = self.mutation_run.as_ref() {
+                    run.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    match run.kind {
+                        // 「后台继续」：重建那发服务端收不回，这里只是摘屏停轮询。
+                        model_mutation::Kind::RoomRebuild => self.logs.info(
+                            &mut self.vm.logs,
+                            "房间重建已在服务端后台继续；再点「重新生成房间」可重新查看进度"
+                                .to_string(),
+                        ),
+                        _ => self.logs.info(
+                            &mut self.vm.logs,
+                            "已取消等待房间参照模型".to_string(),
+                        ),
+                    }
+                }
+                self.vm.regen_busy = false;
+            }
             // 失败态被关掉（跑起来的那一档没有叉，到不了这里）：收摊。
             self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
             self.mutation_run = None;
@@ -4201,11 +4346,12 @@ impl App {
             self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
             return;
         };
-        let (kind, label, targets, dbnum) = (
+        let (kind, label, targets, dbnum, cancel) = (
             run.kind,
             run.label.clone(),
             run.targets.clone(),
             run.dbnum,
+            run.cancel.clone(),
         );
         // 整库清理是三条库行命令里唯一破坏性的那条，确认发出去之前再过一次执行闸门。
         // 按钮灰着挡不住已经开着的确认框，也不挡绕过按钮的入口。
@@ -4227,6 +4373,14 @@ impl App {
             (model_mutation::Kind::Regenerate, None) => data::Req::GenerateModels {
                 epoch: self.mutation_epoch,
                 refnos: targets.clone(),
+                base: self.model_api_url.clone(),
+                project: self.vm.project.clone(),
+                mdb: self.mdb.clone(),
+                namespace: self.namespace.clone(),
+            },
+            (model_mutation::Kind::RoomRebuild, None) => data::Req::RebuildRooms {
+                epoch: self.mutation_epoch,
+                cancel: cancel.clone(),
                 base: self.model_api_url.clone(),
                 project: self.vm.project.clone(),
                 mdb: self.mdb.clone(),
@@ -4258,6 +4412,10 @@ impl App {
                 "{label}：正在生成模型（{} 个目标，范围内已有的产物会被重算替换；服务端预算 120 秒，超时后后台继续）…",
                 targets.len()
             ),
+            (model_mutation::Kind::RoomRebuild, None) => {
+                "{label}：已提交重新生成房间（清边表 → 重建参照模型 → 逐库重算），进度如下…"
+                    .to_string()
+            }
             (model_mutation::Kind::Cleanup, None) => format!(
                 "{label}：正在清理模型产物（{} 个目标，服务端按子树删已生成的产物、不重算；只删产物，不删设计元素）…",
                 targets.len()
@@ -4265,7 +4423,19 @@ impl App {
         };
         self.logs.info(&mut self.vm.logs, started);
         self.vm.regen_busy = true;
-        self.mutation = Some(model_mutation::Vm::Running { kind, label });
+        // 重建那一发受理即 202、随后全程是「等它跑完」：直接进等待档，进度条由
+        // `Evt::ResidentWait` 填；其余两种是在途请求，进 `Running`。
+        self.mutation = Some(match kind {
+            model_mutation::Kind::RoomRebuild => model_mutation::Vm::WaitingResident {
+                kind,
+                label,
+                phase: "提交重建请求".to_string(),
+                files: None,
+                meshes: None,
+                dbnums: None,
+            },
+            _ => model_mutation::Vm::Running { kind, label },
+        });
     }
 
     /// generate 的整批回执落地（ADR-0030 D2 第 3 步）：成功的目标**生成完成之后再显示**——
@@ -6338,11 +6508,12 @@ mod tests {
             .split_once("fn settle_models_generated(")
             .expect("回执那一步")
             .0;
-        // 确认步三种请求：右键生成、右键清理、整库清理。
-        assert_eq!(confirm.matches("data::Req::").count(), 3, "{confirm}");
+        // 确认步四种请求：右键生成、右键清理、整库清理、全库重建房间。
+        assert_eq!(confirm.matches("data::Req::").count(), 4, "{confirm}");
         assert!(confirm.contains("data::Req::GenerateModels {"));
         assert!(confirm.contains("data::Req::CleanupModels {"));
         assert!(confirm.contains("data::Req::CleanupDbnumModel {"));
+        assert!(confirm.contains("data::Req::RebuildRooms {"));
         assert!(
             !confirm.contains("RegenerateScope") && !confirm.contains("RegenerateDelete"),
             "清点 / 整片删已退役"

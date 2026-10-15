@@ -901,6 +901,7 @@ impl Engine {
                 features: Default::default(),
                 started_at: stamp(self.service_started_at),
                 room_incremental: true,
+                room_build: None,
                 queue_paused: self.paused,
                 worker_alive: self.service.worker_alive(),
                 worker_idle_secs: Some((now - self.last_activity).num_seconds().max(0) as u64),
@@ -1833,6 +1834,11 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
             result: Err(anyhow::anyhow!(
                 "演示模式没有模型服务，清理不了 db{dbnum} 的模型"
             )),
+        },
+        // 演示模式没有常驻房间模型可重建：如实回失败，不造一段假进度。
+        Req::RebuildRooms { epoch, .. } => Evt::RoomsRebuilt {
+            epoch,
+            result: Err(anyhow::anyhow!("演示模式没有模型服务，重建不了房间")),
         },
         Req::GetWork {
             branches,

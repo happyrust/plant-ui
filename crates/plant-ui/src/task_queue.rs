@@ -224,6 +224,59 @@ pub struct Health {
     /// 不给这个键 → `None`，整条横幅不画。
     #[serde(default)]
     pub catalogue_reconcile: Option<CatalogueReconcile>,
+    /// gen-model `/health.room_build`：常驻房间参照模型的生命周期与构建进度
+    /// （`resident`）。老服务端没这一格 → `None` → 「等房间参照模型」只画 spinner。
+    #[serde(default)]
+    pub room_build: Option<RoomBuildHealth>,
+}
+
+/// `/health.room_build`：房间面的一格。界面只读 `resident`（常驻参照模型）；
+/// `bootstrap` / `parked` 的用例不在这条路上，不进类型。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RoomBuildHealth {
+    #[serde(default)]
+    pub resident: Option<ResidentHealth>,
+}
+
+/// `/health.room_build.resident`：`status` 是 `ResidentLifecycle` 的 serde tag
+/// （`disabled` / `unsupported` / `loading` / `ready` / `degraded` / `blocked`），
+/// `progress` 是构建进度——`loading` 期间实时前进，翻篇后留最后一帧。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ResidentHealth {
+    #[serde(default)]
+    pub status: String,
+    /// `loading` 期间的阶段字面（`spatial-tree` / `source-snapshot` / `mesh-warm`）。
+    #[serde(default)]
+    pub phase: Option<String>,
+    /// `blocked` 的原因清单；界面展开「为什么建死」用第一条。
+    #[serde(default)]
+    pub problems: Vec<String>,
+    /// 构建进度快照。本次加载之前的版本没这个键 → `None`。
+    #[serde(default)]
+    pub progress: Option<ResidentProgress>,
+}
+
+/// `/health.room_build.resident.progress`：三段各一对 done/total——
+/// `source-snapshot` 数 MDB 设计库文件，`mesh-warm` 数唯一网格键，
+/// `edge-recompute` 数「重新生成房间」收尾段里重算完房间边的库数。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct ResidentProgress {
+    #[serde(default)]
+    pub phase: String,
+    #[serde(default)]
+    pub files_done: usize,
+    #[serde(default)]
+    pub files_total: usize,
+    #[serde(default)]
+    pub meshes_done: usize,
+    #[serde(default)]
+    pub meshes_total: usize,
+    #[serde(default)]
+    pub meshes_failed: usize,
+    #[serde(default)]
+    pub dbnums_done: usize,
+    #[serde(default)]
+    pub dbnums_total: usize,
 }
 
 /// [`Health::room_incremental`] 的缺省方向。`#[serde(default)]` 的 bool 是 false，
@@ -2357,6 +2410,17 @@ fn summary_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &Vm, all: &[RowVm], cmds
             .clicked()
         {
             cmds.push(Cmd::ScanNow);
+        }
+        if ui
+            .add_enabled(
+                vm.can_execute(),
+                widgets::button(t, d, "重新生成房间").icon(ph::HOUSE),
+            )
+            .on_hover_text("清空全库房间归属，重建房间参照模型并逐库重算房间关系；重建期间的生成请求会被拒绝")
+            .on_disabled_hover_text(execution_disabled_hint(vm))
+            .clicked()
+        {
+            cmds.push(Cmd::RebuildRooms);
         }
         // 断线降级的是明细区，不是进度：计数走轮询，连接断了照样准（ADR-0007）。
         match &vm.feed {

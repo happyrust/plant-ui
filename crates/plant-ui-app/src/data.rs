@@ -149,6 +149,9 @@ pub enum Req {
     /// `POST /model/generate { refno, force: true }`，服务端自己解根、删旧、重算。
     /// 客户端不清点、不解根、不删产物；一条请求里顺序跑完整批，回执整批回
     /// （`Evt::ModelsGenerated`），宿主再对成功的目标发显示。
+    ///
+    /// 房间参照模型不在这一趟的操心范围：服务端启动时就建好它，生成路径上的房间
+    /// 计算照常被 `ensure_ready` 把关——真撞上还在建 / 建死，那一发如实 409 回来。
     GenerateModels {
         epoch: u64,
         refnos: Vec<RefU64>,
@@ -202,6 +205,20 @@ pub enum Req {
         mdb: String,
         namespace: String,
         dbnum: u32,
+    },
+    /// 「重新生成房间」（全库）：`POST /api/v1/rooms/rebuild`——服务端清掉两张房间
+    /// 边表、换代重建常驻参照模型、逐库整库重算房间关系。202 受理之后本端轮询
+    /// `/health` 画进度（`Evt::ResidentWait`），全部段落走完回 `Evt::RoomsRebuilt`。
+    ///
+    /// `cancel` 是「后台继续」：重建一旦发出服务端收不回，置位只是让本端停止轮询、
+    /// 摘掉进度屏——服务端照跑到底。
+    RebuildRooms {
+        epoch: u64,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        base: String,
+        project: String,
+        mdb: String,
+        namespace: String,
     },
     /// 库行「清理模型（整库）」：`DELETE /api/v1/dbnums/{dbnum}/model?confirm={dbnum}`。
     /// `epoch` 认帧，与右键清理同一套：晚到的回执对不上就丢掉。
@@ -368,6 +385,18 @@ pub enum Evt {
             RefU64,
             anyhow::Result<crate::model_update_api::GenerateReply>,
         )>,
+    },
+    /// 「等房间参照模型装载 / 重建」的进度：只在 `RebuildRooms` 那一趟里发——
+    /// `Building` 每拍一条，`Ready` 翻篇一条。`epoch` 认帧，与 `ModelsGenerated` 同一套。
+    ResidentWait {
+        epoch: u64,
+        status: crate::model_update_api::ResidentStatus,
+    },
+    /// 「重新生成房间」的收摊回执：重建 + 逐库重算全部走完是 `Ok(())`；
+    /// 建死 / 等超时是 `Err`。「后台继续」之后这条被帧号丢掉，不再发。
+    RoomsRebuilt {
+        epoch: u64,
+        result: anyhow::Result<()>,
     },
     /// 右键「清理模型」整批回执：每个目标各一份成败，按请求顺序。`epoch` 认帧，与生成同一套。
     ModelsCleaned {
@@ -649,6 +678,7 @@ async fn handle_read(
     scope: Scope,
     evt_tx: mpsc::Sender<Evt>,
     ctx: egui::Context,
+    task_ctx: bevy_wasm_tasks::TaskContext,
 ) {
     match req {
         Req::SubtreeBounds { epoch, target } => {
@@ -744,6 +774,8 @@ async fn handle_read(
             // 生成只有这一个入口（ADR-0030 D2）。`force = true`：范围内已有的产物一律重算替换，
             // 解根 / 删旧 / 重算都在服务端。顺序做：一个目标可能就是整个 ZONE，并发只会让
             // 服务端的 per-dbnum 锁互相撞。线上一律斜杠形（`24381/100677`）。
+            // 房间参照模型不在这趟的操心范围：服务端启动就建好它；真撞上还在建，那一发
+            // 如实 409 回来按失败记（「可重试」写在文案里，人再点一次就是）。
             let mut outcomes = Vec::with_capacity(refnos.len());
             for refno in refnos {
                 let result = crate::model_update_api::generate_model(
@@ -758,6 +790,39 @@ async fn handle_read(
                 outcomes.push((refno, result));
             }
             let _ = evt_tx.send(Evt::ModelsGenerated { epoch, outcomes });
+        }
+        Req::RebuildRooms {
+            epoch,
+            cancel,
+            base,
+            project,
+            mdb,
+            namespace,
+        } => {
+            // 「重新生成房间」：受理（202）之后把「还在建 / 逐库重算」等过去，每拍发
+            // `Evt::ResidentWait` 画进度；「后台继续」置位了就不发收摊回执——那一帧
+            // 已被宿主作废。409 updating = 启动首建或上一趟重建还在跑：不算失败，
+            // 直接挂上同一趟的进度等它翻篇（再点一次这项就是重新观战）。
+            let mut task_ctx = task_ctx;
+            let accepted = crate::model_update_api::rebuild_rooms(
+                &base, &project, &mdb, &namespace,
+            )
+            .await;
+            let result = match accepted {
+                Err(error) if !crate::model_update_api::resident_building(&error) => {
+                    Some(Err(error))
+                }
+                _ => match wait_resident_ready(&base, epoch, &cancel, &evt_tx, &mut task_ctx)
+                    .await
+                {
+                    ResidentWaitOutcome::Ready => Some(Ok(())),
+                    ResidentWaitOutcome::Failed(error) => Some(Err(error)),
+                    ResidentWaitOutcome::Cancelled => None,
+                },
+            };
+            if let Some(result) = result {
+                let _ = evt_tx.send(Evt::RoomsRebuilt { epoch, result });
+            }
         }
         Req::CleanupModels {
             epoch,
@@ -944,6 +1009,73 @@ async fn handle_read(
 fn host_alive(task_ctx: &bevy_wasm_tasks::TaskContext) -> bool {
     // `has_changed` 只在所有 Sender 都没了时回 `Err`——正是「宿主已退出」那一刻。
     task_ctx.tick_rx.has_changed().is_ok()
+}
+
+/// 「等房间参照模型装载 / 重建」的轮询节奏与总上限：120 拍 ≈ 2 秒（60 fps），
+/// 上限 300 秒——`「重新生成房间」`一趟可能跑几分钟（建拓扑 + 预热网格 + 逐库重算边）。
+const RESIDENT_POLL_UPDATES: usize = 120;
+const RESIDENT_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// [`wait_resident_ready`] 的三种结局。
+enum ResidentWaitOutcome {
+    /// 放行了——就绪 / 这一格不存在 / 健康拉不到（后两种按「没什么可等」收摊）。
+    Ready,
+    /// 「后台继续」：用户把进度屏摘了（重建那发服务端照跑到底，这里只是停止轮询）。
+    Cancelled,
+    /// 等不到：建死（`blocked`）或超上限。携带可直接当回执用的错误。
+    Failed(anyhow::Error),
+}
+
+/// 把「房间参照模型还在建 / 逐库重算没跑完」这一段等过去：就绪一次往返即回；
+/// `Building` 每拍一条 `Evt::ResidentWait` 给界面画进度；建死 / 超上限回 `Failed`。
+///
+/// 只为 `RebuildRooms` 服务：常驻模型的换代（startup 首建、`rooms/rebuild`）都把
+/// `loading` 期与 `edge-recompute` 段算进 `Building`。`/health` 拉不到按放行处置——
+/// 那不是「还在建」。
+async fn wait_resident_ready(
+    base: &str,
+    epoch: u64,
+    cancel: &std::sync::atomic::AtomicBool,
+    evt_tx: &mpsc::Sender<Evt>,
+    task_ctx: &mut bevy_wasm_tasks::TaskContext,
+) -> ResidentWaitOutcome {
+    use std::sync::atomic::Ordering;
+    let started = std::time::Instant::now();
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return ResidentWaitOutcome::Cancelled;
+        }
+        match crate::model_update_api::resident_status(base).await {
+            Ok(crate::model_update_api::ResidentStatus::Ready) => {
+                let _ = evt_tx.send(Evt::ResidentWait {
+                    epoch,
+                    status: crate::model_update_api::ResidentStatus::Ready,
+                });
+                return ResidentWaitOutcome::Ready;
+            }
+            Ok(crate::model_update_api::ResidentStatus::Blocked { reason }) => {
+                return ResidentWaitOutcome::Failed(anyhow::anyhow!(
+                    "服务端房间参照模型初始化失败（{}）；原因见服务端 /health.room_build.resident",
+                    reason.unwrap_or_else(|| "未给出".into())
+                ));
+            }
+            Ok(status @ crate::model_update_api::ResidentStatus::Building { .. }) => {
+                let _ = evt_tx.send(Evt::ResidentWait { epoch, status });
+            }
+            Err(_) => return ResidentWaitOutcome::Ready,
+        }
+        if started.elapsed() >= RESIDENT_WAIT_LIMIT {
+            return ResidentWaitOutcome::Failed(anyhow::anyhow!(
+                "等房间参照模型初始化超过 {} 秒还没就绪",
+                RESIDENT_WAIT_LIMIT.as_secs()
+            ));
+        }
+        task_ctx.sleep_updates(RESIDENT_POLL_UPDATES).await;
+        // 宿主没了（关窗 / 刷新页面）睡眠立刻返回——不问这一句就是死循环。
+        if !host_alive(task_ctx) {
+            return ResidentWaitOutcome::Cancelled;
+        }
+    }
 }
 
 /// 起数据线程：按供数模式造读面、抓工程标识与 SITE 根层，然后循环处理懒加载请求。
@@ -1238,6 +1370,7 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>, kind: ReadF
                         scope.clone(),
                         evt_tx.clone(),
                         ctx.clone(),
+                        task_ctx.clone(),
                     ))),
                 }
             }

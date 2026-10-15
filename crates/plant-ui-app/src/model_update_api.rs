@@ -11,7 +11,8 @@ mod model_record_union;
 
 use plant_ui::model_update::{Enqueued, Failure, Preview};
 use plant_ui::task_queue::{
-    DbnumReport, Health, ModelSource, PendingUnits, Poll, QueueSnapshot, TaskList,
+    DbnumReport, Health, ModelSource, PendingUnits, Poll, QueueSnapshot, ResidentProgress,
+    TaskList,
 };
 use plant_ui_data::{Attr, AttrKind};
 
@@ -620,6 +621,112 @@ pub async fn dbnum_report(base: &str) -> anyhow::Result<DbnumReport> {
 
 pub async fn service_health(base: &str) -> anyhow::Result<Health> {
     get(base, "/api/v1/health").await
+}
+
+/// `/health` 归一出的常驻房间参照模型状态——「重新生成模型」发出前的等待循环只认这三档。
+/// 归一而不是透传：老服务端（没有 `room_build` 一格）与放行态在这里压成同一个答案，
+/// 调用方不必自己分得清「没这门」和「已就绪」。
+#[derive(Debug, Clone)]
+pub enum ResidentStatus {
+    /// 放行，可以照发：`ready` / `degraded`（带缺口也照算）/ `disabled` /
+    /// `unsupported`（本进程没有房间体制）/ 老服务端根本没这一格。
+    Ready,
+    /// 还在建：界面画「等房间参照模型装载」档（可取消——生成请求还没发）。
+    /// `progress` 缺 = 服务端比这一版老，只画 spinner 与阶段名。
+    Building {
+        phase: Option<String>,
+        progress: Option<ResidentProgress>,
+    },
+    /// 建死了（`blocked`）：等也等不来。`reason` 取 `problems` 第一条点名。
+    Blocked { reason: Option<String> },
+}
+
+/// 从一份 `/health` 快照归一（等待循环与测试共用同一处）。
+pub fn resident_status_of(health: &Health) -> ResidentStatus {
+    let Some(resident) = health
+        .room_build
+        .as_ref()
+        .and_then(|build| build.resident.as_ref())
+    else {
+        // 老服务端 / 没装房间体制的服务端压根不报这一格 → 没有要等的东西。
+        return ResidentStatus::Ready;
+    };
+    match resident.status.as_str() {
+        "loading" => ResidentStatus::Building {
+            phase: resident.phase.clone().or_else(|| {
+                resident
+                    .progress
+                    .as_ref()
+                    .map(|progress| progress.phase.clone())
+                    .filter(|phase| !phase.is_empty())
+            }),
+            progress: resident.progress.clone(),
+        },
+        "blocked" => ResidentStatus::Blocked {
+            reason: resident.problems.first().cloned(),
+        },
+        // ready / degraded / disabled / unsupported：放行——除了「重新生成房间」的
+        // 第三段。换代装上之后生命周期就翻 ready，逐库房间边重算（`edge-recompute`）
+        // 却在它之后跑；那段没跑完前都算 Building，不然进度屏会提前收摊。
+        _ => match &resident.progress {
+            Some(progress)
+                if progress.phase == "edge-recompute"
+                    && progress.dbnums_done < progress.dbnums_total =>
+            {
+                ResidentStatus::Building {
+                    phase: Some(progress.phase.clone()),
+                    progress: resident.progress.clone(),
+                }
+            }
+            // 真不该放行的那半句由服务端 `ensure_ready` 自己兜底
+            // （它会回 RESIDENT_MODEL_UPDATING → 409）。
+            _ => ResidentStatus::Ready,
+        },
+    }
+}
+
+const ROOMS_REBUILD_PATH: &str = "/api/v1/rooms/rebuild";
+
+/// 「重新生成房间」（全库）：`POST /api/v1/rooms/rebuild`。服务端 202 受理后后台清两张
+/// 房间边表 → 换代重建常驻参照模型 → 逐库整库重算房间关系；进度读
+/// `/health.room_build.resident.progress`。受理即 `Ok(())`；`409 updating`
+/// （启动首建或上一趟重建还在跑）与其余失败按 `Failure` 原样上抛——由调用方把
+/// updating 当「挂上已在跑的那趟」处理。
+pub async fn rebuild_rooms(
+    base: &str,
+    project: &str,
+    mdb: &str,
+    namespace: &str,
+) -> anyhow::Result<()> {
+    let body = serde_json::json!({
+        "project": project,
+        "mdb": mdb,
+        "namespace": namespace,
+    })
+    .to_string();
+    let _: serde_json::Value = post(
+        base,
+        ROOMS_REBUILD_PATH,
+        body,
+        Duration::from_secs(30),
+    )
+    .await?;
+    Ok(())
+}
+
+/// 拉一次 `/health` 并归一出常驻房间参照模型的状态。取不到（超时 / 500 / 连不上）
+/// 按 `Err` 上浮，由调用方决定是再试还是放行——别在这里吞成 `Ready`：服务端够不着
+/// 与「就绪」是两个相反的答案。
+pub async fn resident_status(base: &str) -> anyhow::Result<ResidentStatus> {
+    Ok(resident_status_of(&service_health(base).await?))
+}
+
+/// 这次失败是不是「房间参照模型还没装好」（服务端 ADR-067 的 `RESIDENT_MODEL_UPDATING`）：
+/// 新服务端回 `409 / code = "updating"`，老服务端把这串字面埋在 503 `room_reference_unavailable`
+/// 或 500 `internal` 的 message 里——两个都认，都按「还在建，可等」处置。
+pub fn resident_building(error: &anyhow::Error) -> bool {
+    let failure = failure_of(error);
+    failure.code == "updating" || failure.message.contains("RESIDENT_MODEL_UPDATING")
 }
 
 /// 暂停 / 恢复出队。暂停**只挡出队**，正在跑的那一批会跑完为止。
