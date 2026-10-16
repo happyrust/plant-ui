@@ -202,6 +202,36 @@ fn dbnum_model_path(dbnum: u32, project: &str, mdb: &str, namespace: &str) -> St
     )
 }
 
+/// `GET /api/v1/dbnums/{dbnum}/model/roots` 的库级就绪快照（gen-model `dbnum_model_roots`）。
+///
+/// `ready` 的判据本身就要求回执按冻结时的当前源 `sesno` 生成（含必要的发布 ACK），所以
+/// `ready_total > 0` = 库里有现成且仍是最新的模型（「已生成」）；`= 0` = 没生成过或全部
+/// 落后。显示路径拿它做库级预检查：`0` 时不等 records 回空就直接默认重新生成。
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+pub struct DbnumModelRoots {
+    /// 已就绪（按当前源生成）的根数。
+    #[serde(default)]
+    pub ready_total: usize,
+}
+
+/// 库级模型探针：问「这个库现在有没有按当前源生成的模型」。一次根枚举快照，大库秒级——
+/// 调用方按库缓存结论，别逐节点问。
+pub async fn dbnum_model_roots(
+    base: &str,
+    project: &str,
+    mdb: &str,
+    namespace: &str,
+    dbnum: u32,
+) -> anyhow::Result<DbnumModelRoots> {
+    let path = format!(
+        "/api/v1/dbnums/{dbnum}/model/roots?project={}&mdb={}&namespace={}",
+        urlencode(project),
+        urlencode(mdb),
+        urlencode(namespace)
+    );
+    get(base, &path).await
+}
+
 #[derive(Debug, Deserialize)]
 pub struct QueryReply {
     pub tool: String,

@@ -391,6 +391,10 @@ pub struct EleTreeNode {
     #[serde(default)]
     pub children_updated: Option<bool>,
     pub status_code: Option<String>,
+    /// 元素所在的库号（gen-model `/tree/*` 节点上服务端注的 `dbnum`，spec §4.10）。
+    /// 库供数的查询不带它、`DbnumRoots` 之类没注的老服务端也一样——`None` 按「说不出」处理。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dbnum: Option<u32>,
 }
 
 impl EleTreeNode {
@@ -415,6 +419,7 @@ impl EleTreeNode {
             mod_cnt: None,
             children_updated: None,
             status_code: None,
+            dbnum: None,
         }
     }
 
@@ -454,6 +459,7 @@ impl From<PdmsElement> for EleTreeNode {
             mod_cnt: None,
             children_updated: None,
             status_code: None,
+            dbnum: None,
         }
     }
 }

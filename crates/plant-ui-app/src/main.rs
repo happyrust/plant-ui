@@ -750,6 +750,9 @@ struct TreeModel {
     pending_visibility: HashMap<RefU64, RowVisibility>,
     /// 该行已经明确查空或查询失败，不能再从已显示的祖先继承 eye。
     visibility_unavailable: HashSet<RefU64>,
+    /// 行节点的库号：`EleTreeNode.dbnum`（服务供数 `/tree/*` 注的那一格）落表。
+    /// 库供数没有这一格，显示路径的库级预检查只认这张表里的库号。
+    dbnum: HashMap<RefU64, u32>,
     /// 无名元素显示全称（`ZONE 4 of SITE 2`）还是短名（`ZONE 4`）。跟设置窗那一格
     /// （`Settings::tree_full_names`），改了就重新展平；有名字的元素两种都是 NAME。
     full_names: bool,
@@ -1004,6 +1007,26 @@ impl TreeModel {
                 .any(|n| n.refno.refno() == refno)
     }
 
+    /// 节点入库时把服务端注的库号落表（`EleTreeNode.dbnum`）；库供数 / 老服务端
+    /// 没有这一格，按「说不出」处理。
+    fn note_dbnum(&mut self, node: &EleTreeNode) {
+        if let Some(dbnum) = node.dbnum.filter(|dbnum| *dbnum != 0) {
+            self.dbnum.insert(node.refno.refno(), dbnum);
+        }
+    }
+
+    /// 这个 refno 属于哪个库。节点自己的 `dbnum` 是直接答案；还没物化出来的行
+    /// 沿 `parent` 链往上走，任一跳落表就算数。都说不出回 `None`。
+    fn dbnum_of(&self, refno: RefU64) -> Option<u32> {
+        let mut current = refno;
+        loop {
+            if let Some(dbnum) = self.dbnum.get(&current) {
+                return Some(*dbnum);
+            }
+            current = *self.parent.get(&current)?;
+        }
+    }
+
     /// 已确认删除的分支即使 OWNER 未重查，也必须从缓存子层摘掉。
     fn detach_missing(&mut self, missing: &[RefU64]) {
         let missing: HashSet<_> = missing.iter().copied().collect();
@@ -1056,6 +1079,7 @@ impl TreeModel {
             .retain(|refno, _| alive.contains(refno));
         self.visibility_unavailable
             .retain(|refno| alive.contains(refno));
+        self.dbnum.retain(|refno, _| alive.contains(refno));
         let mut removed: Vec<_> = known.difference(&alive).copied().collect();
         removed.sort_by_key(|refno| refno.0);
         removed
@@ -1259,6 +1283,15 @@ struct App {
     model_scopes: HashMap<RefU64, Vec<RefU64>>,
     model_scope_pending: HashSet<RefU64>,
     model_scope_epoch: u64,
+    /// 「这个库有没有按当前源生成的模型」的会话级结论：`GET /dbnums/{n}/model/roots`
+    /// 探针的 `ready_total > 0`，或该库的目标真查出过 records（正写）。`false`
+    /// 不压已确认的 `true`——探针晚回的空结论不许推翻证据。
+    dbnum_model_known: HashMap<u32, bool>,
+    /// 在途的库级探针（每库单飞，回包时摘掉）。
+    dbnum_model_probing: HashSet<u32>,
+    /// 显示路径「库无模型 / 查空 → 默认重新生成」的去重账：每 refno 每会话只自动
+    /// 一发，右键显式「重新生成模型」另走 `begin_mutation` 不受此限。
+    auto_generate_attempted: HashSet<RefU64>,
     focus_bounds_request: focus_bounds::Request<RefU64>,
     /// `clear` bumps this generation so replies from the cleared session are ignored.
     command_epoch: u64,
@@ -1317,6 +1350,9 @@ struct MutationRun {
     /// 右键那几行。各一发 generate / DELETE；成功之后重新生成以它们为祖先发显示，清理把它们
     /// 名下已加载的模型卸掉。整库清理时为空。
     targets: Vec<RefU64>,
+    /// 显示路径「库无模型 / 查空」发起的自动生成（`begin_auto_generate`）。与右键显式发起
+    /// 的区别只在回执落地那一下：自动趟尊重期间翻成隐藏的方向，不再反掰回来。
+    auto: bool,
     /// 库行「清理模型（整库）」的库号。有值时这一趟不走右键那几行。
     dbnum: Option<u32>,
     /// 「等房间参照模型」档的开关（`Req::RebuildRooms` 在用）：重建已发出、服务端
@@ -2157,6 +2193,9 @@ impl App {
             model_scopes: HashMap::new(),
             model_scope_pending: HashSet::new(),
             model_scope_epoch: 0,
+            dbnum_model_known: HashMap::new(),
+            dbnum_model_probing: HashSet::new(),
+            auto_generate_attempted: HashSet::new(),
             focus_bounds_request: Default::default(),
             command_epoch: 0,
             loaded_models: HashSet::new(),
@@ -2227,6 +2266,11 @@ impl App {
                     self.queue.mdb = self.mdb.clone();
                     self.queue.namespace = self.namespace.clone();
                     self.vm.project_code = info.ns;
+                    // 换面之后的库号是另一份世界的：整表重落，别留旧连接的账。
+                    self.tree.dbnum.clear();
+                    for site in &info.sites {
+                        self.tree.note_dbnum(site);
+                    }
                     self.tree.roots = info.sites;
                     // 换面之后的重装（ADR-0026 热切，计划 §5.3）：清场前的快照到这儿才
                     // 移进取回工作那一格，随后走取回工作那条现成路——`clear_scene_for_reload`
@@ -2270,6 +2314,7 @@ impl App {
                     self.logs.info_of(&mut self.vm.logs, el, msg);
                     for kid in &kids {
                         self.tree.parent.insert(kid.refno.refno(), refno);
+                        self.tree.note_dbnum(kid);
                     }
                     self.tree.children.insert(refno, kids);
                     dirty = true;
@@ -2639,46 +2684,82 @@ impl App {
                     };
                     match result {
                         Ok(loaded) if loaded.records.is_empty() => {
-                            mark_model_scope_unavailable(
-                                &mut self.tree.pending_direction,
-                                &mut self.tree.visibility_unavailable,
-                                &mut self.model_scope_failures,
-                                target,
-                            );
-                            // 重新生成之后查空（范围内已无可画几何）：这个目标上一次显示的旧产物
-                            // 也不该再留在场景里。
-                            if self.regenerate_refresh.remove(&target) {
-                                let stale: Vec<RefU64> = self
-                                    .model_scopes
-                                    .remove(&target)
-                                    .unwrap_or_default()
-                                    .into_iter()
-                                    .filter(|refno| self.loaded_models.remove(refno))
-                                    .collect();
-                                for refno in &stale {
-                                    self.model_owner.remove(refno);
+                            // 查空 → 默认重新生成（只限显示方向、每 refno 每会话一发；
+                            // 发不出去 / 已经试过的照旧收「未加载」，见 `mark_model_scope_unavailable`）。
+                            let wants_show =
+                                self.tree.pending_direction.get(&target).copied() == Some(true);
+                            let auto = wants_show
+                                && !self.auto_generate_attempted.contains(&target)
+                                && !self
+                                    .begin_auto_generate(
+                                        vec![target],
+                                        "范围内没有已生成的模型".into(),
+                                    )
+                                    .is_empty();
+                            // 这一发已由库级探针抢先发起、还在在途：安静地等回执落定，
+                            // 别标「未加载」、别打「右键重新生成」的提示——生成正在跑。
+                            let in_flight = self
+                                .mutation_run
+                                .as_ref()
+                                .is_some_and(|run| run.targets.contains(&target));
+                            if auto || in_flight {
+                                if auto {
+                                    let element = self.tree.element(target);
+                                    self.logs.info_of(
+                                        &mut self.vm.logs,
+                                        element,
+                                        "范围内没有已生成的模型，正在默认重新生成（回执落定自动显示）"
+                                            .to_string(),
+                                    );
                                 }
-                                if !stale.is_empty() {
-                                    self.view3d_commands.push(Cmd::Model(
-                                        plant_ui::ModelAction::Unload { refnos: stale },
-                                    ));
+                                self.finish_model_progress("模型加载完成");
+                                self.pending_room_frame.take_if(|room| *room == target);
+                            } else {
+                                mark_model_scope_unavailable(
+                                    &mut self.tree.pending_direction,
+                                    &mut self.tree.visibility_unavailable,
+                                    &mut self.model_scope_failures,
+                                    target,
+                                );
+                                // 重新生成之后查空（范围内已无可画几何）：这个目标上一次显示的旧产物
+                                // 也不该再留在场景里。
+                                if self.regenerate_refresh.remove(&target) {
+                                    let stale: Vec<RefU64> = self
+                                        .model_scopes
+                                        .remove(&target)
+                                        .unwrap_or_default()
+                                        .into_iter()
+                                        .filter(|refno| self.loaded_models.remove(refno))
+                                        .collect();
+                                    for refno in &stale {
+                                        self.model_owner.remove(refno);
+                                    }
+                                    if !stale.is_empty() {
+                                        self.view3d_commands.push(Cmd::Model(
+                                            plant_ui::ModelAction::Unload { refnos: stale },
+                                        ));
+                                    }
                                 }
+                                // 查空就是空：树行停「未加载」，一句提示说清出路，不是告警
+                                // （ADR-0030 D1）。
+                                let element = self.tree.element(target);
+                                self.logs
+                                    .info_of(&mut self.vm.logs, element, EMPTY_SCOPE_HINT);
+                                self.finish_model_progress("模型加载完成");
+                                // 这间房没有已生成模型，取景的账就地销掉——留着它，
+                                // 下一个范围回包会替它把相机带走。
+                                self.pending_room_frame.take_if(|room| *room == target);
                             }
-                            // 查空就是空：树行停「未加载」，一句提示说清出路，不是告警
-                            // （ADR-0030 D1）。
-                            let element = self.tree.element(target);
-                            self.logs
-                                .info_of(&mut self.vm.logs, element, EMPTY_SCOPE_HINT);
-                            self.finish_model_progress("模型加载完成");
-                            // 这间房没有已生成模型，取景的账就地销掉——留着它，
-                            // 下一个范围回包会替它把相机带走。
-                            self.pending_room_frame.take_if(|room| *room == target);
                             dirty = true;
                         }
                         Ok(loaded) => {
                             let memory_note = loaded.memory_note().unwrap_or_default();
                             let models = loaded.records;
                             self.tree.visibility_unavailable.remove(&target);
+                            // 真查出记录 = 这个库有模型：库级结论正写，探针晚到的空结论压不掉它。
+                            if let Some(dbnum) = self.tree.dbnum_of(target) {
+                                self.dbnum_model_known.insert(dbnum, true);
+                            }
                             let mesh_count =
                                 models.iter().map(|model| model.insts.len()).sum::<usize>();
                             let mut refs = Vec::new();
@@ -2882,6 +2963,45 @@ impl App {
                 }
                 data::Evt::SubtreeBounds { .. } => {}
                 data::Evt::ModelScopeProgress { .. } | data::Evt::ModelScope(..) => {}
+                // 库级模型预检查的回包：换代前的不认。`ready_total == 0` = 这个库没有按
+                // 当前源生成的模型——还在等 records 回包的同库目标直接默认重新生成，不必
+                // 先吃一拍查空；`ready_total > 0` / `Err` 都只记账，records 那一路照常裁决。
+                data::Evt::DbnumModelProbe { epoch, .. } if epoch != self.model_scope_epoch => {}
+                data::Evt::DbnumModelProbe { dbnum, result, .. } => {
+                    self.dbnum_model_probing.remove(&dbnum);
+                    if let Ok(roots) = result {
+                        let has_model = roots.ready_total > 0;
+                        match self.dbnum_model_known.entry(dbnum) {
+                            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                                if has_model {
+                                    entry.insert(true);
+                                }
+                            }
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                entry.insert(has_model);
+                            }
+                        }
+                        if !has_model {
+                            // 只替「显示」方向的待决目标发起：隐藏方向的查空不生成。
+                            let pending: Vec<RefU64> = self
+                                .model_scope_pending
+                                .iter()
+                                .copied()
+                                .filter(|target| {
+                                    self.tree.dbnum_of(*target) == Some(dbnum)
+                                        && self.tree.pending_direction.get(target).copied()
+                                            == Some(true)
+                                })
+                                .collect();
+                            self.begin_auto_generate(
+                                pending,
+                                format!("db{dbnum} 还没有已生成的模型"),
+                            );
+                            // 没发出去的留在在途：records 回空那一臂照常收口。
+                        }
+                    }
+                    dirty = true;
+                }
                 data::Evt::ResolvedName(name, result) => match result {
                     // `/名称` 与 `=参考号` 之后走的是同一条定位路径，只有回执文案不同。
                     Ok(Some(refno)) => {
@@ -3230,10 +3350,14 @@ impl App {
                                 }
                             }
                             let before = self.tree.element_count();
+                            for site in &fresh.sites {
+                                self.tree.note_dbnum(site);
+                            }
                             self.tree.roots = fresh.sites;
                             for (refno, kids) in fresh.branches {
                                 for kid in &kids {
                                     self.tree.parent.insert(kid.refno.refno(), refno);
+                                    self.tree.note_dbnum(kid);
                                 }
                                 self.tree.children.insert(refno, kids);
                             }
@@ -4236,6 +4360,7 @@ impl App {
             label: label.clone(),
             targets,
             dbnum: None,
+            auto: false,
             cancel: Default::default(),
         });
         self.mutation = Some(model_mutation::Vm::Confirm {
@@ -4264,6 +4389,7 @@ impl App {
             label: label.clone(),
             targets: Vec::new(),
             dbnum: Some(dbnum),
+            auto: false,
             cancel: Default::default(),
         });
         self.mutation = Some(model_mutation::Vm::Confirm {
@@ -4293,6 +4419,7 @@ impl App {
             label: label.clone(),
             targets: Vec::new(),
             dbnum: None,
+            auto: false,
             cancel: Default::default(),
         });
         self.mutation = Some(model_mutation::Vm::Confirm {
@@ -4300,6 +4427,74 @@ impl App {
             label,
             dbnum: None,
         });
+    }
+
+    /// 「没有模型就默认重新生成」的自动入口：显示路径发现范围内没有已生成模型
+    /// （库级探针 `ready_total == 0`，或按祖先查 records 一条没有）时替用户发起——
+    /// 与右键同一条 `GenerateModels` 通道，只是跳过确认框：这两种发现说的本来就是
+    /// 「现在没有可看的」，问一次没有意义。进度屏照常进 `Running`，回执仍由
+    /// [`Self::settle_models_generated`] 收，成功即按原方向显示。
+    ///
+    /// 返回真正发出去的那批目标。约束：每 refno 每会话只自动一发
+    /// （`auto_generate_attempted`，发不出去不记账，下次点击还能再试）；已有一趟
+    /// 变更在跑或服务不可写时一个都不发，调用方按原来的查空收口。
+    fn begin_auto_generate(&mut self, targets: Vec<RefU64>, reason: String) -> Vec<RefU64> {
+        let targets: Vec<RefU64> = targets
+            .into_iter()
+            .filter(|target| !self.auto_generate_attempted.contains(target))
+            .collect();
+        if targets.is_empty() {
+            return Vec::new();
+        }
+        if self.mutation_run.is_some() || self.vm.regen_busy || !self.model_service_executable() {
+            return Vec::new();
+        }
+        for target in &targets {
+            self.auto_generate_attempted.insert(*target);
+        }
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+        let label = regenerate_label(self.tree.label(targets[0]), targets.len());
+        self.mutation_run = Some(MutationRun {
+            kind: model_mutation::Kind::Regenerate,
+            label: label.clone(),
+            targets: targets.clone(),
+            dbnum: None,
+            auto: true,
+            cancel: Default::default(),
+        });
+        let sent = self
+            .bridge
+            .req
+            .send(data::Req::GenerateModels {
+                epoch: self.mutation_epoch,
+                refnos: targets.clone(),
+                base: self.model_api_url.clone(),
+                project: self.vm.project.clone(),
+                mdb: self.mdb.clone(),
+                namespace: self.namespace.clone(),
+            })
+            .is_ok();
+        if !sent {
+            self.mutation_run = None;
+            self.logs.warn(
+                &mut self.vm.logs,
+                format!("{label}：数据线程已关闭，这一趟没有开始"),
+            );
+            return Vec::new();
+        }
+        self.logs.info(
+            &mut self.vm.logs,
+            format!(
+                "{label}：{reason}，默认重新生成（{} 个目标，服务端预算 120 秒，超时后台继续）…",
+                targets.len()
+            ),
+        );
+        self.vm.regen_busy = true;
+        self.mutation = Some(model_mutation::Vm::Running {
+            kind: model_mutation::Kind::Regenerate,
+            label,
+        });
+        targets
     }
 
     /// 确认框的回执。接受就对右键那几行**各一发**——重新生成是 `generate(force = true)`，整批
@@ -4467,6 +4662,10 @@ impl App {
                     }
                     self.logs
                         .info(&mut self.vm.logs, generate_summary(&label, reply));
+                    // 生成成功 = 这个库有模型了：库级结论正写，显示路径不再为它发探针。
+                    if let Some(dbnum) = self.tree.dbnum_of(*refno) {
+                        self.dbnum_model_known.insert(dbnum, true);
+                    }
                     display.push(*refno);
                 }
                 GenerateOutcome::Background => {
@@ -4502,9 +4701,18 @@ impl App {
         }
         // 生成完成之后，再调用显示接口：这几个目标名下的旧几何要换成重算过的，所以先把
         // 它们从「已知范围」里摘掉，让 `set_model_visible` 走查询那条路，回包时再卸旧装新。
+        // 自动趟（显示路径的默认重新生成）尊重期间翻成隐藏的方向：生成最长两分钟，
+        // 用户中途点掉眼睛 / HideAll 不该被回执掰回显示。显式右键趟照旧一律显示。
         for target in &display {
             self.model_scopes.remove(target);
             self.regenerate_refresh.insert(*target);
+        }
+        if run.auto {
+            display
+                .retain(|target| self.tree.pending_direction.get(target).copied() != Some(false));
+        }
+        if display.is_empty() {
+            return;
         }
         self.set_model_visible(display, true);
     }
@@ -5533,41 +5741,90 @@ impl App {
             }
         }
         if !plan.query.is_empty() {
-            if self.model_scope_pending.is_empty() && self.model_show_waiting.is_empty() {
-                self.model_scope_failures = 0;
-            }
-            self.model_scope_pending.extend(plan.query.iter().copied());
-            let verb = if visible { "显示" } else { "隐藏" };
-            self.logs.info(
-                &mut self.vm.logs,
-                format!("开始查询并{verb}模型：{} 个目标", plan.query.len()),
-            );
-            self.model_progress_until = None;
-            self.vm.model_load = Some(ModelLoadVm::Resolving("解析模型范围…".into()));
-            let targets = plan.query;
-            if self
-                .bridge
-                .req
-                .send(data::Req::ModelScopes {
-                    epoch: self.model_scope_epoch,
-                    targets: targets.clone(),
-                    base: model_update_api::base_url(),
-                    project: self.vm.project.clone(),
-                    mdb: self.mdb.clone(),
-                    namespace: self.namespace.clone(),
-                })
-                .is_err()
-            {
-                for target in targets {
-                    self.model_scope_pending.remove(&target);
-                    self.tree.pending_direction.remove(&target);
-                    self.tree.visibility_unavailable.insert(target);
+            // 库级预检查（只在「显示」方向做；隐藏方向的查询照旧只查不生）：已知这库
+            // 没有就绪模型的目标跳过 records 往返，直接默认重新生成；结论未知的库
+            // 随这次显示各发一发探针（每库单飞，回包落在 `Evt::DbnumModelProbe`）。
+            let mut query = Vec::with_capacity(plan.query.len());
+            let mut regen_now = Vec::new();
+            for target in plan.query {
+                let known = self
+                    .tree
+                    .dbnum_of(target)
+                    .and_then(|dbnum| self.dbnum_model_known.get(&dbnum).copied());
+                match known {
+                    Some(false) if visible => regen_now.push(target),
+                    _ => {
+                        if visible && let Some(dbnum) = self.tree.dbnum_of(target) {
+                            if !self.dbnum_model_known.contains_key(&dbnum)
+                                && self.dbnum_model_probing.insert(dbnum)
+                            {
+                                let sent = self
+                                    .bridge
+                                    .req
+                                    .send(data::Req::DbnumModelProbe {
+                                        epoch: self.model_scope_epoch,
+                                        dbnum,
+                                        base: model_update_api::base_url(),
+                                        project: self.vm.project.clone(),
+                                        mdb: self.mdb.clone(),
+                                        namespace: self.namespace.clone(),
+                                    })
+                                    .is_ok();
+                                if !sent {
+                                    self.dbnum_model_probing.remove(&dbnum);
+                                }
+                            }
+                        }
+                        query.push(target);
+                    }
                 }
-                self.model_scope_failures += 1;
-                let error = anyhow::anyhow!("数据查询线程已停止");
-                self.logs
-                    .error(&mut self.vm.logs, "已有模型查询失败", &error, None);
-                self.finish_model_progress("模型加载完成");
+            }
+            if !regen_now.is_empty() {
+                let all = regen_now.clone();
+                let fired: HashSet<RefU64> = self
+                    .begin_auto_generate(regen_now, "所在库还没有已生成的模型".into())
+                    .into_iter()
+                    .collect();
+                // 没发出去的（已有变更在跑 / 服务不可写）退回查询路，查空那一臂照常收口。
+                query.extend(all.into_iter().filter(|target| !fired.contains(target)));
+            }
+            if !query.is_empty() {
+                if self.model_scope_pending.is_empty() && self.model_show_waiting.is_empty() {
+                    self.model_scope_failures = 0;
+                }
+                self.model_scope_pending.extend(query.iter().copied());
+                let verb = if visible { "显示" } else { "隐藏" };
+                self.logs.info(
+                    &mut self.vm.logs,
+                    format!("开始查询并{verb}模型：{} 个目标", query.len()),
+                );
+                self.model_progress_until = None;
+                self.vm.model_load = Some(ModelLoadVm::Resolving("解析模型范围…".into()));
+                let targets = query;
+                if self
+                    .bridge
+                    .req
+                    .send(data::Req::ModelScopes {
+                        epoch: self.model_scope_epoch,
+                        targets: targets.clone(),
+                        base: model_update_api::base_url(),
+                        project: self.vm.project.clone(),
+                        mdb: self.mdb.clone(),
+                        namespace: self.namespace.clone(),
+                    })
+                    .is_err()
+                {
+                    for target in targets {
+                        self.model_scope_pending.remove(&target);
+                        self.tree.pending_direction.remove(&target);
+                        self.tree.visibility_unavailable.insert(target);
+                    }
+                    self.model_scope_failures += 1;
+                    let error = anyhow::anyhow!("数据查询线程已停止");
+                    self.logs
+                        .error(&mut self.vm.logs, "已有模型查询失败", &error, None);
+                    self.finish_model_progress("模型加载完成");
+                }
             }
         }
     }
@@ -5688,9 +5945,11 @@ impl App {
         self.model_scope_failures = 0;
         self.model_scopes.clear();
         self.model_scope_pending.clear();
-        // 在途的范围查询说的是清场前那个世界，回包一律作废。
+        // 在途的范围查询说的是清场前那个世界，回包一律作废。库级探针同帧换代，
+        // 在途账一并摘掉，不然这一库就再也探不动了；已问出的结论（known）仍有效。
         self.focus_bounds_request.cancel();
         self.model_scope_epoch = self.model_scope_epoch.wrapping_add(1);
+        self.dbnum_model_probing.clear();
         // 尺寸标注量的是清场前那份几何，重装回来的 BRAN 可能已经不是那个样子（计划 B3：
         // 换场景清层）。要看就再右键一次。
         self.clear_pipe_dimensions();
@@ -5919,6 +6178,10 @@ impl App {
         self.focus_bounds_request.cancel();
         self.model_scope_epoch = self.model_scope_epoch.wrapping_add(1);
         self.model_scopes.clear();
+        // 库级结论与「每会话一发」的账都记上一段连接的：换接入点后重新问。
+        self.dbnum_model_known.clear();
+        self.dbnum_model_probing.clear();
+        self.auto_generate_attempted.clear();
         // 上一段连接的库号：换接入点后同一个号未必还是同一个库。
         self.search_hit_dbs.clear();
         self.tree.visibility_unavailable.clear();
@@ -6574,6 +6837,164 @@ mod tests {
             &generate_reply(model_update_api::GenerateStatus::Unknown),
         );
         assert!(line.contains("不认识的状态"), "{line}");
+    }
+
+    /// 库号落表与继承：节点自带的 `dbnum` 是直接答案；没注的行沿 `parent` 链往上
+    /// 继承（SITE 根那一跳总有库号）；`dbnum = 0` / 缺失按「说不出」处理，不造号。
+    #[test]
+    fn dbnum_of_walks_the_parent_chain() {
+        let site = RefU64(1);
+        let zone = RefU64(2);
+        let leaf = RefU64(3);
+        let mut tree = TreeModel::default();
+        let mut site_node = node(site, "SITE", 1);
+        site_node.dbnum = Some(7997);
+        tree.note_dbnum(&site_node);
+        tree.parent.insert(zone, site);
+        tree.parent.insert(leaf, zone);
+        assert_eq!(tree.dbnum_of(site), Some(7997), "节点自己带库号");
+        assert_eq!(tree.dbnum_of(leaf), Some(7997), "沿父链继承 SITE 的库号");
+
+        let mut zero = node(RefU64(4), "ZONE", 0);
+        zero.dbnum = Some(0);
+        tree.note_dbnum(&zero);
+        assert_eq!(tree.dbnum_of(RefU64(4)), None, "dbnum = 0 不落表");
+        assert_eq!(tree.dbnum_of(RefU64(99)), None, "查不到就说不出");
+    }
+
+    /// 「显示前预检查 dbnum 有没有模型，没有就默认重新生成；节点查空同样重新生成」
+    /// （需求口径）。钉住五处接线：显示方向才发探针与默认生成（隐藏只查不生）；库级
+    /// 结论 `ready_total == 0` 直接进生成不绕 records；查空先试生成、发不出去才收
+    /// 「未加载」；每 refno 每会话只自动一发；自动趟尊重生成期间翻成隐藏的方向。
+    #[test]
+    fn display_regenerates_when_dbnum_has_no_model() {
+        let source = include_str!("main.rs");
+        let visible_fn = source
+            .split_once("fn set_model_visible(")
+            .expect("显示/隐藏入口")
+            .1
+            .split_once("fn get_work(")
+            .expect("下一个方法")
+            .0;
+        // 探针随显示方向发出：与 ModelScopes 同一条路，按库单飞去重。
+        assert!(
+            visible_fn.contains("visible && let Some(dbnum) = self.tree.dbnum_of(target)"),
+            "探针只在显示方向发：{visible_fn}"
+        );
+        assert!(
+            visible_fn.contains("self.dbnum_model_probing.insert(dbnum)"),
+            "每库单飞：{visible_fn}"
+        );
+        assert!(
+            visible_fn.contains("data::Req::DbnumModelProbe {")
+                && visible_fn.contains("data::Req::ModelScopes {"),
+            "探针与 records 查询同路并发：{visible_fn}"
+        );
+        // 已知无模型的库直接默认重新生成，只在显示方向；发不出去的退回查询路收口。
+        assert!(
+            visible_fn.contains("Some(false) if visible => regen_now.push(target)"),
+            "隐藏方向不许自动生成：{visible_fn}"
+        );
+        assert!(
+            visible_fn.contains("begin_auto_generate(regen_now"),
+            "{visible_fn}"
+        );
+        let query_fallback = visible_fn
+            .find("query.extend(all.into_iter().filter(|target| !fired.contains(target)))");
+        assert!(query_fallback.is_some(), "发不出去的退回查询：{visible_fn}");
+
+        // 查空那一臂：先试着默认生成（显示方向 + 没试过的），发不出去才收「未加载」；
+        // 重新生成之后仍查空的，把上一趟的旧几何卸掉。
+        let empty = source
+            .split_once("Ok(loaded) if loaded.records.is_empty() => {")
+            .expect("查空那一臂")
+            .1
+            .split_once("Ok(loaded) => {")
+            .expect("非空那一臂")
+            .0;
+        assert!(
+            empty.contains("pending_direction.get(&target).copied() == Some(true)"),
+            "只替显示方向生成：{empty}"
+        );
+        assert!(
+            empty.contains("auto_generate_attempted.contains(&target)"),
+            "每 refno 每会话只自动一发：{empty}"
+        );
+        let generate = empty.find("begin_auto_generate").expect("查空默认生成");
+        let unavailable = empty
+            .find("mark_model_scope_unavailable(")
+            .expect("兜底收口");
+        assert!(generate < unavailable, "先试着生成，发不出去才收未加载");
+        assert!(
+            empty.contains("regenerate_refresh.remove(&target)"),
+            "重生成后仍空要卸旧几何：{empty}"
+        );
+        assert!(
+            empty.contains("run.targets.contains(&target)"),
+            "生成在途的目标不标未加载、不打提示：{empty}"
+        );
+
+        // 探针回包：换代的不认；`ready_total == 0` 才催生成，且只替显示方向的待决目标。
+        assert!(
+            source
+                .contains("Evt::DbnumModelProbe { epoch, .. } if epoch != self.model_scope_epoch"),
+            "换代的探针回包要丢"
+        );
+        let probe = source
+            .split_once("data::Evt::DbnumModelProbe { dbnum, result, .. } => {")
+            .expect("探针回包那一臂")
+            .1
+            .split_once("data::Evt::ResolvedName")
+            .expect("下一臂")
+            .0;
+        assert!(probe.contains("roots.ready_total > 0"), "就绪判据：{probe}");
+        assert!(
+            probe.contains("pending_direction.get(target).copied()"),
+            "探针只替显示方向的待决目标发起：{probe}"
+        );
+        assert!(probe.contains("begin_auto_generate("), "{probe}");
+
+        // 自动入口：跳过确认框，走同一条 GenerateModels 通道；发不出去不记账。
+        let begin = source
+            .split_once("fn begin_auto_generate(")
+            .expect("自动入口")
+            .1
+            .split_once("fn settle_mutation_confirm(")
+            .expect("下一方法")
+            .0;
+        assert!(begin.contains("data::Req::GenerateModels {"), "{begin}");
+        assert!(
+            !begin.contains("model_mutation::Vm::Confirm"),
+            "自动生成不弹确认框：{begin}"
+        );
+        let mark = begin.find("auto_generate_attempted.insert(*target)");
+        let send = begin.find("data::Req::GenerateModels {");
+        assert!(
+            mark.is_some() && send.is_some() && mark.unwrap() < send.unwrap(),
+            "先记账再发：{begin}"
+        );
+
+        // 回执落地：自动趟尊重期间翻成隐藏的方向；显式右键趟照旧一律显示。
+        let settle = source
+            .split_once("fn settle_models_generated(")
+            .expect("回执那一步")
+            .1
+            .split_once("fn settle_models_cleaned(")
+            .expect("下一个方法")
+            .0;
+        let retain = settle.find("retain(|target| self.tree.pending_direction.get(target)");
+        let show = settle.find("self.set_model_visible(display, true);");
+        assert!(
+            settle.contains("run.auto")
+                && retain.is_some()
+                && show.is_some()
+                && retain.unwrap() < show.unwrap(),
+            "自动趟先按方向过滤再显示：{settle}"
+        );
+        assert!(
+            settle.contains("pending_direction.get(target).copied() != Some(false)"),
+            "{settle}"
+        );
     }
 
     /// `timeout` 回执（服务端 120 s 预算到点、后台继续）不发显示，其余失败也不发（ADR-0030 实施约束 3）。

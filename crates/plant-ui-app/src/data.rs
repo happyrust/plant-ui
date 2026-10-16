@@ -120,11 +120,23 @@ pub enum Req {
         mdb: String,
         namespace: String,
     },
-    /// eye 显示路径：以点下去的每个目标为祖先查已生成的模型（ADR-0030 D1）。只查不生：
-    /// 查空就是空，要生成走右键「重新生成模型」。
+    /// eye 显示路径：以点下去的每个目标为祖先查已生成的模型（ADR-0030 D1）。查询这一臂
+    /// 本身只查不生；查空 / 库无模型时**默认重新生成**的兜底在宿主（`Evt::ModelScope`
+    /// 回包与 `Evt::DbnumModelProbe` 会合后由 [`Req::GenerateModels`] 发出）。
     ModelScopes {
         epoch: u64,
         targets: Vec<RefU64>,
+        base: String,
+        project: String,
+        mdb: String,
+        namespace: String,
+    },
+    /// 库级模型预检查：`GET /dbnums/{dbnum}/model/roots` 的就绪根快照（`ready_total > 0`
+    /// 即「这个库有按当前源生成且仍最新的模型」）。与 `ModelScopes` 同帧同发——结果显示
+    /// 路径用它抢在 records 回空之前认账；它是枚举级重查询，按库单飞，宿主去重。
+    DbnumModelProbe {
+        epoch: u64,
+        dbnum: u32,
         base: String,
         project: String,
         mdb: String,
@@ -363,6 +375,13 @@ pub enum Evt {
         RefU64,
         anyhow::Result<crate::model_update_api::ModelRecords>,
     ),
+    /// 库级模型预检查的回包（`Req::DbnumModelProbe`）。`Ok` 且 `ready_total == 0` =
+    /// 这个库没有按当前源生成的模型——宿主据此默认重新生成；`Err` 按「不知道」放行。
+    DbnumModelProbe {
+        epoch: u64,
+        dbnum: u32,
+        result: anyhow::Result<crate::model_update_api::DbnumModelRoots>,
+    },
     ResolvedName(String, anyhow::Result<Option<RefU64>>),
     /// 一次搜索的结果。搜索框每敲一下就发一条，晚到的旧结果靠 `epoch` 认出来丢掉；
     /// `query` 原样带回，绘制层拿它确认手上这份命中是不是当前输入的。
@@ -887,6 +906,24 @@ async fn handle_read(
             .await;
             let _ = evt_tx.send(Evt::ModelUpdateExecute {
                 from_wizard,
+                result,
+            });
+        }
+        Req::DbnumModelProbe {
+            epoch,
+            dbnum,
+            base,
+            project,
+            mdb,
+            namespace,
+        } => {
+            let result = crate::model_update_api::dbnum_model_roots(
+                &base, &project, &mdb, &namespace, dbnum,
+            )
+            .await;
+            let _ = evt_tx.send(Evt::DbnumModelProbe {
+                epoch,
+                dbnum,
                 result,
             });
         }

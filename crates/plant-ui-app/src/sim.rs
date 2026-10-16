@@ -1820,6 +1820,15 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
             from_wizard,
             result: Ok(engine.execute(dbnums.as_deref())),
         },
+        // 演示模式没有模型服务，库级探针也一样答不出——如实回失败，宿主按
+        // 「不知道」放行，records 那一路照常裁决。
+        Req::DbnumModelProbe { epoch, dbnum, .. } => Evt::DbnumModelProbe {
+            epoch,
+            dbnum,
+            result: Err(anyhow::anyhow!(
+                "演示模式没有模型服务，探不了 db{dbnum} 的模型"
+            )),
+        },
         // 演示剧本里还没有整库重建那一幕（重新计算计划 R5 补）：先如实说没有，
         // 别造一个假 task_id 让队列面板等一行永远不出现的任务。
         Req::ModelRebuild { dbnum, .. } => Evt::ModelRebuild {
