@@ -1532,6 +1532,22 @@ fn generate_summary(label: &str, reply: &model_update_api::GenerateReply) -> Str
             reply.generation_root
         ));
     }
+    if reply.failed_root_count > 0 {
+        // 部分失败要点名：三维里出来的只是补齐成功的那一半。
+        let heads = reply
+            .failed_roots
+            .iter()
+            .take(3)
+            .map(|root| format!("{}（{}）", root.generation_root, root.error))
+            .collect::<Vec<_>>()
+            .join("；");
+        line.push_str(&format!(
+            "；{} 个生成根没生成出来{}{}",
+            reply.failed_root_count,
+            if heads.is_empty() { "" } else { "：" },
+            heads
+        ));
+    }
     if let Some(note) = reply.source_note() {
         line.push_str(&note);
     }
@@ -4429,6 +4445,17 @@ impl App {
         });
     }
 
+    /// 取回工作 / 换面之前放弃本端对「重新生成」那一趟的等待：数据线程要先排干在途请求，而补齐
+    /// 循环最长等 30 分钟。置位之后补齐循环交回手里最近的回执、还没发出的目标不再发，服务端照跑。
+    /// 只管生成：等房间参照模型那一档有自己的进度屏与取消入口。
+    fn abandon_generate_wait(&self) {
+        if let Some(run) = self.mutation_run.as_ref()
+            && run.kind == model_mutation::Kind::Regenerate
+        {
+            run.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// 「没有模型就默认重新生成」的自动入口：显示路径发现范围内没有已生成模型
     /// （库级探针 `ready_total == 0`，或按祖先查 records 一条没有）时替用户发起——
     /// 与右键同一条 `GenerateModels` 通道，只是跳过确认框：这两种发现说的本来就是
@@ -4454,13 +4481,14 @@ impl App {
         }
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         let label = regenerate_label(self.tree.label(targets[0]), targets.len());
+        let cancel = std::sync::Arc::<std::sync::atomic::AtomicBool>::default();
         self.mutation_run = Some(MutationRun {
             kind: model_mutation::Kind::Regenerate,
             label: label.clone(),
             targets: targets.clone(),
             dbnum: None,
             auto: true,
-            cancel: Default::default(),
+            cancel: cancel.clone(),
         });
         let sent = self
             .bridge
@@ -4468,6 +4496,9 @@ impl App {
             .send(data::Req::GenerateModels {
                 epoch: self.mutation_epoch,
                 refnos: targets.clone(),
+                // 显示补齐只补缺口、不先删（gen-model spec §4.5）：「查空」误判时先删会把已有模型清掉。
+                force: false,
+                cancel,
                 base: self.model_api_url.clone(),
                 project: self.vm.project.clone(),
                 mdb: self.mdb.clone(),
@@ -4485,7 +4516,7 @@ impl App {
         self.logs.info(
             &mut self.vm.logs,
             format!(
-                "{label}：{reason}，默认重新生成（{} 个目标，服务端预算 120 秒，超时后台继续）…",
+                "{label}：{reason}，默认重新生成（{} 个目标，服务端预算 120 秒，超时自动续跑补齐）…",
                 targets.len()
             ),
         );
@@ -4568,6 +4599,9 @@ impl App {
             (model_mutation::Kind::Regenerate, None) => data::Req::GenerateModels {
                 epoch: self.mutation_epoch,
                 refnos: targets.clone(),
+                // 右键「重新生成模型」= 先删后生成（ADR-0030 D2）。
+                force: true,
+                cancel: cancel.clone(),
                 base: self.model_api_url.clone(),
                 project: self.vm.project.clone(),
                 mdb: self.mdb.clone(),
@@ -4604,7 +4638,7 @@ impl App {
                 "db{dbnum}：正在清理全部模型产物（只删产物、水位归零，不自动重算）…"
             ),
             (model_mutation::Kind::Regenerate, None) => format!(
-                "{label}：正在生成模型（{} 个目标，范围内已有的产物会被重算替换；服务端预算 120 秒，超时后后台继续）…",
+                "{label}：正在生成模型（{} 个目标，范围内已有的产物会被重算替换；服务端预算 120 秒，超时后自动续跑补齐）…",
                 targets.len()
             ),
             (model_mutation::Kind::RoomRebuild, None) => {
@@ -4662,6 +4696,14 @@ impl App {
                     }
                     self.logs
                         .info(&mut self.vm.logs, generate_summary(&label, reply));
+                    // 有根没生成出来 = 部分成功：三维照常显示已补齐的那一半，横幅把这半句
+                    // 留住——不然人对着缺口的模型只会以为「本来就这样」。
+                    if reply.failed_root_count > 0 {
+                        failures.push(format!(
+                            "{label}：{} 个生成根未生成（详见日志）",
+                            reply.failed_root_count
+                        ));
+                    }
                     // 生成成功 = 这个库有模型了：库级结论正写，显示路径不再为它发探针。
                     if let Some(dbnum) = self.tree.dbnum_of(*refno) {
                         self.dbnum_model_known.insert(dbnum, true);
@@ -4669,10 +4711,11 @@ impl App {
                     display.push(*refno);
                 }
                 GenerateOutcome::Background => {
+                    // 走得到这里 = 续跑补齐也等到上限（30 分钟）或宿主退出，服务端可能仍在跑。
                     self.logs.warn(
                         &mut self.vm.logs,
                         format!(
-                            "{label}：服务端 120 秒内没做完，后台继续生成；完成后再点眼睛查看（这次不显示）"
+                            "{label}：服务端还没做完（已续跑补齐至上限），后台继续生成；完成后再点眼睛查看（这次不显示）"
                         ),
                     );
                 }
@@ -5892,6 +5935,7 @@ impl App {
             &mut self.vm.logs,
             format!("正在取回工作：重查根层与 {} 个分支…", branches.len()),
         );
+        self.abandon_generate_wait();
         let sent = self
             .bridge
             .req
@@ -6167,6 +6211,7 @@ impl App {
         );
         self.command_output(line.clone());
         self.logs.info(&mut self.vm.logs, line);
+        self.abandon_generate_wait();
         let _ = self.bridge.req.send(data::Req::SwitchReadFace(kind));
     }
 
@@ -6729,6 +6774,8 @@ mod tests {
             generation_root_count: 3,
             cached_root_count: 1,
             generated_root_count: 2,
+            failed_root_count: 0,
+            failed_roots: vec![],
             model_source: None,
             model_source_reason: None,
             legacy_endpoint: false,
@@ -6756,7 +6803,10 @@ mod tests {
             .expect("清理那一臂紧随其后")
             .0;
         assert_eq!(lane.matches("generate_model(").count(), 1, "{lane}");
-        assert!(lane.contains("true,"), "force = true：{lane}");
+        assert!(
+            lane.contains("&base, &slash, force,"),
+            "force 由发起方定（右键 true、显示补齐 false）：{lane}"
+        );
         // 生成那一臂不删：删旧是服务端 `force = true` 里的事，客户端的 DELETE 只属于清理那一臂。
         assert!(!lane.contains("delete_model_subtree"), "{lane}");
         for forbidden in ["regeneration_count", "regeneration_roots"] {
@@ -6774,6 +6824,10 @@ mod tests {
         // 确认步四种请求：右键生成、右键清理、整库清理、全库重建房间。
         assert_eq!(confirm.matches("data::Req::").count(), 4, "{confirm}");
         assert!(confirm.contains("data::Req::GenerateModels {"));
+        assert!(
+            confirm.contains("force: true,"),
+            "右键先删后生成：{confirm}"
+        );
         assert!(confirm.contains("data::Req::CleanupModels {"));
         assert!(confirm.contains("data::Req::CleanupDbnumModel {"));
         assert!(confirm.contains("data::Req::RebuildRooms {"));
@@ -6860,6 +6914,43 @@ mod tests {
         tree.note_dbnum(&zero);
         assert_eq!(tree.dbnum_of(RefU64(4)), None, "dbnum = 0 不落表");
         assert_eq!(tree.dbnum_of(RefU64(99)), None, "查不到就说不出");
+    }
+
+    /// 取回工作与换面都要先排干数据线程的在途请求：发之前先放弃「重新生成」那一趟的补齐等待，
+    /// 不然要陪它等到补齐上限（30 分钟）。
+    #[test]
+    fn get_work_and_face_switch_abandon_the_generate_wait_first() {
+        let source = include_str!("main.rs");
+        let get_work = source
+            .split_once("fn start_get_work_for_tasks(")
+            .expect("取回工作")
+            .1
+            .split_once("data::Req::GetWork {")
+            .expect("发取回工作")
+            .0;
+        assert!(
+            get_work.contains("self.abandon_generate_wait();"),
+            "{get_work}"
+        );
+        let switch = source
+            .split_once("fn switch_read_face(")
+            .expect("换面")
+            .1
+            .split_once("data::Req::SwitchReadFace(kind)")
+            .expect("发换面")
+            .0;
+        assert!(switch.contains("self.abandon_generate_wait();"), "{switch}");
+        let abandon = source
+            .split_once("fn abandon_generate_wait(&self) {")
+            .expect("放弃等待")
+            .1
+            .split_once("fn begin_auto_generate(")
+            .expect("下一方法")
+            .0;
+        assert!(
+            abandon.contains("model_mutation::Kind::Regenerate"),
+            "只管生成：{abandon}"
+        );
     }
 
     /// 「显示前预检查 dbnum 有没有模型，没有就默认重新生成；节点查空同样重新生成」
@@ -6963,6 +7054,10 @@ mod tests {
             .expect("下一方法")
             .0;
         assert!(begin.contains("data::Req::GenerateModels {"), "{begin}");
+        assert!(
+            begin.contains("force: false,"),
+            "显示补齐只补缺口、不先删：{begin}"
+        );
         assert!(
             !begin.contains("model_mutation::Vm::Confirm"),
             "自动生成不弹确认框：{begin}"

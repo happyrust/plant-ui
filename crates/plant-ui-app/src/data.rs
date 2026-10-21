@@ -160,13 +160,21 @@ pub enum Req {
     /// 右键「重新生成模型」（ADR-0030 D2）：对选中的每个目标**各一发**
     /// `POST /model/generate { refno, force: true }`，服务端自己解根、删旧、重算。
     /// 客户端不清点、不解根、不删产物；一条请求里顺序跑完整批，回执整批回
-    /// （`Evt::ModelsGenerated`），宿主再对成功的目标发显示。
+    /// （`Evt::ModelsGenerated`），宿主再对成功的目标发显示。显示路径的默认生成
+    /// （`begin_auto_generate`）走同一条通道，但 `force = false`。
     ///
     /// 房间参照模型不在这一趟的操心范围：服务端启动时就建好它，生成路径上的房间
     /// 计算照常被 `ensure_ready` 把关——真撞上还在建 / 建死，那一发如实 409 回来。
     GenerateModels {
         epoch: u64,
         refnos: Vec<RefU64>,
+        /// 右键 `true`（先删后生成）；显示路径的默认生成 `false`：显示补齐不许先删（gen-model
+        /// spec §4.5）——「查空」误判时 `force = true` 会把库里已有的模型删掉，而范围真没有模型时
+        /// `force = false` 一样整根生成。
+        force: bool,
+        /// 本端放弃等待：取回工作 / 换面要先排干在途请求，宿主先置位，补齐循环就不再轮询、
+        /// 还没发出的目标不再发；已发出的生成服务端照跑（「后台继续」）。
+        cancel: Arc<std::sync::atomic::AtomicBool>,
         base: String,
         project: String,
         mdb: String,
@@ -697,7 +705,7 @@ async fn handle_read(
     scope: Scope,
     evt_tx: mpsc::Sender<Evt>,
     ctx: egui::Context,
-    task_ctx: bevy_wasm_tasks::TaskContext,
+    mut task_ctx: bevy_wasm_tasks::TaskContext,
 ) {
     match req {
         Req::SubtreeBounds { epoch, target } => {
@@ -785,27 +793,52 @@ async fn handle_read(
         Req::GenerateModels {
             epoch,
             refnos,
+            force,
+            cancel,
             base,
             project,
             mdb,
             namespace,
         } => {
-            // 生成只有这一个入口（ADR-0030 D2）。`force = true`：范围内已有的产物一律重算替换，
-            // 解根 / 删旧 / 重算都在服务端。顺序做：一个目标可能就是整个 ZONE，并发只会让
-            // 服务端的 per-dbnum 锁互相撞。线上一律斜杠形（`24381/100677`）。
-            // 房间参照模型不在这趟的操心范围：服务端启动就建好它；真撞上还在建，那一发
-            // 如实 409 回来按失败记（「可重试」写在文案里，人再点一次就是）。
+            // 生成只有这一个入口（ADR-0030 D2）。右键 `force = true`：范围内已有的产物一律重算替换，
+            // 解根 / 删旧 / 重算都在服务端；显示路径的默认生成 `force = false`：只补缺口、不删。
+            // 顺序做：一个目标可能就是整个 ZONE，并发只会让服务端的 per-dbnum 锁互相撞。
+            // 线上一律斜杠形（`24381/100677`）。
+            // 没收敛（服务端 120 s 预算内没做完 / 回执里还有可重试的失败根 / 忙线 409）就进
+            // `await_scope_generated`：以 force = false 逐轮补齐——凭证当前的根直接命中，
+            // 只有缺口根真跑。这堵的是「服务端后台任务被重启 / 单根失败中断整片」留下的
+            // 半截生成（2026-10-20 不全修复）。
             let mut outcomes = Vec::with_capacity(refnos.len());
             for refno in refnos {
-                let result = crate::model_update_api::generate_model(
-                    &base,
-                    &refno.to_slash_string(),
-                    true,
-                    &project,
-                    &mdb,
-                    &namespace,
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    outcomes.push((
+                        refno,
+                        Err(anyhow::anyhow!(
+                            "已放弃等待（取回工作 / 换面），这个目标没有发出生成"
+                        )),
+                    ));
+                    continue;
+                }
+                let slash = refno.to_slash_string();
+                let mut result = crate::model_update_api::generate_model(
+                    &base, &slash, force, &project, &mdb, &namespace,
                 )
                 .await;
+                if scope_generation_unsettled(&result) {
+                    result = await_scope_generated(
+                        result,
+                        ScopeFill {
+                            base: &base,
+                            refno: &slash,
+                            project: &project,
+                            mdb: &mdb,
+                            namespace: &namespace,
+                            cancel: &cancel,
+                        },
+                        &mut task_ctx,
+                    )
+                    .await;
+                }
                 outcomes.push((refno, result));
             }
             let _ = evt_tx.send(Evt::ModelsGenerated { epoch, outcomes });
@@ -1053,6 +1086,111 @@ fn host_alive(task_ctx: &bevy_wasm_tasks::TaskContext) -> bool {
 const RESIDENT_POLL_UPDATES: usize = 120;
 const RESIDENT_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// 「补齐生成」的轮询节奏与总上限：与等房间同一拍（≈2 秒）；上限 30 分钟——SITE 级
+/// 重算可能跑十几分钟，范围内每根在飞锁都会把那一轮照成「部分失败」，得等它走完。
+/// 真到上限也兜得住：按 timeout 交回，宿主那一层照旧是「后台继续，人再点眼睛」。
+const SCOPE_FILL_POLL_UPDATES: usize = 120;
+const SCOPE_FILL_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(1800);
+
+/// 一发范围生成收没收口：504 超时（服务端后台继续）、忙线 409 之类、回执里还有可重试的失败根，
+/// 都是「还没做完」——进 [`await_scope_generated`] 续跑补齐。只剩不可重试的失败根就是收口了：
+/// 再重发也是同一个答案，只会白跑一轮必然失败的生成。
+fn scope_generation_unsettled(
+    result: &anyhow::Result<crate::model_update_api::GenerateReply>,
+) -> bool {
+    match result {
+        Ok(reply) => reply.failed_roots.iter().any(|root| root.retryable),
+        Err(error) => scope_generation_retryable(error),
+    }
+}
+
+/// 「等一等重发有意义」的那几类失败：连不上 / 超时（服务端后台在跑）、409（根锁、库级
+/// 任务、初始化门、参照模型在装载——撞着它的那一发等它翻篇就好）、503（库 / 直读源
+/// 暂不可得；服务端带 `Retry-After` 的写后台不收、依赖库在入库 / 读不开）。其余（422 前置、
+/// `container`、internal）按终局失败原样上抛。
+fn scope_generation_retryable(error: &anyhow::Error) -> bool {
+    let failure = crate::model_update_api::failure_of(error);
+    failure.form() == plant_ui::model_update::FailForm::Timeout
+        || matches!(
+            failure.code.as_str(),
+            "conflict"
+                | "updating"
+                | "initialization_not_ready"
+                | "room_bootstrap_in_progress"
+                | "db_unavailable"
+                | "source_unavailable"
+                | "overlay_rejected"
+                | "dependency_db_initializing"
+                | "dependency_db_unreadable"
+        )
+}
+
+/// 补齐循环要的那一份身份与开关：同一个目标、同一个服务，一轮一轮重发。
+struct ScopeFill<'a> {
+    base: &'a str,
+    refno: &'a str,
+    project: &'a str,
+    mdb: &'a str,
+    namespace: &'a str,
+    /// 宿主放弃等待（取回工作 / 换面）。
+    cancel: &'a std::sync::atomic::AtomicBool,
+}
+
+/// 范围生成没收口之后的补齐循环：等一拍再以 `force = false` 重发同一范围——凭证当前的根
+/// 直接命中不返工，只有缺口根（先删未重生 / 在飞锁没抢上 / 瞬时失败）真跑生成。服务端
+/// 重启过也一样收：凭证缺口还在，补齐照常。`first` 是触发补齐的那一发回执，还没重发就被
+/// 叫停时交回的就是它。
+///
+/// 三种收口：无失败根的完成回执；不可重试的真失败（原样上抛）；只剩终局失败根的回执
+/// （点名交回——再重发也是同一个答案）。超时上限、宿主退出与宿主放弃等待三处兜底：手里
+/// 有最近一份部分回执就交它（缺哪几根都在点名里），否则回最后那次错误。
+async fn await_scope_generated(
+    first: anyhow::Result<crate::model_update_api::GenerateReply>,
+    fill: ScopeFill<'_>,
+    task_ctx: &mut bevy_wasm_tasks::TaskContext,
+) -> anyhow::Result<crate::model_update_api::GenerateReply> {
+    use std::sync::atomic::Ordering;
+    // 浏览器端（wasm）标准库的 `Instant::now()` 会直接 panic，计时走 `web_time`。
+    let started = web_time::Instant::now();
+    let (mut partial, mut last_error) = match first {
+        Ok(reply) => (Some(reply), None),
+        Err(error) => (None, Some(error)),
+    };
+    loop {
+        if started.elapsed() >= SCOPE_FILL_WAIT_LIMIT || fill.cancel.load(Ordering::Relaxed) || {
+            task_ctx.sleep_updates(SCOPE_FILL_POLL_UPDATES).await;
+            !host_alive(task_ctx) || fill.cancel.load(Ordering::Relaxed)
+        } {
+            return match partial {
+                Some(reply) => Ok(reply),
+                None => Err(last_error.unwrap_or_else(|| {
+                    anyhow::anyhow!(
+                        "范围生成补齐等待超过 {} 秒，服务端后台仍在跑",
+                        SCOPE_FILL_WAIT_LIMIT.as_secs()
+                    )
+                })),
+            };
+        }
+        let result = crate::model_update_api::generate_model(
+            fill.base,
+            fill.refno,
+            false,
+            fill.project,
+            fill.mdb,
+            fill.namespace,
+        )
+        .await;
+        match result {
+            Ok(reply) if !reply.failed_roots.iter().any(|root| root.retryable) => {
+                return Ok(reply);
+            }
+            Ok(reply) => partial = Some(reply),
+            Err(error) if !scope_generation_retryable(&error) => return Err(error),
+            Err(error) => last_error = Some(error),
+        }
+    }
+}
+
 /// [`wait_resident_ready`] 的三种结局。
 enum ResidentWaitOutcome {
     /// 放行了——就绪 / 这一格不存在 / 健康拉不到（后两种按「没什么可等」收摊）。
@@ -1077,7 +1215,8 @@ async fn wait_resident_ready(
     task_ctx: &mut bevy_wasm_tasks::TaskContext,
 ) -> ResidentWaitOutcome {
     use std::sync::atomic::Ordering;
-    let started = std::time::Instant::now();
+    // 浏览器端（wasm）标准库的 `Instant::now()` 会直接 panic，计时走 `web_time`。
+    let started = web_time::Instant::now();
     loop {
         if cancel.load(Ordering::Relaxed) {
             return ResidentWaitOutcome::Cancelled;
@@ -1929,5 +2068,128 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    fn reply_with(failed: &[bool]) -> crate::model_update_api::GenerateReply {
+        crate::model_update_api::GenerateReply {
+            status: crate::model_update_api::GenerateStatus::Generated,
+            generation_root: "24381/1".into(),
+            model_available: true,
+            generation_root_count: failed.len() + 1,
+            cached_root_count: 0,
+            generated_root_count: 1,
+            failed_root_count: failed.len(),
+            failed_roots: failed
+                .iter()
+                .enumerate()
+                .map(|(index, retryable)| crate::model_update_api::FailedRoot {
+                    generation_root: format!("24381/{}", index + 2),
+                    error: "boom".into(),
+                    retryable: *retryable,
+                })
+                .collect(),
+            model_source: None,
+            model_source_reason: None,
+            legacy_endpoint: false,
+        }
+    }
+
+    fn api_error(code: &str) -> anyhow::Error {
+        anyhow::Error::new(crate::model_update_api::ApiError(
+            plant_ui::model_update::Failure::new(code, "x"),
+        ))
+        .context("POST /api/v1/model/generate")
+    }
+
+    /// 补齐只追「等一等就能好」的缺口：回执里只剩不可重试的失败根就是收口了，再重发只会白跑
+    /// 一轮必然失败的生成。
+    #[test]
+    fn only_retryable_leftovers_keep_a_scope_generation_unsettled() {
+        assert!(!super::scope_generation_unsettled(&Ok(reply_with(&[]))));
+        assert!(!super::scope_generation_unsettled(&Ok(reply_with(&[
+            false, false
+        ]))));
+        assert!(super::scope_generation_unsettled(&Ok(reply_with(&[
+            false, true
+        ]))));
+        assert!(super::scope_generation_unsettled(&Err(api_error(
+            "timeout"
+        ))));
+        assert!(!super::scope_generation_unsettled(&Err(api_error(
+            "precondition"
+        ))));
+    }
+
+    /// 409 冲突与服务端带 `Retry-After` 的 503 都值得等；422 / 404 / internal 是终局。
+    #[test]
+    fn retryable_generation_failures_follow_the_server_retry_codes() {
+        for code in [
+            "timeout",
+            "conflict",
+            "updating",
+            "initialization_not_ready",
+            "overlay_rejected",
+            "dependency_db_initializing",
+            "dependency_db_unreadable",
+        ] {
+            assert!(
+                super::scope_generation_retryable(&api_error(code)),
+                "{code}"
+            );
+        }
+        for code in ["precondition", "container", "not_found", "internal"] {
+            assert!(
+                !super::scope_generation_retryable(&api_error(code)),
+                "{code}"
+            );
+        }
+        assert!(!super::scope_generation_retryable(&anyhow::anyhow!(
+            "plain"
+        )));
+    }
+
+    /// 取回工作 / 换面要先排干在途请求：补齐循环每一拍都看宿主的放弃开关，开关置位后还没发出的
+    /// 目标不再发——不然那两个操作要陪它等到补齐上限。
+    #[test]
+    fn the_fill_loop_and_the_batch_honour_the_cancel_switch() {
+        let source = include_str!("data.rs");
+        let fill = source
+            .split_once("async fn await_scope_generated(")
+            .expect("补齐循环")
+            .1
+            .split_once("enum ResidentWaitOutcome {")
+            .expect("下一项")
+            .0;
+        assert_eq!(
+            fill.matches("fill.cancel.load(Ordering::Relaxed)").count(),
+            2,
+            "重发之前、睡醒之后各看一次：{fill}"
+        );
+        let lane = source
+            .split_once("Req::GenerateModels {")
+            .expect("生成那一臂")
+            .1
+            .split_once("Req::CleanupModels {")
+            .expect("清理那一臂紧随其后")
+            .0;
+        let skip = lane
+            .find("if cancel.load(std::sync::atomic::Ordering::Relaxed) {")
+            .expect("放弃之后不再发");
+        let send = lane.find("generate_model(").expect("发生成");
+        assert!(skip < send, "{lane}");
+    }
+
+    /// 数据线程在浏览器端也跑（bevy-wasm-tasks），而 wasm 上标准库的 `Instant::now()` 直接 panic：
+    /// 计时一律走 `web_time`（与 main.rs 同一口径）。
+    #[test]
+    fn the_data_thread_never_times_itself_with_the_std_instant() {
+        let production = include_str!("data.rs")
+            .split_once("#[cfg(test)]")
+            .expect("测试在生产代码之后")
+            .0;
+        assert!(
+            !production.contains("std::time::Instant"),
+            "数据线程的计时要用 web_time::Instant"
+        );
     }
 }

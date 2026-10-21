@@ -823,6 +823,12 @@ pub struct GenerateReply {
     pub generation_root_count: usize,
     pub cached_root_count: usize,
     pub generated_root_count: usize,
+    /// 范围内没跑出来的生成根数（2026-10-20 不全修复：服务端逐根记错续跑后点名）。
+    /// 老服务端没有这一格 → 0（它本来就整片成败，部分失败无从表达）。
+    pub failed_root_count: usize,
+    /// 失败根点名。`retryable = true` 的在飞根靠下一轮 `force = false` 补；全 `false`
+    /// 是这几根真没生成出来——再重发也是同一个答案，按现状交回让日志点名。
+    pub failed_roots: Vec<FailedRoot>,
     /// 这批模型此刻在哪儿（spec §4.12）：`Memory` = 服务端没等初始化队列、直接从文件算进
     /// 进程内投影，活不过服务端重启，持久由初始化发布负责；`Database` = 已落 rocksdb。
     /// 老服务端不给这一格 → `None`，日志里不多说。
@@ -832,6 +838,21 @@ pub struct GenerateReply {
     /// 这一发是退回旧路径 `/api/v1/model/ensure` 才成的（服务端还没有 `/model/generate`，
     /// ADR-0030 后果 7）。日志据此点名一次「模型服务是旧版」。
     pub legacy_endpoint: bool,
+}
+
+/// 服务端 `OnDemandModelResult.failed_roots[]` 的单根记录（gen-model `ScopeRootFailure`）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct FailedRoot {
+    /// 没生成出来的生成根。
+    #[serde(default)]
+    pub generation_root: String,
+    /// 首错摘要（`{error:#}` 形态），只进日志与详情。
+    #[serde(default)]
+    pub error: String,
+    /// 服务端判定「等一等重发有意义」（根锁在飞 / 判据过期 / 初始化门没放行）。
+    /// 缺席按 false：别为一个不报名的旧回执干等整段补齐窗口。
+    #[serde(default)]
+    pub retryable: bool,
 }
 
 impl GenerateReply {
@@ -864,6 +885,10 @@ struct GenerateBody {
     cached_root_count: usize,
     #[serde(default)]
     generated_root_count: usize,
+    #[serde(default)]
+    failed_root_count: usize,
+    #[serde(default)]
+    failed_roots: Vec<FailedRoot>,
     #[serde(default)]
     model_source: Option<String>,
     #[serde(default)]
@@ -920,6 +945,8 @@ pub async fn generate_model(
         generation_root_count: reply.generation_root_count,
         cached_root_count: reply.cached_root_count,
         generated_root_count: reply.generated_root_count,
+        failed_root_count: reply.failed_root_count,
+        failed_roots: reply.failed_roots,
         model_source: reply.model_source.as_deref().and_then(ModelSource::parse),
         model_source_reason: reply.model_source_reason,
         legacy_endpoint,
