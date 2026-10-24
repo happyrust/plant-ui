@@ -39,7 +39,7 @@ use plant_ui::model_update::{
 };
 use plant_ui::task_queue::{
     CatalogueReconcile, DbnumStatus, Health, KIND_DATA_BATCH, KIND_ROOM_RECALC, ModelSource, Poll,
-    QueueRow, QueueSnapshot, RoomCounts, TaskEntry,
+    QueueRow, QueueSnapshot, RoomCounts, TaskEntry, TaskStep,
 };
 use plant_ui_data::{Attr, AttrKind, EleTreeNode, RefU64};
 
@@ -888,6 +888,7 @@ impl Engine {
                 rows,
             },
             tasks,
+            tasks_has_more: false,
             tasks_error: None,
             health: Some(Health {
                 project: PROJECT.into(),
@@ -1037,9 +1038,17 @@ impl Engine {
                     } else {
                         UnitKind::Regen
                     },
+                    rooms_before: None,
+                    rooms_after: None,
+                    geometry_before: None,
+                    geometry_after: None,
+                    geometry_diff: None,
                 })
                 .collect(),
             warnings: Vec::new(),
+            detail: None,
+            stamped: None,
+            trigger: None,
         });
         TaskEntry {
             task_id: batch.task_id.clone(),
@@ -1060,6 +1069,10 @@ impl Engine {
             events_seen: batch.events_seen,
             detail: None,
             result,
+            steps: batch.finished_at.map(|_| sim_steps(state)),
+            superseded_by: None,
+            supersedes: Vec::new(),
+            changes_total: None,
         }
     }
 
@@ -1088,6 +1101,10 @@ impl Engine {
             events_seen: 0,
             detail: Some(room.counts()),
             result: None,
+            steps: None,
+            superseded_by: None,
+            supersedes: Vec::new(),
+            changes_total: None,
         }
     }
 
@@ -1854,6 +1871,12 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
             reload_models,
         } => Evt::GetWork(Ok(engine.get_work(&branches, reload_models))),
         Req::QueuePoll { .. } => Evt::QueuePoll(Ok(engine.poll())),
+        // 剧本没有历史可翻：空页、没有更早的。
+        Req::OlderTasks { .. } => Evt::OlderTasks(Ok(plant_ui::task_queue::TaskList::default())),
+        // 剧本没有元素级清单：空表。
+        Req::TaskChanges { task_id, .. } => {
+            Evt::TaskChanges(task_id, Ok(plant_ui::task_queue::TaskChanges::default()))
+        }
         Req::QueueSetPaused { paused, .. } => {
             engine.set_paused(paused);
             Evt::QueueSetPaused(paused, Ok(()))
@@ -1902,4 +1925,33 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
         }
     };
     let _ = evt_tx.send(evt);
+}
+
+/// 收口批次的分步账（与 gen-model `task_registry` 的 steps[] 同形）：段名与比例照抄 2026-10-23
+/// 实测的一条 654→655 批次，失败批次的收尾段 `ok = false`。只为增量记录页的阶段耗时条有东西可画。
+fn sim_steps(state: &str) -> Vec<TaskStep> {
+    let step = |name: &str, ms: u64, ok: bool| TaskStep {
+        name: name.into(),
+        at: None,
+        ms,
+        ok,
+    };
+    let failed = state == "failed";
+    let mut steps = vec![
+        step("data_parse", 24, true),
+        step("write_marker", 16, true),
+        step("identity_check", 16, true),
+        step("resolve_window", 36, true),
+        step("collect_window", 202, true),
+        step("stage_apply", 806, true),
+        step("dependency_index", 40, true),
+        step("dependency_closure", 648, true),
+    ];
+    if !failed {
+        steps.push(step("model_generate", 395, true));
+        steps.push(step("ref0_snapshot", 3, true));
+    }
+    steps.push(step("durable_pending", 0, true));
+    steps.push(step("task_end", 35, !failed));
+    steps
 }

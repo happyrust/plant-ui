@@ -12,7 +12,7 @@ mod model_record_union;
 use plant_ui::model_update::{Enqueued, Failure, Preview};
 use plant_ui::task_queue::{
     DbnumReport, Health, ModelSource, PendingUnits, Poll, QueueSnapshot, ResidentProgress,
-    TaskList,
+    TaskChanges, TaskList,
 };
 use plant_ui_data::{Attr, AttrKind};
 
@@ -591,9 +591,9 @@ pub async fn poll_queue(base: &str) -> anyhow::Result<Poll> {
     // 任务表失败只退化计时与终态历史（沿用上一份快照，`Vm::adopt` 负责保留），
     // 一条解不动的 result 不许把整个面板冻在旧快照上。
     let tasks = get::<TaskList>(base, "/api/v1/tasks?limit=200").await;
-    let (tasks, tasks_error) = match tasks {
-        Ok(list) => (list.tasks, None),
-        Err(error) => (Vec::new(), Some(crate::logs::error_chain(&error))),
+    let (tasks, tasks_has_more, tasks_error) = match tasks {
+        Ok(list) => (list.tasks, list.has_more, None),
+        Err(error) => (Vec::new(), false, Some(crate::logs::error_chain(&error))),
     };
     let health = get::<Health>(base, "/api/v1/health").await.ok();
     // 欠账表有三种答案，不是两种。取到了是一种；**服务端没有这个端点**是另一种
@@ -614,6 +614,7 @@ pub async fn poll_queue(base: &str) -> anyhow::Result<Poll> {
     Ok(Poll {
         queue,
         tasks,
+        tasks_has_more,
         tasks_error,
         health,
         pending,
@@ -621,6 +622,27 @@ pub async fn poll_queue(base: &str) -> anyhow::Result<Poll> {
         pending_unsupported,
         dbnums,
     })
+}
+
+/// 增量记录页「加载更早」：以 `before`（入队时刻，RFC3339，不含）为上界再翻一页。
+/// 服务端 2026-10-24 起把终态行落盘、翻到注册表里没有的就翻归档；老服务端不认 `before`、原样回最新一页，
+/// 调用方按 id 去重后什么也不多，`has_more` 缺省 false，按钮随之收起。
+pub async fn tasks_before(base: &str, before: &str) -> anyhow::Result<TaskList> {
+    get(
+        base,
+        &format!("/api/v1/tasks?limit=160&before={}", urlencode(before)),
+    )
+    .await
+}
+
+/// 增量记录页「变化清单」：一批的元素级清单（gen-model 2026-10-24 W3）。一次取满服务端单页上限 1000 条；
+/// 再多的有 `next_cursor`，界面只说「还有」不继续翻。404 = 这条任务没有清单（老服务端 / 回放 / 日志已清），原文就是解释。
+pub async fn task_changes(base: &str, task_id: &str) -> anyhow::Result<TaskChanges> {
+    get(
+        base,
+        &format!("/api/v1/tasks/{}/changes?limit=1000", urlencode(task_id)),
+    )
+    .await
 }
 
 /// 这次失败是不是「服务端没有这个端点」。

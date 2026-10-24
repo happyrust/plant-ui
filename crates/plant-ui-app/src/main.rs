@@ -3561,6 +3561,26 @@ impl App {
                     }
                     self.vm.queue = task_queue::status(&self.queue);
                 }
+                data::Evt::TaskChanges(task_id, result) => {
+                    let state = match result {
+                        Ok(changes) => task_queue::ChangesState::Loaded(changes),
+                        Err(error) => {
+                            let text = logs::error_chain(&error);
+                            self.logs
+                                .error(&mut self.vm.logs, "取变化清单失败", &error, None);
+                            task_queue::ChangesState::Failed(text)
+                        }
+                    };
+                    self.queue.changes.insert(task_id, state);
+                }
+                data::Evt::OlderTasks(result) => match result {
+                    Ok(page) => self.queue.adopt_older(page),
+                    Err(error) => {
+                        self.queue.archive_loading = false;
+                        self.logs
+                            .error(&mut self.vm.logs, "加载更早的增量记录失败", &error, None);
+                    }
+                },
                 data::Evt::QueueSetPaused(paused, result) => match result {
                     Ok(()) => {
                         let text = if paused {
@@ -4091,6 +4111,38 @@ impl App {
                     let _ = self.bridge.req.send(data::Req::QueueSetPaused {
                         base: self.model_api_url.clone(),
                         paused,
+                    });
+                }
+                // 增量记录页「变化清单」：只读、按需；在飞或已取到就不重发（失败的许重试）。
+                Cmd::LoadTaskChanges(task_id) => {
+                    if matches!(
+                        self.queue.changes.get(&task_id),
+                        Some(
+                            task_queue::ChangesState::Loading | task_queue::ChangesState::Loaded(_)
+                        )
+                    ) {
+                        continue;
+                    }
+                    self.queue
+                        .changes
+                        .insert(task_id.clone(), task_queue::ChangesState::Loading);
+                    let _ = self.bridge.req.send(data::Req::TaskChanges {
+                        base: self.model_api_url.clone(),
+                        task_id,
+                    });
+                }
+                // 增量记录页「加载更早」：只读，上界是手上最老一条的入队时刻；一次在飞就不重发。
+                Cmd::LoadOlderTasks => {
+                    if self.queue.archive_loading {
+                        continue;
+                    }
+                    let Some(before) = self.queue.oldest_created_at() else {
+                        continue;
+                    };
+                    self.queue.archive_loading = true;
+                    let _ = self.bridge.req.send(data::Req::OlderTasks {
+                        base: self.model_api_url.clone(),
+                        before,
                     });
                 }
                 // 死信只有人按这一下才会再动一次。它不入队，所以按完不会立刻多出

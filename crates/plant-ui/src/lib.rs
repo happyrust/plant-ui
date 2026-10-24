@@ -3,6 +3,7 @@
 
 pub mod data_publish;
 pub mod fonts;
+pub mod increment_records;
 pub mod manual_data_publish;
 pub mod model_mutation;
 pub mod model_update;
@@ -305,6 +306,13 @@ pub enum Cmd {
     /// 暂停 / 恢复队列出队。暂停**只挡出队**，正在跑的那一批会跑完为止——
     /// 服务端没有中止接口，所以这条命令也不该被当成「停下来」。
     SetQueuePaused(bool),
+    /// 增量记录页底部「加载更早」：以手上最老一条的入队时刻为上界再翻一页 `/tasks?before=`
+    /// （gen-model 2026-10-24 起终态行落盘，重启前的批次也翻得到）。回包进 `task_queue::Vm::archived`，
+    /// 轮询不覆盖。
+    LoadOlderTasks,
+    /// 增量记录页展开明细里「变化清单」：按需取这一批的元素级清单 `GET /tasks/{id}/changes`
+    /// （gen-model 2026-10-24 W3）。回包进 `task_queue::Vm::changes`，取过就留着。
+    LoadTaskChanges(String),
     /// 复活一行死信。自动路径到了重试上限就永不再碰它，人按这一下是**唯一**的出路。
     ///
     /// 它不排新的数据批次：服务端只把这一行的 `attempts` 清零、`revision` 加一，

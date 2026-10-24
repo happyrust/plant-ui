@@ -1005,6 +1005,16 @@ pub struct Outcome {
     pub units: Vec<UnitResult>,
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// `room_rebuild` 行的收口一句（与服务端 stderr 同文：「整库重算完成并盖章：根 N、成员边 M」或失败原因）。
+    /// 数据批次没有这格。
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// `room_rebuild`：整库对齐代号盖上了没有。
+    #[serde(default)]
+    pub stamped: Option<bool>,
+    /// `room_rebuild`：谁叫的（`startup_alignment` / `startup_full_init` / `rooms_rebuild`）。
+    #[serde(default)]
+    pub trigger: Option<String>,
 }
 
 /// 一个成功生成的交付单元给出的刷新线索。
@@ -1211,6 +1221,56 @@ pub struct UnitResult {
     /// 终态明细那一句整格不画（计划 §五 V2）。
     #[serde(default)]
     pub kind: UnitKind,
+    /// 开工前挂在哪些房间（gen-model 2026-10-24 W1：根 + 子树全部构件，按房间 × 面板数构件）。
+    /// `None` = 服务端没拍（老回执 / 读透 / 算不了房间 / 一批太大），不画；`Some([])` = 拍了、不属于任何房间。
+    #[serde(default)]
+    pub rooms_before: Option<Vec<RoomRef>>,
+    /// 收尾后挂在哪些房间（同上）。
+    #[serde(default)]
+    pub rooms_after: Option<Vec<RoomRef>>,
+    /// 开工前这根的几何概要（gen-model 2026-10-24 W4：行数 + 并集包围盒）。`None` = 没拍，不画。
+    #[serde(default)]
+    pub geometry_before: Option<GeometrySnapshot>,
+    /// 收尾后这根的几何概要。
+    #[serde(default)]
+    pub geometry_after: Option<GeometrySnapshot>,
+    /// 服务端按构件对好的差异：动了 / 多了 / 少了几条，带几个样本 refno。
+    #[serde(default)]
+    pub geometry_diff: Option<GeometryDiff>,
+}
+
+/// 一根某一刻的几何概要。`aabb` 是 `[min_x, min_y, min_z, max_x, max_y, max_z]`，没有行就没有。
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct GeometrySnapshot {
+    #[serde(default)]
+    pub records: u32,
+    #[serde(default)]
+    pub aabb: Option<[f32; 6]>,
+}
+
+/// 前后按 refno 对出来的差异。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct GeometryDiff {
+    #[serde(default)]
+    pub moved: u32,
+    #[serde(default)]
+    pub added: u32,
+    #[serde(default)]
+    pub removed: u32,
+    #[serde(default)]
+    pub sample: Vec<String>,
+}
+
+/// 一根挂在的一间房（按面板）：这根下有 `members` 个构件被判到这块面板的房间里。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct RoomRef {
+    #[serde(default)]
+    pub room_num: String,
+    /// `a_b`。
+    #[serde(default)]
+    pub panel_refno: String,
+    #[serde(default)]
+    pub members: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]

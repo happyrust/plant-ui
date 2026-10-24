@@ -27,6 +27,7 @@ pub enum Pane {
     Properties,
     Room,
     TaskQueue,
+    IncrementRecords,
 }
 
 impl Pane {
@@ -39,6 +40,7 @@ impl Pane {
             Pane::Properties => (ph::SLIDERS_HORIZONTAL, "属性"),
             Pane::Room => (ph::DOOR_OPEN, "房间"),
             Pane::TaskQueue => (ph::LIST_CHECKS, "任务队列"),
+            Pane::IncrementRecords => (ph::GIT_COMMIT, "增量记录"),
         }
     }
 }
@@ -101,6 +103,7 @@ pub struct Viewer<'a> {
     pub queue: &'a crate::task_queue::Vm,
     pub command: &'a mut super::command_line::State,
     pub queue_state: &'a mut crate::task_queue::State,
+    pub records_state: &'a mut crate::increment_records::State,
     pub cmds: &'a mut Vec<Cmd>,
 }
 
@@ -130,6 +133,16 @@ impl TabViewer for Viewer<'_> {
                     self.queue,
                     self.queue_state,
                     self.vm.regen_busy,
+                    self.cmds,
+                )
+            }
+            Pane::IncrementRecords => {
+                crate::increment_records::show(
+                    ui,
+                    self.t,
+                    self.d,
+                    self.queue,
+                    self.records_state,
                     self.cmds,
                 )
             }

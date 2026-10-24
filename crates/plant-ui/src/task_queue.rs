@@ -42,6 +42,9 @@ pub const KIND_ROOM_RECALC: &str = "room_recalc";
 /// `POST /api/v1/dbnums/{dbnum}/model/rebuild` 排出来的那一行）。创建即 `running`，没有 `queued`；
 /// 同库重复请求回同一个 `task_id`。2026-09-10 重新计算计划 R1。
 pub const KIND_MODEL_REBUILD: &str = "model_rebuild";
+/// 整库房间重算（gen-model 2026-10-24：启动对齐 / 「重新生成房间」逐库那一轮，每库一行）。
+/// 不是退役的 `room_recalc`：那是随批走的房间轮，这是一次性整库重写；队列泳道不认它，增量记录页认。
+pub const KIND_ROOM_REBUILD: &str = "room_rebuild";
 
 // ================================================================ 契约
 
@@ -73,6 +76,9 @@ pub struct QueueRow {
 pub struct TaskList {
     #[serde(default)]
     pub tasks: Vec<TaskEntry>,
+    /// 这一页之后还有更早的（gen-model 2026-10-24：终态行落盘，`?before=` 往回翻）。老服务端不给 = false。
+    #[serde(default)]
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -121,6 +127,90 @@ pub struct TaskEntry {
     /// 终态结果；queued / running 时缺席。
     #[serde(default, deserialize_with = "lenient")]
     pub result: Option<crate::model_update::Outcome>,
+    /// 有界分步账（gen-model `task_registry` ISSUE-025）：每次阶段切换结算上一步、收尾结算最后
+    /// 一步。老服务端不发；新服务端账为空时也不发（`skip_serializing_if`），所以缺席是常态，
+    /// 整格不画——不许画成「0 ms」。
+    #[serde(default, deserialize_with = "lenient")]
+    pub steps: Option<Vec<TaskStep>>,
+    /// 补排链（gen-model 2026-10-24）：本行是没收口的失败批次时，重新覆盖了它的窗口的后继数据批次。
+    /// 服务端只在自己排出后继时写；老服务端没有这格，增量记录页那时才按窗口推。
+    #[serde(default)]
+    pub superseded_by: Option<String>,
+    /// 反向：本行入队 / 扩窗时覆盖掉的失败批次。
+    #[serde(default)]
+    pub supersedes: Vec<String>,
+    /// 元素级变化清单的条数（gen-model 2026-10-24 W3）：有就画「变化清单（N）」入口，清单本身按需取
+    /// `GET /tasks/{id}/changes`。老服务端 / 非数据批次没有这格，不画。
+    #[serde(default)]
+    pub changes_total: Option<u32>,
+}
+
+/// 一批的元素级变化清单（`GET /tasks/{id}/changes`，gen-model 2026-10-24 W3）。字段全宽容：服务端只给事实，
+/// 缺席的格这边不补。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TaskChanges {
+    #[serde(default)]
+    pub task_id: String,
+    #[serde(default)]
+    pub dbnum: Option<u32>,
+    /// 账本上的不同元素数；`items` 被服务端封顶截过时 `truncated`。
+    #[serde(default)]
+    pub total: u32,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub next_cursor: Option<usize>,
+    #[serde(default)]
+    pub items: Vec<ElementChange>,
+}
+
+/// 清单里的一条：一个元素这一窗怎么了。`op` 是服务端的稳定英文值（added / deleted / type_changed / reparented /
+/// members_changed / modified / opaque / unresolved），认不出的原样显示。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ElementChange {
+    #[serde(default)]
+    pub refno: String,
+    #[serde(default)]
+    pub noun: String,
+    #[serde(default)]
+    pub op: String,
+    #[serde(default)]
+    pub attrs: Vec<String>,
+    /// 折进了哪个生成根；服务端折不到就缺席。
+    #[serde(default)]
+    pub root_refno: Option<String>,
+    /// `rolled_up` / `no_model` / `unresolved`。
+    #[serde(default)]
+    pub disposition: Option<String>,
+    /// `metadata_only` / `unread_attribute` / `cache_stamp`。
+    #[serde(default)]
+    pub no_model_reason: Option<String>,
+    #[serde(default)]
+    pub details: Vec<String>,
+    #[serde(default)]
+    pub placement_only: bool,
+}
+
+/// 一条任务的变化清单在界面里的状态（按需取，取回来就留着）。
+#[derive(Debug, Clone)]
+pub enum ChangesState {
+    Loading,
+    Loaded(TaskChanges),
+    Failed(String),
+}
+
+/// 分步账的一行（与 gen-model `task_registry::TaskStep` 同形）：阶段的稳定英文值、进入时刻
+/// （RFC3339）、占用毫秒、是否正常走完。终态结算那一步的 `ok` 按终态定，失败批次最后一步为 false。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TaskStep {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub at: Option<String>,
+    #[serde(default)]
+    pub ms: u64,
+    #[serde(default)]
+    pub ok: bool,
 }
 
 /// `result` / `detail` 按 kind 承载不同形状（数据批次的终态摘要、房间轮的
@@ -880,6 +970,8 @@ impl WatermarkLag {
 pub struct Poll {
     pub queue: QueueSnapshot,
     pub tasks: Vec<TaskEntry>,
+    /// `/tasks` 这一页之后服务端还有更早的（`TaskList::has_more`）。
+    pub tasks_has_more: bool,
     /// `/tasks` 没取到（或没解动）时的原因。它失败不作废整次轮询：队列行、health、
     /// 欠账、dbnums 照常换代，计时与终态历史沿用上一份快照，界面要把这句说出来。
     pub tasks_error: Option<String>,
@@ -928,6 +1020,16 @@ pub struct Vm {
     pub namespace: String,
     pub queue: QueueSnapshot,
     pub tasks: Vec<TaskEntry>,
+    /// 轮询那一页之后服务端还有更早的（最近一拍的 `has_more`）。
+    pub tasks_has_more: bool,
+    /// 「加载更早」翻回来的终态行（`/tasks?before=`），轮询不覆盖它们；与 `tasks` 同 id 的以 `tasks` 为准。
+    pub archived: Vec<TaskEntry>,
+    /// 最近一次「加载更早」之后还有没有；`None` = 还没翻过。
+    pub archive_has_more: Option<bool>,
+    /// 一次「加载更早」在飞。
+    pub archive_loading: bool,
+    /// 按需取回的元素级变化清单，按 task_id（`Cmd::LoadTaskChanges`）。
+    pub changes: HashMap<String, ChangesState>,
     pub health: Option<Health>,
     pub pending: Vec<PendingModelUnit>,
     /// 服务端没有欠账端点（`Poll::pending_unsupported`）。为真时 `pending` 恒空、
@@ -1051,12 +1153,40 @@ impl Vm {
         self.read_face != ReadFaceKind::Store
     }
 
+    /// 「加载更早」的上界：手上最老一条（轮询页 ∪ 已翻回来的）的入队时刻。一条都没有就没有上界。
+    pub fn oldest_created_at(&self) -> Option<String> {
+        self.tasks
+            .iter()
+            .chain(self.archived.iter())
+            .map(|task| task.created_at.as_str())
+            .filter(|at| !at.is_empty())
+            .min()
+            .map(str::to_owned)
+    }
+
+    /// 收一页「加载更早」的回包：只收手上没有的 id，记下还有没有。
+    pub fn adopt_older(&mut self, page: TaskList) {
+        self.archive_loading = false;
+        self.archive_has_more = Some(page.has_more);
+        for task in page.tasks {
+            let known = self
+                .tasks
+                .iter()
+                .chain(self.archived.iter())
+                .any(|t| t.task_id == task.task_id);
+            if !known {
+                self.archived.push(task);
+            }
+        }
+    }
+
     pub fn adopt(&mut self, poll: Poll) {
         self.queue = poll.queue;
         // 任务表取不到时保留上一份：一条 result 解不动不许把计时与终态历史
         // 整个清空——排队与运行中的行以 `/queue` 为准，本来就不靠它。
         if poll.tasks_error.is_none() {
             self.tasks = poll.tasks;
+            self.tasks_has_more = poll.tasks_has_more;
         }
         self.tasks_error = poll.tasks_error;
         self.health = poll.health;

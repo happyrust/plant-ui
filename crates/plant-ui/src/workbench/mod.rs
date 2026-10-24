@@ -65,7 +65,9 @@ fn dock_side_of(pane: Pane) -> Option<DockSide> {
     match pane {
         Pane::ModelTree => Some(DockSide::Left),
         Pane::Properties | Pane::Room => Some(DockSide::Right),
-        Pane::CommandLine | Pane::Logs | Pane::TaskQueue => Some(DockSide::Bottom),
+        Pane::CommandLine | Pane::Logs | Pane::TaskQueue | Pane::IncrementRecords => {
+            Some(DockSide::Bottom)
+        }
         Pane::View3d => None,
     }
 }
@@ -100,6 +102,7 @@ pub struct WorkbenchState {
     vis: DockVisibility,
     command: command_line::State,
     queue: crate::task_queue::State,
+    records: crate::increment_records::State,
     search: search::State,
 }
 
@@ -111,6 +114,7 @@ impl Default for WorkbenchState {
             vis,
             command: command_line::State::default(),
             queue: crate::task_queue::State::default(),
+            records: crate::increment_records::State::default(),
             search: search::State::default(),
         }
     }
@@ -141,8 +145,11 @@ fn build_dock(vis: DockVisibility) -> DockState<Pane> {
             // 任务队列与日志同一排页签：两者都是「余光扫一眼」的监控面，而命令行要
             // 和它们同时看得见，所以不并进同一格。
             let [_center, bottom] = surface.split_below(center, 0.7, vec![Pane::CommandLine]);
-            let [_command, _logs] =
-                surface.split_right(bottom, 0.4, vec![Pane::Logs, Pane::TaskQueue]);
+            let [_command, _logs] = surface.split_right(
+                bottom,
+                0.4,
+                vec![Pane::Logs, Pane::TaskQueue, Pane::IncrementRecords],
+            );
         }
     }
     dock
@@ -236,6 +243,7 @@ pub fn show(
                 vis: _,
                 command,
                 queue: queue_state,
+                records: records_state,
                 search: _,
             } = state;
             let mut viewer = panes::Viewer {
@@ -245,6 +253,7 @@ pub fn show(
                 queue,
                 command,
                 queue_state,
+                records_state,
                 cmds: &mut cmds,
             };
             DockArea::new(dock)

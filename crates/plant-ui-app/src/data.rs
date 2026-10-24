@@ -261,6 +261,10 @@ pub enum Req {
     },
     /// 队列面板的一次轮询（队列快照 + 任务表 + health + 持久欠账）。
     QueuePoll { base: String },
+    /// 增量记录页「加载更早」：`GET /tasks?before=<created_at>`，只要终态历史。
+    OlderTasks { base: String, before: String },
+    /// 增量记录页「变化清单」：`GET /tasks/{id}/changes`。
+    TaskChanges { base: String, task_id: String },
     /// 暂停 / 恢复出队。
     QueueSetPaused { base: String, paused: bool },
     /// 复活一行死信。它不排新的数据批次，结果一律等下一拍轮询。
@@ -458,6 +462,10 @@ pub enum Evt {
     GetWork(anyhow::Result<GetWork>),
     /// 队列面板的一次轮询结果。四份数据一起换代，不留自相矛盾的中间态。
     QueuePoll(anyhow::Result<QueuePoll>),
+    /// 「加载更早」的一页终态任务（含 `has_more`）。
+    OlderTasks(anyhow::Result<plant_ui::task_queue::TaskList>),
+    /// 一条任务的元素级变化清单（带 task_id，失败也要知道是谁的）。
+    TaskChanges(String, anyhow::Result<plant_ui::task_queue::TaskChanges>),
     /// 暂停 / 恢复的回执。真值仍以下一次轮询的快照为准，这里只负责把失败说出来。
     QueueSetPaused(bool, anyhow::Result<()>),
     /// 复活死信的回执，带上是哪一个根。真值同样等下一拍快照。
@@ -993,6 +1001,14 @@ async fn handle_read(
         Req::QueuePoll { base } => {
             let result = crate::model_update_api::poll_queue(&base).await;
             let _ = evt_tx.send(Evt::QueuePoll(result));
+        }
+        Req::OlderTasks { base, before } => {
+            let result = crate::model_update_api::tasks_before(&base, &before).await;
+            let _ = evt_tx.send(Evt::OlderTasks(result));
+        }
+        Req::TaskChanges { base, task_id } => {
+            let result = crate::model_update_api::task_changes(&base, &task_id).await;
+            let _ = evt_tx.send(Evt::TaskChanges(task_id, result));
         }
         Req::QueueSetPaused { base, paused } => {
             let result = crate::model_update_api::set_queue_paused(&base, paused).await;
