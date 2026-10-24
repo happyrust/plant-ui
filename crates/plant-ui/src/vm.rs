@@ -335,6 +335,10 @@ pub struct View3dVm {
     /// 纹理 UV（与 `axis_labels` 同机制），出画与相机身后的已经筛掉。绘制层只在锚点
     /// 画字，首版不做遮挡剔除与避让。没挂标注时为空。
     pub dimension_labels: Vec<DimensionLabelVm>,
+    /// 视口底色（渐变上 / 下两色）的覆盖（E3D 外观移植计划）。渲染纹理的空白处是透明的，
+    /// 底色由绘制层在纹理底下画：`None` = 跟主题（`viewport_top/bottom`），`Some` = 外观自己的配色
+    /// （E3D 外观是 grey→白，渐变关是纯 grey），由宿主按此刻生效的外观算好填进来。
+    pub background: Option<(egui::Color32, egui::Color32)>,
 }
 
 /// 一条投影好的尺寸标注文字。

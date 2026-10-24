@@ -43,6 +43,10 @@ pub struct RuntimeConfig {
     pub model_api_url: Option<String>,
     pub data_api_url: String,
     pub auto_gen_mesh: bool,
+    /// 站点给的三维外观默认（`config.json` 的 `look` 段，可只给一部分）；只有 wasm 的 `start()` 读，
+    /// 原生端的外观走 `settings.ron`。
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub look: plant_ui::ViewportLookOverrides,
 }
 
 /// 这一组连同 [`browser_runtime_config`] 只有 wasm 的 `start()` 入口用得到——配置由
@@ -62,6 +66,8 @@ struct BrowserConfig {
     db: BrowserDb,
     model_api_url: String,
     data_api_url: String,
+    #[serde(default)]
+    look: plant_ui::ViewportLookOverrides,
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -89,6 +95,8 @@ struct LegacyBrowserConfig {
     username: String,
     #[serde(default)]
     password: String,
+    #[serde(default)]
+    look: plant_ui::ViewportLookOverrides,
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -96,18 +104,17 @@ pub fn browser_runtime_config(json: &str) -> Result<RuntimeConfig> {
     let config: BrowserStartupConfig =
         serde_json::from_str(json).context("解析浏览器启动配置失败")?;
     match config {
-        BrowserStartupConfig::Legacy(config) => {
-            if config.model_api_url.trim().is_empty() {
-                bail!("model_api_url 不能为空");
-            }
-            legacy_runtime_config(
-                &config.legacy_project_ron,
-                &config.username,
-                &config.password,
-                Some(config.model_api_url),
-                Some(config.data_api_url),
-            )
-        }
+        BrowserStartupConfig::Legacy(config) => legacy_runtime_config(
+            &config.legacy_project_ron,
+            &config.username,
+            &config.password,
+            Some(config.model_api_url),
+            Some(config.data_api_url),
+        )
+        .map(|mut runtime| {
+            runtime.look = config.look;
+            runtime
+        }),
         BrowserStartupConfig::Current(config) => {
             if config.db.host.trim().is_empty() {
                 bail!("db.host 不能为空");
@@ -147,6 +154,7 @@ pub fn browser_runtime_config(json: &str) -> Result<RuntimeConfig> {
                 model_api_url: Some(model_api_url),
                 data_api_url,
                 auto_gen_mesh: false,
+                look: config.look,
             })
         }
     }
@@ -188,10 +196,12 @@ pub fn legacy_runtime_config(
             .filter(|value| !value.trim().is_empty())
             .unwrap_or(&legacy.api_host),
     )?;
+    // 旧版路径的后端访问地址唯一来源是 ron 的 api_host：调用方显式给了才优先，
+    // 否则一律回落到 ron——config.json 的 URL 与页面 origin 都不许兜底。
     let model_api_url = model_api_url
         .filter(|value| !value.trim().is_empty())
-        .map(|value| normalize_http_url("model_api_url", &value))
-        .transpose()?;
+        .unwrap_or_else(|| legacy.api_host.clone());
+    let model_api_url = Some(normalize_http_url("model_api_url", &model_api_url)?);
 
     let mut db = aios_core::options::DbOption::default();
     db.v_ip = v_ip;
@@ -207,6 +217,7 @@ pub fn legacy_runtime_config(
         model_api_url,
         data_api_url,
         auto_gen_mesh: legacy.auto_gen_mesh,
+        look: plant_ui::ViewportLookOverrides::default(),
     })
 }
 
@@ -480,16 +491,50 @@ mod tests {
         assert_eq!(current.db.project_name, "AvevaMarineSample");
         assert_eq!(current.db.mdb_name, "/ALL");
         assert!(!current.auto_gen_mesh);
+        assert!(current.look.is_empty(), "没给 look 段就是空覆盖");
     }
 
-    /// gen-model 的 `store_mode=mem` 没有可供浏览器直连的数据库端口；旧 RON 启动形态也必须
-    /// 把数据 API 缺省到当前页面 origin，不能回落到打包机写死的 api_host。
+    /// 站点可在 config.json 里给三维外观默认（`look` 段，可只给一部分）：两种启动形态都带得过来。
     #[test]
-    fn browser_legacy_entry_defaults_the_data_api_to_window_origin() {
+    fn browser_startup_carries_the_optional_look_section() {
+        let legacy = serde_json::json!({
+            "legacy_project_ron": legacy_ron("wss://db.example.test:443", "DESI"),
+            "model_api_url": "https://plant.example.test/",
+            "look": { "mode": "pbr" },
+        });
+        let legacy = browser_runtime_config(&legacy.to_string()).unwrap();
+        assert_eq!(legacy.look.mode, Some(plant_ui::LookMode::Pbr));
+        assert_eq!(legacy.look.aa, None);
+
+        let current = serde_json::json!({
+            "db": {
+                "host": "127.0.0.1",
+                "port": 8009,
+                "namespace": "1516",
+                "database": "AvevaMarineSample",
+                "mdb": "/ALL",
+                "username": "root",
+                "password": "root"
+            },
+            "model_api_url": "http://127.0.0.1:8021",
+            "data_api_url": "http://127.0.0.1:9099",
+            "look": { "aa": "fxaa", "hlr": false }
+        });
+        let current = browser_runtime_config(&current.to_string()).unwrap();
+        assert_eq!(current.look.aa, Some(plant_ui::AntiAlias::Fxaa));
+        assert_eq!(current.look.hlr, Some(false));
+        assert_eq!(current.look.mode, None);
+    }
+
+    /// 旧 RON 启动形态的后端访问地址唯一来源是 e3d.project.ron 的 api_host：
+    /// index.html 不读 config.json 的 model_api_url/data_api_url，也不用页面 origin 兜底，
+    /// 否则现场改了 ron 也不会生效（mem 档同理——地址正确性由 ron 文件本身负责）。
+    #[test]
+    fn browser_legacy_entry_uses_ron_api_host_for_backend_urls() {
         let index = include_str!("../../../web/public/index.html");
         assert!(
-            index.contains("data_api_url: current.data_api_url?.trim() || window.location.origin"),
-            "legacy browser entry must use the serving origin when data_api_url is blank"
+            index.contains("model_api_url: apiHost") && index.contains("data_api_url: apiHost"),
+            "legacy browser entry must take backend URLs from e3d.project.ron api_host"
         );
     }
 }

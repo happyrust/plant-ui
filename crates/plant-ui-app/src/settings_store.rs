@@ -208,6 +208,19 @@ pub fn startup() -> Option<&'static Startup> {
     STARTUP.get()
 }
 
+/// 浏览器端的三维外观：站点 `config.json` 的 `look` 段打底、地址栏 `?look=…` 压一层，由 wasm 的 `start()`
+/// 算好交底；那一侧没有 `settings.ron`，`App::new` 拿它代替出厂位。原生端没人调它。
+static BROWSER_LOOK: std::sync::OnceLock<plant_ui::ViewportLook> = std::sync::OnceLock::new();
+
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn set_browser_look(look: plant_ui::ViewportLook) {
+    let _ = BROWSER_LOOK.set(look);
+}
+
+pub fn browser_look() -> Option<plant_ui::ViewportLook> {
+    BROWSER_LOOK.get().copied()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,11 +258,23 @@ mod tests {
             mesh_dir: "D:/models/meshes".into(),
             tree_full_names: true,
             room_view_truncate_tubes: false,
+            look: {
+                // 故意每一格都离开出厂位：枚举字面要是 RON 认得出的标识符（下划线，不是连字符）。
+                let mut look = plant_ui::ViewportLook::default();
+                look.apply_preset(plant_ui::LookPreset::SglMachine);
+                look.colour_scheme = plant_ui::ColourScheme::ByType;
+                look.aa = plant_ui::AntiAlias::Fxaa;
+                look.hlr = true;
+                look
+            },
         };
         let text =
             ron::ser::to_string_pretty(&settings, ron::ser::PrettyConfig::default()).unwrap();
         // 落盘字面是计划 D11 写的那两个小写单词，手改文件的人照着写就行。
         assert!(text.contains("read_face: store"), "{text}");
+        assert!(text.contains("preset: sgl_machine"), "{text}");
+        assert!(text.contains("colour_scheme: by_type"), "{text}");
+        assert!(text.contains("aa: fxaa"), "{text}");
         assert_eq!(ron::from_str::<Settings>(&text).unwrap(), settings);
     }
 

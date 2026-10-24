@@ -20,10 +20,12 @@ use std::str::FromStr;
 use aios_core::pdms_types::PdmsGenericType;
 use aios_core::shape::pdms_shape::PlantMesh;
 use aios_core::{GeomInstQuery, RefU64};
+use bevy::anti_aliasing::fxaa::Fxaa;
 use bevy::asset::io::Reader;
 use bevy::asset::{
     AssetLoader, AssetServer, Assets, LoadContext, LoadState, load_internal_asset, weak_handle,
 };
+use bevy::core_pipeline::prepass::NormalPrepass;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::pbr::{MaterialPipeline, MaterialPipelineKey, NotShadowCaster, NotShadowReceiver};
 use bevy::prelude::*;
@@ -39,19 +41,34 @@ use bevy::render::render_resource::{
     SpecializedMeshPipelineError, TextureDescriptor, TextureDimension, TextureFormat,
     TextureUsages, VertexFormat,
 };
+use bevy::render::renderer::{RenderAdapter, RenderDevice};
 use bevy::render::view::RenderLayers;
 use bevy::render::{Render, RenderApp, RenderSystems, renderer::render_system};
 use bevy::transform::TransformSystems;
 use bevy_egui35::{EguiUserTextures, egui};
-use plant_ui::{CameraGesture, CameraMotion, CameraPose, IsolateMatching, ModelAction};
+use plant_ui::{
+    AntiAlias, CameraGesture, CameraMotion, CameraPose, IsolateMatching, LookMode, ModelAction,
+    ViewportLook,
+};
 
+pub mod e3d_look;
+mod look_materials;
 pub mod mesh_source;
 mod room_clip;
+
+use e3d_look::env_cube::SglEnvCube;
+use e3d_look::material::{SGL_LOOK_SHADER, SglLookMaterial};
+use e3d_look::post::{
+    SglLookPost, SglLookPostPlugin, blur_sharpness_for_depth_range, eye_depth_range,
+};
+use look_materials::{LookMaterials, MaterialAssets};
 
 pub use room_clip::{RoomClipPhase, RoomClipStatus, RoomVolumeBatch, panel_bounds_mm};
 
 const INITIAL_SIZE: UVec2 = UVec2::new(1200, 700);
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(120);
+/// 没有渲染设备可问（单元测试）时当作纹理边长上限：wgpu 的 downlevel 缺省。
+const DEFAULT_MAX_TEXTURE_DIM: u32 = 8192;
 /// 模型单位（PDMS 毫米）到世界单位：1 mm = 0.01 世界单位，也就是
 /// **1 世界单位 = 100 mm**。它只挂在 `SceneRoot` 上，所以场景里任何表示
 /// 「多长」的数都要过这一层才有物理意义。
@@ -167,17 +184,36 @@ impl Plugin for View3dPlugin {
             "invalid_tubi_line.wgsl",
             Shader::from_wgsl
         );
+        load_internal_asset!(
+            app,
+            SGL_LOOK_SHADER,
+            "e3d_look/sgl_look.wgsl",
+            Shader::from_wgsl
+        );
         app.init_resource::<ViewportResizeSync>()
             .init_resource::<WorldAxesEnabled>()
             .init_resource::<room_clip::RoomClip>()
+            .init_resource::<LookMaterials>()
             .add_plugins(MaterialPlugin::<InvalidTubiLineMaterial> {
                 prepass_enabled: false,
                 shadows_enabled: false,
                 ..default()
             })
+            // E3D 外观的实体材质：prepass 开着，阶段二的边线 / 伪阴影读它写的深度与标记；
+            // 没有阴影（SGL 本来就没有）。
+            .add_plugins(MaterialPlugin::<SglLookMaterial> {
+                prepass_enabled: true,
+                shadows_enabled: false,
+                ..default()
+            })
+            // 边线 / 伪阴影后处理（阶段二）：只对挂了生效 `SglLookPost` 的视图跑。
+            .add_plugins(SglLookPostPlugin)
             .add_plugins(ExtractResourcePlugin::<ViewportResizeSync>::default())
             .init_asset_loader::<MeshLoader>()
-            .add_systems(Startup, (setup, room_clip::setup_room_clip))
+            .add_systems(
+                Startup,
+                (setup, room_clip::setup_room_clip),
+            )
             .add_systems(
                 Update,
                 (
@@ -187,10 +223,10 @@ impl Plugin for View3dPlugin {
                     apply_resize,
                     apply_commands,
                     // 房间体与直段截断排在可见性 / 隔离落地之后、材质刷新之前：补出来的兄弟段
-                    // 抄的是这一拍的材质，选中高亮随后照常刷到它们身上。
+                    // 带着 `ModelMesh` 出生，材质由同帧的 apply_materials 按外观补上。
                     room_clip::apply_room_clip_ops,
                     room_clip::advance_room_clip,
-                    apply_selection,
+                    apply_materials,
                     animate_snap,
                     update_grid,
                 )
@@ -202,8 +238,15 @@ impl Plugin for View3dPlugin {
                     aim_headlight.before(TransformSystems::Propagate),
                     // 发布的是本帧真正用于渲染的姿态，所以要等传播完。
                     publish_camera.after(TransformSystems::Propagate),
+                    // 后处理的深度范围同理用本帧的相机位姿。
+                    sync_camera_look.after(TransformSystems::Propagate),
                 ),
             );
+        // `--look-demo` / `?look_demo=1`（E3D 外观移植计划的演示厂）：宿主插了 `LookDemo` 资源才摆场景。
+        // debug 构建总带着，release 构建要开 `look-demo` feature（浏览器端像素验收用）。
+        #[cfg(any(debug_assertions, feature = "look-demo"))]
+        app.add_systems(PostStartup, e3d_look::demo::spawn_look_demo)
+            .add_systems(Update, e3d_look::demo::report_frame_time);
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app.add_systems(
                 Render,
@@ -312,7 +355,20 @@ fn acknowledge_viewport_render(sync: Res<ViewportResizeSync>) {
 #[derive(Resource)]
 pub struct View3d {
     pub texture: egui::TextureId,
+    /// 视口的逻辑像素尺寸（绘制层要的那个）。离屏图的物理尺寸 = `size × render_scale`。
     pub size: UVec2,
+    /// E3D 外观的整帧超采样倍数（E3D 外观移植计划阶段三）：离屏图按 `size × render_scale` 分配，egui 线性采样
+    /// 缩回视口（2× 整数倍 = 4 像素盒式平均，就是 sglDx11 HLR 的 Σ/N 与 MSAA 解析的结构）。由 [`render_scale_for`] 按外观定。
+    render_scale: u32,
+    /// 正在展示的离屏图是按哪个倍数建的；与 `render_scale` 不等时 `apply_resize` 按同一套「新图渲染完才换」纪律重建。
+    image_scale: u32,
+    /// 这台设备能不能跑边线 / 伪阴影（E3D 外观移植计划阶段四）：后处理的 ND 纹理是 `Rgba16Float` 颜色附件，
+    /// WebGL2 要 `EXT_color_buffer_float`（wgpu 按它判半浮点可渲染）。不支持就不挂 prepass、不跑后处理、不超采样（留着 MSAA），
+    /// 材质与背景照常；设置窗那两格由宿主按这个值灰掉。
+    post_effects_supported: bool,
+    /// 设备二维纹理的边长上限（`Limits::max_texture_dimension_2d`）。离屏图的物理尺寸 `size × render_scale`
+    /// 夹在它之内：超采样时拖得很宽的窗（或启动头几帧的异常尺寸）不能让 wgpu 校验炸掉。
+    max_texture_dim: u32,
     /// 相机世界旋转的三列：right / up / back。egui 侧 ViewCube 的全部输入。
     pub camera_rot: [[f32; 3]; 3],
     /// 相机此刻的完整位姿（位置 / 姿态 / 转心），与 `camera_rot` 同拍发布。
@@ -351,6 +407,9 @@ pub struct View3d {
     retired_resize: VecDeque<RetiredResize>,
     picked: Option<RefU64>,
     selected: HashSet<RefU64>,
+    /// 主选中 = 宿主 `Selection::primary()`（最后一次点中的那一个），E3D 口径的 CE：E3D 外观下
+    /// 它染 CE yellow，其余选中染 highlight white；PBR 外观下两者同色。总在 `selected` 里。
+    primary: Option<RefU64>,
     selection_dirty: bool,
     /// 当前完整的 X-Ray 目标集；同时匹配模型 refno 与 owner。
     xray: HashSet<RefU64>,
@@ -370,6 +429,9 @@ pub struct View3d {
     room_clip_status: Option<RoomClipStatus>,
     /// 房间视图里「视图适应」与 Home 对准的房间体包围盒（场景世界系）。没有房间体时为 `None`。
     room_frame_bounds: Option<(Vec3, Vec3)>,
+    /// 三维外观（E3D 外观移植计划）：设置下发的整份。换了就翻 `material_dirty`，材质全场重挑。
+    /// 视口底色不在这边管：背景相机是 `is_active: false`，纹理空白处透明，底色由绘制层按外观画。
+    look: ViewportLook,
 }
 
 impl View3d {
@@ -447,12 +509,15 @@ impl View3d {
         self.commands.push_back(ViewCommand::Pick(uv));
     }
 
-    /// 下发当前选择集。传空集即取消全部高亮。宿主每次选择变更都发一遍整集，
-    /// 视口无状态地照它重刷——不发「加了谁减了谁」，跟树侧 `SetSelection` 同理。
-    pub fn set_selection(&mut self, refnos: Vec<RefU64>) {
+    /// 下发当前选择集与主选中（宿主 `Selection::primary()`，最后一次点中的那一个 = E3D 口径的 CE）。
+    /// 传空集即取消全部高亮。宿主每次选择变更都发一遍整集，视口无状态地照它重刷——不发
+    /// 「加了谁减了谁」，跟树侧 `SetSelection` 同理。不在集内的主选中按没有算。
+    pub fn set_selection(&mut self, refnos: Vec<RefU64>, primary: Option<RefU64>) {
         let selected: HashSet<_> = refnos.into_iter().collect();
-        if self.selected != selected {
+        let primary = primary.filter(|refno| selected.contains(refno));
+        if self.selected != selected || self.primary != primary {
             self.selected = selected;
+            self.primary = primary;
             self.selection_dirty = true;
         }
     }
@@ -469,6 +534,22 @@ impl View3d {
             bottom: srgb(bottom),
             grid: srgb(grid),
         });
+    }
+
+    /// 设置下发的三维外观（E3D 外观移植计划）：整份换，视口照它换背景与材质。
+    pub fn set_look(&mut self, look: ViewportLook) {
+        self.commands.push_back(ViewCommand::Look(look));
+    }
+
+    /// 此刻生效的外观。
+    pub fn look(&self) -> ViewportLook {
+        self.look
+    }
+
+    /// 这台设备能不能跑 E3D 外观的边线 / 伪阴影（半浮点颜色附件）。不能时这两样在视口里恒关，
+    /// 设置里的值照存照发。
+    pub fn post_effects_supported(&self) -> bool {
+        self.post_effects_supported
     }
 
     /// 导航历史回放：把相机送回一份记下的位姿。走 Snap 那条 0.3s 插值动画，
@@ -567,7 +648,9 @@ impl View3d {
 }
 
 struct PreparedResize {
+    /// 逻辑尺寸；图的物理尺寸 = `size × scale`。
     size: UVec2,
+    scale: u32,
     image: Handle<Image>,
     texture: egui::TextureId,
     generation: u64,
@@ -846,6 +929,8 @@ enum ViewCommand {
     Pose(CameraPose),
     /// 尺寸标注层整层替换：`Some` 换成这一批，`None` 撤掉（计划 B3）。
     Dimensions(Option<DimensionBatch>),
+    /// 三维外观整份换（E3D 外观移植计划）。
+    Look(ViewportLook),
 }
 
 #[derive(Component)]
@@ -873,15 +958,18 @@ struct ModelRoot {
     owner: RefU64,
 }
 
+/// 模型网格的身份与颜色键。材质不存在这里：两种外观是两种组件类型，这一刻该挂哪枚由
+/// `apply_materials` 按外观 × 配色方案 × 状态在 [`LookMaterials`] 里现挑（E3D 外观移植计划）。
 #[derive(Component, Clone)]
 struct ModelMesh {
     refno: RefU64,
     owner: RefU64,
-    /// 该网格按类型算出的常态材质。选中高亮换成 [`ModelMesh::highlight`]，
-    /// 取消选中时靠它还原——不存的话就得重算颜色，还得重新走一遍类型解析。
-    base: Handle<StandardMaterial>,
-    /// 该网格选中时该换成哪枚材质。
-    highlight: Handle<StandardMaterial>,
+    /// 按类型算出的 sRGB 字节（`type_color`，alpha = 半透明）。「按类型」配色与 PBR 外观直接用它，
+    /// E3D 出厂配色只留 alpha。存字节而不存材质，换配色方案才不用重新走一遍类型解析。
+    colour: [u8; 4],
+    /// 无光照线（无效 TUBI 的 `LineList` 兜底）还是实体网格。线在两种外观下都是无光照
+    /// `StandardMaterial`，实体在 E3D 外观下换 `SglLookMaterial`。
+    line: bool,
 }
 
 /// 拾取只依赖模型身份，不依赖它使用 StandardMaterial 还是专用虚线材质。
@@ -898,14 +986,6 @@ struct InvalidTubiLine {
     base: Handle<InvalidTubiLineMaterial>,
     highlight: Handle<InvalidTubiLineMaterial>,
 }
-
-/// 选中高亮共用的一枚材质句柄；换选择集只改各网格指向哪枚材质，不新建材质。
-#[derive(Resource)]
-struct HighlightMaterial(Handle<StandardMaterial>);
-
-/// 无效 TUBI 的 `LineList` 高亮不参与光照，避免随视角变暗消失。
-#[derive(Resource)]
-struct LineHighlightMaterial(Handle<StandardMaterial>);
 
 /// 全部无效 TUBI 共用的一枚四顶点单位带；长度完全来自实例的局部 Z 缩放。
 #[derive(Resource)]
@@ -988,16 +1068,23 @@ impl AssetLoader for MeshLoader {
     }
 }
 
+/// 离屏图的物理尺寸：逻辑尺寸 × 超采样倍数，再夹进设备的纹理边长上限（夹到了那一轴就不再是整数倍，
+/// egui 照样拉伸铺满，只是超采样打了折）。
+fn physical_size(size: UVec2, scale: u32, max_texture_dim: u32) -> UVec2 {
+    (size * scale).min(UVec2::splat(max_texture_dim.max(16)))
+}
+
+/// 不带初始数据：渲染目标第一帧就被整张画满。带数据的话 Bevy 会把一整块零字节传上 GPU（超采样时几十 MB），
+/// WebGL2 还不收 BGRA 的上传（控制台 `texSubImage2D: invalid format`）。
 fn viewport_image(size: UVec2) -> Image {
-    let extent = Extent3d {
-        width: size.x,
-        height: size.y,
-        ..default()
-    };
-    let mut image = Image {
+    Image {
         texture_descriptor: TextureDescriptor {
             label: Some("plant-ui 3d viewport"),
-            size: extent,
+            size: Extent3d {
+                width: size.x,
+                height: size.y,
+                ..default()
+            },
             dimension: TextureDimension::D2,
             format: TextureFormat::Bgra8UnormSrgb,
             mip_level_count: 1,
@@ -1007,10 +1094,9 @@ fn viewport_image(size: UVec2) -> Image {
                 | TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         },
+        data: None,
         ..default()
-    };
-    image.resize(extent);
-    image
+    }
 }
 
 /// 所有写入三维离屏目标的相机。换目标必须一起换，否则背景与模型会分写到两张图。
@@ -1025,12 +1111,33 @@ fn setup(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut line_materials: ResMut<Assets<InvalidTubiLineMaterial>>,
     world_axes: Res<WorldAxesEnabled>,
+    adapter: Option<Res<RenderAdapter>>,
+    device: Option<Res<RenderDevice>>,
 ) {
-    let image = images.add(viewport_image(INITIAL_SIZE));
+    let look = ViewportLook::default();
+    let max_texture_dim = device.as_deref().map_or(DEFAULT_MAX_TEXTURE_DIM, |device| {
+        device.limits().max_texture_dimension_2d
+    });
+    let post_effects_supported = adapter
+        .as_deref()
+        .is_none_or(|adapter| e3d_look::post::float_targets_supported(adapter));
+    if !post_effects_supported {
+        diag("[E3D 外观] 这台设备没有半浮点颜色附件（WebGL2 缺 EXT_color_buffer_float），边线 / 伪阴影关闭，材质与背景照常".into());
+    }
+    let render_scale = render_scale_for(look, post_effects_supported);
+    let image = images.add(viewport_image(physical_size(
+        INITIAL_SIZE,
+        render_scale,
+        max_texture_dim,
+    )));
     let texture = egui_textures.add_image(image.clone());
     commands.insert_resource(View3d {
         texture,
         size: INITIAL_SIZE,
+        render_scale,
+        image_scale: render_scale,
+        post_effects_supported,
+        max_texture_dim,
         camera_rot: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
         camera_pose: CameraPose {
             position: [0.0; 3],
@@ -1055,6 +1162,7 @@ fn setup(
         retired_resize: VecDeque::new(),
         picked: None,
         selected: HashSet::new(),
+        primary: None,
         selection_dirty: false,
         xray: HashSet::new(),
         material_dirty: false,
@@ -1065,8 +1173,21 @@ fn setup(
         room_clip_ops: VecDeque::new(),
         room_clip_status: None,
         room_frame_bounds: None,
+        look,
     });
     commands.insert_resource(OrbitCamera::default());
+    // E3D 外观的环境立方体贴图：六张内嵌 PNG 解一次，所有 SglLookMaterial 共用。
+    // 解不出来不致命——材质退到天地两段灰度兜底，日志说一句。
+    let env_cube = match e3d_look::env_cube::build_env_cube_image() {
+        Ok(image) => Some(images.add(image)),
+        Err(error) => {
+            diag(format!(
+                "[E3D 外观] 环境贴图不可用，反射退回天地兜底：{error}"
+            ));
+            None
+        }
+    };
+    commands.insert_resource(SglEnvCube(env_cube));
 
     // 背景：独立相机先画一张全屏渐变面片（拷问定案第 2 题，用户点名 Bevy 内画），
     // 主相机不清色、按序叠在上面。渐变色是顶点色，换主题只动四枚顶点。
@@ -1118,6 +1239,9 @@ fn setup(
         },
         Transform::from_xyz(8.0, 6.0, 10.0).looking_at(Vec3::ZERO, Vec3::Y),
         Tonemapping::None,
+        // E3D 外观的后处理开关（阶段二）：总在相机上，`sync_camera_look` 每帧按外观填；
+        // prepass 组件与 Msaa 也由它按外观挂 / 摘。
+        SglLookPost::off(),
         ViewCamera,
         ViewportRenderCamera,
     ));
@@ -1137,12 +1261,6 @@ fn setup(
         brightness: 220.0,
         affects_lightmapped_meshes: false,
     });
-    commands.insert_resource(HighlightMaterial(
-        materials.add(model_material(SELECT_COLOR)),
-    ));
-    commands.insert_resource(LineHighlightMaterial(
-        materials.add(fallback_line_material(SELECT_COLOR)),
-    ));
     commands.insert_resource(XRayMaterial(materials.add(xray_material())));
     commands.insert_resource(DimensionMaterial(
         materials.add(fallback_line_material(DIMENSION_COLOR)),
@@ -1393,6 +1511,100 @@ fn publish_camera(
 }
 
 /// NDC → 渲染纹理上的归一化 UV（左上原点）；在相机身后或裁剪范围外回 None。
+/// 相机上的 E3D 外观件（阶段二）：E3D 外观挂 `NormalPrepass`（线性深度与参与标记都在法线纹理里，不要
+/// `DepthPrepass` 那份深度拷贝）、`Msaa::Off`（prepass 纹理在 WebGL2 上读不了多重采样，两端统一），
+/// 并按设置与本帧场景深度范围填 `SglLookPost`；PBR 外观摘掉 prepass、
+/// MSAA 回 4×、后处理关（不提取，节点不跑）。跑在变换传播之后，深度范围用的是本帧真正渲染的相机位姿。
+fn sync_camera_look(
+    mut commands: Commands,
+    view: Res<View3d>,
+    mut cameras: Query<
+        (
+            Entity,
+            &GlobalTransform,
+            &Projection,
+            &mut Msaa,
+            &mut SglLookPost,
+            Has<NormalPrepass>,
+            Has<Fxaa>,
+        ),
+        With<ViewCamera>,
+    >,
+) {
+    let look = view.look;
+    // 边线 / 伪阴影这条链只在 E3D 外观且设备有半浮点颜色附件时才挂；不支持的设备上 E3D 外观 = 材质 + 背景，
+    // prepass / 后处理 / 超采样都不起，MSAA 照旧。
+    let e3d = look.mode == LookMode::E3d && view.post_effects_supported;
+    // FXAA 是 E3D 3.1 新增的可选后处理，与超采样互斥；PBR 外观维持今天的 MSAA 4×，不挂它。
+    let fxaa = e3d && look.aa == AntiAlias::Fxaa;
+    for (entity, transform, projection, mut msaa, mut post, has_prepass, has_fxaa) in &mut cameras {
+        if e3d != has_prepass {
+            if e3d {
+                commands.entity(entity).insert(NormalPrepass);
+            } else {
+                commands.entity(entity).remove::<NormalPrepass>();
+            }
+        }
+        if fxaa != has_fxaa {
+            if fxaa {
+                commands.entity(entity).insert(Fxaa::default());
+            } else {
+                commands.entity(entity).remove::<Fxaa>();
+            }
+        }
+        let wanted_msaa = if e3d { Msaa::Off } else { Msaa::Sample4 };
+        if *msaa != wanted_msaa {
+            *msaa = wanted_msaa;
+        }
+        let wanted = if e3d {
+            // E3D 3.1 每帧按场景深度范围算模糊锐度；算不出（空场景）沿用上一帧。
+            let sharpness = scene_depth_range(&view.bounds, transform, projection)
+                .and_then(blur_sharpness_for_depth_range)
+                .unwrap_or(post.ao2.w);
+            // AO / 模糊按 1/render_scale 分辨率跑：超采样时正好是屏幕分辨率（E3D 的 halfRes 关）。
+            SglLookPost::new(look.hlr, look.ao, sharpness, view.render_scale)
+                .with_background(e3d_look::presets::e3d_background(look.gradient))
+        } else {
+            SglLookPost::off()
+        };
+        if *post != wanted {
+            *post = wanted;
+        }
+    }
+}
+
+/// 离屏图的超采样倍数：E3D 外观 + 「2×2 超采样」= 2，其余（PBR 外观 / FXAA / 关）= 1。SSAA 只服务 E3D 外观，
+/// PBR 外观维持今天的 MSAA 4×；设备跑不了后处理时 E3D 外观也留着 MSAA，不超采样。
+fn render_scale_for(look: ViewportLook, post_effects_supported: bool) -> u32 {
+    match (look.mode, look.aa) {
+        (LookMode::E3d, AntiAlias::Ssaa2x2) if post_effects_supported => 2,
+        _ => 1,
+    }
+}
+
+/// 所有已装模型的包围盒并集在相机眼空间的线性深度范围（世界单位）；没有模型为 `None`。
+fn scene_depth_range(
+    bounds: &HashMap<RefU64, (Vec3, Vec3)>,
+    camera: &GlobalTransform,
+    projection: &Projection,
+) -> Option<f32> {
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for (lo, hi) in bounds.values() {
+        min = min.min(*lo);
+        max = max.max(*hi);
+    }
+    if !min.is_finite() || !max.is_finite() {
+        return None;
+    }
+    let near = match projection {
+        Projection::Perspective(perspective) => perspective.near,
+        Projection::Orthographic(orthographic) => orthographic.near,
+        _ => 0.0,
+    };
+    eye_depth_range(min, max, &camera.compute_matrix().inverse(), near)
+}
+
 fn ndc_to_texture_uv(ndc: Vec3) -> Option<[f32; 2]> {
     (ndc.z > 0.0 && ndc.z < 1.0).then(|| [ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5])
 }
@@ -1551,10 +1763,15 @@ fn xray_material() -> StandardMaterial {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 一块网格此刻的显示状态。E3D 外观下四态四色（常态 / highlight 白 / CE 黄 / X-Ray 蓝），
+/// PBR 外观与无效 TUBI 屏幕带只有三枚材质，CE 与 Highlight 落到同一枚高亮。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum MaterialState {
     Base,
-    Selected,
+    /// 选中但不是主选中。
+    Highlight,
+    /// 主选中（E3D 的 CE）。
+    Ce,
     XRay,
 }
 
@@ -1567,24 +1784,27 @@ impl MaterialState {
     ) -> Handle<M> {
         match self {
             Self::Base => base.clone(),
-            Self::Selected => highlight.clone(),
+            Self::Highlight | Self::Ce => highlight.clone(),
             Self::XRay => xray.clone(),
         }
     }
 }
 
-/// 普通实体与无效 TUBI 共用的唯一状态裁决：X-Ray > Selected > Base，且 refno / owner
+/// 普通实体与无效 TUBI 共用的唯一状态裁决：X-Ray > CE > Highlight > Base，且 refno / owner
 /// 任一命中都生效。
 fn material_state(
     selected: &HashSet<RefU64>,
+    primary: Option<RefU64>,
     xray: &HashSet<RefU64>,
     refno: RefU64,
     owner: RefU64,
 ) -> MaterialState {
     if xray.contains(&refno) || xray.contains(&owner) {
         MaterialState::XRay
+    } else if primary == Some(refno) || primary == Some(owner) {
+        MaterialState::Ce
     } else if selected.contains(&refno) || selected.contains(&owner) {
-        MaterialState::Selected
+        MaterialState::Highlight
     } else {
         MaterialState::Base
     }
@@ -1604,6 +1824,9 @@ fn forget_model_state(view: &mut View3d, removed: &HashSet<RefU64>) {
     view.retrying_meshes
         .retain(|mesh| !removed.contains(&mesh.mesh.refno));
     view.selected.retain(|refno| !removed.contains(refno));
+    if view.primary.is_some_and(|refno| removed.contains(&refno)) {
+        view.primary = None;
+    }
     view.xray.retain(|refno| !removed.contains(refno));
     if let Some(snapshot) = &mut view.isolate_restore {
         snapshot.retain(|refno, _| !removed.contains(refno));
@@ -1622,11 +1845,7 @@ fn load_models(
     scene_models: Query<(Entity, &ModelRoot)>,
     assets: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
     mut line_materials: ResMut<Assets<InvalidTubiLineMaterial>>,
-    highlight: Res<HighlightMaterial>,
-    line_highlight: Res<LineHighlightMaterial>,
-    xray_material: Res<XRayMaterial>,
     invalid_line_mesh: Res<InvalidTubiLineMesh>,
     invalid_line_state: Res<InvalidTubiLineStateMaterials>,
 ) {
@@ -1700,16 +1919,11 @@ fn load_models(
                 .id()
         })
     };
-    // 一类一枚材质：同类构件成千上万，逐网格建材质既费显存也断批。按基色缓存，
-    // 同色（含 UNKOWN 兜底）只落一枚。
-    let mut material_cache: HashMap<[u8; 4], Handle<StandardMaterial>> = HashMap::new();
-    let mut fallback_line_material_cache: HashMap<[u8; 4], Handle<StandardMaterial>> =
-        HashMap::new();
+    // 模型网格出生时不带材质：材质由同帧的 `apply_materials` 按外观 × 配色方案 × 状态从
+    // `LookMaterials` 取（一色一枚），这里只记类型色字节。
     let mut fallback_line_mesh_cache: HashMap<u32, Handle<Mesh>> = HashMap::new();
-    // 无效 TUBI 的屏幕空间材质同样按类型色缓存；Mesh 则全场只用资源里的那一枚。
+    // 无效 TUBI 的屏幕空间材质按类型色缓存；Mesh 则全场只用资源里的那一枚。
     let mut line_material_cache: HashMap<[u8; 4], Handle<InvalidTubiLineMaterial>> = HashMap::new();
-    let selected = view.selected.clone();
-    let xray = view.xray.clone();
     let desired_visibility = view.desired_visibility.clone();
     let mut loading_meshes = Vec::new();
     let mut spawned: Vec<(RefU64, bool, usize, usize)> = Vec::new();
@@ -1718,12 +1932,7 @@ fn load_models(
             let refno = model.refno.refno();
             let owner = model.owner.refno();
             let color = type_color(&model.generic);
-            let key = color.to_srgba().to_u8_array();
-            let material = material_cache
-                .entry(key)
-                .or_insert_with(|| materials.add(model_material(color)))
-                .clone();
-            let state = material_state(&selected, &xray, refno, owner);
+            let colour = color.to_srgba().to_u8_array();
             let visible = initial_model_visibility(&desired_visibility, refno, owner);
             let visibility = if visible {
                 Visibility::Visible
@@ -1743,7 +1952,7 @@ fn load_models(
             // 只有真挂着无效 TUBI 的模型才建线材质。
             let line_material = (mesh_immediate > 0).then(|| {
                 line_material_cache
-                    .entry(key)
+                    .entry(colour)
                     .or_insert_with(|| {
                         line_materials.add(InvalidTubiLineMaterial::new(
                             color,
@@ -1760,11 +1969,6 @@ fn load_models(
                             // 这里使用 Bevy 原生 LineList，而不是自定义屏幕带。后者的材质
                             // bind group / 离屏管线一旦失配会整段不画；LineList 已在同一实库
                             // 场景验证过，且仍保留正确的起点、方向、深度遮挡和选择状态。
-                            let base = fallback_line_material_cache
-                                .entry(key)
-                                .or_insert_with(|| materials.add(fallback_line_material(color)))
-                                .clone();
-                            let shown = state.choose(&base, &line_highlight.0, &xray_material.0);
                             let axis_length_mm =
                                 (model.world_trans.scale.z * inst.transform.scale.z).abs();
                             let mesh = fallback_line_mesh_cache
@@ -1781,13 +1985,12 @@ fn load_models(
                             );
                             element.spawn((
                                 Mesh3d(mesh),
-                                MeshMaterial3d(shown),
                                 inst.transform,
                                 ModelMesh {
                                     refno,
                                     owner,
-                                    base,
-                                    highlight: line_highlight.0.clone(),
+                                    colour,
+                                    line: true,
                                 },
                                 ModelPickTarget { refno },
                                 NotShadowCaster,
@@ -1802,16 +2005,14 @@ fn load_models(
                                 path,
                                 handle: handle.clone(),
                             });
-                            let shown = state.choose(&material, &highlight.0, &xray_material.0);
                             let mut mesh_entity = element.spawn((
                                 Mesh3d(handle),
-                                MeshMaterial3d(shown),
                                 inst.transform,
                                 ModelMesh {
                                     refno,
                                     owner,
-                                    base: material.clone(),
-                                    highlight: highlight.0.clone(),
+                                    colour,
+                                    line: false,
                                 },
                                 ModelPickTarget { refno },
                             ));
@@ -2021,6 +2222,7 @@ fn apply_resize(
         let old_image = std::mem::replace(&mut view.image, prepared.image);
         view.texture = prepared.texture;
         view.size = prepared.size;
+        view.image_scale = prepared.scale;
         view.retired_resize.push_back(RetiredResize {
             image: old_image,
             remove_after_rendered_frame: rendered_frame + 1,
@@ -2030,14 +2232,24 @@ fn apply_resize(
         }
     }
 
-    let Some((wanted, asked_at)) = view.pending_resize else {
-        return;
+    let (wanted, asked_at) = match view.pending_resize {
+        Some(pending) => pending,
+        // 外观换了超采样倍数：逻辑尺寸不变、物理尺寸要重建，走同一套纪律，不等防抖。
+        None if view.image_scale != view.render_scale && view.prepared_resize.is_none() => {
+            (view.size, Instant::now() - RESIZE_DEBOUNCE)
+        }
+        None => return,
     };
     if asked_at.elapsed() < RESIZE_DEBOUNCE {
         return;
     }
     view.pending_resize = None;
-    let image = images.add(viewport_image(wanted));
+    let scale = view.render_scale;
+    let image = images.add(viewport_image(physical_size(
+        wanted,
+        scale,
+        view.max_texture_dim,
+    )));
     let texture = egui_textures.add_image(image.clone());
     sync.requested_generation += 1;
     for mut camera in &mut cameras {
@@ -2045,6 +2257,7 @@ fn apply_resize(
     }
     view.prepared_resize = Some(PreparedResize {
         size: wanted,
+        scale,
         image,
         texture,
         generation: sync.requested_generation,
@@ -2137,6 +2350,15 @@ fn apply_commands(
                 if grid.color != grid_color {
                     grid.color = grid_color;
                     grid.rebuild = true;
+                }
+            }
+            ViewCommand::Look(look) => {
+                if view.look != look {
+                    view.look = look;
+                    // 材质按外观全场重挑（`apply_materials`）；`LookMaterials` 见外观变了自己清表。
+                    view.material_dirty = true;
+                    // 超采样倍数变了由 `apply_resize` 重建离屏图；prepass / Msaa / FXAA 由 `sync_camera_look` 挂摘。
+                    view.render_scale = render_scale_for(look, view.post_effects_supported);
                 }
             }
             ViewCommand::Snap { forward, up, fit } => {
@@ -2406,34 +2628,64 @@ fn orbit_camera(camera: &mut Transform, focus: Vec3, x: f32, y: f32) {
     camera.rotate_around(focus, yaw * pitch);
 }
 
-fn apply_selection(
+/// 全场材质刷新：选择集 / X-Ray / 外观变了，或有新的 `ModelMesh` 出生（装模型、房间截断补的兄弟段），
+/// 就按 `material_state` 四态从 [`LookMaterials`] 取句柄挂上。模型网格出生时不带材质，材质只在
+/// 这里给——一个出处，两种外观才不会各漏一处。无效 TUBI 的屏幕带材质仍是自己那三枚句柄。
+#[allow(clippy::too_many_arguments)]
+fn apply_materials(
+    mut commands: Commands,
     mut view: ResMut<View3d>,
+    mut look_materials: ResMut<LookMaterials>,
+    mut standard: ResMut<Assets<StandardMaterial>>,
+    mut sgl: ResMut<Assets<SglLookMaterial>>,
+    env: Res<SglEnvCube>,
     xray: Res<XRayMaterial>,
     invalid_line_state: Res<InvalidTubiLineStateMaterials>,
-    mut meshes: Query<(&ModelMesh, &mut MeshMaterial3d<StandardMaterial>)>,
+    born: Query<(), Added<ModelMesh>>,
+    mut meshes: Query<(
+        Entity,
+        &ModelMesh,
+        Option<&mut MeshMaterial3d<StandardMaterial>>,
+        Option<&mut MeshMaterial3d<SglLookMaterial>>,
+    )>,
     mut invalid_lines: Query<(
         &InvalidTubiLine,
         &mut MeshMaterial3d<InvalidTubiLineMaterial>,
     )>,
 ) {
-    if !view.selection_dirty && !view.material_dirty {
+    if !view.selection_dirty && !view.material_dirty && born.is_empty() {
         return;
     }
     view.selection_dirty = false;
     view.material_dirty = false;
-    for (mesh, mut material) in &mut meshes {
-        material.0 = material_state(&view.selected, &view.xray, mesh.refno, mesh.owner).choose(
-            &mesh.base,
-            &mesh.highlight,
-            &xray.0,
+    let look = view.look;
+    let mut assets = MaterialAssets {
+        standard: &mut standard,
+        sgl: &mut sgl,
+        env: env.0.clone(),
+        xray: xray.0.clone(),
+    };
+    for (entity, mesh, pbr, sgl_material) in &mut meshes {
+        let state = material_state(
+            &view.selected,
+            view.primary,
+            &view.xray,
+            mesh.refno,
+            mesh.owner,
         );
+        look_materials
+            .resolve(look, mesh, state, &mut assets)
+            .attach(entity, pbr, sgl_material, &mut commands);
     }
     for (line, mut material) in &mut invalid_lines {
-        material.0 = material_state(&view.selected, &view.xray, line.refno, line.owner).choose(
-            &line.base,
-            &line.highlight,
-            &invalid_line_state.xray,
-        );
+        material.0 = material_state(
+            &view.selected,
+            view.primary,
+            &view.xray,
+            line.refno,
+            line.owner,
+        )
+        .choose(&line.base, &line.highlight, &invalid_line_state.xray);
     }
 }
 
@@ -2597,6 +2849,10 @@ pub(crate) fn blank_view() -> View3d {
     View3d {
         texture: egui::TextureId::Managed(0),
         size: UVec2::new(16, 16),
+        render_scale: 1,
+        image_scale: 1,
+        post_effects_supported: true,
+        max_texture_dim: DEFAULT_MAX_TEXTURE_DIM,
         camera_rot: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
         camera_pose: CameraPose {
             position: [0.0; 3],
@@ -2621,6 +2877,7 @@ pub(crate) fn blank_view() -> View3d {
         retired_resize: VecDeque::new(),
         picked: None,
         selected: HashSet::new(),
+        primary: None,
         selection_dirty: false,
         xray: HashSet::new(),
         material_dirty: false,
@@ -2631,6 +2888,7 @@ pub(crate) fn blank_view() -> View3d {
         room_clip_ops: VecDeque::new(),
         room_clip_status: None,
         room_frame_bounds: None,
+        look: ViewportLook::default(),
     }
 }
 
@@ -2855,37 +3113,53 @@ mod tests {
     }
 
     #[test]
-    fn invalid_tubi_material_state_is_xray_then_selected_then_base_for_refno_or_owner() {
+    fn material_state_is_xray_then_ce_then_highlight_then_base_for_refno_or_owner() {
         let refno = RefU64::from(42);
         let owner = RefU64::from(7);
         let mut view = test_view();
+        let state =
+            |view: &View3d| material_state(&view.selected, view.primary, &view.xray, refno, owner);
 
+        assert_eq!(state(&view), MaterialState::Base);
+        view.set_selection(vec![owner], None);
         assert_eq!(
-            material_state(&view.selected, &view.xray, refno, owner),
-            MaterialState::Base
+            state(&view),
+            MaterialState::Highlight,
+            "选中但不是主选中 = highlight"
         );
-        view.selected.insert(owner);
-        assert_eq!(
-            material_state(&view.selected, &view.xray, refno, owner),
-            MaterialState::Selected
-        );
+        view.set_selection(vec![owner], Some(owner));
+        assert_eq!(state(&view), MaterialState::Ce, "owner 是主选中 = CE");
         view.xray.insert(refno);
-        assert_eq!(
-            material_state(&view.selected, &view.xray, refno, owner),
-            MaterialState::XRay
-        );
+        assert_eq!(state(&view), MaterialState::XRay, "X-Ray 压过一切");
         view.xray.clear();
-        view.selected.clear();
-        view.selected.insert(refno);
+        view.set_selection(vec![refno], Some(refno));
+        assert_eq!(state(&view), MaterialState::Ce);
+        view.set_selection(vec![refno, owner], Some(owner));
         assert_eq!(
-            material_state(&view.selected, &view.xray, refno, owner),
-            MaterialState::Selected
+            state(&view),
+            MaterialState::Ce,
+            "refno 与 owner 任一是主选中都算 CE"
         );
+        view.set_selection(vec![refno, owner], None);
+        assert_eq!(state(&view), MaterialState::Highlight);
         view.xray.insert(owner);
+        assert_eq!(state(&view), MaterialState::XRay);
+
+        // 三枚句柄的裁决（无效 TUBI 屏幕带）：CE 与 Highlight 都落到高亮那枚。
+        let mut materials = Assets::<StandardMaterial>::default();
+        let base = materials.add(StandardMaterial::default());
+        let highlight = materials.add(StandardMaterial::default());
+        let xray = materials.add(StandardMaterial::default());
+        assert_eq!(MaterialState::Base.choose(&base, &highlight, &xray), base);
         assert_eq!(
-            material_state(&view.selected, &view.xray, refno, owner),
-            MaterialState::XRay
+            MaterialState::Highlight.choose(&base, &highlight, &xray),
+            highlight
         );
+        assert_eq!(
+            MaterialState::Ce.choose(&base, &highlight, &xray),
+            highlight
+        );
+        assert_eq!(MaterialState::XRay.choose(&base, &highlight, &xray), xray);
     }
 
     #[test]
@@ -3089,6 +3363,121 @@ mod tests {
     }
 
     /// 档位表：1/2/5×10ⁿ 毫米，夹在格距上下限之内。
+    /// 超采样倍数的推导表：E3D + SSAA 2×2 → 2，其余全是 1（SSAA 只服务 E3D 外观）。
+    #[test]
+    fn render_scale_follows_mode_and_anti_alias() {
+        let mut look = ViewportLook::default();
+        assert_eq!(render_scale_for(look, true), 2, "出厂 = E3D + SSAA 2×2");
+        assert_eq!(
+            render_scale_for(look, false),
+            1,
+            "跑不了后处理的设备留着 MSAA，不超采样"
+        );
+        look.aa = AntiAlias::Fxaa;
+        assert_eq!(render_scale_for(look, true), 1);
+        look.aa = AntiAlias::Off;
+        assert_eq!(render_scale_for(look, true), 1);
+        look.aa = AntiAlias::Ssaa2x2;
+        look.mode = LookMode::Pbr;
+        assert_eq!(
+            render_scale_for(look, true),
+            1,
+            "PBR 外观维持 MSAA，不超采样"
+        );
+    }
+
+    /// 离屏图的物理尺寸是逻辑尺寸 × 倍数，但不超过设备的纹理边长上限：超采样下跨三块屏的窗只是那一轴打折，不炸。
+    /// 没带初始数据：渲染目标不该往 GPU 传一块零（WebGL2 还不收 BGRA 上传）。
+    #[test]
+    fn the_offscreen_image_is_clamped_to_the_device_limit_and_carries_no_data() {
+        assert_eq!(
+            physical_size(UVec2::new(1463, 767), 2, 16384),
+            UVec2::new(2926, 1534)
+        );
+        assert_eq!(
+            physical_size(UVec2::new(11520, 2160), 2, 16384),
+            UVec2::new(16384, 4320)
+        );
+        assert_eq!(
+            physical_size(UVec2::new(16, 16), 1, 0),
+            UVec2::new(16, 16),
+            "上限再小也留一块最小图"
+        );
+        let image = viewport_image(UVec2::new(64, 32));
+        assert!(image.data.is_none());
+        assert_eq!(image.texture_descriptor.size.width, 64);
+        assert_eq!(image.texture_descriptor.size.height, 32);
+        assert!(
+            image
+                .texture_descriptor
+                .usage
+                .contains(TextureUsages::RENDER_ATTACHMENT)
+        );
+    }
+
+    /// 超采样倍数变了：逻辑尺寸不变，离屏图按 2× 重建，仍走「新图渲染完才换」；换完不会反复重建。
+    #[test]
+    fn changing_the_render_scale_rebuilds_the_offscreen_image_at_twice_the_size() {
+        let size = UVec2::new(320, 180);
+        let mut app = App::new();
+        app.init_resource::<Assets<Image>>()
+            .init_resource::<EguiUserTextures>()
+            .init_resource::<ViewportResizeSync>();
+        let old_image = app
+            .world_mut()
+            .resource_mut::<Assets<Image>>()
+            .add(viewport_image(size));
+        let old_texture = app
+            .world_mut()
+            .resource_mut::<EguiUserTextures>()
+            .add_image(old_image.clone());
+        let mut view = test_view();
+        view.image = old_image.clone();
+        view.texture = old_texture;
+        view.size = size;
+        view.render_scale = 2;
+        app.insert_resource(view).add_systems(Update, apply_resize);
+        app.world_mut().spawn((
+            Camera {
+                target: RenderTarget::Image(old_image.clone().into()),
+                ..default()
+            },
+            ViewportRenderCamera,
+        ));
+
+        app.update();
+        let view = app.world().resource::<View3d>();
+        assert_eq!(view.size, size);
+        assert_eq!(view.image, old_image, "新图渲染完之前不换");
+        let prepared = view.prepared_resize.as_ref().expect("该开始预热 2× 的新图");
+        assert_eq!((prepared.size, prepared.scale), (size, 2));
+        let prepared_image = prepared.image.clone();
+        assert_eq!(
+            app.world()
+                .resource::<Assets<Image>>()
+                .get(&prepared_image)
+                .unwrap()
+                .size(),
+            size * 2,
+            "物理尺寸 = 逻辑尺寸 × 2"
+        );
+
+        app.world()
+            .resource::<ViewportResizeSync>()
+            .acknowledge_rendered();
+        app.update();
+        let view = app.world().resource::<View3d>();
+        assert_eq!(view.image, prepared_image);
+        assert_eq!(view.size, size, "逻辑尺寸不变，绘制层不知道超采样");
+        assert_eq!(view.image_scale, 2);
+
+        app.update();
+        assert!(
+            app.world().resource::<View3d>().prepared_resize.is_none(),
+            "倍数已一致，不该再重建"
+        );
+    }
+
     fn ladder_mm() -> Vec<f32> {
         (0..=6)
             .flat_map(|exp| {
@@ -3397,8 +3786,6 @@ mod tests {
             .init_asset::<Mesh>()
             .insert_resource(view)
             .insert_resource(OrbitCamera::default())
-            .insert_resource(HighlightMaterial(Handle::default()))
-            .insert_resource(LineHighlightMaterial(Handle::default()))
             .insert_resource(XRayMaterial(Handle::default()))
             .insert_resource(InvalidTubiLineMesh(Handle::default()))
             .insert_resource(test_invalid_line_state())
@@ -3716,60 +4103,228 @@ mod tests {
         }
     }
 
+    /// 材质刷新的最小 App：`apply_materials` 要的资源齐备，没有渲染器。
+    fn materials_app(view: View3d) -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(view)
+            .init_resource::<LookMaterials>()
+            .insert_resource(Assets::<StandardMaterial>::default())
+            .insert_resource(Assets::<SglLookMaterial>::default())
+            .insert_resource(SglEnvCube(None))
+            .insert_resource(XRayMaterial(Handle::default()))
+            .insert_resource(test_invalid_line_state())
+            .add_systems(Update, apply_materials);
+        app
+    }
+
+    fn pbr_view() -> View3d {
+        let mut view = test_view();
+        view.look.mode = plant_ui::LookMode::Pbr;
+        view
+    }
+
+    /// 像 `load_models` 那样只挂 `ModelMesh`，不带材质。
+    fn spawn_model_mesh(app: &mut App, refno: RefU64, owner: RefU64, generic: &str) -> Entity {
+        app.world_mut()
+            .spawn(ModelMesh {
+                refno,
+                owner,
+                colour: type_color(generic).to_srgba().to_u8_array(),
+                line: false,
+            })
+            .id()
+    }
+
+    fn standard_material_of(app: &App, entity: Entity) -> Handle<StandardMaterial> {
+        app.world()
+            .entity(entity)
+            .get::<MeshMaterial3d<StandardMaterial>>()
+            .expect("该挂 StandardMaterial")
+            .0
+            .clone()
+    }
+
+    fn sgl_material_of(app: &App, entity: Entity) -> Handle<SglLookMaterial> {
+        app.world()
+            .entity(entity)
+            .get::<MeshMaterial3d<SglLookMaterial>>()
+            .expect("该挂 SglLookMaterial")
+            .0
+            .clone()
+    }
+
+    fn base_colour_of(app: &App, handle: &Handle<StandardMaterial>) -> [u8; 4] {
+        app.world()
+            .resource::<Assets<StandardMaterial>>()
+            .get(handle)
+            .unwrap()
+            .base_color
+            .to_srgba()
+            .to_u8_array()
+    }
+
+    fn sgl_colour_of(app: &App, handle: &Handle<SglLookMaterial>) -> [u8; 3] {
+        let colour = app
+            .world()
+            .resource::<Assets<SglLookMaterial>>()
+            .get(handle)
+            .unwrap()
+            .params
+            .colour;
+        [
+            (colour.x * 255.0).round() as u8,
+            (colour.y * 255.0).round() as u8,
+            (colour.z * 255.0).round() as u8,
+        ]
+    }
+
+    /// PBR 外观 = 改动前：选中换成橙红高亮，取消回到同一枚类型色材质。网格出生不带材质，
+    /// 第一帧靠 `Added<ModelMesh>` 补上。
     #[test]
     fn selection_highlight_replaces_and_restores_the_type_material() {
         let refno = RefU64::from(42);
         let owner = RefU64::from(7);
-        let mut materials = Assets::<StandardMaterial>::default();
-        let base = materials.add(model_material(type_color("PIPE")));
-        let highlight = materials.add(model_material(SELECT_COLOR));
         assert_eq!(type_color("CE").to_srgba().to_u8_array()[3], 200);
-        let mut app = App::new();
-        let mut view = test_view();
-        view.selected.insert(owner);
-        view.selection_dirty = true;
-        app.add_plugins(MinimalPlugins)
-            .insert_resource(XRayMaterial(Handle::default()))
-            .insert_resource(test_invalid_line_state())
-            .insert_resource(view)
-            .add_systems(Update, apply_selection);
-        let entity = app
-            .world_mut()
-            .spawn((
-                ModelMesh {
-                    refno,
-                    owner,
-                    base: base.clone(),
-                    highlight: highlight.clone(),
-                },
-                MeshMaterial3d(base.clone()),
-            ))
-            .id();
+        let mut app = materials_app(pbr_view());
+        let entity = spawn_model_mesh(&mut app, refno, owner, "PIPE");
 
         app.update();
+        let base = standard_material_of(&app, entity);
         assert_eq!(
+            base_colour_of(&app, &base),
+            type_color("PIPE").to_srgba().to_u8_array()
+        );
+        assert!(
             app.world()
                 .entity(entity)
+                .get::<MeshMaterial3d<SglLookMaterial>>()
+                .is_none(),
+            "PBR 外观下没有 SGL 组件"
+        );
+
+        app.world_mut()
+            .resource_mut::<View3d>()
+            .set_selection(vec![owner], Some(owner));
+        app.update();
+        let highlight = standard_material_of(&app, entity);
+        assert_ne!(highlight, base);
+        assert_eq!(
+            base_colour_of(&app, &highlight),
+            SELECT_COLOR.to_srgba().to_u8_array()
+        );
+
+        app.world_mut()
+            .resource_mut::<View3d>()
+            .set_selection(Vec::new(), None);
+        app.update();
+        assert_eq!(
+            standard_material_of(&app, entity),
+            base,
+            "取消选中回到同一枚常态材质，不新建"
+        );
+    }
+
+    /// E3D 外观：实体挂 `SglLookMaterial`、出厂配色一色 lightgrey；主选中 CE 黄、其它选中 highlight 白；
+    /// 换「按类型」配色回到类型色；切回 PBR 整场换回 StandardMaterial。
+    #[test]
+    fn e3d_look_paints_lightgrey_ce_yellow_highlight_white_and_swaps_back_to_pbr() {
+        let a = RefU64::from(1);
+        let b = RefU64::from(2);
+        let owner = RefU64::from(7);
+        let mut app = materials_app(test_view());
+        assert_eq!(
+            app.world().resource::<View3d>().look.mode,
+            plant_ui::LookMode::E3d
+        );
+        let ea = spawn_model_mesh(&mut app, a, owner, "PIPE");
+        let eb = spawn_model_mesh(&mut app, b, owner, "EQUI");
+
+        app.update();
+        assert!(
+            app.world()
+                .entity(ea)
                 .get::<MeshMaterial3d<StandardMaterial>>()
-                .unwrap()
-                .0,
-            highlight
+                .is_none(),
+            "E3D 外观下没有 StandardMaterial 组件"
+        );
+        let grey = sgl_material_of(&app, ea);
+        assert_eq!(
+            grey,
+            sgl_material_of(&app, eb),
+            "出厂配色一色，不同类型共用一枚"
+        );
+        assert_eq!(sgl_colour_of(&app, &grey), [189, 189, 189]);
+
+        app.world_mut()
+            .resource_mut::<View3d>()
+            .set_selection(vec![a, b], Some(b));
+        app.update();
+        assert_eq!(
+            sgl_colour_of(&app, &sgl_material_of(&app, eb)),
+            [255, 255, 0],
+            "主选中 = CE 黄"
+        );
+        assert_eq!(
+            sgl_colour_of(&app, &sgl_material_of(&app, ea)),
+            [255, 255, 255],
+            "其它选中 = highlight 白"
         );
 
         {
             let mut view = app.world_mut().resource_mut::<View3d>();
-            view.selected.clear();
-            view.selection_dirty = true;
+            view.set_selection(Vec::new(), None);
+            view.look.colour_scheme = plant_ui::ColourScheme::ByType;
+            view.material_dirty = true;
         }
         app.update();
         assert_eq!(
-            app.world()
-                .entity(entity)
-                .get::<MeshMaterial3d<StandardMaterial>>()
-                .unwrap()
-                .0,
-            base
+            sgl_colour_of(&app, &sgl_material_of(&app, ea)),
+            [250, 250, 30],
+            "按类型：PIPE 黄"
         );
+        assert_eq!(
+            sgl_colour_of(&app, &sgl_material_of(&app, eb)),
+            [255, 190, 0],
+            "按类型：EQUI 橙"
+        );
+
+        {
+            let mut view = app.world_mut().resource_mut::<View3d>();
+            view.look.mode = plant_ui::LookMode::Pbr;
+            view.material_dirty = true;
+        }
+        app.update();
+        assert!(
+            app.world()
+                .entity(ea)
+                .get::<MeshMaterial3d<SglLookMaterial>>()
+                .is_none(),
+            "切回 PBR 摘掉 SGL 组件"
+        );
+        assert_eq!(
+            base_colour_of(&app, &standard_material_of(&app, ea)),
+            type_color("PIPE").to_srgba().to_u8_array()
+        );
+    }
+
+    /// `set_selection`：不在集内的主选中按没有算；集与主选中都没变就不翻脏标，只换主选中也要刷。
+    #[test]
+    fn set_selection_keeps_the_primary_inside_the_set_and_only_dirties_on_change() {
+        let a = RefU64::from(1);
+        let b = RefU64::from(2);
+        let mut view = test_view();
+        view.set_selection(vec![a, b], Some(b));
+        assert!(view.selection_dirty);
+        assert_eq!(view.primary, Some(b));
+        view.selection_dirty = false;
+        view.set_selection(vec![b, a], Some(b));
+        assert!(!view.selection_dirty, "同集同主选中不翻脏标");
+        view.set_selection(vec![a, b], Some(a));
+        assert!(view.selection_dirty, "只换主选中也要刷：CE 黄要挪位置");
+        view.set_selection(vec![a], Some(b));
+        assert_eq!(view.primary, None, "主选中不在集内按没有算");
+        assert_eq!(view.selected, HashSet::from([a]));
     }
 
     /// 无效 TUBI 的屏幕带选中再取消，必须回到自己的类型色与 1.5px 常态宽度。
@@ -3791,18 +4346,13 @@ mod tests {
             XRAY_COLOR,
             INVALID_TUBI_LINE_WIDTH_PX,
         ));
-        let mut app = App::new();
         let mut view = test_view();
-        view.selected.insert(owner);
-        view.selection_dirty = true;
-        app.add_plugins(MinimalPlugins)
-            .insert_resource(XRayMaterial(Handle::default()))
-            .insert_resource(InvalidTubiLineStateMaterials {
-                highlight: line_highlight.clone(),
-                xray: line_xray,
-            })
-            .insert_resource(view)
-            .add_systems(Update, apply_selection);
+        view.set_selection(vec![owner], Some(owner));
+        let mut app = materials_app(view);
+        app.insert_resource(InvalidTubiLineStateMaterials {
+            highlight: line_highlight.clone(),
+            xray: line_xray,
+        });
         let entity = app
             .world_mut()
             .spawn((
@@ -3826,11 +4376,9 @@ mod tests {
             .clone();
         assert_eq!(shown, line_highlight);
 
-        {
-            let mut view = app.world_mut().resource_mut::<View3d>();
-            view.selected.clear();
-            view.selection_dirty = true;
-        }
+        app.world_mut()
+            .resource_mut::<View3d>()
+            .set_selection(Vec::new(), None);
         app.update();
         assert_eq!(
             app.world()
@@ -3842,13 +4390,11 @@ mod tests {
         );
     }
 
+    /// 房间 X-Ray 压过选中：PBR 外观下换成 `XRayMaterial` 那枚；撤掉 X-Ray 回到高亮，再取消回常态。
     #[test]
     fn room_xray_overrides_selection_and_restores_the_highlight() {
         let refno = RefU64::from(42);
         let owner = RefU64::from(7);
-        let mut materials = Assets::<StandardMaterial>::default();
-        let base = materials.add(model_material(type_color("PIPE")));
-        let highlight = materials.add(model_material(SELECT_COLOR));
         let xray_material_value = xray_material();
         assert_eq!(
             xray_material_value.base_color.to_srgba().to_u8_array(),
@@ -3858,39 +4404,19 @@ mod tests {
         assert!(xray_material_value.unlit);
         assert!(xray_material_value.double_sided);
         assert_eq!(xray_material_value.cull_mode, None);
-        let xray = materials.add(xray_material_value);
-        let mut app = App::new();
-        let mut view = test_view();
-        view.selected.insert(owner);
+        let mut view = pbr_view();
+        view.set_selection(vec![owner], Some(owner));
         view.xray.insert(refno);
-        view.material_dirty = true;
-        app.add_plugins(MinimalPlugins)
-            .insert_resource(XRayMaterial(xray.clone()))
-            .insert_resource(test_invalid_line_state())
-            .insert_resource(view)
-            .add_systems(Update, apply_selection);
-        let entity = app
+        let mut app = materials_app(view);
+        let xray = app
             .world_mut()
-            .spawn((
-                ModelMesh {
-                    refno,
-                    owner,
-                    base: base.clone(),
-                    highlight: highlight.clone(),
-                },
-                MeshMaterial3d(base.clone()),
-            ))
-            .id();
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(xray_material_value);
+        app.insert_resource(XRayMaterial(xray.clone()));
+        let entity = spawn_model_mesh(&mut app, refno, owner, "PIPE");
 
         app.update();
-        assert_eq!(
-            app.world()
-                .entity(entity)
-                .get::<MeshMaterial3d<StandardMaterial>>()
-                .unwrap()
-                .0,
-            xray
-        );
+        assert_eq!(standard_material_of(&app, entity), xray);
 
         {
             let mut view = app.world_mut().resource_mut::<View3d>();
@@ -3898,28 +4424,22 @@ mod tests {
             view.material_dirty = true;
         }
         app.update();
+        let highlight = standard_material_of(&app, entity);
+        assert_ne!(highlight, xray);
         assert_eq!(
-            app.world()
-                .entity(entity)
-                .get::<MeshMaterial3d<StandardMaterial>>()
-                .unwrap()
-                .0,
-            highlight
+            base_colour_of(&app, &highlight),
+            SELECT_COLOR.to_srgba().to_u8_array()
         );
 
-        {
-            let mut view = app.world_mut().resource_mut::<View3d>();
-            view.selected.clear();
-            view.selection_dirty = true;
-        }
+        app.world_mut()
+            .resource_mut::<View3d>()
+            .set_selection(Vec::new(), None);
         app.update();
+        let base = standard_material_of(&app, entity);
+        assert_ne!(base, highlight);
         assert_eq!(
-            app.world()
-                .entity(entity)
-                .get::<MeshMaterial3d<StandardMaterial>>()
-                .unwrap()
-                .0,
-            base
+            base_colour_of(&app, &base),
+            type_color("PIPE").to_srgba().to_u8_array()
         );
     }
 
@@ -4044,6 +4564,17 @@ mod tests {
             "下沿该是 bottom 色"
         );
         assert!(colors[2][0] > 0.9 && colors[3][0] > 0.9, "上沿该是 top 色");
+    }
+
+    /// 设置下发的外观进 `View3d.look`，换了才翻 `material_dirty`；视口底色不归这边（绘制层按外观画）。
+    #[test]
+    fn set_look_records_the_look_and_flags_materials_dirty_only_on_change() {
+        let mut view = blank_view();
+        assert_eq!(view.look(), ViewportLook::default());
+        let mut look = ViewportLook::default();
+        look.mode = plant_ui::LookMode::Pbr;
+        view.set_look(look);
+        assert!(matches!(view.commands.back(), Some(ViewCommand::Look(l)) if *l == look));
     }
 
     /// Snap 动画在 0.3s 里把相机滑到目标位并对准焦点，走完自我了断。

@@ -386,7 +386,6 @@ type Tubes<'w, 's> = Query<
         &'static ModelMesh,
         &'static ModelPickTarget,
         &'static ChildOf,
-        &'static MeshMaterial3d<StandardMaterial>,
         &'static mut Mesh3d,
         &'static mut Transform,
         &'static mut Visibility,
@@ -529,12 +528,12 @@ impl Active {
         for (entity, outcome) in self.done.drain() {
             match outcome {
                 Outcome::Hidden => {
-                    if let Ok((_, _, _, _, _, _, _, _, mut visibility)) = tubes.get_mut(entity) {
+                    if let Ok((_, _, _, _, _, _, _, mut visibility)) = tubes.get_mut(entity) {
                         *visibility = Visibility::Inherited;
                     }
                 }
                 Outcome::Cut(extras) => {
-                    if let Ok((_, body, _, _, _, _, mut mesh, mut transform, _)) =
+                    if let Ok((_, body, _, _, _, mut mesh, mut transform, _)) =
                         tubes.get_mut(entity)
                     {
                         *transform = body.base;
@@ -582,7 +581,7 @@ impl Active {
             let Some(entity) = self.queue.pop_front() else {
                 break;
             };
-            let Ok((_, body, model, pick, child_of, material, mut mesh, mut transform, mut visibility)) =
+            let Ok((_, body, model, pick, child_of, mut mesh, mut transform, mut visibility)) =
                 tubes.get_mut(entity)
             else {
                 // 这段直段已经随模型卸掉了。
@@ -626,7 +625,6 @@ impl Active {
                             model,
                             pick: *pick,
                             parent: child_of.parent(),
-                            material: &material.0,
                             mesh: &mut mesh,
                             transform: &mut transform,
                         },
@@ -679,13 +677,13 @@ struct CutTarget<'a> {
     model: &'a ModelMesh,
     pick: ModelPickTarget,
     parent: Entity,
-    material: &'a Handle<StandardMaterial>,
     mesh: &'a mut Mesh3d,
     transform: &'a mut Transform,
 }
 
 /// 截一段：第一截改写子实体本身，其余每截补一个兄弟实体，每个截点（落在管端之间的）盖一片断口。
-/// 交回补出来的实体。
+/// 交回补出来的实体。兄弟段只带 `ModelMesh` 出生、不抄材质：材质由同帧的 `apply_materials`
+/// 按当前外观补上（两种外观是两种组件类型，这里不该知道是哪种）。
 fn cut(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -700,7 +698,6 @@ fn cut(
         model,
         pick,
         parent,
-        material,
         mesh,
         transform,
     } = target;
@@ -722,7 +719,6 @@ fn cut(
         } else {
             let mut sibling = commands.spawn((
                 Mesh3d(piece_mesh.unwrap_or_else(|| prototype.clone())),
-                MeshMaterial3d(material.clone()),
                 piece,
                 model.clone(),
                 pick,
@@ -755,7 +751,7 @@ fn cut(
     extras
 }
 
-fn triangles_of(mesh: &Mesh) -> Option<(Vec<Vec3>, Vec<u32>)> {
+pub(crate) fn triangles_of(mesh: &Mesh) -> Option<(Vec<Vec3>, Vec<u32>)> {
     if mesh.primitive_topology() != PrimitiveTopology::TriangleList {
         return None;
     }
@@ -1094,8 +1090,8 @@ mod tests {
                 ModelMesh {
                     refno,
                     owner: refno,
-                    base: Handle::default(),
-                    highlight: Handle::default(),
+                    colour: [0; 4],
+                    line: invalid,
                 },
                 ModelPickTarget { refno },
                 body,
@@ -1464,21 +1460,28 @@ mod tests {
     }
 
     /// 选中所属分支（计划 M3 验收 9）：保留段与补出来的兄弟段一起变高亮；断口不挂 `ModelMesh`，
-    /// 保持剖切色，但挂着 BRAN 的 `ModelPickTarget`——点断口选中的是这根分支。
+    /// 保持剖切色，但挂着 BRAN 的 `ModelPickTarget`——点断口选中的是这根分支。兄弟段出生时不带材质，
+    /// 同帧的 `apply_materials` 补上与保留段同一枚。
     #[test]
     fn selecting_the_branch_highlights_every_piece_but_not_the_caps() {
         let bran = RefU64::from(11);
-        let mut materials = Assets::<StandardMaterial>::default();
-        let base = materials.add(StandardMaterial::default());
-        let highlight = materials.add(StandardMaterial::default());
-        let section = materials.add(section_material());
         let mut app = test_app();
-        app.insert_resource(SectionMaterial(section.clone()))
+        app.init_asset::<StandardMaterial>()
+            .init_asset::<crate::e3d_look::material::SglLookMaterial>()
+            .init_resource::<crate::look_materials::LookMaterials>()
+            .insert_resource(crate::e3d_look::env_cube::SglEnvCube(None))
             .insert_resource(crate::InvalidTubiLineStateMaterials {
                 highlight: Handle::default(),
                 xray: Handle::default(),
             })
-            .add_systems(Update, crate::apply_selection.after(advance_room_clip));
+            .add_systems(Update, crate::apply_materials.after(advance_room_clip));
+        // PBR 外观：材质是 StandardMaterial，断口的剖切色也是，一把尺子量到底。
+        app.world_mut().resource_mut::<View3d>().look.mode = plant_ui::LookMode::Pbr;
+        let section = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(section_material());
+        app.insert_resource(SectionMaterial(section.clone()));
         let cylinder = add_mesh(&mut app, cylinder_v3());
         activate(&mut app, vec![l_room()], &[bran], true);
         let root = tube_root(Vec3::new(1800.0, 500.0, 500.0), Vec3::new(500.0, 1800.0, 500.0));
@@ -1490,13 +1493,12 @@ mod tests {
             .world_mut()
             .spawn((
                 Mesh3d(cylinder),
-                MeshMaterial3d(base.clone()),
                 Transform::IDENTITY,
                 ModelMesh {
                     refno: bran,
                     owner: bran,
-                    base: base.clone(),
-                    highlight: highlight.clone(),
+                    colour: [250, 250, 30, 255],
+                    line: false,
                 },
                 ModelPickTarget { refno: bran },
                 TubeBody::solid(Transform::IDENTITY, root),
@@ -1506,15 +1508,6 @@ mod tests {
         app.update();
         app.update();
         assert_eq!(extras(&mut app), (1, 2), "凹房里一段直段得两截、两片断口");
-
-        {
-            let mut view = app.world_mut().resource_mut::<View3d>();
-            view.selected.insert(bran);
-            view.selection_dirty = true;
-        }
-        app.update();
-
-        let world = app.world_mut();
         let material_of = |world: &World, entity: Entity| {
             world
                 .entity(entity)
@@ -1523,7 +1516,24 @@ mod tests {
                 .0
                 .clone()
         };
-        assert_eq!(material_of(world, tube), highlight);
+        let base = material_of(app.world(), tube);
+        {
+            let world = app.world_mut();
+            let mut pieces = world.query_filtered::<Entity, (With<TubeExtra>, With<ModelMesh>)>();
+            let pieces: Vec<Entity> = pieces.iter(world).collect();
+            assert_eq!(pieces.len(), 1);
+            assert_eq!(material_of(world, pieces[0]), base, "兄弟段出生就拿到与保留段同一枚常态材质");
+        }
+
+        {
+            let mut view = app.world_mut().resource_mut::<View3d>();
+            view.set_selection(vec![bran], Some(bran));
+        }
+        app.update();
+
+        let world = app.world_mut();
+        let highlight = material_of(world, tube);
+        assert_ne!(highlight, base, "选中换成高亮材质");
         let mut pieces = world.query_filtered::<Entity, (With<TubeExtra>, With<ModelMesh>)>();
         let pieces: Vec<Entity> = pieces.iter(world).collect();
         assert_eq!(pieces.len(), 1);

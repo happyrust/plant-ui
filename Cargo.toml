@@ -30,9 +30,11 @@ aios_core = { path = "vendor/rs-core", default-features = false, features = ["re
 plant-mbd = { path = "../vendor/plant-mbd/crates/plant-mbd" }
 
 # 三维那一半的地基。特性列表照抄 rs-plant3-d，换列表要连带核对 e3d_plugin 的用法。
+# `bevy_anti_aliasing`：E3D 外观的 FXAA 备选（E3D 外观移植计划阶段三）；vendor 与 lock 里本来就有，不新增下载。
 bevy = { git = "https://gitee.com/happydpc/bevy", default-features = false, features = [
     "std", "bevy_winit", "bevy_asset", "bevy_render", "bevy_core_pipeline",
     "bevy_pbr", "bevy_picking", "bevy_mesh_picking_backend", "png", "webgl2",
+    "bevy_anti_aliasing",
 ] }
 # egui 0.35 + Bevy 0.16 脱离上游支持矩阵，所以以可编辑源码树进 vendor（计划书 M3-1）
 # `manage_clipboard`：两端的复制粘贴。原生走 arboard；浏览器靠 copy/cut/paste 事件
@@ -68,6 +70,7 @@ futures = { version = "0.3", default-features = false, features = ["std", "async
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+web-sys = "0.3"
 ron = "0.8.1"
 config = "0.14.1"
 url = "2"

@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 许亲风 <1161352794@qq.com>
+Date: Sat, 24 Oct 2026 21:46:58 +0800
+Subject: [PATCH] bevy_core_pipeline: only queue the tonemapping pipeline for
+ HDR views
+
+`prepare_view_tonemapping_pipelines` specialized a pipeline that targets
+`ViewTarget::TEXTURE_FORMAT_HDR` (Rgba16Float) for every view, including
+the non-HDR views that `TonemappingNode` skips anyway. `PipelineCache`
+compiles queued pipelines eagerly, so on a WebGL2 device without
+`EXT_color_buffer_float` that pipeline fails validation ("Format
+Rgba16Float is not renderable") and the app panics before its first
+frame.
+
+Skip non-HDR views. `ViewNodeRunner` already treats a missing
+`ViewTonemappingPipeline` component as "nothing to run for this view".
+
+Carried as a local patch in plant-ui's vendor/registry since 2026-10-24
+(see vendor/patches/README.md there); base commit 9d8f7921.
+---
+ crates/bevy_core_pipeline/src/tonemapping/mod.rs | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/crates/bevy_core_pipeline/src/tonemapping/mod.rs b/crates/bevy_core_pipeline/src/tonemapping/mod.rs
+--- a/crates/bevy_core_pipeline/src/tonemapping/mod.rs
++++ b/crates/bevy_core_pipeline/src/tonemapping/mod.rs
+@@ -343,6 +343,13 @@ pub fn prepare_view_tonemapping_pipelines(
+     >,
+ ) {
+     for (entity, view, tonemapping, dither) in view_targets.iter() {
++        // The pipeline always targets `ViewTarget::TEXTURE_FORMAT_HDR` and `TonemappingNode`
++        // skips non-HDR views, so only queue it for HDR views: queued pipelines compile eagerly,
++        // and on devices where `Rgba16Float` is not renderable (WebGL2 without
++        // `EXT_color_buffer_float`) that compile fails validation and panics before the first frame.
++        if !view.hdr {
++            continue;
++        }
+         // As an optimization, we omit parts of the shader that are unneeded.
+         let mut flags = TonemappingPipelineKeyFlags::empty();
+         flags.set(
+-- 
+2.47.0
+

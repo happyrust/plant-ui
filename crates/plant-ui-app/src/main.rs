@@ -1,5 +1,7 @@
 //! plant-ui-app：Bevy 宿主（bevy_egui35 + plant-ui + plant-ui-data）。
-//! 默认进入主工作台 S1；`--gallery` 进入 M0 组件画廊。
+//! 默认进入主工作台 S1；`--gallery` 进入 M0 组件画廊；`--look-demo`（浏览器端 `?look_demo=1`；debug 构建或
+//! `look-demo` feature）在主工作台里摆一座
+//! 演示厂，不要后端也能看三维外观（E3D 外观移植计划）。
 
 mod command;
 mod data;
@@ -113,6 +115,16 @@ pub fn start(canvas: String, config_json: String) -> Result<(), wasm_bindgen::Js
     if config.auto_gen_mesh {
         console_warn("旧配置的 auto_gen_mesh 由模型服务负责，客户端不会在本地生成 mesh");
     }
+    // 三维外观：站点默认（config.json 的 look 段）打底，地址栏 `?look=…` 压一层、只活到刷新
+    //（E3D 外观移植计划阶段四；浏览器端没有 settings.ron）。
+    let query = web_sys::window()
+        .and_then(|window| window.location().search().ok())
+        .unwrap_or_default();
+    let look = config
+        .look
+        .then(plant_ui::ViewportLookOverrides::from_query(&query))
+        .apply(plant_ui::ViewportLook::default());
+    settings_store::set_browser_look(look);
     run(&canvas, "assets".into());
     Ok(())
 }
@@ -372,6 +384,12 @@ fn run(canvas: &str, asset_root: String) {
                 file_path: asset_root,
                 meta_check: AssetMetaCheck::Never,
                 ..Default::default()
+            })
+            // E3D 外观（阶段二）：`StandardMaterial` 的辅助几何（网格 / 三轴 / 断口 / 标注线）不进 prepass，
+            // 在边线 / 伪阴影里等于 E3D 的 handles 全关；PBR 外观本来就不跑 prepass，不受影响。
+            .set(bevy::pbr::PbrPlugin {
+                prepass_enabled: false,
+                ..Default::default()
             }),
     )
     .add_plugins(bevy_wasm_tasks::TasksPlugin::default())
@@ -389,7 +407,39 @@ fn run(canvas: &str, asset_root: String) {
                 .before(EguiPostUpdateSet::ProcessOutput),
         ),
     );
+    // `--look-demo`（桌面）/ `?look_demo=1`（浏览器）：E3D 外观移植计划的演示厂，不要后端也能看三维外观。
+    // debug 构建总带着，release 构建要开 `look-demo` feature。
+    #[cfg(any(debug_assertions, feature = "look-demo"))]
+    if look_demo_requested() {
+        app.insert_resource(plant_ui_view3d::e3d_look::demo::LookDemo);
+    }
     app.run();
+}
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(debug_assertions, feature = "look-demo")
+))]
+fn look_demo_requested() -> bool {
+    std::env::args().any(|a| a == "--look-demo")
+}
+
+/// 浏览器端看页面地址的查询串：`?look_demo=1`（可与别的参数并列）。
+#[cfg(all(target_arch = "wasm32", any(debug_assertions, feature = "look-demo")))]
+fn look_demo_requested() -> bool {
+    web_sys::window()
+        .and_then(|window| window.location().search().ok())
+        .is_some_and(|search| {
+            search
+                .trim_start_matches('?')
+                .split('&')
+                .any(|pair| pair == "look_demo=1")
+        })
+}
+
+/// 绘制层要的渲染目标尺寸是不是真的装得进窗口（物理像素）。窗口尺寸还不知道就放行。
+fn viewport_fits_window(size: [u32; 2], window_px: Option<bevy::prelude::UVec2>) -> bool {
+    window_px.is_none_or(|window| size[0] <= window.x && size[1] <= window.y)
 }
 
 fn setup_ui_camera(mut commands: Commands, mut egui: ResMut<EguiGlobalSettings>) {
@@ -524,6 +574,7 @@ fn show_app(
     mut app: bevy::prelude::Local<Option<App>>,
     mut view3d: bevy::prelude::ResMut<plant_ui_view3d::View3d>,
     tasks: bevy_wasm_tasks::Tasks,
+    windows: bevy::prelude::Query<&Window, bevy::prelude::With<bevy::window::PrimaryWindow>>,
 ) -> bevy::prelude::Result {
     let ctx = contexts.ctx_mut()?;
     let first_frame = app.is_none();
@@ -560,6 +611,11 @@ fn show_app(
     }
     // 房间视图的截断回执（直段截断计划 M4）：视口上一拍的进度抄给 HUD。
     app.sync_room_clip(view3d.room_clip_status());
+    // 边线 / 伪阴影在这台设备上跑不了（WebGL2 缺半浮点颜色附件）时，设置窗那两格灰掉并说明原因；设置值照存。
+    app.settings_state.post_effects_lock = (!view3d.post_effects_supported()).then(|| {
+        "这台设备的渲染器没有半浮点颜色附件（WebGL2 缺 EXT_color_buffer_float），边线 / 伪阴影在这里不生效；设置照存，换台机器就有"
+            .to_owned()
+    });
     // 导航历史抄的相机：这一帧的位姿，与下面 `camera_rot` 同拍。
     app.camera_pose = Some(view3d.camera_pose);
     app.vm.view3d = Some(View3dVm {
@@ -578,6 +634,8 @@ fn show_app(
                 text: text.to_owned(),
             })
             .collect(),
+        // 视口底色跟着视口此刻生效的外观走（E3D 外观移植计划）：纹理空白处透明，底色由绘制层画。
+        background: look_background(view3d.look()),
     });
     let size = ctx.content_rect().size();
     egui::Area::new("plant-workbench".into())
@@ -588,7 +646,8 @@ fn show_app(
             ui.set_max_size(size);
             app.ui(ui);
         });
-    view3d.set_selection(app.vm.selection.to_vec());
+    // 主选中一并下发：E3D 外观把它染 CE 黄，其余选中染 highlight 白。
+    view3d.set_selection(app.vm.selection.to_vec(), app.vm.selection.primary());
     if let Some(models) = app.pending_models.take() {
         view3d.load(models);
     }
@@ -611,16 +670,24 @@ fn show_app(
             RoomVolumeUpdate::Clear => view3d.clear_room_volume(),
         }
     }
+    let window_px = windows.single().ok().map(|window| window.physical_size());
     let mut retried = 0;
     for command in app.view3d_commands.drain(..) {
         match command {
             Cmd::PickViewport(uv) => view3d.pick(uv),
             Cmd::Camera(gesture) => view3d.camera(gesture),
             Cmd::Model(action) => view3d.model(action),
-            Cmd::ResizeViewport(size) => view3d.resize(size),
+            // 视口不可能比窗口大：比窗口还大的请求来自 egui 还没拿到真窗口尺寸的头几帧（浏览器里按缺省的
+            // 10000×10000 布局），按它建图会要一张六七千像素见方的渲染目标（超采样再翻倍），WebGL2 分不出来还丢上下文。
+            Cmd::ResizeViewport(size) => {
+                if viewport_fits_window(size, window_px) {
+                    view3d.resize(size);
+                }
+            }
             Cmd::SetViewportBackground { top, bottom, grid } => {
                 view3d.set_background(top, bottom, grid)
             }
+            Cmd::SetViewportLook(look) => view3d.set_look(look),
             Cmd::SnapView { forward, up, fit } => view3d.snap(forward, up, fit),
             Cmd::RestoreCamera(pose) => view3d.restore_camera(pose),
             Cmd::RetryFailedMeshes => retried = view3d.retry_failed_meshes(),
@@ -1317,9 +1384,29 @@ struct App {
     /// 上一次发给三维视口的主题配色。视口的渐变背景画在宿主侧（拷问定案第 2 题），
     /// 主题一换就要把新颜色送下去；对着这份留底比对，别把同一套颜色每帧发一遍。
     sent_viewport_bg: Option<(egui::Color32, egui::Color32, egui::Color32)>,
+    /// 上一次发给三维视口的外观（E3D 外观移植计划）。与 `sent_viewport_bg` 同一条房规：对着已存设置比对，
+    /// 变了才发一整份；设置的写入口不止设置窗一处（恢复默认值、将来的 URL 覆盖），这里只认结果。
+    sent_look: Option<plant_ui::ViewportLook>,
 }
 
 const COMMAND_CAP: usize = 2000;
+
+/// E3D 外观的视口底色（grey→白，渐变关是纯 grey）；PBR 外观还是跟主题，给 `None`。
+/// 颜色由 view3d 的 `e3d_look::presets` 算（字节域，159 / 242），这里只换成 egui 的 `Color32`。
+fn look_background(look: plant_ui::ViewportLook) -> Option<(egui::Color32, egui::Color32)> {
+    use bevy::color::ColorToPacked;
+    match look.mode {
+        plant_ui::LookMode::Pbr => None,
+        plant_ui::LookMode::E3d => {
+            let (top, bottom) = plant_ui_view3d::e3d_look::presets::e3d_background(look.gradient);
+            let to_color32 = |colour: bevy::prelude::Color| {
+                let [r, g, b, _] = colour.to_srgba().to_u8_array();
+                egui::Color32::from_rgb(r, g, b)
+            };
+            Some((to_color32(top), to_color32(bottom)))
+        }
+    }
+}
 
 /// 子串有命中时留给前缀那一段的行数上限（ADR-0023 决定 7）。总行数仍是
 /// `data::SEARCH_LIMIT`，余下的补给子串——不切一刀的话前缀一满 20 条，
@@ -2106,9 +2193,13 @@ impl App {
             .map(|startup| startup.settings.clone())
             .unwrap_or_default();
         if startup.is_none() {
-            // 宿主没交底（浏览器端）：服务地址仍旧由 `base_url()` 那条链解出来。
+            // 宿主没交底（浏览器端）：服务地址仍旧由 `base_url()` 那条链解出来；三维外观由 `start()` 按站点
+            // 默认 + 地址栏覆盖算好交底，没交就是出厂位。
             adopted.model_api_url = model_update_api::base_url();
             adopted.data_api_url = data_publish_api::base_url();
+            if let Some(look) = settings_store::browser_look() {
+                adopted.look = look;
+            }
         }
         let model_api_url = adopted.model_api_url.clone();
         let data_api_url = adopted.data_api_url.clone();
@@ -2227,6 +2318,7 @@ impl App {
             mesh_dir_pick: None,
             font_weights_pending,
             sent_viewport_bg: None,
+            sent_look: None,
         };
         // 队列的明细通道进程一起来就开：队列是常驻视图，不像向导那样跟着某一次
         // 运行开合。连不上不影响队列行本身——那些走轮询，断的只是逐单元明细。
@@ -4255,6 +4347,7 @@ impl App {
                 | Cmd::Camera(_)
                 | Cmd::ResizeViewport(_)
                 | Cmd::SetViewportBackground { .. }
+                | Cmd::SetViewportLook(_)
                 | Cmd::SnapView { .. }
                 | Cmd::RestoreCamera(_)
                 | Cmd::RetryFailedMeshes) => self.view3d_commands.push(command),
@@ -6571,7 +6664,7 @@ mod tests {
         refresh_anchor, regenerate_label, reload_snapshot, resolve_panel_room_reply,
         restore_model_reload, scope_not_generated, settle_pending_directions,
         settle_refresh_generation, settled_pending_roots, sync_ime_window, take_hidden_for_replay,
-        task_matches_project, task_queue, tree_label,
+        task_matches_project, task_queue, tree_label, viewport_fits_window,
     };
     // 房间视图 · 直段截断（2026-09-29 计划 M4）的纯函数与编排账。
     use super::{
@@ -6582,6 +6675,30 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use plant_ui::model_update::PendingModelUnit;
     use std::collections::{HashMap, HashSet};
+
+    /// 浏览器里 egui 头几帧按缺省的 10000×10000 布局，绘制层会要一张比窗口还大的渲染目标；这种请求不交给视口，
+    /// 等真尺寸。窗口尺寸还没有时不拦。
+    #[test]
+    fn only_viewport_sizes_that_fit_the_window_reach_the_viewport() {
+        let window = Some(bevy::prelude::UVec2::new(2379, 1325));
+        assert!(viewport_fits_window([1463, 767], window));
+        assert!(
+            viewport_fits_window([2379, 1325], window),
+            "正好占满也算装得下"
+        );
+        assert!(
+            !viewport_fits_window([6154, 6839], window),
+            "缺省布局的虚尺寸"
+        );
+        assert!(
+            !viewport_fits_window([2400, 1500], window),
+            "按起始分辨率而不是真窗口算的那一帧"
+        );
+        assert!(
+            viewport_fits_window([6154, 6839], None),
+            "没有窗口尺寸就放行"
+        );
+    }
 
     fn ime_output(cursor: egui::Rect) -> egui::output::IMEOutput {
         egui::output::IMEOutput {
@@ -8981,6 +9098,21 @@ impl App {
                 bottom: t.viewport_bottom,
                 grid: t.viewport_grid,
             });
+        }
+        // 同理把三维外观送下去：首帧一次，之后只在已存设置变了时发（设置窗「保存」落到 saved 的那一帧）。
+        let look = self.settings_state.saved.look;
+        if self.sent_look != Some(look) {
+            // 首次启动说一句：默认已经不是老的 PBR 画面了，知道去哪切回。这台设备跑不了边线 / 伪阴影时不说有。
+            if self.sent_look.is_none() && look.mode == plant_ui::LookMode::E3d {
+                let message = if self.settings_state.post_effects_lock.is_some() {
+                    "三维外观已切为 E3D 出厂口径（lightgrey；边线 / 伪阴影 / 超采样在这台设备上不可用，原因见设置 → 渲染外观）；那里也可切回 web PBR"
+                } else {
+                    "三维外观已切为 E3D 出厂口径（lightgrey、边线、伪阴影、2×2 超采样）；设置 → 渲染外观 可切回 web PBR"
+                };
+                self.logs.info(&mut self.vm.logs, message);
+            }
+            self.sent_look = Some(look);
+            self.view3d_commands.push(Cmd::SetViewportLook(look));
         }
         let mut cmds = workbench::show(ui, &t, d, &self.vm, &self.queue, &mut self.state);
         cmds.extend(data_publish::show(

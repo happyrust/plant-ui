@@ -125,8 +125,14 @@ fn non_empty(selection: &Selection) -> Option<Vec<RefU64>> {
 
 pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Vec<Cmd>) {
     let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
-    ui.painter()
-        .add(gradient(rect, t.viewport_top, t.viewport_bottom));
+    // 底色：渲染纹理的空白处是透明的，这层渐变就是视口的背景。E3D 外观有自己的配色（grey→白），
+    // 宿主算好放在 `background` 里；没有就跟主题。
+    let (top, bottom) = vm
+        .view3d
+        .as_ref()
+        .and_then(|view| view.background)
+        .unwrap_or((t.viewport_top, t.viewport_bottom));
+    ui.painter().add(gradient(rect, top, bottom));
 
     let Some(view) = vm.view3d.as_ref() else {
         note(ui, t, d, rect);
@@ -795,6 +801,8 @@ mod tests {
                 axis_labels: [None; 3],
                 grid_cell_mm: 1_000.0,
                 dimension_labels: Vec::new(),
+                hole_labels: Vec::new(),
+                background: None,
             }),
             ..Default::default()
         }

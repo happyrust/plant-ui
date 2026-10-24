@@ -5,6 +5,7 @@ use egui::{Align, ComboBox, Layout, RichText, TextEdit};
 use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Tokens};
 use crate::style::widgets;
+use crate::{AntiAlias, ColourScheme, LookMode, LookPreset, ViewportLook};
 
 /// 模型服务地址的出厂默认。
 ///
@@ -17,6 +18,13 @@ pub const DEFAULT_DATA_API_URL: &str = "http://127.0.0.1:9099";
 
 /// 浏览器端那一行为什么是灰的。按住不放才看得到，所以话要说全。
 const WEB_MESH_DIR_HINT: &str = "浏览器端的网格与字体贴图一样由站点供给，不读本地目录";
+
+/// E3D 外观的边线 / 伪阴影（计划阶段二）与抗锯齿（阶段三）都已落地。开关留着：哪一样在某个端（如阶段四的
+/// WebGL2 降级）还不可用，翻成 false 就把那格灰掉并悬停说明；设置里的值照存照发。
+const POST_EFFECTS_AVAILABLE: bool = true;
+const ANTI_ALIAS_AVAILABLE: bool = true;
+const PENDING_HINT: &str =
+    "这一格的实现还在路上（见 docs/plans/2026-10-22-e3d-look-port-plannotator.md），落地前不生效";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Theme {
@@ -113,6 +121,9 @@ pub struct Settings {
     /// 没这一格按出厂值。开关只在房间视图的 HUD 上，设置窗不另摆一行；「恢复默认值」会把它一起
     /// 恢复。
     pub room_view_truncate_tubes: bool,
+    /// 三维视口外观（E3D 外观移植计划）。出厂 = E3D 外观 + 出厂 E3D 3.1 预设；老 `settings.ron`
+    /// 没这一格就是出厂值，于是老用户升级即切到 E3D 外观，设置窗一键切回 PBR。随本文件按机器落盘。
+    pub look: ViewportLook,
 }
 
 impl Default for Settings {
@@ -126,6 +137,7 @@ impl Default for Settings {
             mesh_dir: String::new(),
             tree_full_names: false,
             room_view_truncate_tubes: true,
+            look: ViewportLook::default(),
         }
     }
 }
@@ -139,6 +151,9 @@ pub struct State {
     /// 供数模式那一格为什么改不了。`Some` = 环境变量压过了设置（`PLANT_READ_FACE` 在场，
     /// 计划 D11）：下拉灰掉、悬停与右下小字都说这一句。宿主填，绘制层不读环境变量。
     pub read_face_lock: Option<String>,
+    /// 边线 / 伪阴影在这台设备上为什么不可用（E3D 外观移植计划阶段四）。`Some` = 渲染器说没有半浮点颜色附件
+    /// （WebGL2 缺 `EXT_color_buffer_float`）：两格灰掉、悬停说这一句；设置里的值照存照发，换台机器就生效。宿主填。
+    pub post_effects_lock: Option<String>,
     draft: Settings,
     mesh_dir_status: MeshDirStatus,
     browse_requested: bool,
@@ -273,6 +288,10 @@ pub fn show(ctx: &egui::Context, t: &Tokens, d: Density, state: &mut State) -> O
             );
 
             ui.add_space(12.0);
+            ui.label(RichText::new("渲染外观").strong().color(t.text_secondary));
+            look_rows(ui, t, d, &mut state.draft.look, state.post_effects_lock.as_deref());
+
+            ui.add_space(12.0);
             ui.label(RichText::new("资产").strong().color(t.text_secondary));
             // 浏览器端整行不适用：禁用而不是隐藏，两端的设置窗才长得一样
             // （与模型树菜单里「取回工作」同一条房规）。
@@ -379,6 +398,161 @@ pub fn show(ctx: &egui::Context, t: &Tokens, d: Density, state: &mut State) -> O
         return Some(state.saved.clone());
     }
     None
+}
+
+/// 「渲染外观」一节（E3D 外观移植计划）：外观 / 预设 / 元素配色 / 三个效果开关 / 抗锯齿 /
+/// 「恢复预设出厂位」。除「三维外观」外整节只在 E3D 外观下可用：PBR 外观没有预设也没有这些效果，
+/// 灰掉而不藏起来，人才看得见切过去会多出什么。
+fn look_rows(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    d: Density,
+    look: &mut ViewportLook,
+    post_effects_lock: Option<&str>,
+) {
+    // 边线 / 伪阴影：没落地或这台设备不支持都灰掉，悬停说清是哪一种。
+    let effects_ok = POST_EFFECTS_AVAILABLE && post_effects_lock.is_none();
+    let effects_hint = post_effects_lock.unwrap_or(PENDING_HINT);
+    setting_row(
+        ui,
+        t,
+        "三维外观",
+        "E3D 外观复刻 AVEVA E3D 3.1 的显示效果（头灯着色 + 环境反射 + 边线 + 伪阴影）；web PBR 是之前的视口",
+        |ui| {
+            widgets::segmented(
+                ui,
+                t,
+                d,
+                &mut look.mode,
+                &[(LookMode::E3d, "E3D 外观"), (LookMode::Pbr, "web PBR")],
+            );
+        },
+    );
+    let e3d = look.mode == LookMode::E3d;
+    let preset_detail = look.preset.description();
+    setting_row(ui, t, "E3D 预设", preset_detail, |ui| {
+        ui.add_enabled_ui(e3d, |ui| {
+            let mut preset = look.preset;
+            let changed = widgets::segmented(
+                ui,
+                t,
+                d,
+                &mut preset,
+                &[
+                    (LookPreset::E3d31Factory, LookPreset::E3d31Factory.label()),
+                    (LookPreset::SglMachine, LookPreset::SglMachine.label()),
+                ],
+            );
+            if changed {
+                look.apply_preset(preset);
+            }
+        });
+    });
+    setting_row(
+        ui,
+        t,
+        "元素配色",
+        "E3D 出厂把所有元素画成一色 lightgrey；按类型是之前的管道黄 / 结构蓝…，只换光照与后处理",
+        |ui| {
+            ui.add_enabled_ui(e3d, |ui| {
+                widgets::segmented(
+                    ui,
+                    t,
+                    d,
+                    &mut look.colour_scheme,
+                    &[
+                        (ColourScheme::E3dFactory, "E3D 出厂"),
+                        (ColourScheme::ByType, "按类型"),
+                    ],
+                );
+            });
+        },
+    );
+    setting_row(
+        ui,
+        t,
+        "边线",
+        "EnhancedEdges：按法线 / 深度差判边并去杂，黑色轮廓线",
+        |ui| {
+            let response =
+                ui.add_enabled(e3d && effects_ok, egui::Checkbox::new(&mut look.hlr, ""));
+            if e3d {
+                response.on_disabled_hover_text(effects_hint);
+            }
+        },
+    );
+    setting_row(
+        ui,
+        t,
+        "伪阴影",
+        "PseudoShadows：HBAO 环境光遮蔽 + 深度感知模糊，接触面 / 管口发暗",
+        |ui| {
+            let response = ui.add_enabled(e3d && effects_ok, egui::Checkbox::new(&mut look.ao, ""));
+            if e3d {
+                response.on_disabled_hover_text(effects_hint);
+            }
+        },
+    );
+    setting_row(
+        ui,
+        t,
+        "背景渐变",
+        "BackgroundGradient：背景色 grey 在上 → 端色白在下的纵向渐变；关掉是纯 grey",
+        |ui| {
+            ui.add_enabled(e3d, egui::Checkbox::new(&mut look.gradient, ""));
+        },
+    );
+    setting_row(
+        ui,
+        t,
+        "抗锯齿",
+        "E3D 出厂是 4× MSAA；这里用整帧 2×2 超采样代替（颜色与边线都是 4 样本平均），FXAA 更便宜",
+        |ui| {
+            let response = ui
+                .add_enabled_ui(e3d && ANTI_ALIAS_AVAILABLE, |ui| {
+                    widgets::segmented(
+                        ui,
+                        t,
+                        d,
+                        &mut look.aa,
+                        &[
+                            (AntiAlias::Ssaa2x2, "2×2 超采样"),
+                            (AntiAlias::Fxaa, "FXAA"),
+                            (AntiAlias::Off, "关"),
+                        ],
+                    );
+                })
+                .response;
+            if e3d {
+                response.on_disabled_hover_text(PENDING_HINT);
+            }
+        },
+    );
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let reset = ui.add_enabled(
+                e3d && look.is_modified_from_preset(),
+                widgets::button(t, d, "恢复预设出厂位"),
+            );
+            if reset.clicked() {
+                look.apply_preset(look.preset);
+            }
+            if e3d && look.is_modified_from_preset() {
+                ui.label(
+                    RichText::new("子开关已偏离预设出厂位")
+                        .small()
+                        .color(t.text_muted),
+                );
+            }
+        });
+    });
+    // 浏览器端没有 settings.ron：这里改的只活到刷新，站点默认与地址栏覆盖在别处（E3D 外观移植计划阶段四）。
+    if cfg!(target_arch = "wasm32") {
+        const WEB_LOOK_HINT: &str = "浏览器端不落盘：这里改的只活到刷新。站点默认写在 config.json 的 look 段，地址栏 ?look=pbr、?look_hlr=0 这类参数只覆盖本次。";
+        ui.add_space(4.0);
+        ui.label(RichText::new(WEB_LOOK_HINT).small().color(t.text_muted));
+    }
 }
 
 /// 校验结论那一行的文案与颜色；没什么可说的时候不画。
@@ -641,7 +815,8 @@ mod tests {
     }
 
     /// `PLANT_READ_FACE` 在场时下拉灰掉（计划 D11）：改了也不生效的格子不能看着像能改。
-    /// 没锁时整窗一个灰控件都没有——网格目录那一行只在浏览器端灰，本机测试不在那一侧。
+    /// 没锁时这一行不贡献灰控件——网格目录那一行只在浏览器端灰，本机测试不在那一侧；「渲染外观」里
+    /// 还没落地的格子有自己的灰（见 `pending_look_widgets_are_the_only_grey_ones`），所以这里比的是增量。
     ///
     /// 每一态都多转几帧再数：窗口头一帧是量尺寸的那一遍，egui 把整窗控件都标成灰的，
     /// 那一帧数出来的不是设置窗的意思。
@@ -653,18 +828,82 @@ mod tests {
         for _ in 0..3 {
             one_frame(&ctx, &mut state);
         }
-        assert_eq!(disabled_widgets(&ctx), 0, "没被压过时不该有灰掉的控件");
+        let baseline = disabled_widgets(&ctx);
 
         state.read_face_lock = Some(READ_FACE_LOCK.to_owned());
         for _ in 0..3 {
             one_frame(&ctx, &mut state);
         }
-        assert!(disabled_widgets(&ctx) > 0, "被压过时供数模式下拉该是灰的");
+        assert!(
+            disabled_widgets(&ctx) > baseline,
+            "被压过时供数模式下拉该是灰的"
+        );
 
         state.read_face_lock = None;
         for _ in 0..3 {
             one_frame(&ctx, &mut state);
         }
-        assert_eq!(disabled_widgets(&ctx), 0, "锁一撤，下拉就该能改");
+        assert_eq!(disabled_widgets(&ctx), baseline, "锁一撤，下拉就该能改");
+    }
+
+    /// 「渲染外观」里还没落地的格子（边线 / 伪阴影 / 抗锯齿）是默认态下**仅有**的灰控件；两个
+    /// `*_AVAILABLE` 常量都翻成 true 那天，这里就该是 0——没有别的东西有资格在这张窗里灰着。
+    /// 切到 web PBR 后整节（预设 / 配色 / 渐变 / 恢复按钮）跟着灰，灰控件只多不少。
+    #[test]
+    fn pending_look_widgets_are_the_only_grey_ones() {
+        let ctx = egui::Context::default();
+        let mut state = State::default();
+        state.open();
+        for _ in 0..3 {
+            one_frame(&ctx, &mut state);
+        }
+        let pending = disabled_widgets(&ctx);
+        if POST_EFFECTS_AVAILABLE && ANTI_ALIAS_AVAILABLE {
+            // 出厂位上唯一有资格灰着的是「恢复预设出厂位」（没什么可恢复）；把外观拨离出厂位它就亮了，
+            // 这张窗里再没有别的东西该灰。
+            assert_eq!(pending, 1, "出厂位上只有「恢复预设出厂位」一个灰控件");
+            state.draft.look.hlr = false;
+            for _ in 0..3 {
+                one_frame(&ctx, &mut state);
+            }
+            assert_eq!(disabled_widgets(&ctx), 0, "全部落地后不该有灰控件");
+            state.draft.look.hlr = true;
+        } else {
+            assert!(pending > 0, "还没落地的格子该灰着，而不是看着像能改");
+        }
+
+        state.draft.look.mode = LookMode::Pbr;
+        for _ in 0..3 {
+            one_frame(&ctx, &mut state);
+        }
+        assert!(
+            disabled_widgets(&ctx) > pending,
+            "web PBR 下 E3D 预设这一节该整体灰掉"
+        );
+    }
+
+    /// 渲染器说这台设备没有半浮点颜色附件：边线 / 伪阴影两格灰掉，其它格照旧；锁撤了就亮回来。
+    #[test]
+    fn a_device_without_float_targets_greys_the_two_effect_rows() {
+        let ctx = egui::Context::default();
+        let mut state = State::default();
+        state.open();
+        state.draft.look.hlr = false;
+        for _ in 0..3 {
+            one_frame(&ctx, &mut state);
+        }
+        let baseline = disabled_widgets(&ctx);
+
+        state.post_effects_lock = Some("这台设备没有半浮点颜色附件".to_owned());
+        for _ in 0..3 {
+            one_frame(&ctx, &mut state);
+        }
+        assert_eq!(disabled_widgets(&ctx), baseline + 2, "边线与伪阴影两格灰掉");
+
+        state.post_effects_lock = None;
+        for _ in 0..3 {
+            one_frame(&ctx, &mut state);
+        }
+        assert_eq!(disabled_widgets(&ctx), baseline);
     }
 }

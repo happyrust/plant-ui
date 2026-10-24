@@ -38,16 +38,21 @@
             throw new Error(`config.json: HTTP ${currentResponse.status}`);
           }
           const current = currentResponse.ok ? await currentResponse.json() : {};
-          const configuredModelUrl = current.model_api_url?.trim();
+          // 后端访问地址只认 e3d.project.ron 的 api_host（db_host 在 WASM 侧同样取自 ron）；
+          // config.json 的 URL 与 window.location.origin 一律不兜底——现场要改地址就改 ron。
+          const ron = await legacyResponse.text();
+          const apiHost = /api_host\s*:\s*"([^"]*)"/.exec(ron)?.[1]?.trim();
+          if (!apiHost) {
+            throw new Error("e3d.project.ron: api_host 缺失或为空");
+          }
           return {
-            legacy_project_ron: await legacyResponse.text(),
-            model_api_url:
-              configuredModelUrl && configuredModelUrl !== "http://127.0.0.1:8022"
-                ? configuredModelUrl
-                : window.location.origin,
-            data_api_url: current.data_api_url?.trim() || window.location.origin,
+            legacy_project_ron: ron,
+            model_api_url: apiHost,
+            data_api_url: apiHost,
             username: current.db?.username || "",
             password: current.db?.password || "",
+            // 三维外观的站点默认（可选，字段同 ViewportLook，可只给一部分）；地址栏 ?look=… 再压一层。
+            look: current.look,
           };
         }
         if (legacyResponse.status !== 404) {

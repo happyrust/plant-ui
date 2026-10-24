@@ -343,6 +343,14 @@ pub fn prepare_view_tonemapping_pipelines(
     >,
 ) {
     for (entity, view, tonemapping, dither) in view_targets.iter() {
+        // plant-ui local patch: the tonemapping pipeline always targets `ViewTarget::TEXTURE_FORMAT_HDR`
+        // (Rgba16Float) and `TonemappingNode` skips non-HDR views anyway, so only queue it for HDR views.
+        // Queueing it unconditionally compiles it eagerly, and on a WebGL2 device without
+        // `EXT_color_buffer_float` that fails validation ("Format Rgba16Float is not renderable") and
+        // panics before the first frame. Upstream fork: happydpc/bevy — carry this over when re-vendoring.
+        if !view.hdr {
+            continue;
+        }
         // As an optimization, we omit parts of the shader that are unneeded.
         let mut flags = TonemappingPipelineKeyFlags::empty();
         flags.set(

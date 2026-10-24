@@ -146,6 +146,255 @@ pub enum NavStep {
     Jump(usize),
 }
 
+/// 三维视口的两套外观（E3D 外观移植计划）。
+///
+/// `Pbr` 是今天的 Bevy PBR 视口；`E3d` 复刻 AVEVA E3D 3.1 的 SGL 显示效果（前向头灯着色 +
+/// 环境立方体反射 + 边线 + 伪阴影 + 背景渐变）。它是**视口设置**：随 `settings.ron` 按机器落盘，
+/// 不进项目 bundle，不改模型数据、可见性台账与拾取。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LookMode {
+    Pbr,
+    E3d,
+}
+
+/// E3D 外观的预设：一套光照常量 + 四个子开关的出厂位，对应两台不同口径的 E3D 3.1
+///（plant3d-web `sglLookPresets.ts`，落盘字面与那边的 id 一致）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LookPreset {
+    /// 出厂 E3D 3.1：PML `gphviewopt.default()` 走完的视图——边线 / 伪阴影 / 渐变 / 4× 抗锯齿全开，
+    /// 光照 {Ka 0.7, Kd 0, Ks 0, Kr 0.8, Kse 0}（无漫反射 / 高光，体积感靠环境反射），背景 grey→白。
+    E3d31Factory,
+    /// 本机那台经修补脚本启动的 E3D 3.1（没跑 PML 视图默认）：全关，光照落在 SGL 的 C++ 默认
+    /// {0.5, 0.8, 0.3, 0.35, 64}，背景纯灰 #828282。
+    SglMachine,
+}
+
+impl LookPreset {
+    /// 设置窗里的两项，出厂默认在前。
+    pub const ALL: [Self; 2] = [Self::E3d31Factory, Self::SglMachine];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::E3d31Factory => "出厂 E3D 3.1",
+            Self::SglMachine => "本机真机",
+        }
+    }
+
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::E3d31Factory => {
+                "PML 出厂视图：边线 / 伪阴影 / 渐变 / 抗锯齿全开，0.7·颜色 + 0.8·环境反射，背景 grey→白"
+            }
+            Self::SglMachine => {
+                "未跑 PML 视图默认的真机：边线 / 伪阴影 / 渐变 / 抗锯齿全关，0.5/0.8 Blinn-Phong + 0.35 反射，背景纯灰"
+            }
+        }
+    }
+}
+
+/// E3D 外观下元素怎么着色。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColourScheme {
+    /// E3D 出厂：所有元素一色 lightgrey #bdbdbd（Design 模块 autocolour 关、Add element colour = lightgrey）。
+    E3dFactory,
+    /// 保留今天按类型的配色（管道黄、结构蓝…），只换 E3D 的光照与后处理。
+    ByType,
+}
+
+/// 抗锯齿。E3D 出厂是 4× MSAA；Bevy 的离屏视口在 WebGL2 上读不到多重采样的 prepass 纹理，
+/// 两端统一用整帧 2×2 超采样代替（颜色与边线都是 4 样本平均，结构上与 E3D 一致），FXAA 是 E3D 3.1 也有的便宜选项。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AntiAlias {
+    Off,
+    Ssaa2x2,
+    Fxaa,
+}
+
+/// 三维视口外观的全部设置，整份下发（[`Cmd::SetViewportLook`]）。老 `settings.ron` 没这些格就是出厂位。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ViewportLook {
+    pub mode: LookMode,
+    pub preset: LookPreset,
+    /// 边线（SGL_ENHANCED_EDGES：HLR 判边 + 去杂）。
+    pub hlr: bool,
+    /// 伪阴影（SGL_PSEUDO_SHADOWS：HBAO + 深度感知模糊）。
+    pub ao: bool,
+    /// 背景渐变（SGL_BACKGROUND_GRADIENT：背景色在上 → 端色白在下）。
+    pub gradient: bool,
+    pub aa: AntiAlias,
+    pub colour_scheme: ColourScheme,
+}
+
+impl Default for ViewportLook {
+    /// 出厂就是 E3D 外观 + 出厂 E3D 3.1 预设（2026-10-22 拍板）。
+    fn default() -> Self {
+        Self::for_preset(LookPreset::E3d31Factory)
+    }
+}
+
+impl ViewportLook {
+    /// 某预设的出厂位：E3D 外观、E3D 出厂配色；四个子开关照预设（出厂 E3D 3.1 全开 + 2×2 超采样，
+    /// 本机真机全关 + 无抗锯齿）。
+    pub const fn for_preset(preset: LookPreset) -> Self {
+        let on = matches!(preset, LookPreset::E3d31Factory);
+        Self {
+            mode: LookMode::E3d,
+            preset,
+            hlr: on,
+            ao: on,
+            gradient: on,
+            aa: if on {
+                AntiAlias::Ssaa2x2
+            } else {
+                AntiAlias::Off
+            },
+            colour_scheme: ColourScheme::E3dFactory,
+        }
+    }
+
+    /// 换预设：光照常量换掉，四个子开关回到该预设的出厂位；外观与元素配色不动
+    /// （同 plant3d-web `useRenderLookStore.setPreset`）。
+    pub fn apply_preset(&mut self, preset: LookPreset) {
+        let factory = Self::for_preset(preset);
+        self.preset = preset;
+        self.hlr = factory.hlr;
+        self.ao = factory.ao;
+        self.gradient = factory.gradient;
+        self.aa = factory.aa;
+    }
+
+    /// 四个子开关有没有偏离当前预设的出厂位（设置窗「恢复预设出厂位」按它亮灰）。
+    pub fn is_modified_from_preset(&self) -> bool {
+        let factory = Self::for_preset(self.preset);
+        self.hlr != factory.hlr
+            || self.ao != factory.ao
+            || self.gradient != factory.gradient
+            || self.aa != factory.aa
+    }
+
+    /// 后处理（边线 / 伪阴影）这一刻是否一样都不跑（sglDx11 的 `_legacy_mode`）。PBR 外观下恒 true。
+    pub fn effects_off(&self) -> bool {
+        self.mode == LookMode::Pbr || (!self.hlr && !self.ao)
+    }
+}
+
+/// 外观的局部覆盖：哪格给了就压哪格。浏览器端没有 `settings.ron`，站点在 `config.json` 的 `look` 段给默认
+///（字段同 [`ViewportLook`]，可以只给一部分），地址栏 `?look=…` 再压一层、只活到刷新
+///（照 plant3d-web `applyQueryOverrides`）；原生端不经过它。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default)]
+pub struct ViewportLookOverrides {
+    pub mode: Option<LookMode>,
+    pub preset: Option<LookPreset>,
+    pub hlr: Option<bool>,
+    pub ao: Option<bool>,
+    pub gradient: Option<bool>,
+    pub aa: Option<AntiAlias>,
+    pub colour_scheme: Option<ColourScheme>,
+}
+
+impl ViewportLookOverrides {
+    /// 地址栏查询串（带不带 `?` 都行）：`look=sgl|e3d|pbr`、`look_preset=factory|machine`、
+    /// `look_hlr=0|1`、`look_ao=0|1`、`look_gradient=0|1`、`look_aa=0|fxaa|ssaa`、`look_colours=e3d|type`。
+    /// 认不出的键值当没写。
+    pub fn from_query(query: &str) -> Self {
+        let mut out = Self::default();
+        for pair in query.trim_start_matches('?').split('&') {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            let value = value.trim().to_ascii_lowercase();
+            let flag = match value.as_str() {
+                "0" | "off" | "false" | "no" => Some(false),
+                "1" | "on" | "true" | "yes" => Some(true),
+                _ => None,
+            };
+            match key.trim() {
+                "look" => {
+                    out.mode = match value.as_str() {
+                        "sgl" | "e3d" => Some(LookMode::E3d),
+                        "pbr" => Some(LookMode::Pbr),
+                        _ => None,
+                    }
+                }
+                "look_preset" => {
+                    out.preset = match value.as_str() {
+                        "factory" | "e3d31_factory" => Some(LookPreset::E3d31Factory),
+                        "machine" | "sgl_machine" => Some(LookPreset::SglMachine),
+                        _ => None,
+                    }
+                }
+                "look_hlr" => out.hlr = flag,
+                "look_ao" => out.ao = flag,
+                "look_gradient" => out.gradient = flag,
+                "look_aa" => {
+                    out.aa = match value.as_str() {
+                        "0" | "off" => Some(AntiAlias::Off),
+                        "fxaa" => Some(AntiAlias::Fxaa),
+                        "ssaa" | "ssaa2x2" | "4" => Some(AntiAlias::Ssaa2x2),
+                        _ => None,
+                    }
+                }
+                "look_colours" | "look_colors" => {
+                    out.colour_scheme = match value.as_str() {
+                        "e3d" | "e3d_factory" => Some(ColourScheme::E3dFactory),
+                        "type" | "by_type" => Some(ColourScheme::ByType),
+                        _ => None,
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// 两层叠：`over` 给了的格压过 `self` 的。
+    pub fn then(self, over: Self) -> Self {
+        Self {
+            mode: over.mode.or(self.mode),
+            preset: over.preset.or(self.preset),
+            hlr: over.hlr.or(self.hlr),
+            ao: over.ao.or(self.ao),
+            gradient: over.gradient.or(self.gradient),
+            aa: over.aa.or(self.aa),
+            colour_scheme: over.colour_scheme.or(self.colour_scheme),
+        }
+    }
+
+    /// 压到一份外观上：先换预设（四个子开关回到该预设的出厂位），再逐格压上给了的值。
+    pub fn apply(&self, mut look: ViewportLook) -> ViewportLook {
+        if let Some(preset) = self.preset {
+            look.apply_preset(preset);
+        }
+        if let Some(mode) = self.mode {
+            look.mode = mode;
+        }
+        if let Some(hlr) = self.hlr {
+            look.hlr = hlr;
+        }
+        if let Some(ao) = self.ao {
+            look.ao = ao;
+        }
+        if let Some(gradient) = self.gradient {
+            look.gradient = gradient;
+        }
+        if let Some(aa) = self.aa {
+            look.aa = aa;
+        }
+        if let Some(colour_scheme) = self.colour_scheme {
+            look.colour_scheme = colour_scheme;
+        }
+        look
+    }
+}
+
 /// UI 发出的命令：独立应用直接执行，接进 Bevy 后转成 Event。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cmd {
@@ -355,6 +604,12 @@ pub enum Cmd {
         bottom: egui::Color32,
         grid: egui::Color32,
     },
+    /// 设置下发的三维视口外观（E3D 外观移植计划）：外观 / 预设 / 四个子开关 / 元素配色一次整份送下去。
+    ///
+    /// 与 [`Self::SetViewportBackground`] 同理：宿主无状态，不认识「设置」，只认结果；首帧与每次设置变更由
+    /// App 发，视口照它换材质、换背景、挂 / 摘后处理。E3D 外观下背景不再跟主题（是 E3D 的 grey→白），
+    /// 但主题色照收照记，切回 PBR 时还原。
+    SetViewportLook(ViewportLook),
     /// ViewCube 触发的一次视角跳转。
     ///
     /// `forward` / `up` 是**宿主世界系**（场景已含 PDMS Z-up → Bevy Y-up 那次旋转）
@@ -450,6 +705,98 @@ mod tests {
         assert!(
             !cmd.contains("CleanupConfirm") && !cmd.contains("RegenerateConfirm"),
             "两件事一个确认框、一条回执: {cmd}"
+        );
+    }
+
+    use super::{
+        AntiAlias, ColourScheme, LookMode, LookPreset, ViewportLook, ViewportLookOverrides,
+    };
+
+    /// 2026-10-22 拍板：默认就是 E3D 外观的出厂 E3D 3.1 预设，元素一色 lightgrey，2×2 超采样。
+    #[test]
+    fn the_default_look_is_the_e3d_factory_preset() {
+        let look = ViewportLook::default();
+        assert_eq!(look.mode, LookMode::E3d);
+        assert_eq!(look.preset, LookPreset::E3d31Factory);
+        assert!(look.hlr && look.ao && look.gradient);
+        assert_eq!(look.aa, AntiAlias::Ssaa2x2);
+        assert_eq!(look.colour_scheme, ColourScheme::E3dFactory);
+        assert!(!look.is_modified_from_preset());
+        assert!(!look.effects_off());
+    }
+
+    /// 本机真机预设全关；换预设只动子开关，不动外观与配色（同 plant3d-web setPreset）。
+    #[test]
+    fn switching_preset_resets_the_toggles_but_keeps_mode_and_colours() {
+        let mut look = ViewportLook::default();
+        look.colour_scheme = ColourScheme::ByType;
+        look.hlr = false;
+        assert!(look.is_modified_from_preset());
+        look.apply_preset(LookPreset::SglMachine);
+        assert_eq!(look.preset, LookPreset::SglMachine);
+        assert!(!look.hlr && !look.ao && !look.gradient);
+        assert_eq!(look.aa, AntiAlias::Off);
+        assert_eq!(look.mode, LookMode::E3d);
+        assert_eq!(look.colour_scheme, ColourScheme::ByType);
+        assert!(!look.is_modified_from_preset());
+        assert!(look.effects_off());
+    }
+
+    /// PBR 外观下后处理一律不跑，不管子开关怎么拨。
+    #[test]
+    fn pbr_mode_never_runs_the_effects() {
+        let mut look = ViewportLook::default();
+        look.mode = LookMode::Pbr;
+        assert!(look.effects_off());
+    }
+
+    /// 落盘字面是 plant3d-web 预设 id 的下划线写法（`sgl_machine`，不是 `sgl-machine`）：宿主的
+    /// `settings.ron` 走同一套 serde 规则，而 RON 的枚举字面是标识符，连字符读不回来。老文件缺格
+    /// 按出厂位读出来（`serde(default)`）。
+    #[test]
+    fn the_look_round_trips_and_tolerates_missing_fields() {
+        let look = ViewportLook::for_preset(LookPreset::SglMachine);
+        let text = serde_json::to_string(&look).unwrap();
+        assert!(text.contains("\"sgl_machine\""), "{text}");
+        assert!(text.contains("\"e3d_factory\""), "{text}");
+        assert!(text.contains("\"e3d\""), "{text}");
+        assert_eq!(serde_json::from_str::<ViewportLook>(&text).unwrap(), look);
+        let partial: ViewportLook = serde_json::from_str(r#"{"mode":"pbr"}"#).unwrap();
+        assert_eq!(partial.mode, LookMode::Pbr);
+        assert_eq!(partial.preset, LookPreset::E3d31Factory);
+        assert_eq!(partial.aa, AntiAlias::Ssaa2x2);
+    }
+
+    /// 浏览器端的两层覆盖：config.json 的 look 段可以只给一部分，地址栏的 `?look=…` 再压一层；
+    /// 预设先换（子开关回出厂位）再逐格压值；认不出的键值当没写。
+    #[test]
+    fn look_overrides_layer_config_then_query_over_the_factory_look() {
+        let site: ViewportLookOverrides =
+            serde_json::from_str(r#"{"aa":"fxaa","colour_scheme":"by_type"}"#).unwrap();
+        assert_eq!(site.aa, Some(AntiAlias::Fxaa));
+        assert_eq!(site.mode, None);
+        let query =
+            ViewportLookOverrides::from_query("?look_demo=1&look=pbr&look_hlr=0&look_aa=bogus");
+        assert_eq!(query.mode, Some(LookMode::Pbr));
+        assert_eq!(query.hlr, Some(false));
+        assert_eq!(query.aa, None, "认不出的值当没写");
+        let look = site.then(query).apply(ViewportLook::default());
+        assert_eq!(look.mode, LookMode::Pbr);
+        assert!(!look.hlr);
+        assert_eq!(look.aa, AntiAlias::Fxaa, "地址栏没给的格由站点默认顶上");
+        assert_eq!(look.colour_scheme, ColourScheme::ByType);
+
+        let machine = ViewportLookOverrides::from_query("look=sgl&look_preset=machine&look_ao=1")
+            .apply(ViewportLook::default());
+        assert_eq!(machine.mode, LookMode::E3d);
+        assert_eq!(machine.preset, LookPreset::SglMachine);
+        assert!(!machine.hlr, "换预设先回该预设的出厂位");
+        assert!(machine.ao, "再压上地址栏给的值");
+        assert_eq!(machine.aa, AntiAlias::Off);
+        assert!(ViewportLookOverrides::from_query("").is_empty());
+        assert_eq!(
+            ViewportLookOverrides::default().apply(ViewportLook::default()),
+            ViewportLook::default()
         );
     }
 }

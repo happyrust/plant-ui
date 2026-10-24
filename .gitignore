@@ -13,6 +13,8 @@
 /.kiro/
 /.idea/
 vendor/*
+# vendor/registry 里本地改过源码的 crate，按上游仓路径留的 git am 补丁（见 vendor/patches/README.md）要入库。
+!/vendor/patches/
 /.review/
 /.sigmap-cache.json
 /.teach/

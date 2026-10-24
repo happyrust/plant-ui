@@ -3,6 +3,10 @@ name = "rs-plant"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# `--look-demo` / `?look_demo=1` 的演示厂：debug 构建总带着，release 构建要它时开这个。
+look-demo = ["plant-ui-view3d/look-demo"]
+
 [dependencies]
 plant-ui.workspace = true
 plant-ui-data.workspace = true
@@ -41,3 +45,7 @@ bevy-wasm-tasks = { workspace = true, features = ["wasm"] }
 getrandom = { workspace = true, features = ["wasm_js"] }
 ring = { workspace = true, features = ["wasm32_unknown_unknown_js"] }
 wasm-bindgen.workspace = true
+web-sys = { workspace = true, features = [
+    "Location",
+    "Window",
+] }
