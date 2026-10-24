@@ -1,6 +1,7 @@
 use aios_core::RefU64;
 
 use crate::style::tokens::Status;
+use crate::virtual_hole::VirtualHoleStatus;
 
 /// 主工作台视图模型（外壳字段随 M1 各视图逐步补齐）。
 ///
@@ -73,6 +74,9 @@ pub struct WorkbenchVm {
     /// 正在进行的房间视图（隔离 + 取景）。`Some` 时视口 HUD 挂房间徽章与
     /// 「退出」入口；退出隔离或重连时由宿主清掉。
     pub room_view: Option<RoomViewVm>,
+    /// 「虚拟孔洞」页签（ADR-0031 阶段一 / 阶段二）。会话状态（孔洞、映射、布尔
+    /// 结果）归宿主的 `VirtualHoleSession`；这里只放绘制层需要的只读投影。
+    pub virtual_holes: VirtualHolesVm,
     /// eye 查询和增量 mesh 装载的短状态；完成/失败由宿主延时清除。
     pub model_load: Option<ModelLoadVm>,
     /// 任务队列在状态栏上的那一格。
@@ -335,6 +339,9 @@ pub struct View3dVm {
     /// 纹理 UV（与 `axis_labels` 同机制），出画与相机身后的已经筛掉。绘制层只在锚点
     /// 画字，首版不做遮挡剔除与避让。没挂标注时为空。
     pub dimension_labels: Vec<DimensionLabelVm>,
+    /// 虚拟孔洞层的文字（ADR-0031 阶段二）：选中孔洞的编号 + 尺寸 + 深度，同一套
+    /// 投影机制。没选中孔洞时为空。
+    pub hole_labels: Vec<DimensionLabelVm>,
     /// 视口底色（渐变上 / 下两色）的覆盖（E3D 外观移植计划）。渲染纹理的空白处是透明的，
     /// 底色由绘制层在纹理底下画：`None` = 跟主题（`viewport_top/bottom`），`Some` = 外观自己的配色
     /// （E3D 外观是 grey→白，渐变关是纯 grey），由宿主按此刻生效的外观算好填进来。
@@ -902,6 +909,54 @@ impl DimensionsVm {
             Self::Off | Self::Failed { .. } => false,
         }
     }
+}
+
+/// 「虚拟孔洞」页签的视图模型（ADR-0031 阶段一 / 阶段二）。
+///
+/// 孔洞列表、映射与布尔状态的真值归宿主的会话；这里是每帧同步过去的只读投影。
+/// 布尔回执与切削体层都走视口，不进这份 Vm。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct VirtualHolesVm {
+    /// 会话里的孔洞行（导入顺序）。
+    pub holes: Vec<VirtualHoleRowVm>,
+    /// 逐行解析错误（行号从 1 开始，含表头行）。
+    pub row_errors: Vec<(usize, String)>,
+    /// 选中的孔洞 id（单选），`None` = 没选。
+    pub selected: Option<String>,
+    /// 「看原始网格」开关（阶段二「恢复」的反向操作）。
+    pub show_original: bool,
+    /// 孔洞预览 X-Ray 是否打开。
+    pub xray: bool,
+    /// 正在计算的孔洞数（> 0 时工具栏挂「计算中 n/m」）。
+    pub calculating: usize,
+    /// 已出布尔结果的孔洞数（Changed + NoIntersection + Failed）。
+    pub done: usize,
+}
+
+/// 孔洞行在页签上的样子。
+#[derive(Debug, Clone, PartialEq)]
+pub struct VirtualHoleRowVm {
+    /// 记录的 `Code`（行上的主键；可能为空串——导入时没要求唯一）。
+    pub id: String,
+    /// 尺寸标签：圆孔 `Φ325`，矩形 `300×400`。
+    pub size_label: String,
+    /// 映射目标的四态（解析 / 确认中 / 已映射 / 不存在）。
+    pub target: VirtualHoleTargetVm,
+    /// 布尔状态。未进入布尔的行恒是 [`VirtualHoleStatus::Ready`]。
+    pub status: VirtualHoleStatus,
+}
+
+/// 一条孔洞的映射目标在界面上的四态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtualHoleTargetVm {
+    /// `RelyItemREF` 没解析出参考号（格式不对）——只能手动映射。
+    Unparsed,
+    /// 参考号已解析，正在确认目标在不在库里。
+    Resolving,
+    /// 目标已确认在库里。
+    Mapped(RefU64),
+    /// 参考号解析出了，但库里没有这个元素——只能手动映射。
+    Missing,
 }
 
 /// 一条 BRAN 尺寸标注的摘要（B4 状态条 / tooltip 的数据源）。

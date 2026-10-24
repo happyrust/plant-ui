@@ -6,6 +6,7 @@ members = [
     "crates/plant-ui-view3d",
     "crates/plant-ui-app",
     "crates/plant-room",
+    "crates/plant-csg",
 ]
 # vendor path deps must NOT be auto-absorbed as workspace members (would build with their own default features)
 exclude = ["vendor"]
@@ -19,6 +20,7 @@ plant-ui = { path = "crates/plant-ui" }
 plant-ui-data = { path = "crates/plant-ui-data" }
 plant-ui-view3d = { path = "crates/plant-ui-view3d" }
 plant-room = { path = "crates/plant-room" }
+plant-csg = { path = "crates/plant-csg" }
 parry3d = { path = "vendor/forks/parry/crates/parry3d" }
 glam = "0.29"
 # vendored from rs-core-pin (= git rev 5667b70 + get_world fallthrough fix), editable
@@ -70,7 +72,13 @@ futures = { version = "0.3", default-features = false, features = ["std", "async
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+calamine = { git = "https://gitee.com/happydpc/calamine", rev = "f35ae176fa9f763851b236f7166e38a884efc8d6" }
+# 虚拟孔洞布尔预览（ADR-0031）：原生端 CSG 内核，与 gen-model ADR-029 同款，path 钉在
+# gen-model 锁定的同一个 rev（2233c5a）。只挂非 wasm 目标，见 crates/plant-csg。
+manifold-csg = { path = "../manifold-csg/crates/manifold-csg", default-features = false }
+js-sys = "0.3"
 web-sys = "0.3"
+wasm-bindgen-futures = "0.4"
 ron = "0.8.1"
 config = "0.14.1"
 url = "2"

@@ -26,6 +26,7 @@ pub enum Pane {
     Logs,
     Properties,
     Room,
+    VirtualHoles,
     TaskQueue,
     IncrementRecords,
 }
@@ -39,6 +40,7 @@ impl Pane {
             Pane::Logs => (ph::LIST_DASHES, "日志"),
             Pane::Properties => (ph::SLIDERS_HORIZONTAL, "属性"),
             Pane::Room => (ph::DOOR_OPEN, "房间"),
+            Pane::VirtualHoles => (ph::CIRCLE_DASHED, "虚拟孔洞"),
             Pane::TaskQueue => (ph::LIST_CHECKS, "任务队列"),
             Pane::IncrementRecords => (ph::GIT_COMMIT, "增量记录"),
         }
@@ -120,6 +122,9 @@ impl TabViewer for Viewer<'_> {
             Pane::ModelTree => super::tree::show(ui, self.t, self.d, self.vm, self.cmds),
             Pane::Properties => super::props::show(ui, self.t, self.d, self.vm, self.cmds),
             Pane::Room => super::room::show(ui, self.t, self.d, self.vm, self.cmds),
+            Pane::VirtualHoles => {
+                super::virtual_holes::show(ui, self.t, self.d, self.vm, self.cmds)
+            }
             Pane::CommandLine => {
                 super::command_line::show(ui, self.t, self.d, self.vm, self.command, self.cmds)
             }

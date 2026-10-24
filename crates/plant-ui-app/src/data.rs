@@ -197,6 +197,12 @@ pub enum Req {
     },
     /// 树定位目标的祖先链。目标不在已加载的树里时才发，见 ADR-0014。
     Ancestors(RefU64),
+    /// 虚拟孔洞（ADR-0031 阶段一）的映射确认：这一批参考号在不在库里。
+    ///
+    /// 顺序一条一条查祖先链（`face.ancestors`），链首就是自己才算存在——
+    /// 与树定位同一份语义，查不动（`Err`）按不存在算：映射失败只影响这一条
+    /// 记录，不该让整趟导入陪葬。`epoch` 原样带回，宿主靠它丢弃过期回包。
+    VirtualHoleTargets { epoch: u64, refnos: Vec<RefU64> },
     /// 丢查询缓存并重跑启动序列。连库失败后命令行上的「重试」走这条，结果仍走
     /// `Evt::Ready`。
     Reconnect,
@@ -448,6 +454,12 @@ pub enum Evt {
     /// 目标的祖先链，「自己 -> 上级 -> …」序。带上请求时的那个 refno：
     /// 连续定位只算最后一次，晚到的旧链要认得出来才好丢。
     Ancestors(RefU64, anyhow::Result<Vec<RefU64>>),
+    /// 虚拟孔洞映射确认的回包：每个参考号在不在库里，按请求顺序。
+    /// `epoch` 对不上当前帧的整包宿主丢弃。
+    VirtualHoleTargets {
+        epoch: u64,
+        results: Vec<(RefU64, bool)>,
+    },
     ModelUpdatePreview(anyhow::Result<Preview>),
     /// 「扫描 + 入队」的回执。合流之后它不再是单个 task_id。
     ModelUpdateExecute {
@@ -929,6 +941,20 @@ async fn handle_read(
         Req::Ancestors(refno) => {
             let result = face.ancestors(refno).await;
             let _ = evt_tx.send(Evt::Ancestors(refno, result));
+        }
+        Req::VirtualHoleTargets { epoch, refnos } => {
+            // 顺序查：一条孔洞的映射确认是轻查询，但一张表几百条时并发也没必要——
+            // 数据线程本来就是串行消费，留着以后真要快了再开并发。
+            let mut results = Vec::with_capacity(refnos.len());
+            for refno in refnos {
+                // 链首是自己才算存在；查不动按不存在算（fail-soft，见 Req 注释）。
+                let exists = match face.ancestors(refno).await {
+                    Ok(chain) => chain.first() == Some(&refno),
+                    Err(_) => false,
+                };
+                results.push((refno, exists));
+            }
+            let _ = evt_tx.send(Evt::VirtualHoleTargets { epoch, results });
         }
         Req::ModelUpdatePreview {
             base,

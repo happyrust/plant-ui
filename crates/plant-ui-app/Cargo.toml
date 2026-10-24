@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [features]
+default = ["virtual-hole-csg"]
+# 虚拟孔洞布尔预览（ADR-0031）：原生端 manifold-csg 内核，默认开启。
+virtual-hole-csg = ["plant-ui-view3d/virtual-hole-csg"]
 # `--look-demo` / `?look_demo=1` 的演示厂：debug 构建总带着，release 构建要它时开这个。
 look-demo = ["plant-ui-view3d/look-demo"]
 
@@ -23,6 +26,8 @@ anyhow.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+calamine.workspace = true
+glam.workspace = true
 ron.workspace = true
 url.workspace = true
 chrono.workspace = true
@@ -31,6 +36,10 @@ bevy_egui35.workspace = true
 ehttp.workspace = true
 ewebsock.workspace = true
 web-time.workspace = true
+
+[dev-dependencies]
+# 虚拟孔洞导入测试：在内存里拼最小 xlsx 喂给 calamine（与 calamine 自己用的同一版 zip）。
+zip = { version = "4", default-features = false, features = ["deflate"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 bevy-wasm-tasks = { workspace = true, features = ["tokio"] }
@@ -45,7 +54,19 @@ bevy-wasm-tasks = { workspace = true, features = ["wasm"] }
 getrandom = { workspace = true, features = ["wasm_js"] }
 ring = { workspace = true, features = ["wasm32_unknown_unknown_js"] }
 wasm-bindgen.workspace = true
+# 虚拟孔洞（ADR-0031）：浏览器端文件上传（隐藏 input + array_buffer）。
+js-sys = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
 web-sys = { workspace = true, features = [
+    "Blob",
+    "Document",
+    "Element",
+    "Event",
+    "EventTarget",
+    "File",
+    "FileList",
+    "HtmlInputElement",
     "Location",
     "Window",
+    "console",
 ] }

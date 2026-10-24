@@ -14,6 +14,7 @@ pub mod style;
 pub mod task_queue;
 pub mod vm;
 pub mod workbench;
+pub mod virtual_hole;
 
 pub use aios_core::RefU64;
 
@@ -667,6 +668,42 @@ pub enum Cmd {
         /// 在有意识的情况下决定要不要连盘上那份一起清。
         purge_meshes: bool,
     },
+    /// 导入 AMS 虚拟孔洞表（xlsx/csv；ADR-0031 阶段一）。只打开文件选择：
+    /// 原生端走系统对话框，浏览器端走隐藏的 `<input type=file>`；解析与映射都在
+    /// 宿主拿到字节之后做，这条命令本身不带数据。
+    ImportVirtualHoles,
+    /// 在「虚拟孔洞」页签里选中一条记录（单选）。`hole_id` 是记录的 `Code`，
+    /// 空串表示清掉选中。
+    SelectVirtualHole(String),
+    /// 手动改一条记录的映射目标（阶段一「映射失败时允许手动选择」）：把孔洞的
+    /// `RelyItemREF` 改指到这个 refno。宿主把它当一次新的映射请求发出去，
+    /// 原来的自动映射结果作废。
+    MapVirtualHole {
+        hole_id: String,
+        refno: aios_core::RefU64,
+    },
+    /// 对当前会话里已映射的记录发起布尔预览（阶段四）。不带名单：范围就是
+    /// 「此刻已映射且没在算」的那些——点「全部预览」和点单行「预览」都落到这里，
+    /// 宿主按行发和按全量发的分别只体现在它先把哪些行翻成 Calculating。
+    PreviewVirtualHoles,
+    /// 清掉整层预览：恢复所有被替换的原始网格，撤掉切削体，作废在途的布尔
+    /// 结果（进一帧 epoch）。不清孔洞列表本身——那是导入会话的内容。
+    ClearVirtualHolePreview,
+    /// 把相机对准一条孔洞的切削体（阶段二「定位」）。宿主先把孔洞的世界包围盒
+    /// 交给视口取景；孔洞没映射实体也照常能定位——切削体是独立画的。
+    FocusVirtualHole(String),
+    /// 把相机对准孔洞映射到的实体，并选中它（阶段一「映射到 AMS 元素后定位」）。
+    /// 与 [`Self::FocusVirtualHole`] 分开：那条对的是孔洞，这条对的是实体——
+    /// 实体没加载时宿主先去显示它，落地了再取景。
+    FocusVirtualHoleTarget(String),
+    /// 原始 / 布尔预览两态开关（阶段二「恢复」的反向操作）。`true` 看原始网格，
+    /// `false` 看布尔结果；只对已经算出结果的实体有意义，宿主把开关状态记在
+    /// 会话里，之后的回执也按它落。
+    ShowVirtualHoleOriginal(bool),
+    /// 孔洞预览的 X-Ray 开关：打开时被开孔的实体画成半透明，孔洞切削体照常实画，
+    /// 好看清孔洞在实体内部的样子。与房间 X-Ray 互斥——两家抢同一份半透明材质，
+    /// 后拨的赢（宿主负责关掉另一家）。
+    SetVirtualHoleXRay(bool),
 }
 
 #[cfg(test)]

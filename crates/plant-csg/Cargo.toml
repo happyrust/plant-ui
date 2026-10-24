@@ -1,0 +1,28 @@
+[package]
+name = "plant-csg"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+# 原生端布尔内核：manifold-csg（gen-model ADR-029 同款，rev 2233c5a）。依赖只挂在非 wasm
+# 目标上——在 wasm 上打开这个 feature 是空操作，浏览器端走 web 模块（Worker）。
+manifold = ["dep:manifold-csg", "dep:glam", "dep:anyhow"]
+
+[dependencies]
+# 共享类型与纯函数两端都要，保持零依赖。
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+manifold-csg = { workspace = true, optional = true }
+glam = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = { workspace = true }
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+web-sys = { workspace = true, features = ["console", "MessageEvent", "Worker", "WorkerOptions", "WorkerType"] }
+
+[dev-dependencies]
+# 黄金对拍夹具（tests/parity.rs）的录制 / 比对。
+serde_json = { workspace = true }

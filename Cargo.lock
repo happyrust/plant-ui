@@ -259,7 +259,7 @@ dependencies = [
  "bincode",
  "bitflags 2.13.1",
  "cached",
- "calamine",
+ "calamine 0.26.1 (git+https://gitee.com/happydpc/calamine)",
  "cavalier_contours",
  "chrono",
  "clap",
@@ -2186,6 +2186,22 @@ checksum = "ade8366b8bd5ba243f0a58f036cc0ca8a2f069cff1a2351ef1cac6b083e16fc0"
 [[package]]
 name = "calamine"
 version = "0.26.1"
+source = "git+https://gitee.com/happydpc/calamine?rev=f35ae176fa9f763851b236f7166e38a884efc8d6#f35ae176fa9f763851b236f7166e38a884efc8d6"
+dependencies = [
+ "atoi_simd",
+ "byteorder",
+ "codepage",
+ "encoding_rs",
+ "fast-float2",
+ "log",
+ "quick-xml 0.37.5",
+ "serde",
+ "zip",
+]
+
+[[package]]
+name = "calamine"
+version = "0.26.1"
 source = "git+https://gitee.com/happydpc/calamine#f35ae176fa9f763851b236f7166e38a884efc8d6"
 dependencies = [
  "atoi_simd",
@@ -2463,6 +2479,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bde03770d3df201d4fb868f2c9c59e66a3e4e2bd06692a0fe701e7103c7e84d4"
 dependencies = [
  "error-code",
+]
+
+[[package]]
+name = "cmake"
+version = "0.1.58"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -5180,6 +5205,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "manifold-csg"
+version = "0.4.0"
+dependencies = [
+ "log",
+ "manifold-csg-sys",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "manifold-csg-sys"
+version = "3.5.104"
+dependencies = [
+ "cmake",
+]
+
+[[package]]
 name = "maplit"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6561,6 +6602,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
+name = "plant-csg"
+version = "0.1.14"
+dependencies = [
+ "anyhow",
+ "glam",
+ "js-sys",
+ "manifold-csg",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "plant-mbd"
 version = "0.1.0"
 dependencies = [
@@ -6588,6 +6643,7 @@ dependencies = [
  "egui-phosphor",
  "egui_dock",
  "egui_extras",
+ "glam",
  "serde",
  "serde_json",
  "web-time",
@@ -6615,6 +6671,7 @@ dependencies = [
  "bevy",
  "bevy_egui35",
  "getrandom 0.3.4",
+ "plant-csg",
  "plant-room",
  "plant-ui",
  "ring",
@@ -7315,6 +7372,7 @@ dependencies = [
  "bevy",
  "bevy-wasm-tasks",
  "bevy_egui35",
+ "calamine 0.26.1 (git+https://gitee.com/happydpc/calamine?rev=f35ae176fa9f763851b236f7166e38a884efc8d6)",
  "chrono",
  "config",
  "eframe",
@@ -7325,6 +7383,8 @@ dependencies = [
  "ewebsock",
  "futures",
  "getrandom 0.3.4",
+ "glam",
+ "js-sys",
  "plant-mbd",
  "plant-ui",
  "plant-ui-data",
@@ -7337,7 +7397,10 @@ dependencies = [
  "tokio",
  "url",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
  "web-time",
+ "zip",
 ]
 
 [[package]]

@@ -55,6 +55,7 @@ pub mod e3d_look;
 mod look_materials;
 pub mod mesh_source;
 mod room_clip;
+mod virtual_hole;
 
 use e3d_look::env_cube::SglEnvCube;
 use e3d_look::material::{SGL_LOOK_SHADER, SglLookMaterial};
@@ -212,7 +213,7 @@ impl Plugin for View3dPlugin {
             .init_asset_loader::<MeshLoader>()
             .add_systems(
                 Startup,
-                (setup, room_clip::setup_room_clip),
+                (setup, room_clip::setup_room_clip, virtual_hole::setup_virtual_hole),
             )
             .add_systems(
                 Update,
@@ -226,7 +227,12 @@ impl Plugin for View3dPlugin {
                     // 带着 `ModelMesh` 出生，材质由同帧的 apply_materials 按外观补上。
                     room_clip::apply_room_clip_ops,
                     room_clip::advance_room_clip,
+                    // 虚拟孔洞（ADR-0031）：指令与布尔推进同样排在材质刷新之前；
+                    // 被替换过网格的实体由 apply_hole_materials 在 apply_materials 之后接管材质。
+                    virtual_hole::apply_virtual_hole_ops,
+                    virtual_hole::advance_virtual_hole,
                     apply_materials,
+                    virtual_hole::apply_hole_materials,
                     animate_snap,
                     update_grid,
                 )
@@ -429,6 +435,15 @@ pub struct View3d {
     room_clip_status: Option<RoomClipStatus>,
     /// 房间视图里「视图适应」与 Home 对准的房间体包围盒（场景世界系）。没有房间体时为 `None`。
     room_frame_bounds: Option<(Vec3, Vec3)>,
+    /// 虚拟孔洞图层的待办（ADR-0031）：宿主经 `virtual_hole_op` 交来，`virtual_hole` 按序执行。
+    virtual_hole_ops: VecDeque<plant_ui::virtual_hole::VirtualHoleOp>,
+    /// 虚拟孔洞图层攒下的布尔回执，宿主每帧经 `take_virtual_hole_receipts` 取走。
+    virtual_hole_receipts: Vec<plant_ui::virtual_hole::VirtualHoleReceipt>,
+    /// 选中孔洞的标签（毫米锚点 + 文字），随选中整份替换（ADR-0031 阶段二）。
+    hole_labels: Vec<DimensionLabel>,
+    /// 上一帧把孔洞标签锚点投影到纹理上的结果，与 `hole_labels` 同长同序；
+    /// 出画或在相机身后为 None。由 `publish_camera` 在变换传播之后写。
+    hole_label_uvs: Vec<Option<[f32; 2]>>,
     /// 三维外观（E3D 外观移植计划）：设置下发的整份。换了就翻 `material_dirty`，材质全场重挑。
     /// 视口底色不在这边管：背景相机是 `is_active: false`，纹理空白处透明，底色由绘制层按外观画。
     look: ViewportLook,
@@ -1173,6 +1188,10 @@ fn setup(
         room_clip_ops: VecDeque::new(),
         room_clip_status: None,
         room_frame_bounds: None,
+        virtual_hole_ops: VecDeque::new(),
+        virtual_hole_receipts: Vec::new(),
+        hole_labels: Vec::new(),
+        hole_label_uvs: Vec::new(),
         look,
     });
     commands.insert_resource(OrbitCamera::default());
@@ -1493,6 +1512,12 @@ fn publish_camera(
     view.grid_cell_mm = grid.level * MM_PER_WORLD;
     // 尺寸标注文字的锚点：毫米 → 世界 → 纹理 UV，与轴标签同一条投影（计划 B3）。
     view.dimension_label_uvs = project_dimension_labels(&view.dimension_labels, |world| {
+        camera
+            .world_to_ndc(transform, world)
+            .and_then(ndc_to_texture_uv)
+    });
+    // 虚拟孔洞选中行的标签：同一套投影（ADR-0031 阶段二）。
+    view.hole_label_uvs = project_dimension_labels(&view.hole_labels, |world| {
         camera
             .world_to_ndc(transform, world)
             .and_then(ndc_to_texture_uv)
@@ -2888,6 +2913,10 @@ pub(crate) fn blank_view() -> View3d {
         room_clip_ops: VecDeque::new(),
         room_clip_status: None,
         room_frame_bounds: None,
+        virtual_hole_ops: VecDeque::new(),
+        virtual_hole_receipts: Vec::new(),
+        hole_labels: Vec::new(),
+        hole_label_uvs: Vec::new(),
         look: ViewportLook::default(),
     }
 }

@@ -174,6 +174,20 @@ pub fn command_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: 
                                 .color(t.text_muted),
                         );
                     }
+                    ui.separator();
+                    // 虚拟孔洞预览（ADR-0031）：导入 AMS 提资表，布尔结果只改画面、
+                    // 不写回正式模型。与取回工作同理，连不上库时没得映射，灰掉。
+                    if ui
+                        .add_enabled(
+                            vm.data_source_ok,
+                            command_menu_action(d, ph::CIRCLE_DASHED, "导入虚拟孔洞…", "AMS 提资表"),
+                        )
+                        .on_disabled_hover_text("连接数据源后可用")
+                        .clicked()
+                    {
+                        cmds.push(Cmd::ImportVirtualHoles);
+                        ui.close();
+                    }
                 });
 
                 let create = ui.add(command_menu_button(d, "创建", true));

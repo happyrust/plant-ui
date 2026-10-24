@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [features]
+# 虚拟孔洞布尔预览（ADR-0031）：打开原生端 manifold-csg 内核。浏览器端不受影响
+#（那边固定走 Worker 里的 manifold-3d）。
+virtual-hole-csg = ["plant-csg/manifold"]
 # `--look-demo` / `?look_demo=1` 的演示厂（E3D 外观移植计划）：debug 构建总带着；release 构建要它时开这个
 #（浏览器端的像素验收是 release wasm）。
 look-demo = []
@@ -12,6 +15,8 @@ look-demo = []
 plant-ui.workspace = true
 # 房间体判定（ADR-0029）：直段截断问的「这一截在不在房间里」与 gen-model 归属计算同一份口径。
 plant-room.workspace = true
+# 虚拟孔洞布尔预览后端（ADR-0031）。
+plant-csg.workspace = true
 aios_core.workspace = true
 anyhow.workspace = true
 bevy.workspace = true

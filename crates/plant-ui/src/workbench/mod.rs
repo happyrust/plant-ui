@@ -13,6 +13,7 @@ pub mod search;
 pub mod tree;
 pub mod view3d;
 pub mod viewcube;
+pub mod virtual_holes;
 
 pub use panes::Pane;
 
@@ -64,7 +65,8 @@ impl DockVisibility {
 fn dock_side_of(pane: Pane) -> Option<DockSide> {
     match pane {
         Pane::ModelTree => Some(DockSide::Left),
-        Pane::Properties | Pane::Room => Some(DockSide::Right),
+        // 虚拟孔洞与属性 / 房间同一格页签：都是「选中一条记录看详情」的右侧面板。
+        Pane::Properties | Pane::Room | Pane::VirtualHoles => Some(DockSide::Right),
         Pane::CommandLine | Pane::Logs | Pane::TaskQueue | Pane::IncrementRecords => {
             Some(DockSide::Bottom)
         }
@@ -136,9 +138,13 @@ fn build_dock(vis: DockVisibility) -> DockState<Pane> {
             center = c;
         }
         if vis.right {
-            // 房间与属性同一格页签（S13-B 的右侧面板分组）。
-            let [c, _right] =
-                surface.split_right(center, 0.76, vec![Pane::Properties, Pane::Room]);
+            // 房间与属性同一格页签（S13-B 的右侧面板分组）；虚拟孔洞是同一类
+            // 「记录列表 + 详情」面板，并进这一格。
+            let [c, _right] = surface.split_right(
+                center,
+                0.76,
+                vec![Pane::Properties, Pane::Room, Pane::VirtualHoles],
+            );
             center = c;
         }
         if vis.bottom {

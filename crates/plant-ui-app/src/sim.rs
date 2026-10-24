@@ -1801,6 +1801,15 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
             crate::search_index::SearchIndexState::Ready(engine.name_count()),
         ),
         Req::Ancestors(refno) => Evt::Ancestors(refno, Ok(engine.ancestors(refno))),
+        // 剧本里的树就是全量元素表：在 nodes 里就是存在。不在就回 false，
+        // 宿主那头按「目标不存在」处理，演示时能手动映射救回来。
+        Req::VirtualHoleTargets { epoch, refnos } => Evt::VirtualHoleTargets {
+            epoch,
+            results: refnos
+                .into_iter()
+                .map(|refno| (refno, engine.tree.nodes.contains_key(&refno)))
+                .collect(),
+        },
         // 剧本里没有模型服务，生成不了。每个目标各回一句失败而不是装作做过了：
         // 那会让人以为演示模式动过库。
         Req::GenerateModels { epoch, refnos, .. } => Evt::ModelsGenerated {

@@ -22,7 +22,9 @@ use super::viewcube;
 use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Tokens, radius};
 use crate::style::widgets;
-use crate::vm::{RoomViewVm, Selection, TruncationVm, View3dVm, WorkbenchVm};
+use crate::vm::{
+    DimensionLabelVm, RoomViewVm, Selection, TruncationVm, View3dVm, WorkbenchVm,
+};
 use crate::{CameraGesture, CameraMotion, Cmd, ModelAction, RefU64};
 
 /// 占位纹理的不透明度，取自 S1 的「模型场景」矩形。压这么一点让渐变底透上来，
@@ -156,13 +158,17 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
     }
     // 渲染目标跟着视口走。宿主换纹理是异步的（还带防抖），在它换过来之前上面那句
     // `cover_uv` 照旧按当前纹理裁切——那几帧宁可少看见一圈，也不要把管子拉成椭圆。
+    // 头几帧 egui 可能还没拿到真窗口尺寸（浏览器里 bevy_egui 的相机还没算好，egui 按 10000×10000 的缺省布局），
+    // 这里要出去的尺寸就是虚的；绘制层分不出来，由宿主按「视口不可能比窗口大」挡掉（见 `show_app` 的分发）。
     let wanted = wanted_texture_size(rect.size(), ui.ctx().pixels_per_point());
     if wanted != [view.size.x as u32, view.size.y as u32] {
         cmds.push(Cmd::ResizeViewport(wanted));
     }
 
     axis_labels(ui, t, d, rect, view);
-    dimension_labels(ui, t, d, rect, view);
+    dimension_labels(ui, t, d, rect, view, &view.dimension_labels);
+    // 虚拟孔洞选中行的标签（ADR-0031）：同一套投影与画字，单独一份名单。
+    dimension_labels(ui, t, d, rect, view, &view.hole_labels);
     // 浮层先画完再判拾取：工具栏、立方体、HUD 盖住的这几片是控件，不是模型。
     let bar = toolbar(ui, t, d, rect, vm, response.id, cmds);
     let cube = viewcube::show(ui, t, d, view, rect, response.id, cmds);
@@ -326,18 +332,26 @@ fn axis_labels(ui: &mut Ui, t: &Tokens, d: Density, view: Rect, vm3d: &View3dVm)
     }
 }
 
-/// 尺寸标注层的文字（计划 B3）：尺寸数值 / 位号 / 辅助文字，画在宿主投影好的锚点上。
+/// 悬空文字标签（尺寸标注层的尺寸数值 / 位号 / 辅助文字，计划 B3；虚拟孔洞层的
+/// 选中行标签，ADR-0031），画在宿主投影好的锚点上。
 ///
 /// 与 [`axis_labels`] 同一套「纹理 UV → 视口点」换算；被裁掉的不画。字底垫一块面板色
 /// 圆角底——线画在三维里、字画在 egui 上，没有这块底，白字落在浅色构件上就读不出来。
 /// 首版不做遮挡剔除与避让：被管子挡住的锚点照样出字，字与字叠了也不挪。
-fn dimension_labels(ui: &mut Ui, t: &Tokens, d: Density, view: Rect, vm3d: &View3dVm) {
-    if vm3d.dimension_labels.is_empty() {
+fn dimension_labels(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    view: Rect,
+    vm3d: &View3dVm,
+    labels: &[DimensionLabelVm],
+) {
+    if labels.is_empty() {
         return;
     }
     let uv_rect = cover_uv(view.size(), vm3d.size);
     let pad = vec2(d.px(3.0), d.px(1.0));
-    for label in &vm3d.dimension_labels {
+    for label in labels {
         let Some(center) = texture_uv_to_view(view, uv_rect, label.uv) else {
             continue;
         };

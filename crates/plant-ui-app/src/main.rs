@@ -20,6 +20,9 @@ mod search_index;
 mod settings_store;
 mod sim;
 mod source_versions;
+mod virtual_hole;
+mod virtual_hole_pick;
+mod virtual_hole_session;
 mod startup;
 
 use std::collections::{HashMap, HashSet};
@@ -66,9 +69,12 @@ use plant_ui::vm::{
     RoomVm, RoomsDataVm, RowVisibility, SearchHitVm, SearchRunVm, SearchVm, Selection, SubIndexVm,
     TreeRowVm, TreeVm, TruncationVm, View3dVm, WorkbenchVm,
 };
+use plant_ui::virtual_hole::{VirtualHoleOp, VirtualHoleReceipt, VirtualHoleStatus};
 use plant_ui::workbench::{self, Pane, WorkbenchState};
 use plant_ui::{CameraPose, Cmd, IsolateMatching, NavStep};
 use plant_ui_data::{EleTreeNode, RefU64};
+use virtual_hole_pick::{HoleFilePick, HolePickPoll, PickedHoleFile};
+use virtual_hole_session::{ReceiptEffect, VirtualHoleSession};
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() {
@@ -611,6 +617,10 @@ fn show_app(
     }
     // 房间视图的截断回执（直段截断计划 M4）：视口上一拍的进度抄给 HUD。
     app.sync_room_clip(view3d.room_clip_status());
+    // 虚拟孔洞（ADR-0031 阶段四）：视口上一拍的布尔回执取回，落进会话。
+    for receipt in view3d.take_virtual_hole_receipts() {
+        app.apply_hole_receipt(receipt);
+    }
     // 边线 / 伪阴影在这台设备上跑不了（WebGL2 缺半浮点颜色附件）时，设置窗那两格灰掉并说明原因；设置值照存。
     app.settings_state.post_effects_lock = (!view3d.post_effects_supported()).then(|| {
         "这台设备的渲染器没有半浮点颜色附件（WebGL2 缺 EXT_color_buffer_float），边线 / 伪阴影在这里不生效；设置照存，换台机器就有"
@@ -629,6 +639,14 @@ fn show_app(
         // 尺寸标注文字：视口上一拍投影好的锚点（计划 B3），只带画内的那些。
         dimension_labels: view3d
             .visible_dimension_labels()
+            .map(|(uv, text)| DimensionLabelVm {
+                uv,
+                text: text.to_owned(),
+            })
+            .collect(),
+        // 虚拟孔洞选中行的标签（ADR-0031）：同一套投影，单独一份名单。
+        hole_labels: view3d
+            .visible_hole_labels()
             .map(|(uv, text)| DimensionLabelVm {
                 uv,
                 text: text.to_owned(),
@@ -669,6 +687,10 @@ fn show_app(
             RoomVolumeUpdate::Truncate(on) => view3d.set_room_truncation(on),
             RoomVolumeUpdate::Clear => view3d.clear_room_volume(),
         }
+    }
+    // 虚拟孔洞图层指令按序交给视口（ADR-0031）。
+    for op in app.pending_hole_ops.drain(..) {
+        view3d.virtual_hole_op(op);
     }
     let window_px = windows.single().ok().map(|window| window.physical_size());
     let mut retried = 0;
@@ -1336,6 +1358,22 @@ struct App {
     /// 等着交给视口的房间体图层指令。与 `pending_dimensions` 同理：批次是视口自己的类型；
     /// 按序排着交（先撤旧的再挂新的），不是只留最后一条。
     pending_room_volume: Vec<RoomVolumeUpdate>,
+    /// 虚拟孔洞会话（ADR-0031）：孔洞列表、映射与布尔状态的编排账。内存-only，
+    /// 布尔结果只换三维画面，不写回正式模型。
+    hole_session: VirtualHoleSession,
+    /// 虚拟孔洞映射确认（`Req::VirtualHoleTargets`）的帧号。与会话帧号分开：
+    /// 清预览也会进会话帧，那不该作废还在路上的映射回包（映射在清预览后仍然有效）。
+    hole_map_epoch: u64,
+    /// 等着交给视口的虚拟孔洞图层指令（ADR-0031 阶段二 / 阶段四）。
+    pending_hole_ops: Vec<VirtualHoleOp>,
+    /// 虚拟孔洞表的文件选择：原生端是对话框线程，浏览器端是隐藏 input。
+    hole_pick: Option<HoleFilePick>,
+    /// 布尔回执「目标一个实例都没有」时的重发等待：宿主先显示模型，等网格落地
+    /// （`sync_render_states` 里看到 `mesh_loaded`）再重发同一批孔洞的预览。
+    hole_retry_pending: Option<RefU64>,
+    /// 已经为「目标未加载」重试过的目标。每目标只重试一次——模型加载失败时
+    /// 再重试也只是第二个 `no_instances`，徒增一轮空转。
+    hole_target_retried: HashSet<RefU64>,
     bridge: data::Bridge,
     tree: TreeModel,
     /// 还没落地的那一次树定位。同时只留一个：连续定位只完成最后一次。
@@ -2286,6 +2324,12 @@ impl App {
             room_view: None,
             room_view_epoch: 0,
             pending_room_volume: Vec::new(),
+            hole_session: VirtualHoleSession::new(),
+            hole_map_epoch: 0,
+            pending_hole_ops: Vec::new(),
+            hole_pick: None,
+            hole_retry_pending: None,
+            hole_target_retried: HashSet::new(),
             // 交互通道与模型通道都按这一个供数模式造读面（ADR-0026）。
             bridge: data::spawn(ctx.clone(), tasks, read_face),
             tree: TreeModel {
@@ -3339,6 +3383,32 @@ impl App {
                         ));
                     }
                 }
+                // 虚拟孔洞映射确认（ADR-0031 阶段一）：帧号对不上是上一份导入的尾巴，丢掉。
+                data::Evt::VirtualHoleTargets { epoch, results } => {
+                    if epoch == self.hole_map_epoch && self.hole_session.apply_targets(epoch, &results) {
+                        let vm = self.hole_session.vm();
+                        let mapped = vm
+                            .holes
+                            .iter()
+                            .filter(|row| {
+                                matches!(row.target, plant_ui::vm::VirtualHoleTargetVm::Mapped(_))
+                            })
+                            .count();
+                        let missing = vm
+                            .holes
+                            .iter()
+                            .filter(|row| {
+                                matches!(row.target, plant_ui::vm::VirtualHoleTargetVm::Missing)
+                            })
+                            .count();
+                        self.sync_hole_vm();
+                        let mut message = format!("虚拟孔洞映射确认：{mapped} 条已映射");
+                        if missing > 0 {
+                            message.push_str(&format!("，{missing} 条的目标在库里不存在"));
+                        }
+                        self.logs.info(&mut self.vm.logs, message);
+                    }
+                }
                 // 预览是长请求，用户可能中途放弃等待（Vm 回到 Idle）。晚到的结果
                 // 不许把界面拽回来——那一下会覆盖掉用户刚做出的选择。
                 data::Evt::ModelUpdatePreview(_)
@@ -3957,6 +4027,8 @@ impl App {
             );
         }
         self.rebuild_tree();
+        // 等重试的虚拟孔洞目标网格落地了就重发预览（ADR-0031 阶段四）。
+        self.settle_hole_retry();
     }
 
     fn handle_cmds(&mut self, ctx: &egui::Context, cmds: Vec<Cmd>) {
@@ -4020,6 +4092,95 @@ impl App {
                     _ => {}
                 },
                 Cmd::ClearLogs => self.logs.clear(&mut self.vm.logs),
+                Cmd::ImportVirtualHoles => self.open_hole_pick(),
+                Cmd::SelectVirtualHole(id) => {
+                    if id.is_empty() {
+                        self.hole_session.select(None);
+                    } else {
+                        self.hole_session.select(Some(&id));
+                    }
+                    let selected = self.hole_session.selected().map(str::to_string);
+                    self.pending_hole_ops.push(VirtualHoleOp::SelectHole(selected));
+                    self.sync_hole_vm();
+                }
+                Cmd::MapVirtualHole { hole_id, refno } => {
+                    if self.hole_session.map_manually(&hole_id, refno) {
+                        // 映射换了目标，旧的布尔结果（连同被换过的网格）整个作废：
+                        // 清预览层再按新目标来，不留一半新旧混着的画面。
+                        self.clear_hole_preview();
+                        self.logs.info(
+                            &mut self.vm.logs,
+                            format!("虚拟孔洞 {hole_id} 已手动映射到 {refno}，预览已清掉请重新发起"),
+                        );
+                    }
+                }
+                Cmd::PreviewVirtualHoles => {
+                    let targets = self.hole_session.begin_preview();
+                    if targets.is_empty() {
+                        self.logs.info(
+                            &mut self.vm.logs,
+                            "虚拟孔洞：没有可预览的记录（需要 RelyItemREF 映射到库里的元素）",
+                        );
+                    } else {
+                        let epoch = self.hole_session.epoch();
+                        let target_count = targets.len();
+                        for target in targets {
+                            let holes = self
+                                .hole_session
+                                .holes_for_target(target)
+                                .into_iter()
+                                .cloned()
+                                .collect();
+                            self.pending_hole_ops.push(VirtualHoleOp::Preview {
+                                epoch,
+                                target,
+                                holes,
+                            });
+                        }
+                        self.hole_retry_pending = None;
+                        self.hole_target_retried.clear();
+                        self.sync_hole_vm();
+                        self.logs.info(
+                            &mut self.vm.logs,
+                            format!("虚拟孔洞预览已发起：{target_count} 个目标"),
+                        );
+                    }
+                }
+                Cmd::ClearVirtualHolePreview => {
+                    if !self.hole_session.is_empty() {
+                        self.clear_hole_preview();
+                        self.logs
+                            .info(&mut self.vm.logs, "虚拟孔洞预览已清掉，原始网格已恢复");
+                    }
+                }
+                Cmd::FocusVirtualHole(id) => {
+                    if self.hole_session.hole(&id).is_some() {
+                        self.pending_hole_ops.push(VirtualHoleOp::FocusHole(id));
+                    }
+                }
+                Cmd::FocusVirtualHoleTarget(id) => {
+                    if let Some(target) = self.hole_session.target_of(&id) {
+                        // 先选中并展开树上那一行，再显示模型、取景到它的包围盒。
+                        self.handle_cmds(ctx, vec![Cmd::LocateElement(target)]);
+                        self.set_model_visible(vec![target], true);
+                        self.view3d_commands
+                            .push(Cmd::Model(plant_ui::ModelAction::Focus(target)));
+                    }
+                }
+                Cmd::ShowVirtualHoleOriginal(on) => {
+                    self.hole_session.set_show_original(on);
+                    self.pending_hole_ops.push(VirtualHoleOp::SetShowOriginal(on));
+                    self.sync_hole_vm();
+                }
+                Cmd::SetVirtualHoleXRay(on) => {
+                    // 与房间 X-Ray 抢同一份半透明材质：后拨的赢。
+                    if on {
+                        self.clear_room_xray();
+                    }
+                    self.hole_session.set_xray(on);
+                    self.pending_hole_ops.push(VirtualHoleOp::SetXRay(on));
+                    self.sync_hole_vm();
+                }
                 Cmd::SubmitCommand(command) => dirty |= self.submit_command(command),
                 Cmd::SearchElements { query } => self.search_elements(query),
                 Cmd::CloseSearch => {
@@ -5456,6 +5617,165 @@ impl App {
         self.pending_dimensions = Some(DimensionLayerUpdate::Clear);
     }
 
+    /// 会话 → 页签 Vm 的同步。会话是真值，`vm.virtual_holes` 是每帧抄过去的投影。
+    fn sync_hole_vm(&mut self) {
+        self.vm.virtual_holes = self.hole_session.vm();
+    }
+
+    /// 打开虚拟孔洞表的文件选择。已经开着时再点只当没听见——对话框自己排队。
+    fn open_hole_pick(&mut self) {
+        if self.hole_pick.is_some() {
+            return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.hole_pick = Some(HoleFilePick::open());
+        }
+        // 浏览器端：click 必须落在用户手势里（这条命令就是那一下），
+        // 拿不到 input（没 DOM）时静默失败，日志里说一声。
+        #[cfg(target_arch = "wasm32")]
+        {
+            match HoleFilePick::open() {
+                Some(pick) => self.hole_pick = Some(pick),
+                None => self.logs.warn(
+                    &mut self.vm.logs,
+                    "虚拟孔洞表选择器打不开（浏览器环境异常）",
+                ),
+            }
+        }
+    }
+
+    /// 文件选择回来了：喂给导入器，换会话、换切削体层、发起映射确认。
+    fn import_hole_file(&mut self, file: PickedHoleFile) {
+        let result = match &file {
+            PickedHoleFile::Path(path) => virtual_hole::import_file(path),
+            PickedHoleFile::Bytes { name, bytes } => virtual_hole::import_bytes(name, bytes),
+        };
+        let report = match result {
+            Ok(report) => report,
+            Err(error) => {
+                self.logs.error(
+                    &mut self.vm.logs,
+                    "虚拟孔洞表导入失败",
+                    &error,
+                    None,
+                );
+                return;
+            }
+        };
+        let hole_count = report.holes.len();
+        let error_count = report.row_errors.len();
+        // 重导入是整份替换：旧会话进新帧（在途回执作废），切削体层整层换掉。
+        self.hole_session.import(report);
+        self.hole_map_epoch = self.hole_map_epoch.wrapping_add(1);
+        self.hole_retry_pending = None;
+        self.hole_target_retried.clear();
+        let holes = self.hole_session.holes().to_vec();
+        self.pending_hole_ops.push(VirtualHoleOp::SetLayer { holes });
+        self.sync_hole_vm();
+        // 自动映射：RelyItemREF 解析出的参考号去库里确认真伪。
+        let refnos = self.hole_session.pending_mapping_refnos();
+        if !refnos.is_empty() {
+            let _ = self.bridge.req.send(data::Req::VirtualHoleTargets {
+                epoch: self.hole_map_epoch,
+                refnos,
+            });
+        }
+        // 导入完自己跳到「虚拟孔洞」页签（ADR-0011：动作之后进度该自己现身）。
+        self.state.focus(Pane::VirtualHoles);
+        let mut message = format!("虚拟孔洞表已导入：{hole_count} 条记录");
+        if error_count > 0 {
+            message.push_str(&format!("，{error_count} 行解析失败（见页签「解析错误」）"));
+        }
+        self.logs.info(&mut self.vm.logs, message);
+    }
+
+    /// 视口的一份布尔回执落地：行状态进会话，「目标没实例」的重试在这里排队。
+    fn apply_hole_receipt(&mut self, receipt: VirtualHoleReceipt) {
+        let effect = self.hole_session.apply_receipt(&receipt);
+        match effect {
+            ReceiptEffect::RetryAfterShow(refno) => {
+                if self.hole_target_retried.insert(refno) {
+                    // 只改画面不改库：显示模型，等网格落地再重发预览。
+                    self.set_model_visible(vec![refno], true);
+                    self.hole_retry_pending = Some(refno);
+                    self.logs.info(
+                        &mut self.vm.logs,
+                        format!("虚拟孔洞目标 {refno} 未加载，已发起显示，网格落地后自动重试预览"),
+                    );
+                }
+            }
+            ReceiptEffect::StatusOnly => match receipt.status {
+                VirtualHoleStatus::Changed => {
+                    self.logs.info(
+                        &mut self.vm.logs,
+                        format!(
+                            "虚拟孔洞预览完成：{}，{} 个孔洞，{} ms",
+                            receipt.refno,
+                            receipt.hole_ids.len(),
+                            receipt.elapsed_ms
+                        ),
+                    );
+                }
+                VirtualHoleStatus::Failed => {
+                    let el = self.tree.element(receipt.refno);
+                    let error = anyhow::anyhow!(
+                        "{}",
+                        receipt.error.as_deref().unwrap_or("未知错误")
+                    );
+                    self.logs
+                        .error_of(&mut self.vm.logs, el, "虚拟孔洞布尔失败", &error, None);
+                }
+                _ => {}
+            },
+        }
+        // 帧号对不上（清预览 / 重导入之后回来的）apply_receipt 内部已丢弃，这里照常同步。
+        self.sync_hole_vm();
+    }
+
+    /// 网格落地检查：等重试的虚拟孔洞目标画出来了就重发预览。
+    fn settle_hole_retry(&mut self) {
+        let Some(target) = self.hole_retry_pending else {
+            return;
+        };
+        let loaded = self
+            .tree
+            .visibility
+            .get(&target)
+            .is_some_and(|state| state.mesh_loaded > 0);
+        if !loaded {
+            return;
+        }
+        self.hole_retry_pending = None;
+        let holes: Vec<_> = self
+            .hole_session
+            .holes_for_target(target)
+            .into_iter()
+            .cloned()
+            .collect();
+        if holes.is_empty() {
+            return;
+        }
+        self.pending_hole_ops.push(VirtualHoleOp::Preview {
+            epoch: self.hole_session.epoch(),
+            target,
+            holes,
+        });
+        self.logs.info(
+            &mut self.vm.logs,
+            format!("虚拟孔洞目标 {target} 已加载，重试预览"),
+        );
+    }
+
+    /// 清掉虚拟孔洞预览层：恢复原始网格、撤切削体；孔洞列表与映射保留。
+    fn clear_hole_preview(&mut self) {
+        self.hole_session.clear_preview();
+        self.hole_retry_pending = None;
+        self.hole_target_retried.clear();
+        self.pending_hole_ops.push(VirtualHoleOp::Clear);
+        self.sync_hole_vm();
+    }
+
     fn refetch_props(&mut self, refno: RefU64) {
         self.vm.props.begin_query();
         let _ = self.bridge.req.send(data::Req::Props(refno));
@@ -5510,6 +5830,12 @@ impl App {
                 refnos: panels,
             }));
         self.xray_active_room = Some(room);
+        // 房间 X-Ray 与虚拟孔洞 X-Ray 抢同一份半透明材质：后拨的赢。
+        if self.hole_session.xray() {
+            self.hole_session.set_xray(false);
+            self.pending_hole_ops.push(VirtualHoleOp::SetXRay(false));
+            self.sync_hole_vm();
+        }
         self.logs.info(
             &mut self.vm.logs,
             format!("房间 X-Ray 已启用：{room} · 面板 {panel_count} · 不透明度 25%"),
@@ -6177,6 +6503,11 @@ impl App {
         // 尺寸标注量的是清场前那份几何，重装回来的 BRAN 可能已经不是那个样子（计划 B3：
         // 换场景清层）。要看就再右键一次。
         self.clear_pipe_dimensions();
+        // 场景清空，被替换过的预览网格随实体一起没了：撤掉孔洞预览层，孔洞列表
+        // 与映射保留（重装回来还能再发预览）。
+        if !self.hole_session.is_empty() {
+            self.clear_hole_preview();
+        }
         self.loaded_models.clear();
         self.model_owner.clear();
         self.tree.visibility.clear();
@@ -6469,6 +6800,15 @@ impl App {
         self.sync_nav_vm();
         // 尺寸标注层挂的是旧库的 BRAN：清掉，在途的取数回来也不再上屏。
         self.clear_pipe_dimensions();
+        // 旧库的虚拟孔洞参考号在新库里没意义：整份会话作废，预览层撤掉。
+        if !self.hole_session.is_empty() {
+            self.hole_session.reset();
+            self.hole_map_epoch = self.hole_map_epoch.wrapping_add(1);
+            self.hole_retry_pending = None;
+            self.hole_target_retried.clear();
+            self.pending_hole_ops.push(VirtualHoleOp::Clear);
+            self.sync_hole_vm();
+        }
         self.vm.selection_branch = None;
         // 换库了，旧库的房间总览不作数。窗口开着就顺手重拉，关着就等下次打开。
         if self.room_browser_state.open {
@@ -9177,6 +9517,15 @@ impl App {
             self.browse_mesh_dir();
         }
         self.poll_mesh_dir_pick(ui.ctx());
+        // 虚拟孔洞表的文件选择（对话框线程 / 浏览器隐藏 input），拿到就导入。
+        match self.hole_pick.as_mut().map(|pick| pick.poll(ui.ctx())) {
+            Some(HolePickPoll::Picked(file)) => {
+                self.hole_pick = None;
+                self.import_hole_file(file);
+            }
+            Some(HolePickPoll::Finished) => self.hole_pick = None,
+            _ => {}
+        }
         if let Some(saved) = saved {
             theme_tokens::apply(ui.ctx(), &saved.theme.tokens(), saved.density);
             let moved = self.model_api_url != saved.model_api_url;
@@ -9214,6 +9563,11 @@ impl App {
         // 绘制层只读、消费不掉自己的滚动请求，所以由这里判断它落地没有。
         self.settle_tree_reveal();
         self.handle_cmds(ui.ctx(), cmds);
+        // 布尔作业是异步的：计算中有回执没回来时催下一帧，计数别停在旧数字上。
+        if self.vm.virtual_holes.calculating > 0 {
+            ui.ctx()
+                .request_repaint_after(Duration::from_millis(200));
+        }
         self.poll_queue(ui.ctx());
         // 这一帧才展开出来的行要等下一帧才画得到，别让界面停在这儿等下一次输入。
         // 子层还在路上的那种不在这里空转——祖先链和子层回来时数据线程会叫醒它。
