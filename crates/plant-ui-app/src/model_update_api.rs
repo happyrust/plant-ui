@@ -1301,7 +1301,7 @@ fn generate_status(raw: &str) -> GenerateStatus {
 
 /// query 串里的 refno 带 `/`，项目名与 MDB 带 `/` 也带空格。
 /// 只做百分号转义，不引第三方依赖——这几个字段的字符集很窄。
-fn urlencode(value: &str) -> String {
+pub(crate) fn urlencode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.as_bytes() {
         match byte {
@@ -1314,7 +1314,8 @@ fn urlencode(value: &str) -> String {
     out
 }
 
-async fn get<T: DeserializeOwned>(base: &str, path: &str) -> anyhow::Result<T> {
+/// 无 body 的 GET。`spatial_api` 的两条房间树路由也走它（同一台服务、同一套超时与错误包封）。
+pub(crate) async fn get<T: DeserializeOwned>(base: &str, path: &str) -> anyhow::Result<T> {
     let mut req = ehttp::Request::get(format!("{base}{path}"));
     req.timeout = Some(Duration::from_secs(15));
     let response = ehttp::fetch_async(req)

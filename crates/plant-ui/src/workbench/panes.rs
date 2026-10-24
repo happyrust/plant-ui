@@ -21,6 +21,9 @@ use crate::vm::WorkbenchVm;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Pane {
     ModelTree,
+    /// 房间树（plant3d-web「房间」页签移植）：与模型树同一侧、同一组页签。单立一个 dock 页签而不是
+    /// 模型树里自画子页签：plant-ui 的面板本身就是页签，再套一层是两套页签样式（计划 D1）。
+    RoomTree,
     View3d,
     CommandLine,
     Logs,
@@ -35,6 +38,7 @@ impl Pane {
     pub fn title(self) -> (&'static str, &'static str) {
         match self {
             Pane::ModelTree => (ph::TREE_STRUCTURE, "模型树"),
+            Pane::RoomTree => (ph::TREE_VIEW, "房间树"),
             Pane::View3d => (ph::CUBE, "三维视图"),
             Pane::CommandLine => (ph::TERMINAL_WINDOW, "命令行"),
             Pane::Logs => (ph::LIST_DASHES, "日志"),
@@ -104,6 +108,7 @@ pub struct Viewer<'a> {
     pub vm: &'a WorkbenchVm,
     pub queue: &'a crate::task_queue::Vm,
     pub command: &'a mut super::command_line::State,
+    pub room_tree: &'a mut super::room_tree::State,
     pub queue_state: &'a mut crate::task_queue::State,
     pub records_state: &'a mut crate::increment_records::State,
     pub cmds: &'a mut Vec<Cmd>,
@@ -120,6 +125,9 @@ impl TabViewer for Viewer<'_> {
     fn ui(&mut self, ui: &mut Ui, tab: &mut Self::Tab) {
         match tab {
             Pane::ModelTree => super::tree::show(ui, self.t, self.d, self.vm, self.cmds),
+            Pane::RoomTree => {
+                super::room_tree::show(ui, self.t, self.d, self.vm, self.room_tree, self.cmds)
+            }
             Pane::Properties => super::props::show(ui, self.t, self.d, self.vm, self.cmds),
             Pane::Room => super::room::show(ui, self.t, self.d, self.vm, self.cmds),
             Pane::VirtualHoles => {

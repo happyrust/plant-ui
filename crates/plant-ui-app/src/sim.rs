@@ -1929,11 +1929,291 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
                 message: "演示模式没有模型服务，取不到尺寸标注".to_owned(),
             }),
         },
+        // 房间树（plant3d-web「房间」页签移植）：剧本里摆一份小树供独立壳截图——两间有树的房 + 一间空房壳，
+        // 两个专业，BRAN 单元带直段，一个单元与一组 noun 的叶子超上限未内联（展开时按 `unit=` / `other_noun=` 补）。
+        Req::SpatialRooms { epoch } => Evt::SpatialRooms {
+            epoch,
+            result: Ok(spatial_rooms_fixture()),
+        },
+        Req::SpatialRoomTree { epoch, room, only } => {
+            let result = spatial_room_tree_fixture(room, only.as_ref());
+            Evt::SpatialRoomTree {
+                epoch,
+                room,
+                only,
+                result,
+            }
+        }
         Req::Models { .. } | Req::ModelScopes { .. } => {
             unreachable!("模型请求已在桥上路由到专用通道")
         }
     };
     let _ = evt_tx.send(evt);
+}
+
+/// 剧本里的在册房间：两间有树、一间空房壳（`panel_count == 0`，树恒答不出）。清单故意乱序，
+/// 界面按房间号自然序排（R12 < R101 < R102）。
+fn spatial_rooms_fixture() -> plant_ui::room_tree::RoomsResponse {
+    use plant_ui::room_tree::{RoomListItem, RoomsResponse};
+    let room = |refno: &str, num: &str, name: Option<&str>, panels: usize| RoomListItem {
+        refno: refno.into(),
+        room_num: num.into(),
+        name: name.map(str::to_owned),
+        dbnum: Some(9001),
+        panel_count: panels,
+        panel_refnos: (0..panels).map(|i| format!("9001_{}", 700 + i)).collect(),
+    };
+    RoomsResponse {
+        status: "ready".into(),
+        reason: None,
+        definition_version: Some("sim-1".into()),
+        rooms: vec![
+            room("9001_502", "R102", Some("泵房"), 4),
+            room("9001_503", "R12", Some("空房壳"), 0),
+            room("9001_501", "R101", Some("控制室"), 6),
+        ],
+    }
+}
+
+/// 剧本里一间房的树；`only` 给了就只内联那一组的叶子（与服务端 `unit=` / `other_noun=` 同形）。
+/// 不在剧本里的房回「没生成过面板模型」——跟服务端的 404 同一型。
+fn spatial_room_tree_fixture(
+    room: RefU64,
+    only: Option<&plant_ui::room_tree::LeafSelector>,
+) -> Result<plant_ui::room_tree::TreeResponse, crate::spatial_api::SpatialError> {
+    use plant_ui::room_tree::{
+        Aabb, LeafSelector, TreeLeaf, TreeOtherNoun, TreeOthers, TreeResponse, TreeRoom, TreeSpec,
+        TreeTube, TreeUnit, TreeUnitType,
+    };
+    let leaf = |refno: &str, noun: &str, distance: f64| TreeLeaf {
+        refno: refno.into(),
+        noun: noun.into(),
+        distance,
+        shared_rooms: None,
+    };
+    let tube = |ordinal: u32,
+                from: &str,
+                to: &str,
+                from_noun: &str,
+                to_noun: &str,
+                length: f64,
+                invalid: bool| {
+        TreeTube {
+            ordinal,
+            from: from.into(),
+            to: to.into(),
+            from_noun: from_noun.into(),
+            to_noun: to_noun.into(),
+            distance: 80.0 + ordinal as f64 * 10.0,
+            length,
+            aabb: Aabb {
+                min: [0.0, 0.0, 0.0],
+                max: [length, 100.0, 100.0],
+            },
+            invalid,
+            shared_rooms: None,
+        }
+    };
+    let wants_unit =
+        |refno: &str| matches!(only, Some(LeafSelector::Unit(unit)) if unit.to_string() == refno);
+    let wants_noun = |noun: &str| matches!(only, Some(LeafSelector::OtherNoun(n)) if n == noun);
+    let full = only.is_none();
+    let (refno, room_num, name, specs) = match room.to_string().as_str() {
+        "9001_501" => {
+            let b1_elements = vec![
+                leaf("9001_1011", "ELBO", 250.0),
+                leaf("9001_1012", "VALV", 1000.0),
+                TreeLeaf {
+                    shared_rooms: Some(2),
+                    ..leaf("9001_1013", "FLAN", 1800.0)
+                },
+            ];
+            let b1_tubes = vec![
+                tube(0, "9001_1010", "9001_1011", "BRAN", "ELBO", 141.0, false),
+                tube(1, "9001_1011", "9001_1012", "ELBO", "VALV", 2500.0, false),
+                tube(2, "9001_1012", "9001_1013", "VALV", "FLAN", 320.0, true),
+            ];
+            // 第二条 BRAN 的叶子故意不内联：展开它时走 `unit=` 补叶子那条路。
+            let b2_inline = full || wants_unit("9001_1020");
+            let b2_elements = vec![
+                leaf("9001_1021", "TEE", 90.0),
+                leaf("9001_1022", "REDU", 640.0),
+            ];
+            let b2_tubes = vec![tube(
+                0,
+                "9001_1021",
+                "9001_1022",
+                "TEE",
+                "REDU",
+                870.0,
+                false,
+            )];
+            // 面板故意给得多：单组就超过「加载模型」的 200 个确认阈值，演示确认框那条路。
+            const PANE_COUNT: usize = 230;
+            let pane_inline = wants_noun("PANE");
+            let pane_elements: Vec<TreeLeaf> = (0..PANE_COUNT)
+                .map(|i| leaf(&format!("9001_{}", 3000 + i), "PANE", 30.0 * (i + 1) as f64))
+                .collect();
+            (
+                "9001_501",
+                "R101",
+                Some("控制室"),
+                vec![
+                    TreeSpec {
+                        spec_value: 1,
+                        count: 7,
+                        tube_count: Some(4),
+                        unit_types: vec![
+                            TreeUnitType {
+                                noun: "BRAN".into(),
+                                count: 5,
+                                tube_count: Some(4),
+                                units: vec![
+                                    TreeUnit {
+                                        refno: "9001_1010".into(),
+                                        noun: "BRAN".into(),
+                                        name: Some("/SIM-P1/B1".into()),
+                                        count: 3,
+                                        tube_count: Some(3),
+                                        min_distance: 250.0,
+                                        elements: (full || wants_unit("9001_1010"))
+                                            .then(|| b1_elements.clone()),
+                                        tubes: (full || wants_unit("9001_1010"))
+                                            .then(|| b1_tubes.clone()),
+                                    },
+                                    TreeUnit {
+                                        refno: "9001_1020".into(),
+                                        noun: "BRAN".into(),
+                                        name: Some("/SIM-P1/B2".into()),
+                                        count: 2,
+                                        tube_count: Some(1),
+                                        min_distance: 90.0,
+                                        elements: b2_inline.then(|| b2_elements.clone()),
+                                        tubes: b2_inline.then(|| b2_tubes.clone()),
+                                    },
+                                ],
+                            },
+                            TreeUnitType {
+                                noun: "EQUI".into(),
+                                count: 2,
+                                tube_count: None,
+                                units: vec![TreeUnit {
+                                    refno: "9001_1030".into(),
+                                    noun: "EQUI".into(),
+                                    name: Some("/SIM-E1".into()),
+                                    count: 2,
+                                    tube_count: None,
+                                    min_distance: 0.0,
+                                    elements: full.then(|| {
+                                        vec![
+                                            leaf("9001_1031", "NOZZ", 0.0),
+                                            leaf("9001_1032", "NOZZ", 120.0),
+                                        ]
+                                    }),
+                                    tubes: None,
+                                }],
+                            },
+                        ],
+                        others: TreeOthers::default(),
+                    },
+                    TreeSpec {
+                        spec_value: 6,
+                        count: 3 + PANE_COUNT,
+                        tube_count: None,
+                        unit_types: Vec::new(),
+                        others: TreeOthers {
+                            count: 3 + PANE_COUNT,
+                            by_noun: vec![
+                                TreeOtherNoun {
+                                    noun: "SCTN".into(),
+                                    count: 3,
+                                    min_distance: 410.0,
+                                    elements: full.then(|| {
+                                        vec![
+                                            leaf("9001_1201", "SCTN", 410.0),
+                                            leaf("9001_1202", "SCTN", 1500.0),
+                                            leaf("9001_1203", "SCTN", 2000.0),
+                                        ]
+                                    }),
+                                },
+                                TreeOtherNoun {
+                                    noun: "PANE".into(),
+                                    count: PANE_COUNT,
+                                    min_distance: 30.0,
+                                    elements: pane_inline.then(|| pane_elements.clone()),
+                                },
+                            ],
+                        },
+                    },
+                ],
+            )
+        }
+        "9001_502" => (
+            "9001_502",
+            "R102",
+            Some("泵房"),
+            vec![TreeSpec {
+                spec_value: 1,
+                count: 1,
+                tube_count: Some(1),
+                unit_types: vec![TreeUnitType {
+                    noun: "BRAN".into(),
+                    count: 1,
+                    tube_count: Some(1),
+                    units: vec![TreeUnit {
+                        refno: "9001_2010".into(),
+                        noun: "BRAN".into(),
+                        name: Some("/SIM-P2/B1".into()),
+                        count: 1,
+                        tube_count: Some(1),
+                        min_distance: 60.0,
+                        elements: Some(vec![leaf("9001_2011", "GASK", 60.0)]),
+                        tubes: Some(vec![tube(
+                            0,
+                            "9001_2010",
+                            "9001_2011",
+                            "BRAN",
+                            "GASK",
+                            1200.0,
+                            false,
+                        )]),
+                    }],
+                }],
+                others: TreeOthers::default(),
+            }],
+        ),
+        _ => {
+            return Err(crate::spatial_api::SpatialError::RoomNotFound(format!(
+                "剧本里没有 {room} 的面板模型"
+            )));
+        }
+    };
+    let leaf_count: usize = specs.iter().map(|spec| spec.count).sum();
+    let inlined = match only {
+        Some(LeafSelector::Unit(unit)) => Some(format!("unit:{unit}")),
+        Some(LeafSelector::OtherNoun(noun)) => Some(format!("other_noun:{noun}")),
+        None => None,
+    };
+    Ok(TreeResponse {
+        total_count: leaf_count,
+        total_tube_count: Some(specs.iter().filter_map(|spec| spec.tube_count).sum()),
+        tubes_truncated: false,
+        // 剧本里的上限故意定得小：演示「叶子超上限、按组补取」那条路。
+        leaves_inline: false,
+        leaf_cap: 10,
+        leaf_count,
+        inlined,
+        delivery_unit_types: vec!["BRAN".into(), "EQUI".into()],
+        rooms: vec![TreeRoom {
+            refno: refno.into(),
+            room_num: room_num.into(),
+            name: name.map(str::to_owned),
+            count: leaf_count,
+            tube_count: Some(specs.iter().filter_map(|spec| spec.tube_count).sum()),
+            specs,
+        }],
+        warnings: Vec::new(),
+    })
 }
 
 /// 收口批次的分步账（与 gen-model `task_registry` 的 steps[] 同形）：段名与比例照抄 2026-10-23

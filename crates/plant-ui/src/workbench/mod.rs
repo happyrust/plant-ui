@@ -9,6 +9,7 @@ pub mod logs;
 pub mod panes;
 pub mod props;
 pub mod room;
+pub mod room_tree;
 pub mod search;
 pub mod tree;
 pub mod view3d;
@@ -64,7 +65,7 @@ impl DockVisibility {
 /// 常驻视图归在哪一侧 dock；三维视图在中央，不归任何一侧。
 fn dock_side_of(pane: Pane) -> Option<DockSide> {
     match pane {
-        Pane::ModelTree => Some(DockSide::Left),
+        Pane::ModelTree | Pane::RoomTree => Some(DockSide::Left),
         // 虚拟孔洞与属性 / 房间同一格页签：都是「选中一条记录看详情」的右侧面板。
         Pane::Properties | Pane::Room | Pane::VirtualHoles => Some(DockSide::Right),
         Pane::CommandLine | Pane::Logs | Pane::TaskQueue | Pane::IncrementRecords => {
@@ -103,6 +104,7 @@ pub struct WorkbenchState {
     dock: DockState<Pane>,
     vis: DockVisibility,
     command: command_line::State,
+    room_tree: room_tree::State,
     queue: crate::task_queue::State,
     records: crate::increment_records::State,
     search: search::State,
@@ -115,6 +117,7 @@ impl Default for WorkbenchState {
             dock: build_dock(vis),
             vis,
             command: command_line::State::default(),
+            room_tree: room_tree::State::default(),
             queue: crate::task_queue::State::default(),
             records: crate::increment_records::State::default(),
             search: search::State::default(),
@@ -134,7 +137,10 @@ fn build_dock(vis: DockVisibility) -> DockState<Pane> {
         let surface = dock.main_surface_mut();
         let mut center = NodeIndex::root();
         if vis.left {
-            let [c, _left] = surface.split_left(center, 0.19, vec![Pane::ModelTree]);
+            // 房间树跟在模型树后面同一组：都是「浏览库里有什么」的左侧导航，与 plant3d-web
+            // 把它做成模型树里的子页签是同一个位置感。
+            let [c, _left] =
+                surface.split_left(center, 0.19, vec![Pane::ModelTree, Pane::RoomTree]);
             center = c;
         }
         if vis.right {
@@ -186,6 +192,19 @@ impl WorkbenchState {
     /// 就不动页签。
     pub fn active_pane(&mut self) -> Option<Pane> {
         self.dock.find_active_focused().map(|(_, pane)| *pane)
+    }
+
+    /// 这个视图此刻是不是它所在那一格里激活的页签（画在前台）。与 [`Self::active_pane`] 不同：
+    /// 那个说的是整个 dock 里拿焦点的那一格，这个问的是某一格里谁在前。房间树的外部选中联动只在
+    /// 它在前台时做（plant3d-web 同口径：页签不在前台不拉数据、不动树）。页签被拖走了就是 `false`。
+    pub fn is_pane_active(&self, pane: Pane) -> bool {
+        let Some(path) = self.dock.find_tab(&pane) else {
+            return false;
+        };
+        self.dock
+            .get_surface(path.surface)
+            .and_then(|surface| surface[path.node].get_leaf())
+            .is_some_and(|leaf| leaf.active == path.tab)
     }
 
     /// 收 / 展某一侧 dock。dock 布局属于界面自身，宿主收到 `Cmd::ToggleDock` 后
@@ -248,6 +267,7 @@ pub fn show(
                 dock,
                 vis: _,
                 command,
+                room_tree: room_tree_state,
                 queue: queue_state,
                 records: records_state,
                 search: _,
@@ -258,6 +278,7 @@ pub fn show(
                 vm,
                 queue,
                 command,
+                room_tree: room_tree_state,
                 queue_state,
                 records_state,
                 cmds: &mut cmds,
@@ -269,6 +290,8 @@ pub fn show(
                 .show_leaf_collapse_buttons(false)
                 .show_inside(ui, &mut viewer);
         });
+    // 房间树「加载模型」超过阈值的确认框是窗口级的：页签切走了它也得在，不能跟着面板画。
+    room_tree::confirm_dialog(ui.ctx(), t, d, vm, &mut cmds);
 
     cmds
 }

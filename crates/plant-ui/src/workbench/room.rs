@@ -209,37 +209,47 @@ fn summary(
                         .font(Font::mono_meta(d))
                         .color(t.text_secondary),
                     );
-                    if live {
-                        ui.horizontal(|ui| {
-                            // 取景要面板参与：房间的空间范围由墙面板围出来，
-                            // 光取成员会把相机贴到设备堆上。与宿主 FocusRoom
-                            // 展开的目标集同一口径。
-                            let mut targets = det.panels.clone();
-                            targets.extend(
-                                det.member_refnos
-                                    .iter()
-                                    .filter(|refno| !det.panels.contains(refno)),
-                            );
-                            // 摆在最前：另两枚都只对**已经加载**的模型生效，而房间的
-                            // 墙面板多半从没被加载过——先有这一枚把几何取回来，那两枚
-                            // 才有东西可取景、可隔离。
-                            if ui.add(widgets::chip(t, d, "显示房间模型", false)).clicked() {
-                                cmds.push(Cmd::ShowRoomModel(det.room));
-                            }
-                            if ui.add(widgets::chip(t, d, "缩放到房间", false)).clicked() {
-                                cmds.push(Cmd::Model(ModelAction::FocusGroup {
-                                    refnos: targets.clone(),
-                                }));
-                            }
-                            if ui.add(widgets::chip(t, d, "隔离成员", false)).clicked() {
-                                // 不是房间视图：没有房间体可截，按 owner 展开留下成员底下的件。
-                                cmds.push(Cmd::Model(ModelAction::Isolate {
-                                    refnos: targets,
-                                    matching: IsolateMatching::RefnoOrOwner,
-                                }));
-                            }
-                        });
-                    }
+                    ui.horizontal(|ui| {
+                        // 「在房间树查看」（plant3d-web 关联房间浮窗的同名入口）：切到房间树页签取这间房的
+                        // 层级并展开。不吃 live 门禁——它是数据浏览，不是模型动作。
+                        if ui
+                            .add(widgets::chip(t, d, "在房间树查看", false))
+                            .on_hover_text("切到「房间树」页签，取这间房的 专业 → 最小交付单元 → 构件 层级并展开")
+                            .clicked()
+                        {
+                            cmds.push(Cmd::RevealRoomInTree(det.room));
+                        }
+                        if !live {
+                            return;
+                        }
+                        // 取景要面板参与：房间的空间范围由墙面板围出来，
+                        // 光取成员会把相机贴到设备堆上。与宿主 FocusRoom
+                        // 展开的目标集同一口径。
+                        let mut targets = det.panels.clone();
+                        targets.extend(
+                            det.member_refnos
+                                .iter()
+                                .filter(|refno| !det.panels.contains(refno)),
+                        );
+                        // 摆在最前：另两枚都只对**已经加载**的模型生效，而房间的
+                        // 墙面板多半从没被加载过——先有这一枚把几何取回来，那两枚
+                        // 才有东西可取景、可隔离。
+                        if ui.add(widgets::chip(t, d, "显示房间模型", false)).clicked() {
+                            cmds.push(Cmd::ShowRoomModel(det.room));
+                        }
+                        if ui.add(widgets::chip(t, d, "缩放到房间", false)).clicked() {
+                            cmds.push(Cmd::Model(ModelAction::FocusGroup {
+                                refnos: targets.clone(),
+                            }));
+                        }
+                        if ui.add(widgets::chip(t, d, "隔离成员", false)).clicked() {
+                            // 不是房间视图：没有房间体可截，按 owner 展开留下成员底下的件。
+                            cmds.push(Cmd::Model(ModelAction::Isolate {
+                                refnos: targets,
+                                matching: IsolateMatching::RefnoOrOwner,
+                            }));
+                        }
+                    });
                 });
             super::chrome::hairline(ui, t);
         }

@@ -9,6 +9,7 @@ pub mod model_mutation;
 pub mod model_update;
 pub mod project_picker;
 pub mod room_browser;
+pub mod room_tree;
 pub mod settings;
 pub mod style;
 pub mod task_queue;
@@ -460,6 +461,14 @@ pub enum Cmd {
     /// 打开房间浏览器浮窗并（重新）拉取全表。全表是全库扫描级的重查询，
     /// 所以由这条命令按需触发，不进启动路径；查询在途时再按只开窗不重发。
     OpenRoomBrowser,
+    /// 「房间树」面板（plant3d-web「房间」页签移植，ADR 0068）的动作：取根清单 / 取一间房的树、
+    /// 展开、过滤、点选、显隐 / 聚焦 / 隔离 / 加载。节点身份是 [`room_tree::RoomNodeId`]——分组行
+    /// （专业 / 单元类型 / 其他构件）没有 refno，模型树那套按 refno 的命令套不上。宿主把节点下的
+    /// refno 收齐（单元级及以上连所属 BRAN）再转成既有的 [`ModelAction`]，没有第二套显隐路径。
+    RoomTree(room_tree::RoomTreeAction),
+    /// 「房间」页签上的「在房间树查看」：切到房间树面板，取这间房的树、展开到第一层、滚到它。
+    /// 带的是房间 FRMW 的 refno；不在册（服务端清单里没有）时宿主在日志里说一句。
+    RevealRoomInTree(aios_core::RefU64),
     /// 右键「查看尺寸标注」（计划 B2）：取这条 BRAN 的 MBD 尺寸标注并挂到视口上。
     ///
     /// 带的是**BRAN** 的 refno，不是右键落点：落点是 ELBO / ATTA 这类成员时，归属到

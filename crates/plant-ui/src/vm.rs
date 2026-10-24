@@ -55,6 +55,9 @@ pub struct WorkbenchVm {
     pub rooms: RoomVm,
     /// 「房间」页签聚焦房间的详情，`Cmd::FocusRoom` 后由宿主填。
     pub room_detail: RoomDetailVm,
+    /// 「房间树」面板（plant3d-web「房间」页签移植）：在册房间平铺一层，展开一间房是服务端聚合的
+    /// 房间 → 专业 → 最小交付单元类型 → 单元 → 构件。行由宿主按展开状态展平，绘制层逐帧只读。
+    pub room_tree: RoomTreeVm,
     /// 尺寸标注层（计划 B2–B4）：视口此刻挂着哪条 BRAN 的尺寸标注、到了哪一步。
     /// 不跟选中走——右键「查看尺寸标注」才换，之后换选中它照样挂着。
     pub dimensions: DimensionsVm,
@@ -750,6 +753,90 @@ impl RoomVm {
         };
         *self = Self::Loading(previous);
     }
+}
+
+/// 「房间树」面板的数据状态。
+///
+/// 树是 gen-model 服务端聚合的（ADR 0068），只在服务供数下有：库供数 / 老服务端 / 房间体制未就绪
+/// 都是 `Unavailable` 一句明白的注释（ADR-0026：缺的格要标出来，不许安静空着），不是失败。
+#[derive(Debug, Clone, Default)]
+pub enum RoomTreeVm {
+    /// 还没拉过根清单：面板第一次成为活动页签才发 `RoomTreeAction::Load`。
+    #[default]
+    Idle,
+    Unavailable(String),
+    Loading,
+    Ready(RoomTreeDataVm),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RoomTreeDataVm {
+    pub rows: Vec<RoomTreeRowVm>,
+    /// 在册房间数。
+    pub total: usize,
+    /// 过滤后的根数。
+    pub matched: usize,
+    /// 宿主此刻的过滤词（绘制层的输入框跟它对齐：「在房间树查看」会把挡住目标的过滤词清掉）。
+    pub filter: String,
+    /// `degraded` 时服务端给的原因，跟在状态行后面。
+    pub note: Option<String>,
+    /// 取树 / 补叶子失败的节点，逐条列在树上方。
+    pub errors: Vec<RoomTreeErrorVm>,
+    /// 「把这一行滚进视野」的待办（外部选中联动 / 「在房间树查看」），由宿主在行出现后收掉，
+    /// 与 [`WorkbenchVm::tree_reveal`] 同一条规矩。
+    pub reveal: Option<crate::room_tree::RoomNodeId>,
+    /// 「加载模型」超过阈值时开着的确认框。
+    pub confirm: Option<RoomTreeConfirmVm>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoomTreeErrorVm {
+    pub id: crate::room_tree::RoomNodeId,
+    pub label: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoomTreeConfirmVm {
+    pub id: crate::room_tree::RoomNodeId,
+    pub label: String,
+    pub count: usize,
+}
+
+/// 行尾的标签片（「跨 N 房」「无效」）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoomTreeTagVm {
+    pub text: String,
+    pub tone: Status,
+}
+
+/// 房间树的一个可见行。展平由宿主在结构 / 可见性变化时做，绘制层逐帧只读。
+#[derive(Debug, Clone)]
+pub struct RoomTreeRowVm {
+    pub id: crate::room_tree::RoomNodeId,
+    pub kind: crate::room_tree::RoomNodeKind,
+    pub depth: u16,
+    pub label: String,
+    /// 行尾：计数尾巴 / noun · 距离。
+    pub meta: String,
+    pub hover: String,
+    /// 图标用的类型（房间 `ROOM`、直段 `TUBI`、分组为空）。
+    pub noun: String,
+    pub tags: Vec<RoomTreeTagVm>,
+    pub expandable: Option<bool>,
+    pub loading: bool,
+    /// `None` = 这一行没有眼睛（直段行：第一版只读）。有值时读的是三维的实际可见性，分组行按子行聚合。
+    pub visibility: Option<RowVisibility>,
+    /// 点眼睛时 `SetVisible` 该带的方向（与 [`TreeRowVm::next_visible`] 同一条理由）。
+    pub next_visible: bool,
+    pub selected: bool,
+    pub primary: bool,
+    /// 构件 / 单元行自己的 refno；直段行是所属 BRAN；分组行没有。右键「查看属性」「查看关联房间」
+    /// 「复制 REFNO」对它。
+    pub refno: Option<RefU64>,
+    /// 节点下的构件数（右键「加载模型（N 个构件）」）；房间根在树取回前为 `None`。
+    pub count: Option<usize>,
 }
 
 /// 一次房间视图的身份牌：HUD 徽章、「截断直段」芯片与退出入口的数据源。

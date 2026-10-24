@@ -318,6 +318,17 @@ pub enum Req {
     /// 同口径」）——求解器要的成员结点视图只有服务端会拼，库供数下也一样。
     /// `epoch` 认帧：右键换了别的 BRAN、或者已经点了隐藏，晚到的旧结果不许再贴回来。
     PipeDimensions { epoch: u64, refno: RefU64 },
+    /// 房间树的在册房间清单（`GET /api/v1/spatial/rooms`，plant3d-web「房间」页签移植）。
+    ///
+    /// 不走读面：树是 gen-model 服务端聚合的（ADR 0068：单元根派生、跨房去重、直段补全），库供数没有
+    /// 第二条路（计划 D2）——库供数下宿主不发这条，面板显一句注释。`epoch` 认帧：刷新 / 重连之后晚到的旧清单丢。
+    SpatialRooms { epoch: u64 },
+    /// 一间房的层级树，或按 `only` 补一组叶子（`GET /api/v1/spatial/rooms/{a_b}/tree?tubes=1[&unit=|&other_noun=]`）。
+    SpatialRoomTree {
+        epoch: u64,
+        room: RefU64,
+        only: Option<plant_ui::room_tree::LeafSelector>,
+    },
 }
 
 /// 一次取回工作重新查回来的那部分树。
@@ -507,6 +518,18 @@ pub enum Evt {
         epoch: u64,
         refno: RefU64,
         result: Result<plant_mbd::MbdV2PipeData, crate::mbd_api::MbdError>,
+    },
+    /// 房间树的在册房间清单回包。错误是分好型的 [`crate::spatial_api::SpatialError`]。
+    SpatialRooms {
+        epoch: u64,
+        result: Result<plant_ui::room_tree::RoomsResponse, crate::spatial_api::SpatialError>,
+    },
+    /// 一间房的树 / 一组叶子回包。`room` / `only` 原样带回：宿主按它们找到是哪个节点在等。
+    SpatialRoomTree {
+        epoch: u64,
+        room: RefU64,
+        only: Option<plant_ui::room_tree::LeafSelector>,
+        result: Result<plant_ui::room_tree::TreeResponse, crate::spatial_api::SpatialError>,
     },
     /// 队列视图的逐单元明细，带发生在哪个任务上。
     ///
@@ -1112,6 +1135,38 @@ async fn handle_read(
             let _ = evt_tx.send(Evt::PipeDimensions {
                 epoch,
                 refno,
+                result,
+            });
+        }
+        // 房间树的两条路由与尺寸标注同一条纪律：直打模型服务，不进读面（树是服务端聚合的）。
+        // 身份三格用这条连接的 `scope`：服务端按它校对自己是不是同一套项目 / MDB。
+        Req::SpatialRooms { epoch } => {
+            let identity = crate::spatial_api::Identity {
+                project: scope.project.clone(),
+                mdb: scope.mdb.clone(),
+                namespace: scope.ns.clone(),
+            };
+            let result =
+                crate::spatial_api::rooms(&crate::model_update_api::base_url(), &identity).await;
+            let _ = evt_tx.send(Evt::SpatialRooms { epoch, result });
+        }
+        Req::SpatialRoomTree { epoch, room, only } => {
+            let identity = crate::spatial_api::Identity {
+                project: scope.project.clone(),
+                mdb: scope.mdb.clone(),
+                namespace: scope.ns.clone(),
+            };
+            let result = crate::spatial_api::room_tree(
+                &crate::model_update_api::base_url(),
+                &identity,
+                room,
+                only.as_ref(),
+            )
+            .await;
+            let _ = evt_tx.send(Evt::SpatialRoomTree {
+                epoch,
+                room,
+                only,
                 result,
             });
         }

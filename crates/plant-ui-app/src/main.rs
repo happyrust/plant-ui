@@ -20,6 +20,7 @@ mod search_index;
 mod settings_store;
 mod sim;
 mod source_versions;
+mod spatial_api;
 mod virtual_hole;
 mod virtual_hole_pick;
 mod virtual_hole_session;
@@ -58,6 +59,10 @@ use plant_ui::model_update::{
 };
 use plant_ui::project_picker::{self, State as ProjectPickerState};
 use plant_ui::room_browser::{self, State as RoomBrowserState, Vm as RoomBrowserVm};
+use plant_ui::room_tree::{
+    EyeState, ExpandNeed, LARGE_LOAD_CONFIRM_THRESHOLD, LeafSelector, RoomNodeId, RoomTreeAction,
+    RoomTreeModel, RootsStatus, rooms_status_fallback,
+};
 use plant_ui::settings::{self, State as SettingsState};
 use plant_ui::style::theme_tokens::{self, set_weight_families_ready};
 use plant_ui::style::tokens::{Density, Tokens};
@@ -65,9 +70,10 @@ use plant_ui::task_queue;
 use plant_ui::vm::{
     AccessPointVm, CommandLineKind, CommandLineVm, DimensionLabelVm, DimensionsDataVm,
     DimensionsVm, LogElement, ModelLoadVm, NavEntryVm, NavHistoryVm, PropKind, PropRowVm,
-    PropsDataVm, PropsVm, RoomDetailDataVm, RoomDetailVm, RoomMemberVm, RoomRelationVm, RoomViewVm,
-    RoomVm, RoomsDataVm, RowVisibility, SearchHitVm, SearchRunVm, SearchVm, Selection, SubIndexVm,
-    TreeRowVm, TreeVm, TruncationVm, View3dVm, WorkbenchVm,
+    PropsDataVm, PropsVm, RoomDetailDataVm, RoomDetailVm, RoomMemberVm, RoomRelationVm,
+    RoomTreeConfirmVm, RoomTreeDataVm, RoomTreeVm, RoomViewVm, RoomVm, RoomsDataVm,
+    RowVisibility, SearchHitVm, SearchRunVm, SearchVm, Selection, SubIndexVm, TreeRowVm, TreeVm,
+    TruncationVm, View3dVm, WorkbenchVm,
 };
 use plant_ui::virtual_hole::{VirtualHoleOp, VirtualHoleReceipt, VirtualHoleStatus};
 use plant_ui::workbench::{self, Pane, WorkbenchState};
@@ -1231,6 +1237,26 @@ struct App {
     /// 房间浏览器的全表数据（重查询，只在打开浮窗 / 手动刷新时拉）。
     rooms_overview: RoomBrowserVm,
     room_browser_state: RoomBrowserState,
+    /// 「房间树」面板（plant3d-web「房间」页签移植）的状态机：根清单、各房取回的树、展开 / 在途 /
+    /// 失败、树内选中。不做 IO：取数走 `data::Req::Spatial*`，回包喂进来；行的 eye 读模型树那份
+    /// 实际可见性账（`tree.visibility` / `model_scopes`），不另记勾选表（计划 D4）。
+    room_tree: RoomTreeModel,
+    /// 房间树取数的帧号：刷新 / 重连进一帧，晚到的旧回包丢。
+    room_tree_epoch: u64,
+    /// 等树 / 等叶子补齐再执行的房间树动作（显隐 / 聚焦 / 隔离 / 加载；计划 D7）。
+    room_tree_deferred: Vec<(RoomNodeId, RoomTreeDeferred)>,
+    /// 「加载模型」超过阈值时开着的确认框。
+    room_tree_confirm: Option<RoomTreeConfirmVm>,
+    /// 待滚动的房间树行（外部选中联动 / 「在房间树查看」），行画出来了就收掉（同 `tree_reveal`）。
+    room_tree_reveal: Option<RoomNodeId>,
+    /// 根清单还没到就被点了「在房间树查看」的那间房：清单到了再定位。
+    room_tree_reveal_room: Option<RefU64>,
+    /// 「加载模型」落地后要取景的目标：全部目标的范围查询都回来了才 `FocusGroup`（理由同
+    /// `pending_room_frame`：范围没回来前视口手上没有它们的包围盒）。
+    room_tree_frame: Option<Vec<RefU64>>,
+    /// 树内点选正在写全局选中：`set_selection` 里的联动看到它就不再反过来展开 / 滚动
+    /// （plant3d-web 的 `internalSelection` 同法）。
+    room_tree_internal_selection: bool,
     data_publish_state: DataPublishState,
     manual_data_publish_state: ManualDataPublishState,
     project_picker_state: ProjectPickerState,
@@ -1428,6 +1454,24 @@ struct App {
 }
 
 const COMMAND_CAP: usize = 2000;
+
+/// 库供数下房间树面板的注释（计划 D2；ADR-0026：库供数缺的格要标出来，不许安静空着）。
+const ROOM_TREE_STORE_NOTE: &str = "房间树只在服务供数下有：它由 gen-model 服务端聚合（ADR 0068），库供数没有这一棵。设置 → 供数模式 切回「服务供数」即可";
+
+/// 房间树一次动作前最多补几组未内联的叶子（照 plant3d-web `collectRefnos` 的 `maxGroups`）。
+const ROOM_TREE_LEAF_GROUP_CAP: usize = 64;
+
+/// 房间树上等数据到齐再做的动作（计划 D7：房间根没取过树先取；叶子未内联的组先补）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoomTreeDeferred {
+    SetVisible(bool),
+    Focus,
+    Isolate,
+    /// 「加载模型」；`confirmed` = 已过确认框（或不超阈值、不需要）。
+    LoadModels {
+        confirmed: bool,
+    },
+}
 
 /// E3D 外观的视口底色（grey→白，渐变关是纯 grey）；PBR 外观还是跟主题，给 `None`。
 /// 颜色由 view3d 的 `e3d_look::presets` 算（字节域，159 / 242），这里只换成 egui 的 `Color32`。
@@ -2271,6 +2315,14 @@ impl App {
             model_update_state: ModelUpdateState::default(),
             rooms_overview: RoomBrowserVm::default(),
             room_browser_state: RoomBrowserState::default(),
+            room_tree: RoomTreeModel::default(),
+            room_tree_epoch: 0,
+            room_tree_deferred: Vec::new(),
+            room_tree_confirm: None,
+            room_tree_reveal: None,
+            room_tree_reveal_room: None,
+            room_tree_frame: None,
+            room_tree_internal_selection: false,
             data_publish_state: DataPublishState::default(),
             manual_data_publish_state: ManualDataPublishState::default(),
             project_picker_state: ProjectPickerState::new(Vec::new(), false),
@@ -2693,6 +2745,70 @@ impl App {
                     room,
                     result,
                 } => self.settle_room_volume(epoch, room, result),
+                // 房间树（plant3d-web「房间」页签移植）：根清单回包。帧号对不上 = 刷新 / 重连之后的旧回包，丢。
+                data::Evt::SpatialRooms { epoch, result } if epoch == self.room_tree_epoch => {
+                    match result {
+                        Ok(response) => self.room_tree.set_roots(response),
+                        // 老服务端没有这条路由：与服务端自己说 `unsupported` 是同一句注释，不当故障。
+                        Err(spatial_api::SpatialError::Unsupported(_)) => self
+                            .room_tree
+                            .set_unavailable(rooms_status_fallback("unsupported")),
+                        Err(error) => {
+                            let reason = error.to_string();
+                            self.logs.error(
+                                &mut self.vm.logs,
+                                "房间树：在册房间清单取数失败",
+                                &anyhow::Error::new(error),
+                                None,
+                            );
+                            self.room_tree.fail_roots(reason);
+                        }
+                    }
+                    if let Some(room) = self.room_tree_reveal_room.take() {
+                        if matches!(self.room_tree.status, RootsStatus::Ready { .. }) {
+                            self.reveal_room_in_tree(room);
+                        } else {
+                            self.logs.warn(
+                                &mut self.vm.logs,
+                                "房间树：在册房间清单没取到，「在房间树查看」作废",
+                            );
+                        }
+                    }
+                    self.rebuild_room_tree();
+                }
+                data::Evt::SpatialRooms { .. } => {}
+                // 一间房的树 / 一组叶子回包。哪个节点在等由 `room` / `only` 找回来；失败挂在那个节点上
+                // 列在树上方，等着它的动作随即结算（到齐了就执行，没到齐就作废）。
+                data::Evt::SpatialRoomTree {
+                    epoch,
+                    room,
+                    only,
+                    result,
+                } if epoch == self.room_tree_epoch => {
+                    if let Some(id) = self.room_tree.loading_node_for(room, only.as_ref()) {
+                        self.room_tree.loading.remove(&id);
+                        let outcome = match result {
+                            Ok(tree) if only.is_none() => self.room_tree.set_tree(room, tree),
+                            Ok(tree) => self.room_tree.merge_leaves(room, tree),
+                            Err(error) => Err(error.to_string()),
+                        };
+                        if let Err(message) = outcome {
+                            let label = self
+                                .room_tree
+                                .node(&id)
+                                .map(|node| node.label.clone())
+                                .unwrap_or_else(|| room.to_slash_string());
+                            self.logs.warn(
+                                &mut self.vm.logs,
+                                format!("房间树：{label} 取数失败——{message}"),
+                            );
+                            self.room_tree.set_error(id, message);
+                        }
+                    }
+                    self.settle_room_tree_deferred();
+                    self.rebuild_room_tree();
+                }
+                data::Evt::SpatialRoomTree { .. } => {}
                 data::Evt::RoomsOverview(result) => {
                     self.rooms_overview = match result {
                         Ok(rows) => {
@@ -4448,6 +4564,8 @@ impl App {
                         let _ = self.bridge.req.send(data::Req::RoomsOverview);
                     }
                 }
+                Cmd::RoomTree(action) => self.room_tree_action(action),
+                Cmd::RevealRoomInTree(room) => self.reveal_room_in_tree(room),
                 Cmd::FocusTreeScope(target) => {
                     let epoch = self.focus_bounds_request.begin(target);
                     if self
@@ -5579,6 +5697,17 @@ impl App {
                 self.vm.room_detail = RoomDetailVm::Uninit;
             }
             _ => {}
+        }
+        // 房间树的外部选中联动（计划 D6）：别处选中了一个构件，若它在**已取过树的房**下且面板在前台，
+        // 展开到它并滚到可见；不为它去拉没展开的房。树内自己点的不再反过来动。
+        if !self.room_tree_internal_selection
+            && before != self.vm.selection.primary()
+            && let Some(refno) = self.vm.selection.primary()
+            && self.state.is_pane_active(Pane::RoomTree)
+            && let Some(id) = self.room_tree.reveal_refno(refno)
+        {
+            self.room_tree_reveal = Some(id);
+            self.rebuild_room_tree();
         }
     }
 
@@ -6810,6 +6939,15 @@ impl App {
             self.sync_hole_vm();
         }
         self.vm.selection_branch = None;
+        // 房间树是旧接入点的：整份丢掉，面板回到 Idle，下次画出来再拉；在途的回包凭帧号作废。
+        self.room_tree.clear();
+        self.room_tree_epoch = self.room_tree_epoch.wrapping_add(1);
+        self.room_tree_deferred.clear();
+        self.room_tree_confirm = None;
+        self.room_tree_reveal = None;
+        self.room_tree_reveal_room = None;
+        self.room_tree_frame = None;
+        self.vm.room_tree = RoomTreeVm::Idle;
         // 换库了，旧库的房间总览不作数。窗口开着就顺手重拉，关着就等下次打开。
         if self.room_browser_state.open {
             self.rooms_overview.begin_query();
@@ -6924,6 +7062,413 @@ impl App {
         self.vm.element_count = self.tree.element_count();
         // 树变了，主选中头上的 BRAN 可能这才加载到（视口拾取 -> 定位 -> 祖先落地）。
         self.sync_selection_branch();
+        // 房间树的 eye 读的是同一份实际可见性账，跟着一起重新展平；「加载模型」的取景也在这里等范围回包。
+        self.settle_room_tree_frame();
+        self.rebuild_room_tree();
+    }
+
+    // ------------------------------------------------ 房间树（plant3d-web「房间」页签移植，ADR 0068）
+
+    /// 把状态机展平成绘制层的 `vm.room_tree`。行的 eye 与模型树同一份账：按 refno 读 View3d 的
+    /// 实际可见性与在途方向（`TreeModel::visibility_for` / `pending_direction`），分组行由状态机按子行聚合。
+    fn rebuild_room_tree(&mut self) {
+        let next = match self.room_tree.status.clone() {
+            RootsStatus::Idle => RoomTreeVm::Idle,
+            RootsStatus::Loading => RoomTreeVm::Loading,
+            RootsStatus::Unavailable(reason) => RoomTreeVm::Unavailable(reason),
+            RootsStatus::Failed(reason) => RoomTreeVm::Failed(reason),
+            RootsStatus::Ready { note } => {
+                let tree = &self.tree;
+                let scopes = &self.model_scopes;
+                let eye = |refno: RefU64| EyeState {
+                    visibility: tree.visibility_for(refno, scopes),
+                    pending: tree.pending_direction.get(&refno).copied(),
+                };
+                RoomTreeVm::Ready(RoomTreeDataVm {
+                    rows: self.room_tree.rows(&eye),
+                    total: self.room_tree.total(),
+                    matched: self.room_tree.filtered_roots().len(),
+                    filter: self.room_tree.filter.clone(),
+                    note,
+                    errors: self.room_tree.errors_vm(),
+                    reveal: self.room_tree_reveal.clone(),
+                    confirm: self.room_tree_confirm.clone(),
+                })
+            }
+        };
+        self.vm.room_tree = next;
+    }
+
+    /// 拉根清单。`force` = 刷新钮：丢掉全部缓存重来；否则在途 / 已就绪就不重发。
+    /// 库供数下不发请求，整面板一句注释（计划 D2：树是服务端聚合的，库供数没有第二条路）。
+    fn room_tree_load(&mut self, force: bool) {
+        if force {
+            self.room_tree.clear();
+            self.room_tree_deferred.clear();
+            self.room_tree_confirm = None;
+            self.room_tree_reveal = None;
+            self.room_tree_frame = None;
+        } else if matches!(
+            self.room_tree.status,
+            RootsStatus::Loading | RootsStatus::Ready { .. }
+        ) {
+            return;
+        }
+        self.room_tree_epoch = self.room_tree_epoch.wrapping_add(1);
+        if self.read_face == settings::ReadFaceKind::Store {
+            self.room_tree
+                .set_unavailable(ROOM_TREE_STORE_NOTE.to_owned());
+            return;
+        }
+        self.room_tree.begin_roots();
+        if self
+            .bridge
+            .req
+            .send(data::Req::SpatialRooms {
+                epoch: self.room_tree_epoch,
+            })
+            .is_err()
+        {
+            self.room_tree.fail_roots("数据查询线程已停止".to_owned());
+        }
+    }
+
+    fn room_tree_action(&mut self, action: RoomTreeAction) {
+        match action {
+            RoomTreeAction::Load => self.room_tree_load(false),
+            RoomTreeAction::Refresh => self.room_tree_load(true),
+            RoomTreeAction::SetFilter(text) => self.room_tree.filter = text,
+            RoomTreeAction::ToggleExpand(id) => match self.room_tree.toggle_expand(&id) {
+                Some(ExpandNeed::Tree(room)) => self.ensure_room_tree(room),
+                Some(ExpandNeed::Leaves(node, selector)) => self.ensure_room_leaves(node, selector),
+                None => {}
+            },
+            RoomTreeAction::Select { id, modifiers } => {
+                // Shift 区间按此刻的可见行序算，那个序就是上一帧画出去的 rows。
+                let order: Vec<RoomNodeId> = match &self.vm.room_tree {
+                    RoomTreeVm::Ready(data) => data.rows.iter().map(|row| row.id.clone()).collect(),
+                    _ => Vec::new(),
+                };
+                let clicked = self.room_tree.node(&id).and_then(|node| {
+                    node.refno
+                        .or_else(|| node.tube.as_ref().map(|tube| tube.unit))
+                });
+                let mut refnos = self.room_tree.select(&id, modifiers, &order);
+                // 只选了分组行：树内高亮，全局选中不动（它们没有场景键，清掉属性面板只会让人以为点空了）。
+                if !refnos.is_empty() {
+                    // 主选中 = 刚点的那一行（有场景键的话），摆到末位让 `toggle` 把光标落到它身上。
+                    if let Some(clicked) = clicked
+                        && let Some(pos) = refnos.iter().position(|refno| *refno == clicked)
+                    {
+                        let primary = refnos.remove(pos);
+                        refnos.push(primary);
+                    }
+                    let mut selection = Selection::single(refnos[0]);
+                    for refno in &refnos[1..] {
+                        selection.toggle(*refno);
+                    }
+                    self.room_tree_internal_selection = true;
+                    self.set_selection(selection);
+                    self.room_tree_internal_selection = false;
+                }
+            }
+            RoomTreeAction::SetVisible { id, visible } => {
+                self.run_room_tree_action(id, RoomTreeDeferred::SetVisible(visible))
+            }
+            RoomTreeAction::Focus(id) => self.run_room_tree_action(id, RoomTreeDeferred::Focus),
+            RoomTreeAction::Isolate(id) => self.run_room_tree_action(id, RoomTreeDeferred::Isolate),
+            RoomTreeAction::LoadModels { id, confirmed } => {
+                self.room_tree_confirm = None;
+                self.run_room_tree_action(id, RoomTreeDeferred::LoadModels { confirmed });
+            }
+            RoomTreeAction::CancelLoadModels => self.room_tree_confirm = None,
+        }
+        self.rebuild_room_tree();
+    }
+
+    /// 取一间房的整树（取过 / 在途 / 空房都不再发）。
+    fn ensure_room_tree(&mut self, room: RefU64) {
+        if !self.room_tree.needs_tree(room) {
+            return;
+        }
+        let id = RoomNodeId::Room(room);
+        self.room_tree.loading.insert(id.clone());
+        self.room_tree.clear_error(&id);
+        if self
+            .bridge
+            .req
+            .send(data::Req::SpatialRoomTree {
+                epoch: self.room_tree_epoch,
+                room,
+                only: None,
+            })
+            .is_err()
+        {
+            self.room_tree.loading.remove(&id);
+            self.room_tree
+                .set_error(id, "数据查询线程已停止".to_owned());
+        }
+    }
+
+    /// 按 `unit=` / `other_noun=` 补一组未内联的叶子。
+    fn ensure_room_leaves(&mut self, id: RoomNodeId, selector: LeafSelector) {
+        let room = id.room();
+        if self.room_tree.loading.contains(&id) || !self.room_tree.is_fetched(room) {
+            return;
+        }
+        self.room_tree.loading.insert(id.clone());
+        self.room_tree.clear_error(&id);
+        if self
+            .bridge
+            .req
+            .send(data::Req::SpatialRoomTree {
+                epoch: self.room_tree_epoch,
+                room,
+                only: Some(selector),
+            })
+            .is_err()
+        {
+            self.room_tree.loading.remove(&id);
+            self.room_tree
+                .set_error(id, "数据查询线程已停止".to_owned());
+        }
+    }
+
+    /// 房间树上的动作要等数据到齐（计划 D7）：房间根没取过树先取；叶子未内联的组先补（最多 64 组，
+    /// 照来源 `collectRefnos`）；到齐了再执行，没到齐先挂着，回包落地时由 `settle_room_tree_deferred` 结算。
+    fn run_room_tree_action(&mut self, id: RoomNodeId, action: RoomTreeDeferred) {
+        let room = id.room();
+        if self.room_tree.needs_tree(room)
+            || self.room_tree.loading.contains(&RoomNodeId::Room(room))
+        {
+            self.ensure_room_tree(room);
+            self.room_tree_deferred.push((id, action));
+            return;
+        }
+        let pending = self.room_tree.pending_leaf_nodes_under(&id);
+        if !pending.is_empty() {
+            for (node, selector) in pending.into_iter().take(ROOM_TREE_LEAF_GROUP_CAP) {
+                self.ensure_room_leaves(node, selector);
+            }
+            self.room_tree_deferred.push((id, action));
+            return;
+        }
+        self.execute_room_tree_action(id, action);
+    }
+
+    /// 回包落地后过一遍挂着的动作：还在等的继续挂；等的那一条失败了就作废并说一声；到齐了就做。
+    /// 超过 64 组的尾巴不再补（来源同）：那时候按已知的构件做。
+    fn settle_room_tree_deferred(&mut self) {
+        let deferred = std::mem::take(&mut self.room_tree_deferred);
+        for (id, action) in deferred {
+            let room = id.room();
+            let root = RoomNodeId::Room(room);
+            if self.room_tree.loading.contains(&root) {
+                self.room_tree_deferred.push((id, action));
+                continue;
+            }
+            if !self.room_tree.is_fetched(room) && !self.room_tree.is_empty_room(room) {
+                let reason = self
+                    .room_tree
+                    .error_of(&root)
+                    .unwrap_or("树没取回来")
+                    .to_owned();
+                self.logs.warn(
+                    &mut self.vm.logs,
+                    format!("房间树：{} 上的动作作废——{reason}", room.to_slash_string()),
+                );
+                continue;
+            }
+            let pending = self.room_tree.pending_leaf_nodes_under(&id);
+            if pending
+                .iter()
+                .any(|(node, _)| self.room_tree.loading.contains(node))
+            {
+                self.room_tree_deferred.push((id, action));
+                continue;
+            }
+            if let Some((node, _)) = pending
+                .iter()
+                .find(|(node, _)| self.room_tree.error_of(node).is_some())
+            {
+                let reason = self.room_tree.error_of(node).unwrap_or_default().to_owned();
+                let label = self
+                    .room_tree
+                    .node(node)
+                    .map(|n| n.label.clone())
+                    .unwrap_or_default();
+                self.logs.warn(
+                    &mut self.vm.logs,
+                    format!("房间树：{label} 的叶子没补回来，这一支上的动作作废——{reason}"),
+                );
+                continue;
+            }
+            self.execute_room_tree_action(id, action);
+        }
+    }
+
+    /// 数据到齐之后真正执行：全部落到既有的 `ModelAction` / `set_model_visible` 上，没有第二套显隐路径。
+    /// 单元级及以上连所属 BRAN 整条（方案 A）；构件行不扩。
+    fn execute_room_tree_action(&mut self, id: RoomNodeId, action: RoomTreeDeferred) {
+        let label = self
+            .room_tree
+            .node(&id)
+            .map(|node| node.label.clone())
+            .unwrap_or_else(|| id.room().to_slash_string());
+        match action {
+            RoomTreeDeferred::SetVisible(visible) => {
+                let refnos = self.room_tree.scene_refnos_under(&id);
+                if refnos.is_empty() {
+                    self.logs
+                        .info(&mut self.vm.logs, format!("房间树：{label} 下没有构件"));
+                    return;
+                }
+                self.set_model_visible(refnos, visible);
+            }
+            RoomTreeDeferred::Isolate => {
+                let refnos = self.room_tree.scene_refnos_under(&id);
+                if refnos.is_empty() {
+                    self.logs.info(
+                        &mut self.vm.logs,
+                        format!("房间树：{label} 下没有构件，没什么可隔离"),
+                    );
+                    return;
+                }
+                // 正在房间视图里就先摘徽章 / 撤房间体（来源 `exitRoomView({ keepIsolation })`），隔离换成这一支。
+                self.leave_room_view();
+                self.view3d_commands
+                    .push(Cmd::Model(plant_ui::ModelAction::Isolate {
+                        refnos,
+                        matching: IsolateMatching::RefnoOrOwner,
+                    }));
+            }
+            RoomTreeDeferred::Focus => {
+                if let Some(aabb) = self
+                    .room_tree
+                    .node(&id)
+                    .and_then(|node| node.tube.as_ref())
+                    .map(|tube| tube.aabb)
+                {
+                    // 直段按服务端给的世界盒飞，不要求已加载。
+                    self.focus_bounds_request.cancel();
+                    self.view3d_commands
+                        .push(Cmd::Model(plant_ui::ModelAction::FocusBounds {
+                            min_mm: [aabb.min[0] as f32, aabb.min[1] as f32, aabb.min[2] as f32],
+                            max_mm: [aabb.max[0] as f32, aabb.max[1] as f32, aabb.max[2] as f32],
+                        }));
+                    return;
+                }
+                // 构件 / 分组按已加载几何的并集盒；一个都没加载就说一声，相机不动。
+                let loaded: Vec<RefU64> = self
+                    .room_tree
+                    .scene_refnos_under(&id)
+                    .into_iter()
+                    .filter(|refno| self.loaded_models.contains(refno))
+                    .collect();
+                if loaded.is_empty() {
+                    self.logs.info(
+                        &mut self.vm.logs,
+                        format!("房间树：{label} 下还没有已加载几何的构件，先「加载模型」再聚焦"),
+                    );
+                    return;
+                }
+                self.focus_bounds_request.cancel();
+                self.view3d_commands
+                    .push(Cmd::Model(plant_ui::ModelAction::FocusGroup {
+                        refnos: loaded,
+                    }));
+            }
+            RoomTreeDeferred::LoadModels { confirmed } => {
+                let refnos = self.room_tree.refnos_under(&id);
+                if refnos.is_empty() {
+                    self.logs
+                        .info(&mut self.vm.logs, format!("房间树：{label} 下没有构件"));
+                    return;
+                }
+                if !confirmed && refnos.len() > LARGE_LOAD_CONFIRM_THRESHOLD {
+                    self.room_tree_confirm = Some(RoomTreeConfirmVm {
+                        id,
+                        label,
+                        count: refnos.len(),
+                    });
+                    return;
+                }
+                // 加载 = 显示这些构件（来源：加载链按生成根走，不扩 BRAN），范围回包落地后再取景。
+                self.logs.info(
+                    &mut self.vm.logs,
+                    format!("房间树：加载 {label} 下 {} 个构件的模型", refnos.len()),
+                );
+                self.room_tree_frame = Some(refnos.clone());
+                self.set_model_visible(refnos, true);
+                self.settle_room_tree_frame();
+            }
+        }
+    }
+
+    /// 「加载模型」的取景：目标的范围查询都回来了才 `FocusGroup`（视口的包围盒来自范围回包的
+    /// `world_aabb`）。一个都没查出模型就不动相机，账一样销掉。
+    fn settle_room_tree_frame(&mut self) {
+        let Some(targets) = &self.room_tree_frame else {
+            return;
+        };
+        if targets
+            .iter()
+            .any(|target| self.model_scope_pending.contains(target))
+        {
+            return;
+        }
+        let targets = self.room_tree_frame.take().unwrap_or_default();
+        let mut refnos: Vec<RefU64> = Vec::new();
+        let mut seen: HashSet<RefU64> = HashSet::new();
+        for target in targets {
+            for model in self.model_scopes.get(&target).into_iter().flatten() {
+                if seen.insert(*model) {
+                    refnos.push(*model);
+                }
+            }
+        }
+        if !refnos.is_empty() {
+            self.view3d_commands
+                .push(Cmd::Model(plant_ui::ModelAction::FocusGroup { refnos }));
+        }
+    }
+
+    /// 「在房间树查看」一间房（「房间」页签过来）：切到房间树页签、取它的树、展开到第一层、滚到它。
+    /// 根清单还没到就先去拉，到了再定位；不在册就在日志里说一句。
+    fn reveal_room_in_tree(&mut self, room: RefU64) {
+        self.state.focus(Pane::RoomTree);
+        if !matches!(self.room_tree.status, RootsStatus::Ready { .. }) {
+            self.room_tree_reveal_room = Some(room);
+            self.room_tree_load(false);
+            self.rebuild_room_tree();
+            return;
+        }
+        match self.room_tree.reveal_room(room) {
+            Some(id) => {
+                self.room_tree_reveal = Some(id);
+                self.ensure_room_tree(room);
+            }
+            None => self.logs.warn(
+                &mut self.vm.logs,
+                format!(
+                    "房间树：{} 不在服务端的在册房间清单里",
+                    room.to_slash_string()
+                ),
+            ),
+        }
+        self.rebuild_room_tree();
+    }
+
+    /// 每帧末尾结算房间树的待滚动：行已经画出来了就把请求收掉，还没有就留着（同 `settle_tree_reveal`）。
+    fn settle_room_tree_reveal(&mut self) {
+        let Some(id) = &self.room_tree_reveal else {
+            return;
+        };
+        let shown = matches!(&self.vm.room_tree, RoomTreeVm::Ready(data) if data.rows.iter().any(|row| &row.id == id));
+        if shown {
+            self.room_tree_reveal = None;
+            self.rebuild_room_tree();
+        }
     }
 
     /// 数据层属性 -> 面板分组。通用组固定 类型/名称/OWNER 顺序，
@@ -9562,6 +10107,7 @@ impl App {
         }
         // 绘制层只读、消费不掉自己的滚动请求，所以由这里判断它落地没有。
         self.settle_tree_reveal();
+        self.settle_room_tree_reveal();
         self.handle_cmds(ui.ctx(), cmds);
         // 布尔作业是异步的：计算中有回执没回来时催下一帧，计数别停在旧数字上。
         if self.vm.virtual_holes.calculating > 0 {
