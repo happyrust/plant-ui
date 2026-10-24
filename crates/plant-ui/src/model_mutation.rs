@@ -61,7 +61,7 @@ impl Kind {
                  120 秒预算，那时服务端后台继续，完成后再点眼睛查看。"
             }
             Self::Cleanup => {
-                "只删已生成的产物，不删设计元素、不删共享的单位网格；服务端按子树删，范围内有根 \
+                "只删已生成的产物，不删设计元素；服务端按子树删，范围内有根 \
                  正在生成会被拒绝（稍后再试）。跑完三维里对应的模型会卸载。"
             }
             Self::RoomRebuild => {
@@ -100,10 +100,15 @@ impl Kind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Vm {
     /// 等人按。还什么都没发。`dbnum` 有值时这一框问的是整库清理，不是右键那几行。
+    ///
+    /// `purge_meshes` 是「一并删除网格文件」那一格此刻的状态。两个清理档都画这一格
+    /// （右键「清理模型」走子树、整库清理走整库，两条服务端接口都收这个参数）；重新生成
+    /// 不带这一格——它走 `force = true`，服务端先删后算，网格删了就得整批重写一遍。
     Confirm {
         kind: Kind,
         label: String,
         dbnum: Option<u32>,
+        purge_meshes: bool,
     },
     /// 等房间参照模型装载 / 重建完。这一档今天只有「重新生成房间」用到：重建请求
     /// 已经发出、服务端收不回，所以按钮是「后台继续」——只摘进度屏，服务端照跑到底。
@@ -173,7 +178,7 @@ pub fn confirm_prompt(kind: Kind, label: &str) -> String {
     }
 }
 
-pub fn show(ctx: &egui::Context, t: &Tokens, d: Density, vm: Option<&Vm>) -> Vec<Cmd> {
+pub fn show(ctx: &egui::Context, t: &Tokens, d: Density, vm: Option<&mut Vm>) -> Vec<Cmd> {
     let Some(vm) = vm else {
         return Vec::new();
     };
@@ -196,17 +201,28 @@ pub fn show(ctx: &egui::Context, t: &Tokens, d: Density, vm: Option<&Vm>) -> Vec
     // 关窗等于不做。窗口右上角那个叉与「取消」必须是同一件事，不然人以为
     // 自己躲开了这个决定。
     if closable && !open {
-        cmds.push(Cmd::ModelMutationConfirm { accepted: false });
+        cmds.push(Cmd::ModelMutationConfirm {
+            accepted: false,
+            purge_meshes: false,
+        });
     }
     cmds
 }
 
-fn body(ui: &mut egui::Ui, t: &Tokens, d: Density, vm: &Vm, cmds: &mut Vec<Cmd>) {
+fn body(ui: &mut egui::Ui, t: &Tokens, d: Density, vm: &mut Vm, cmds: &mut Vec<Cmd>) {
     match vm {
-        Vm::Confirm { kind, label, dbnum } => {
+        Vm::Confirm {
+            kind,
+            label,
+            dbnum,
+            purge_meshes,
+        } => {
+            // 两格都是 Copy，先抄出来：`kind` 后面还要用来查表（`kind.note()` 等），
+            // `dbnum` 也要在渲染那一格时再看一眼。
+            let (kind, dbnum) = (*kind, *dbnum);
             let prompt = match (kind, dbnum) {
-                (Kind::Cleanup, Some(dbnum)) => dbnum_cleanup_prompt(*dbnum),
-                _ => confirm_prompt(*kind, label),
+                (Kind::Cleanup, Some(dbnum)) => dbnum_cleanup_prompt(dbnum),
+                _ => confirm_prompt(kind, label),
             };
             let note = if dbnum.is_some() {
                 "不自动重算。同库有任务在跑或有生成在飞时服务端会拒绝，稍后再试。"
@@ -216,6 +232,22 @@ fn body(ui: &mut egui::Ui, t: &Tokens, d: Density, vm: &Vm, cmds: &mut Vec<Cmd>)
             ui.label(RichText::new(prompt).color(t.text_primary));
             ui.add_space(d.px(6.0));
             ui.label(RichText::new(note).small().color(t.text_muted));
+            // 「一并删除网格文件」那一格（2026-10-23）：两个清理档都有它——右键「清理模型」
+            // 走子树、库行「清理模型（整库）」走整库，两条服务端接口都收这个参数。默认勾上，
+            // 但要摆在按钮上面：网格是内容寻址的，别的范围复用的同一份也会跟着没，这一按的
+            // 后果得在按之前看得见。整库那一档范围更大，撞上共享网格的机会也更大。
+            if kind == Kind::Cleanup {
+                ui.add_space(d.px(6.0));
+                ui.checkbox(purge_meshes, "一并删除网格文件（.mesh）");
+                ui.label(
+                    RichText::new(
+                        "网格文件是内容寻址的、可能被其他范围复用：勾上后它们引用的同一份也会一起\
+                         删掉，那些范围要重新生成才会补回来。",
+                    )
+                    .small()
+                    .color(t.text_muted),
+                );
+            }
             ui.separator();
             ui.horizontal(|ui| {
                 if ui
@@ -226,10 +258,16 @@ fn body(ui: &mut egui::Ui, t: &Tokens, d: Density, vm: &Vm, cmds: &mut Vec<Cmd>)
                     )
                     .clicked()
                 {
-                    cmds.push(Cmd::ModelMutationConfirm { accepted: true });
+                    cmds.push(Cmd::ModelMutationConfirm {
+                        accepted: true,
+                        purge_meshes: *purge_meshes,
+                    });
                 }
                 if ui.add(widgets::button(t, d, "取消")).clicked() {
-                    cmds.push(Cmd::ModelMutationConfirm { accepted: false });
+                    cmds.push(Cmd::ModelMutationConfirm {
+                        accepted: false,
+                        purge_meshes: false,
+                    });
                 }
             });
         }
@@ -301,7 +339,10 @@ fn body(ui: &mut egui::Ui, t: &Tokens, d: Density, vm: &Vm, cmds: &mut Vec<Cmd>)
                     _ => "取消等待",
                 };
                 if ui.add(widgets::button(t, d, leave)).clicked() {
-                    cmds.push(Cmd::ModelMutationConfirm { accepted: false });
+                    cmds.push(Cmd::ModelMutationConfirm {
+                    accepted: false,
+                    purge_meshes: false,
+                });
                 }
             });
         }
@@ -321,7 +362,10 @@ fn body(ui: &mut egui::Ui, t: &Tokens, d: Density, vm: &Vm, cmds: &mut Vec<Cmd>)
             ui.separator();
             ui.horizontal(|ui| {
                 if ui.add(widgets::button(t, d, "关闭")).clicked() {
-                    cmds.push(Cmd::ModelMutationConfirm { accepted: false });
+                    cmds.push(Cmd::ModelMutationConfirm {
+                    accepted: false,
+                    purge_meshes: false,
+                });
                 }
             });
         }
@@ -389,9 +433,62 @@ mod tests {
         );
         let note = Kind::Cleanup.note();
         assert!(note.contains("不删设计元素"), "{note}");
-        assert!(note.contains("单位网格"), "d-8：清理不删共享单位网格 {note}");
+        assert!(
+            !note.contains("不删共享的单位网格"),
+            "网格那一格已经交给人勾了，note 里那句旧承诺不再成立：{note}"
+        );
         assert_eq!(Kind::Cleanup.title(), "清理模型");
         assert_eq!(Kind::Regenerate.title(), "重新生成模型");
+    }
+
+    /// 「一并删除网格文件」那一格（2026-10-23）：两个清理档都画它——右键「清理模型」走
+    /// `DELETE /model/subtree`、库行「清理模型（整库）」走 `DELETE /dbnums/{dbnum}/model`，
+    /// 两条接口都收这个参数；重新生成（`force = true`）不画，它先删后算、网格删了要整批重写。
+    /// 勾选状态随确认回执一起交出去（`accepted` 那一发带上它，其余出口一律 `false`）。
+    /// 默认值由宿主开框时给（`main.rs` 的 `begin_mutation` / `begin_dbnum_model_cleanup`，
+    /// 都默认勾上），这一层只管画与交。
+    #[test]
+    fn the_mesh_purge_checkbox_belongs_to_the_cleanup_dialog_only() {
+        let source = include_str!("model_mutation.rs");
+        let body = source.split_once("mod tests {").expect("测试模块").0;
+        let confirm = body
+            .split_once("Vm::Confirm {")
+            .expect("确认那一臂")
+            .1
+            .split_once("Vm::WaitingResident {")
+            .expect("下一臂")
+            .0;
+        assert!(confirm.contains("ui.checkbox(purge_meshes,"), "{confirm}");
+        assert!(
+            confirm.contains("if kind == Kind::Cleanup {"),
+            "两个清理档都画它，整库那一档不再排除：{confirm}"
+        );
+        assert!(
+            !confirm.contains("dbnum.is_none()"),
+            "整库清理那一档今天也收这个参数，不再按 dbnum 分档：{confirm}"
+        );
+        assert!(
+            confirm.contains("可能被其他范围复用"),
+            "共享网格的后果要写在格边上：{confirm}"
+        );
+        assert!(
+            confirm.contains("purge_meshes: *purge_meshes,"),
+            "确认那一发把勾选状态原样带走：{confirm}"
+        );
+        // 其余出口（取消 / 关窗 / 取消等待 / 关闭失败态）一律 false：没有框在问这件事。
+        let elsewhere = body
+            .split_once("Vm::WaitingResident {")
+            .expect("下一臂")
+            .1;
+        assert!(
+            !elsewhere.contains("purge_meshes: true"),
+            "别的出口不许凭空打开这一格：{elsewhere}"
+        );
+        assert_eq!(
+            body.matches("purge_meshes: false,").count(),
+            4,
+            "取消 / 关窗 / 取消等待 / 关闭：{body}"
+        );
     }
 
     /// 没有「停在这里」也没有「取消」能停掉在途那一发：跑起来之后窗上一个按钮都没有，
@@ -467,6 +564,7 @@ mod tests {
                     kind,
                     label: label(),
                     dbnum: None,
+                    purge_meshes: true,
                 }),
                 Status::Warn
             );

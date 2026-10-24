@@ -3477,7 +3477,8 @@ fn model_cleanup_button(
                         .add_enabled(vm.can_execute(), button())
                         .on_disabled_hover_text(execution_disabled_hint(vm))
                         .on_hover_text(format!(
-                            "清理模型（整库）db{dbnum}：删掉该库全部已生成的模型产物并把模型水位归零；不自动重算"
+                            "清理模型（整库）db{dbnum}：删掉该库全部已生成的模型产物并把模型水位归零；\
+                             不自动重算，确认框里可勾选一并删掉盘上的网格文件"
                         ));
                     if resp.clicked() {
                         cmds.push(Cmd::CleanupDbnumModel { dbnum: *dbnum });

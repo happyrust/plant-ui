@@ -161,6 +161,8 @@ pub async fn model_rebuild(
 /// `DELETE /api/v1/dbnums/{dbnum}/model` 的 200 回执（gen-model spec §4.5.1D）。
 ///
 /// `ref0s` 缺席 = 老服务端没给这一格，不能据此卸载三维；空数组是「这个库没有 Ref0」。
+/// `mesh_files_*` 三格与右键那一档同一口径（[`mesh_purge_note`]）：勾了「一并删除网格文件」
+/// 才有，缺席 = 没勾 / 老服务端不认这一格。
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct DbnumModelCleanupReceipt {
     pub dbnum: u32,
@@ -168,7 +170,10 @@ pub struct DbnumModelCleanupReceipt {
     pub scope: String,
     #[serde(default)]
     pub status: String,
-    #[serde(default)]
+    /// 回执给的是**字符串**（spec §4.5.1D 的例子就是 `["24381"]`——服务端那张表的主键是
+    /// 字符串前缀），而 `/dbnums` 行上的同名字段是整数。两个形状都收，统一归一成 `u32`：
+    /// 内部要的是 Ref0 的数值（`refno.get_0()`），形状是传输层的事。
+    #[serde(default, deserialize_with = "ref0s_from_wire")]
     pub ref0s: Option<Vec<u32>>,
     #[serde(default)]
     pub range_statements: usize,
@@ -176,26 +181,63 @@ pub struct DbnumModelCleanupReceipt {
     pub elapsed_ms: u64,
     #[serde(default)]
     pub model_source_after: Option<String>,
+    #[serde(default)]
+    pub mesh_files_removed: Option<usize>,
+    #[serde(default)]
+    pub mesh_files_absent: Option<usize>,
+    #[serde(default)]
+    pub mesh_files_failed: Option<usize>,
+}
+
+/// `ref0s` 的两种线形状：`["24381"]`（回执，spec §4.5.1D）与 `[24381]`（`/dbnums` 行）。
+///
+/// 认不出的那一项**整项丢掉**而不是编一个 0：这一格只用来决定「三维里卸哪些已加载叶子」，
+/// 丢掉一项的后果是那一项留在场景里（下一次显示会换掉），编一个 0 却会去卸 `0/0` 那个
+/// 不存在的范围。缺席（`None`）与空数组照旧是两句话，这里不合并。
+fn ref0s_from_wire<'de, D>(deserializer: D) -> Result<Option<Vec<u32>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<Vec<Value>>::deserialize(deserializer)?;
+    Ok(raw.map(|items| {
+        items
+            .into_iter()
+            .filter_map(|item| match item {
+                Value::Number(number) => number.as_u64().and_then(|n| u32::try_from(n).ok()),
+                Value::String(text) => text.trim().parse::<u32>().ok(),
+                _ => None,
+            })
+            .collect()
+    }))
 }
 
 /// 整库模型清理：只删这个库的模型面，不重算（清理模型计划 C5）。
 ///
-/// 复用 [`delete`]：无 body、超时 125 秒。`confirm` 填路径上的同一个 dbnum。老服务端没有
-/// 这条路由时是 404，调用方按 [`endpoint_missing`] 降级成一句 INFO。
+/// 复用 [`delete`]：无 body、超时 125 秒。`confirm` 填路径上的同一个 dbnum。
+/// `purge_meshes` 是确认框上「一并删除网格文件」那一格：勾了服务端另把这个库引用过的
+/// `.mesh` 从盘上删掉（老服务端不认这一格，静默忽略）。老服务端没有这条路由时是 404，
+/// 调用方按 [`endpoint_missing`] 降级成一句 INFO。
 pub async fn delete_dbnum_model(
     base: &str,
     project: &str,
     mdb: &str,
     namespace: &str,
     dbnum: u32,
+    purge_meshes: bool,
 ) -> anyhow::Result<DbnumModelCleanupReceipt> {
-    let path = dbnum_model_path(dbnum, project, mdb, namespace);
+    let path = dbnum_model_path(dbnum, purge_meshes, project, mdb, namespace);
     delete(base, &path, Duration::from_secs(125)).await
 }
 
-fn dbnum_model_path(dbnum: u32, project: &str, mdb: &str, namespace: &str) -> String {
+fn dbnum_model_path(
+    dbnum: u32,
+    purge_meshes: bool,
+    project: &str,
+    mdb: &str,
+    namespace: &str,
+) -> String {
     format!(
-        "/api/v1/dbnums/{dbnum}/model?confirm={dbnum}&project={}&mdb={}&namespace={}",
+        "/api/v1/dbnums/{dbnum}/model?confirm={dbnum}&purge_meshes={purge_meshes}&project={}&mdb={}&namespace={}",
         urlencode(project),
         urlencode(mdb),
         urlencode(namespace)
@@ -985,6 +1027,14 @@ struct CleanupBody {
     model_source: Option<String>,
     #[serde(default)]
     model_source_reason: Option<String>,
+    /// 「一并删网格文件」那一格的三格账（服务端只在请求带了 `purge_meshes=true` 时给）：
+    /// 真删掉几个、本来就不在盘上几个、删失败几个。老服务端 / 没勾那一格时全缺席。
+    #[serde(default)]
+    mesh_files_removed: Option<usize>,
+    #[serde(default)]
+    mesh_files_absent: Option<usize>,
+    #[serde(default)]
+    mesh_files_failed: Option<usize>,
 }
 
 /// `DELETE /api/v1/model/subtree` 的回执（gen-model spec §4.5.1）。`requested_refno` 不收：
@@ -999,10 +1049,14 @@ pub struct CleanupReply {
     /// `Database` = 库 + 投影 + 账本。老服务端不给 → `None`。
     pub model_source: Option<ModelSource>,
     pub model_source_reason: Option<String>,
+    /// 勾了「一并删网格文件」时服务端那三格账。缺席 = 没勾 / 老服务端不认这一格。
+    pub meshes_removed: Option<usize>,
+    pub meshes_absent: Option<usize>,
+    pub meshes_failed: Option<usize>,
 }
 
 impl CleanupReply {
-    /// 成功那一行日志的服务端半句：口径 + 认不出的状态 + 内存供数。常态只有 `exact_subtree`。
+    /// 成功那一行日志的服务端半句：口径 + 认不出的状态 + 内存供数 + 网格那一格。
     ///
     /// 清的是内存投影就要说出来——库里那一面（若有）没动，服务端重启后这次清理不复存在；
     /// 状态不是 `deleted` 也要说出来：按「删过了」计，但人得知道服务端换了说法。
@@ -1022,45 +1076,83 @@ impl CleanupReply {
                     .trim_start_matches("模型来源：")
             ));
         }
+        if let Some(removed) = self.meshes_removed {
+            note.push_str(&mesh_purge_note(
+                Some(removed),
+                self.meshes_absent,
+                self.meshes_failed,
+            ));
+        }
         note
     }
+}
+
+/// 「一并删除网格文件」那三格账的半句日志：两条清理路径（右键子树、库行整库）共用一份说法，
+/// 人从哪一档清理看到的都是同一句话。`removed` 缺席 = 没勾这一格 / 老服务端不认它 → 空串
+/// （调用方直接拼在后面，不留标点）。`absent` / `failed` 为 0 时不念。
+pub fn mesh_purge_note(removed: Option<usize>, absent: Option<usize>, failed: Option<usize>) -> String {
+    let Some(removed) = removed else {
+        return String::new();
+    };
+    let mut note = format!("；一并删除网格文件 {removed} 个");
+    if absent.unwrap_or_default() > 0 {
+        note.push_str(&format!("（另 {} 个本来就不在盘上）", absent.unwrap_or_default()));
+    }
+    if failed.unwrap_or_default() > 0 {
+        note.push_str(&format!("，{} 个删失败", failed.unwrap_or_default()));
+    }
+    note
 }
 
 const CLEANUP_PATH: &str = "/api/v1/model/subtree";
 
 /// 对一个节点范围清理已生成的模型产物（`DELETE /api/v1/model/subtree?refno&confirm`，spec §4.5.1）：
-/// 服务端按子树删产物行——不删设计元素、不删共享单位网格、不重算；与右键重新生成里的「先删」是
+/// 服务端按子树删产物行——不删设计元素、不重算；与右键重新生成里的「先删」是
 /// 服务端同一份实现。`confirm` 必须与 `refno` 原文一致，这里替调用方填同一个值：确认在界面上
 /// 已经做过了（确认框），不在这里再问一遍。
+///
+/// `purge_meshes` = 确认框上「一并删除网格文件」那一格：服务端在产物删完之后，把这片范围
+/// 引用过的内容寻址 `.mesh` 也从磁盘删掉。网格可能被其他范围复用（界面上那一格就是这么写的），
+/// 所以这个值由人勾，不在这里替他决定。
 ///
 /// 右键「清理模型」是唯一调用方。显示路径不调它（ADR-0030 D1），重新生成也不调它（服务端在
 /// `force = true` 里自己清）。
 ///
-/// 超时给到 125 秒：服务端这条没有 120 s 预算包装，大范围同步删到底；客户端超时时服务端可能已删
-/// 一部分，日志要把这一点说出来，让人点眼睛重查。
+/// 超时给到 125 秒：服务端这条没有 120 s 预算包装，大范围同步删到底（勾了删网格那一格时还多
+/// 一遍磁盘删除）；客户端超时时服务端可能已删一部分，日志要把这一点说出来，让人点眼睛重查。
 pub async fn delete_model_subtree(
     base: &str,
     refno: &str,
+    purge_meshes: bool,
     project: &str,
     mdb: &str,
     namespace: &str,
 ) -> anyhow::Result<CleanupReply> {
-    let path = cleanup_path(refno, project, mdb, namespace);
+    let path = cleanup_path(refno, purge_meshes, project, mdb, namespace);
     let reply: CleanupBody = delete(base, &path, Duration::from_secs(125)).await?;
     Ok(CleanupReply {
         scope: reply.scope,
         status: reply.status,
         model_source: reply.model_source.as_deref().and_then(ModelSource::parse),
         model_source_reason: reply.model_source_reason,
+        meshes_removed: reply.mesh_files_removed,
+        meshes_absent: reply.mesh_files_absent,
+        meshes_failed: reply.mesh_files_failed,
     })
 }
 
-/// `DELETE /model/subtree` 的请求行。抽出来是为了让测试不必起网络就能钉住两件事：
-/// `confirm` 与 `refno` 是同一个值、斜杠形 refno 编码过。
-fn cleanup_path(refno: &str, project: &str, mdb: &str, namespace: &str) -> String {
+/// `DELETE /model/subtree` 的请求行。抽出来是为了让测试不必起网络就能钉住三件事：
+/// `confirm` 与 `refno` 是同一个值、斜杠形 refno 编码过、「一并删网格文件」那一格随行。
+fn cleanup_path(
+    refno: &str,
+    purge_meshes: bool,
+    project: &str,
+    mdb: &str,
+    namespace: &str,
+) -> String {
     let refno = urlencode(refno);
     format!(
-        "{CLEANUP_PATH}?refno={refno}&confirm={refno}&project={}&mdb={}&namespace={}",
+        "{CLEANUP_PATH}?refno={refno}&confirm={refno}&purge_meshes={purge_meshes}&project={}&mdb={}&namespace={}",
         urlencode(project),
         urlencode(mdb),
         urlencode(namespace)
@@ -1416,13 +1508,17 @@ mod tests {
     }
 
     /// 清理一发的请求行（spec §4.5.1）：`confirm` 必须与 `refno` 原文一致——确认在界面上做过了，
-    /// 这里替调用方填同一个值；斜杠形 refno 与 MDB 都要转义；身份三件套随行。
+    /// 这里替调用方填同一个值；斜杠形 refno 与 MDB 都要转义；身份三件套随行；「一并删除网格文件」
+    /// 那一格随行（勾没勾是两个不同的请求行，不许省略）。
     #[test]
     fn cleanup_request_confirms_the_same_refno_and_encodes_it() {
-        let path = cleanup_path("24381/100677", "ProjAMS", "/ALL", "aios");
         assert_eq!(
-            path,
-            "/api/v1/model/subtree?refno=24381%2F100677&confirm=24381%2F100677&project=ProjAMS&mdb=%2FALL&namespace=aios"
+            cleanup_path("24381/100677", true, "ProjAMS", "/ALL", "aios"),
+            "/api/v1/model/subtree?refno=24381%2F100677&confirm=24381%2F100677&purge_meshes=true&project=ProjAMS&mdb=%2FALL&namespace=aios"
+        );
+        assert_eq!(
+            cleanup_path("24381/100677", false, "ProjAMS", "/ALL", "aios"),
+            "/api/v1/model/subtree?refno=24381%2F100677&confirm=24381%2F100677&purge_meshes=false&project=ProjAMS&mdb=%2FALL&namespace=aios"
         );
         // 清理只有这一条路由，不像 generate 还有旧名可退：字符串常量只许出现一次。
         // 文档注释可以点名同一条路径，不计入。
@@ -1437,24 +1533,67 @@ mod tests {
         );
     }
 
-    /// 整库清理的请求行：`confirm` 等于路径 dbnum，身份三件套转义。`ref0s` 缺席与空数组不是一回事。
+    /// 整库清理的请求行：`confirm` 等于路径 dbnum，身份三件套转义，「一并删除网格文件」
+    /// 那一格随行（勾没勾是两个不同的请求行，不许省略）。`ref0s` 缺席与空数组不是一回事。
     #[test]
     fn dbnum_model_cleanup_confirms_the_path_dbnum_and_keeps_absent_ref0s() {
         assert_eq!(
-            dbnum_model_path(8000, "ProjAMS", "/ALL", "aios"),
-            "/api/v1/dbnums/8000/model?confirm=8000&project=ProjAMS&mdb=%2FALL&namespace=aios"
+            dbnum_model_path(8000, true, "ProjAMS", "/ALL", "aios"),
+            "/api/v1/dbnums/8000/model?confirm=8000&purge_meshes=true&project=ProjAMS&mdb=%2FALL&namespace=aios"
+        );
+        assert_eq!(
+            dbnum_model_path(8000, false, "ProjAMS", "/ALL", "aios"),
+            "/api/v1/dbnums/8000/model?confirm=8000&purge_meshes=false&project=ProjAMS&mdb=%2FALL&namespace=aios"
         );
         let absent: DbnumModelCleanupReceipt = serde_json::from_str(
             r#"{"dbnum":8000,"scope":"model_face","status":"deleted","range_statements":3,"elapsed_ms":12}"#,
         )
         .unwrap();
         assert!(absent.ref0s.is_none(), "缺席不能当成空数组");
+        assert!(
+            absent.mesh_files_removed.is_none(),
+            "没勾那一格时服务端不给网格账，不能当成「删了 0 个」"
+        );
         let present: DbnumModelCleanupReceipt =
             serde_json::from_str(r#"{"dbnum":8000,"ref0s":[24381,31909]}"#).unwrap();
         assert_eq!(present.ref0s, Some(vec![24381, 31909]));
+        // 回执给的其实是字符串（spec §4.5.1D 的例子就是 `["24381"]`，服务端那张表的主键
+        // 是字符串前缀），而 `/dbnums` 行上的同名字段是整数。两个形状都要收下——此前这里
+        // 只认整数，整库清理的回执一到就整条解析失败（`invalid type: string "15544",
+        // expected u32`），而按钮一直是灰的，所以从没被撞见过。
+        let wire: DbnumModelCleanupReceipt =
+            serde_json::from_str(r#"{"dbnum":7352,"ref0s":["15544","23736"]}"#).unwrap();
+        assert_eq!(wire.ref0s, Some(vec![15544, 23736]), "回执的字符串形状");
+        // 认不出的那一项整项丢掉，不编一个 0——编 0 会去卸 `0/0` 那个不存在的范围。
+        let mixed: DbnumModelCleanupReceipt =
+            serde_json::from_str(r#"{"dbnum":8000,"ref0s":["24381","",null,"x",31909]}"#).unwrap();
+        assert_eq!(mixed.ref0s, Some(vec![24381, 31909]));
         let empty: DbnumModelCleanupReceipt =
             serde_json::from_str(r#"{"dbnum":8000,"ref0s":[]}"#).unwrap();
         assert_eq!(empty.ref0s, Some(vec![]));
+        let purged: DbnumModelCleanupReceipt = serde_json::from_str(
+            r#"{"dbnum":8000,"ref0s":[],"mesh_files_removed":389,"mesh_files_absent":0,"mesh_files_failed":0}"#,
+        )
+        .unwrap();
+        assert_eq!(purged.mesh_files_removed, Some(389));
+        assert_eq!(
+            mesh_purge_note(
+                purged.mesh_files_removed,
+                purged.mesh_files_absent,
+                purged.mesh_files_failed
+            ),
+            "；一并删除网格文件 389 个",
+            "两条清理路径共用同一句网格账"
+        );
+        assert_eq!(
+            mesh_purge_note(Some(3), Some(2), Some(1)),
+            "；一并删除网格文件 3 个（另 2 个本来就不在盘上），1 个删失败"
+        );
+        assert_eq!(
+            mesh_purge_note(None, None, None),
+            "",
+            "没勾这一格时不留标点"
+        );
     }
 
     /// generate 的四档状态对界面是四件不同的事，压成布尔就分不出「重做过了」与

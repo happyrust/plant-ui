@@ -186,6 +186,10 @@ pub enum Req {
     CleanupModels {
         epoch: u64,
         refnos: Vec<RefU64>,
+        /// 确认框上「一并删除网格文件」那一格（2026-10-23）：`true` 时请求带
+        /// `purge_meshes=true`，服务端把这片范围引用过的内容寻址 `.mesh` 也从磁盘删掉。
+        /// 网格是可能被其他范围复用的东西，所以这个值只在人勾着的时候才是 `true`。
+        purge_meshes: bool,
         base: String,
         project: String,
         mdb: String,
@@ -242,6 +246,9 @@ pub enum Req {
     },
     /// 库行「清理模型（整库）」：`DELETE /api/v1/dbnums/{dbnum}/model?confirm={dbnum}`。
     /// `epoch` 认帧，与右键清理同一套：晚到的回执对不上就丢掉。
+    ///
+    /// `purge_meshes` = 确认框上「一并删除网格文件」那一格：勾了服务端另把这个库引用过的
+    /// `.mesh` 从盘上删掉（老服务端不认这一格，静默忽略）。
     CleanupDbnumModel {
         epoch: u64,
         base: String,
@@ -249,6 +256,7 @@ pub enum Req {
         mdb: String,
         namespace: String,
         dbnum: u32,
+        purge_meshes: bool,
     },
     /// 取回工作：丢缓存，重查 SITE 根层与这些已展开分支的子层。
     ///
@@ -887,6 +895,7 @@ async fn handle_read(
         Req::CleanupModels {
             epoch,
             refnos,
+            purge_meshes,
             base,
             project,
             mdb,
@@ -899,6 +908,7 @@ async fn handle_read(
                 let result = crate::model_update_api::delete_model_subtree(
                     &base,
                     &refno.to_slash_string(),
+                    purge_meshes,
                     &project,
                     &mdb,
                     &namespace,
@@ -987,9 +997,15 @@ async fn handle_read(
             mdb,
             namespace,
             dbnum,
+            purge_meshes,
         } => {
             let result = crate::model_update_api::delete_dbnum_model(
-                &base, &project, &mdb, &namespace, dbnum,
+                &base,
+                &project,
+                &mdb,
+                &namespace,
+                dbnum,
+                purge_meshes,
             )
             .await;
             let _ = evt_tx.send(Evt::DbnumModelCleaned {

@@ -4268,7 +4268,10 @@ impl App {
                 Cmd::CleanupModels { targets } => {
                     self.begin_mutation(model_mutation::Kind::Cleanup, targets)
                 }
-                Cmd::ModelMutationConfirm { accepted } => self.settle_mutation_confirm(accepted),
+                Cmd::ModelMutationConfirm {
+                    accepted,
+                    purge_meshes,
+                } => self.settle_mutation_confirm(accepted, purge_meshes),
             }
         }
         if dirty {
@@ -4435,6 +4438,9 @@ impl App {
             kind,
             label,
             dbnum: None,
+            // 「一并删除网格文件」默认勾上（2026-10-23）。只有清理那一档画这一格、也只有
+            // 它消费这个值；重新生成走的是 `force = true`，服务端那条不收这个参数。
+            purge_meshes: matches!(kind, model_mutation::Kind::Cleanup),
         });
     }
 
@@ -4464,6 +4470,9 @@ impl App {
             kind: model_mutation::Kind::Cleanup,
             label,
             dbnum: Some(dbnum),
+            // 整库清理也画这一格（`DELETE /dbnums/{dbnum}/model` 收 `purge_meshes`），默认与
+            // 右键那一档一致：勾上。
+            purge_meshes: true,
         });
     }
 
@@ -4494,6 +4503,7 @@ impl App {
             kind: model_mutation::Kind::RoomRebuild,
             label,
             dbnum: None,
+            purge_meshes: false,
         });
     }
 
@@ -4583,7 +4593,11 @@ impl App {
     /// 确认框的回执。接受就对右键那几行**各一发**——重新生成是 `generate(force = true)`，整批
     /// 回执落在 `Evt::ModelsGenerated`；清理是 `DELETE /model/subtree`，整批回执落在
     /// `Evt::ModelsCleaned`。取消 / 关窗 / 关掉失败态一个请求都不发。
-    fn settle_mutation_confirm(&mut self, accepted: bool) {
+    ///
+    /// `purge_meshes` 是框上「一并删除网格文件」那一格此刻的状态。两个清理档都消费它
+    /// （右键走子树、整库走整库，两条服务端接口都收这个参数）；重新生成那一档丢掉它——
+    /// 它走 `force = true`，服务端先删后算，网格删了就得整批重写一遍。
+    fn settle_mutation_confirm(&mut self, accepted: bool, purge_meshes: bool) {
         let closed = self.mutation.take();
         // 「等房间参照模型」那一档的叉 /「取消等待」走到这里：生成请求还没发，置位开关
         // 让数据线程放弃余下目标（已发出的照常跑完——那一档没有叉，走不到这里）。
@@ -4638,6 +4652,9 @@ impl App {
             self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
             return;
         }
+        // 「一并删除网格文件」只对两个清理档有意义：重新生成走 `force = true`（服务端先删
+        // 后算，网格不能删——删了就得重写一遍全部网格）。框上那一格的值只在这两档落地。
+        let purge_meshes = purge_meshes && kind == model_mutation::Kind::Cleanup;
         // 帧号从这里起不再变：整批回执拿它认帧。整库清理没有右键那几行，单独一发。
         let request = match (kind, dbnum) {
             (_, Some(dbnum)) => data::Req::CleanupDbnumModel {
@@ -4647,6 +4664,7 @@ impl App {
                 mdb: self.mdb.clone(),
                 namespace: self.namespace.clone(),
                 dbnum,
+                purge_meshes,
             },
             (model_mutation::Kind::Regenerate, None) => data::Req::GenerateModels {
                 epoch: self.mutation_epoch,
@@ -4670,6 +4688,7 @@ impl App {
             (model_mutation::Kind::Cleanup, None) => data::Req::CleanupModels {
                 epoch: self.mutation_epoch,
                 refnos: targets.clone(),
+                purge_meshes,
                 base: self.model_api_url.clone(),
                 project: self.vm.project.clone(),
                 mdb: self.mdb.clone(),
@@ -4687,7 +4706,12 @@ impl App {
         }
         let started = match (kind, dbnum) {
             (_, Some(dbnum)) => format!(
-                "db{dbnum}：正在清理全部模型产物（只删产物、水位归零，不自动重算）…"
+                "db{dbnum}：正在清理全部模型产物（只删产物、水位归零，不自动重算{}）…",
+                if purge_meshes {
+                    "；另把这个库引用过的网格文件从磁盘删掉"
+                } else {
+                    ""
+                }
             ),
             (model_mutation::Kind::Regenerate, None) => format!(
                 "{label}：正在生成模型（{} 个目标，范围内已有的产物会被重算替换；服务端预算 120 秒，超时后自动续跑补齐）…",
@@ -4698,8 +4722,13 @@ impl App {
                     .to_string()
             }
             (model_mutation::Kind::Cleanup, None) => format!(
-                "{label}：正在清理模型产物（{} 个目标，服务端按子树删已生成的产物、不重算；只删产物，不删设计元素）…",
-                targets.len()
+                "{label}：正在清理模型产物（{} 个目标，服务端按子树删已生成的产物、不重算；只删产物，不删设计元素{}）…",
+                targets.len(),
+                if purge_meshes {
+                    "；另把这片范围引用过的网格文件从磁盘删掉"
+                } else {
+                    ""
+                }
             ),
         };
         self.logs.info(&mut self.vm.logs, started);
@@ -4926,10 +4955,16 @@ impl App {
                         unloaded.len()
                     )
                 };
+                // 网格那一格：勾了才有这三格（老服务端 / 没勾都不给），一句接在尾巴上。
+                let meshes = model_update_api::mesh_purge_note(
+                    receipt.mesh_files_removed,
+                    receipt.mesh_files_absent,
+                    receipt.mesh_files_failed,
+                );
                 self.logs.info(
                     &mut self.vm.logs,
                     format!(
-                        "已清理 db{dbnum} 全部模型产物（{} 条语句 / {} ms）；{tail}",
+                        "已清理 db{dbnum} 全部模型产物（{} 条语句 / {} ms{meshes}）；{tail}",
                         receipt.range_statements, receipt.elapsed_ms
                     ),
                 );
@@ -6867,7 +6902,7 @@ mod tests {
 
         let source = include_str!("main.rs");
         let confirm = source
-            .split_once("fn settle_mutation_confirm(&mut self, accepted: bool) {")
+            .split_once("fn settle_mutation_confirm(&mut self, accepted: bool, purge_meshes: bool) {")
             .expect("确认那一步")
             .1
             .split_once("fn settle_models_generated(")
@@ -6886,6 +6921,61 @@ mod tests {
         assert!(
             !confirm.contains("RegenerateScope") && !confirm.contains("RegenerateDelete"),
             "清点 / 整片删已退役"
+        );
+        // 「一并删除网格文件」那一格落在两个清理档上：右键清理与整库清理的请求里都带上它，
+        // 重新生成那一档不带（它走 `force = true`）。
+        let cleanup_request = confirm
+            .split_once("(model_mutation::Kind::Cleanup, None) => data::Req::CleanupModels {")
+            .expect("右键清理那一发")
+            .1
+            .split_once("},")
+            .expect("请求体结束")
+            .0;
+        assert!(
+            cleanup_request.contains("purge_meshes,"),
+            "框上那一格要原样进请求：{cleanup_request}"
+        );
+        let dbnum_request = confirm
+            .split_once("(_, Some(dbnum)) => data::Req::CleanupDbnumModel {")
+            .expect("整库清理那一发")
+            .1
+            .split_once("},")
+            .expect("请求体结束")
+            .0;
+        assert!(
+            dbnum_request.contains("purge_meshes,"),
+            "整库那一档今天也收这一格：{dbnum_request}"
+        );
+        assert!(
+            confirm.contains("purge_meshes && kind == model_mutation::Kind::Cleanup;"),
+            "只有两个清理档消费它（重新生成那一档丢掉）：{confirm}"
+        );
+        let begin = source
+            .split_once("fn begin_mutation(&mut self, kind: model_mutation::Kind, targets: Vec<RefU64>) {")
+            .expect("开框那一步")
+            .1
+            .split_once("fn begin_dbnum_model_cleanup(")
+            .expect("整库清理开框")
+            .0;
+        assert!(
+            begin.contains("purge_meshes: matches!(kind, model_mutation::Kind::Cleanup),"),
+            "默认勾上（只有清理那一档画它）：{begin}"
+        );
+        let dbnum_begin = source
+            .split_once("fn begin_dbnum_model_cleanup(&mut self, dbnum: u32) {")
+            .expect("整库清理开框那一步")
+            .1
+            .split_once("fn begin_room_rebuild(")
+            .expect("下一个开框")
+            .0;
+        assert!(
+            dbnum_begin.contains("purge_meshes: true,"),
+            "整库那一档也默认勾上：{dbnum_begin}"
+        );
+        assert!(
+            confirm.contains("另把这片范围引用过的网格文件从磁盘删掉")
+                && confirm.contains("另把这个库引用过的网格文件从磁盘删掉"),
+            "两个清理档开跑那一行都要说清勾了之后多删什么：{confirm}"
         );
 
         let settle = source
@@ -7259,9 +7349,33 @@ mod tests {
             status: "deleted".into(),
             model_source: None,
             model_source_reason: None,
+            // 没勾「一并删除网格文件」：三格账全缺席，日志里也不该冒出网格那半句。
+            meshes_removed: None,
+            meshes_absent: None,
+            meshes_failed: None,
         };
         assert_eq!(cleanup_outcome(&Ok(reply.clone())), CleanupOutcome::Cleaned);
         assert_eq!(reply.server_note(), "服务端 exact_subtree");
+        // 勾了那一格：删了几个、几个本来就不在、几个失败都要说出来（含「一个都没删到」）。
+        let purged = model_update_api::CleanupReply {
+            meshes_removed: Some(0),
+            meshes_absent: Some(388),
+            ..reply.clone()
+        };
+        assert_eq!(
+            purged.server_note(),
+            "服务端 exact_subtree；一并删除网格文件 0 个（另 388 个本来就不在盘上）"
+        );
+        let partly = model_update_api::CleanupReply {
+            meshes_removed: Some(386),
+            meshes_absent: Some(0),
+            meshes_failed: Some(2),
+            ..reply.clone()
+        };
+        assert_eq!(
+            partly.server_note(),
+            "服务端 exact_subtree；一并删除网格文件 386 个，2 个删失败"
+        );
         // 服务端换了状态名、或只清了内存投影：按「删过了」计，但要说出来（宪法 III）。
         let odd = model_update_api::CleanupReply {
             status: "purged".into(),
@@ -8908,7 +9022,9 @@ impl App {
             ui.ctx(),
             &t,
             d,
-            self.mutation.as_ref(),
+            // 框里「一并删除网格文件」那一格要就地改这个值，所以是 `&mut`：勾选状态随
+            // 确认回执一起交出去（`Cmd::ModelMutationConfirm`）。
+            self.mutation.as_mut(),
         ));
         cmds.extend(room_browser::show(
             ui.ctx(),
