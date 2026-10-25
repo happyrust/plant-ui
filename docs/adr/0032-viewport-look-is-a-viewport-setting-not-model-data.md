@@ -86,7 +86,7 @@ ND 纹理是 `Rgba32Float`（能当颜色附件就用；同来源 `_ndType = can
    是 2026-10-25 整库全视条纹 / 同心环的根因。来源本来就是 `canFloat ? FloatType : HalfFloatType`，这是回到来源。
 9. **GPU 间接绘制的逃生口** `PLANT_UI_INDIRECT_DRAW=0`（主相机挂 Bevy `NoIndirectDrawing`，退到 `PreprocessingOnly`），计划里没有：2026-10-25 本机 RX 590 + Vulkan 上
    Bevy 0.16 的间接路径让 prepass 整段不落笔（边线 / 伪阴影全无；上游 bevy#18904 / #19000 同类机器相关缺陷），直接 draw 或 DX12 即好。缺省不开：整库直接 draw
-   帧时间翻倍（24–26 fps）；本机首选 `WGPU_BACKEND=dx12`。启动时 `[渲染]` 一行报适配器 / 后端 / 开关（evidence §4.4 末尾）。用户 2026-10-25 拍板：Windows 缺省后端不改。
+   全视 24–26 fps，同场景 DX12 间接绘制 32–34 fps，Vulkan 间接正常那天 47–57 fps；本机首选 `WGPU_BACKEND=dx12`。启动时 `[渲染]` 一行报适配器 / 后端 / 开关（evidence §4.4 末尾）。用户 2026-10-25 拍板：Windows 缺省后端不改。
 
 ## 后果
 
