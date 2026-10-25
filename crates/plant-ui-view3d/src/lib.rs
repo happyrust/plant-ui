@@ -60,7 +60,8 @@ mod virtual_hole;
 use e3d_look::env_cube::SglEnvCube;
 use e3d_look::material::{SGL_LOOK_SHADER, SglLookMaterial};
 use e3d_look::post::{
-    SglLookPost, SglLookPostPlugin, blur_sharpness_for_depth_range, eye_depth_range,
+    SglLookDebugView, SglLookPost, SglLookPostPlugin, blur_sharpness_for_depth_range,
+    eye_depth_range,
 };
 use look_materials::{LookMaterials, MaterialAssets};
 
@@ -1618,7 +1619,7 @@ fn publish_camera(
 /// NDC → 渲染纹理上的归一化 UV（左上原点）；在相机身后或裁剪范围外回 None。
 /// 相机上的 E3D 外观件（阶段二）：E3D 外观挂 `NormalPrepass`（线性深度与参与标记都在法线纹理里，不要
 /// `DepthPrepass` 那份深度拷贝）、`Msaa::Off`（prepass 纹理在 WebGL2 上读不了多重采样，两端统一），
-/// 并按设置与本帧场景深度范围填 `SglLookPost`；PBR 外观摘掉 prepass、
+/// 并按设置与本帧场景深度范围填 `SglLookPost`（宿主插的 [`SglLookDebugView`] 也在这里带进去）；PBR 外观摘掉 prepass、
 /// MSAA 回 4×、后处理关（不提取，节点不跑）。跑在变换传播之后，深度范围用的是本帧真正渲染的相机位姿。
 fn sync_camera_look(
     mut commands: Commands,
@@ -1669,6 +1670,7 @@ fn sync_camera_look(
             // AO / 模糊按 1/render_scale 分辨率跑：超采样时正好是屏幕分辨率（E3D 的 halfRes 关）。
             SglLookPost::new(look.hlr, look.ao, sharpness, view.render_scale)
                 .with_background(e3d_look::presets::e3d_background(look.gradient))
+    debug_view: Res<SglLookDebugView>,
         } else {
             SglLookPost::off()
         };
@@ -1715,6 +1717,7 @@ fn ndc_to_texture_uv(ndc: Vec3) -> Option<[f32; 2]> {
 }
 
 /// 把每条尺寸标注文字的毫米锚点过装载变换，再交给 `project`（相机的世界点 → 纹理 UV）；
+                .with_debug(*debug_view)
 /// 锚点非有限直接 None。与 `dimension_labels` 同长同序，egui 侧按下标对回文字。
 fn project_dimension_labels(
     labels: &[DimensionLabel],

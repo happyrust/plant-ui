@@ -56,6 +56,10 @@ naga 的 GLSL 后端做不了 `texture_depth_2d` 的 `textureLoad`。prepass 把
 写进法线纹理的 RGB（`Rgb10a2Unorm`，范围 65504 世界单位 = 6.5 km，步长 ≈ 0.006 mm），alpha 是参与标记；
 后处理只读法线纹理，面法线由深度差分重建（法线纹理里不存法线）。一套着色器，没有按能力分叉的第二条 ND 路。
 
+ND 纹理是 `Rgba32Float`（能当颜色附件就用；同来源 `_ndType = canFloat ? FloatType : HalfFloatType`，只有半浮点附件的设备才退 `Rgba16Float`）。
+它的 a 通道是 HLR / HBAO / 模糊比对的线性深度：f16 只有 11 bit 尾数，百米外（> 1024 单位）量化步长 ≥ 1 单位 = 100 mm，超过 50 mm 的边线深度阈值，
+每跨一个量化台阶 HLR 判据③就打一条边，在子像素格上打成条纹 / 同心环（2026-10-25 整库全视，evidence §4.3）。计划里写 f16 时只论了范围（65504 单位够）没论精度。
+
 ### D7　Web 端按能力降级，界面如实说
 
 `Rgba16Float` 不能当颜色附件（WebGL2 缺 `EXT_color_buffer_float`，wgpu 按它判半浮点可渲染）时：不挂 prepass、不跑后处理、
@@ -74,15 +78,19 @@ naga 的 GLSL 后端做不了 `texture_depth_2d` 的 `textureLoad`。prepass 把
 3. **深度来源**从硬件深度纹理改为法线纹理里的 3 × 10 bit 线性深度（D6）；`DepthPrepass` 不再挂。
 4. **去杂**在超采样下跑屏幕分辨率、每个样本先对 s×s 子像素取平均（同来源 `hlrResolved`），不是计划里「跑 2× 分辨率再由 egui 缩回」。
 5. **`render_scale`** 只看 `mode` 与 `aa`，两个效果全关也保留超采样（同 plant3d-web 颜色 MSAA 不读 legacy）。
-6. **调试开关** `PLANT_UI_LOOK_DEBUG` 没做；`--look-demo` / `?look_demo=1` 演示厂代替（debug 构建总带，release 要开 `look-demo` feature）。
-7. **Web 端出厂 AA** 暂留 SSAA 2×2（整库场景没量到），站点要换在 `config.json` 写 `"look": {"aa": "fxaa"}`，不按 `cfg!(wasm32)` 分出厂位。
+6. **调试开关** 没用 `PLANT_UI_LOOK_DEBUG` 这个名字：`--look-debug=<模式>` / `?look_debug=<模式>`（`SglLookDebugView`，任何构建都带）把后处理链的中间量
+   直出到视口（ND 深度 / ND 深度相对 prepass 30 bit 深度的误差 / 面法线 / 参与标记 / 去杂前边线 / 伪阴影）；`--look-demo` / `?look_demo=1` 演示厂（debug 构建总带，
+   release 要开 `look-demo` feature），`=far` 再多摆一件远景检验件（安全壳尺寸的筒体 + 穹顶，相机 180 m 外）并只框它取景。
+7. **Web 端出厂 AA** 暂留 SSAA 2×2：整库全视在浏览器里只有 9–10 fps（evidence §4.3），但 FXAA 能不能救回来还没量成，先不按 `cfg!(wasm32)` 分出厂位；站点要换在 `config.json` 写 `"look": {"aa": "fxaa"}`。
+8. **ND 纹理**从计划里的 `Rgba16Float` 改为能当颜色附件时 `Rgba32Float`（D6）：计划只论了 f16 的范围够用，没论精度；百米外 f16 的量化步长超过边线阈值，
+   是 2026-10-25 整库全视条纹 / 同心环的根因。来源本来就是 `canFloat ? FloatType : HalfFloatType`，这是回到来源。
 
 ## 后果
 
 - **老用户第一眼就不一样**：升级即 E3D 外观。补偿是设置窗一键回 web PBR、启动日志一句、CHANGELOG 第一条。
 - **两套材质类型并存**：换外观是换组件类型不是改 uniform，所以任何「自己持 `Handle<StandardMaterial>` 换材质」的新代码都会在 E3D 外观下出错；
   一律经 `LookMaterials::resolve`。
-- **显存**：超采样下 1500×800 视口的离屏图 + ND + HLR + 去杂 + AO / 模糊 ≈ 60 MB；超宽窗的物理尺寸夹在 `max_texture_dimension_2d`。
+- **显存**：超采样下 1500×800 视口的离屏图 + ND + HLR + 去杂 + AO / 模糊 ≈ 100 MB（ND 从 f16 换 f32 多出约 40 MB；下游读它的带宽也翻倍）；超宽窗的物理尺寸夹在 `max_texture_dimension_2d`。
 - **浏览器端头几帧**：egui 在 bevy_egui 算好相机前按 10000×10000 布局，宿主按「视口不可能比窗口大」挡掉那一帧的渲染目标请求；
   离屏图不带 CPU 数据（WebGL2 不收 BGRA 上传）。这两条与外观无关，但是超采样把它们从「报错一行」放大成「丢上下文」。
 - **已知偏差要说出口**：半透明不进边线 / 伪阴影（D4）、SSAA 代 MSAA（D5）、没做 autocolour / Laser / SHINY 分支（来源侧也没做）。

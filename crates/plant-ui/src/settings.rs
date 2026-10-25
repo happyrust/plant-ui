@@ -234,155 +234,160 @@ pub fn show(ctx: &egui::Context, t: &Tokens, d: Density, state: &mut State) -> O
                     });
                 });
 
-            ui.label(RichText::new("外观").strong().color(t.text_secondary));
-            setting_row(ui, t, "主题", "亮色为默认主题", |ui| {
-                widgets::segmented(
-                    ui,
-                    t,
-                    d,
-                    &mut state.draft.theme,
-                    &[(Theme::Light, "亮色"), (Theme::Dark, "深色")],
-                );
-            });
-            setting_row(
-                ui,
-                t,
-                "界面密度",
-                "影响字号、行高和控件尺寸",
-                |ui| {
-                    widgets::segmented(
+            // 「渲染外观」一节进来后内容比窗高：不滚的话底下「服务」那几行会被底栏盖住、点不到。
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("外观").strong().color(t.text_secondary));
+                    setting_row(ui, t, "主题", "亮色为默认主题", |ui| {
+                        widgets::segmented(
+                            ui,
+                            t,
+                            d,
+                            &mut state.draft.theme,
+                            &[(Theme::Light, "亮色"), (Theme::Dark, "深色")],
+                        );
+                    });
+                    setting_row(
                         ui,
                         t,
-                        d,
-                        &mut state.draft.density,
-                        &[
-                            (Density::Compact, "紧凑 12"),
-                            (Density::Standard, "标准 13"),
-                            (Density::Relaxed, "宽松 15"),
-                        ],
+                        "界面密度",
+                        "影响字号、行高和控件尺寸",
+                        |ui| {
+                            widgets::segmented(
+                                ui,
+                                t,
+                                d,
+                                &mut state.draft.density,
+                                &[
+                                    (Density::Compact, "紧凑 12"),
+                                    (Density::Standard, "标准 13"),
+                                    (Density::Relaxed, "宽松 15"),
+                                ],
+                            );
+                        },
                     );
-                },
-            );
-            setting_row(
-                ui,
-                t,
-                "无名元素显示全称",
-                "模型树里没有名字的元素默认显示 E3D 起的短名（ZONE 4）；勾上显示整条（ZONE 4 of SITE 2）",
-                |ui| {
-                    ui.checkbox(&mut state.draft.tree_full_names, "");
-                },
-            );
-            setting_row(
-                ui,
-                t,
-                "数据服务地址",
-                "数据中心与房间查询接口，保存后下一次提交生效",
-                |ui| {
-                    ui.add(
-                        TextEdit::singleline(&mut state.draft.data_api_url)
-                            .desired_width(300.0)
-                            .font(Font::mono(d))
-                            .hint_text(DEFAULT_DATA_API_URL),
+                    setting_row(
+                        ui,
+                        t,
+                        "无名元素显示全称",
+                        "模型树里没有名字的元素默认显示 E3D 起的短名（ZONE 4）；勾上显示整条（ZONE 4 of SITE 2）",
+                        |ui| {
+                            ui.checkbox(&mut state.draft.tree_full_names, "");
+                        },
                     );
-                },
-            );
+                    setting_row(
+                        ui,
+                        t,
+                        "数据服务地址",
+                        "数据中心与房间查询接口，保存后下一次提交生效",
+                        |ui| {
+                            ui.add(
+                                TextEdit::singleline(&mut state.draft.data_api_url)
+                                    .desired_width(300.0)
+                                    .font(Font::mono(d))
+                                    .hint_text(DEFAULT_DATA_API_URL),
+                            );
+                        },
+                    );
 
-            ui.add_space(12.0);
-            ui.label(RichText::new("渲染外观").strong().color(t.text_secondary));
-            look_rows(ui, t, d, &mut state.draft.look, state.post_effects_lock.as_deref());
+                    ui.add_space(12.0);
+                    ui.label(RichText::new("渲染外观").strong().color(t.text_secondary));
+                    look_rows(ui, t, d, &mut state.draft.look, state.post_effects_lock.as_deref());
 
-            ui.add_space(12.0);
-            ui.label(RichText::new("资产").strong().color(t.text_secondary));
-            // 浏览器端整行不适用：禁用而不是隐藏，两端的设置窗才长得一样
-            // （与模型树菜单里「取回工作」同一条房规）。
-            let local_files = cfg!(not(target_arch = "wasm32"));
-            let hint = state.mesh_dir_hint.clone();
-            setting_row(
-                ui,
-                t,
-                "网格目录",
-                "三维网格文件所在的目录；留空则使用灰字那个默认目录",
-                |ui| {
-                    let browse = ui.add_enabled(local_files, widgets::button(t, d, "浏览…"));
-                    if browse.clicked() {
-                        state.browse_requested = true;
+                    ui.add_space(12.0);
+                    ui.label(RichText::new("资产").strong().color(t.text_secondary));
+                    // 浏览器端整行不适用：禁用而不是隐藏，两端的设置窗才长得一样
+                    // （与模型树菜单里「取回工作」同一条房规）。
+                    let local_files = cfg!(not(target_arch = "wasm32"));
+                    let hint = state.mesh_dir_hint.clone();
+                    setting_row(
+                        ui,
+                        t,
+                        "网格目录",
+                        "三维网格文件所在的目录；留空则使用灰字那个默认目录",
+                        |ui| {
+                            let browse = ui.add_enabled(local_files, widgets::button(t, d, "浏览…"));
+                            if browse.clicked() {
+                                state.browse_requested = true;
+                            }
+                            browse.on_disabled_hover_text(WEB_MESH_DIR_HINT);
+                            ui.add_enabled(
+                                local_files,
+                                TextEdit::singleline(&mut state.draft.mesh_dir)
+                                    .desired_width(300.0)
+                                    .font(Font::mono(d))
+                                    .hint_text(hint.as_str()),
+                            )
+                            .on_disabled_hover_text(WEB_MESH_DIR_HINT);
+                        },
+                    );
+                    if local_files && let Some((notice, color)) = mesh_dir_notice(t, &state.mesh_dir_status)
+                    {
+                        // 外面这层 `horizontal` 不能省：`with_layout` 会把剩下的竖直空间整块吃掉，
+                        // 这一行就飘到窗口底部去了，离它解释的那个输入框十万八千里。
+                        ui.horizontal(|ui| {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(RichText::new(notice).small().color(color));
+                            });
+                        });
                     }
-                    browse.on_disabled_hover_text(WEB_MESH_DIR_HINT);
-                    ui.add_enabled(
-                        local_files,
-                        TextEdit::singleline(&mut state.draft.mesh_dir)
-                            .desired_width(300.0)
-                            .font(Font::mono(d))
-                            .hint_text(hint.as_str()),
-                    )
-                    .on_disabled_hover_text(WEB_MESH_DIR_HINT);
-                },
-            );
-            if local_files && let Some((notice, color)) = mesh_dir_notice(t, &state.mesh_dir_status)
-            {
-                // 外面这层 `horizontal` 不能省：`with_layout` 会把剩下的竖直空间整块吃掉，
-                // 这一行就飘到窗口底部去了，离它解释的那个输入框十万八千里。
-                ui.horizontal(|ui| {
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new(notice).small().color(color));
-                    });
-                });
-            }
 
-            ui.add_space(12.0);
-            ui.label(RichText::new("服务").strong().color(t.text_secondary));
-            setting_row(
-                ui,
-                t,
-                "模型服务地址",
-                "gen-model 的 REST 与 WebSocket 入口，保存后下一次预览生效",
-                |ui| {
-                    ui.add(
-                        TextEdit::singleline(&mut state.draft.model_api_url)
-                            .desired_width(300.0)
-                            .font(Font::mono(d))
-                            .hint_text(DEFAULT_MODEL_API_URL),
+                    ui.add_space(12.0);
+                    ui.label(RichText::new("服务").strong().color(t.text_secondary));
+                    setting_row(
+                        ui,
+                        t,
+                        "模型服务地址",
+                        "gen-model 的 REST 与 WebSocket 入口，保存后下一次预览生效",
+                        |ui| {
+                            ui.add(
+                                TextEdit::singleline(&mut state.draft.model_api_url)
+                                    .desired_width(300.0)
+                                    .font(Font::mono(d))
+                                    .hint_text(DEFAULT_MODEL_API_URL),
+                            );
+                        },
                     );
-                },
-            );
-            // 环境变量压过时这一格改了也不生效：灰掉而不是藏起来，人才看得见现在是哪一面、
-            // 为什么改不了（与浏览器端「网格目录」那一行同一条房规）。
-            let read_face_lock = state.read_face_lock.clone();
-            setting_row(
-                ui,
-                t,
-                "供数模式",
-                "模型树 / 属性 / 搜索 / 三维实例从哪儿读；保存后清场并重装已加载范围",
-                |ui| {
-                    let combo = ui.add_enabled_ui(read_face_lock.is_none(), |ui| {
-                        ComboBox::from_id_salt("plant-read-face")
-                            .selected_text(state.draft.read_face.label())
-                            .width(160.0)
-                            .show_ui(ui, |ui| {
-                                for kind in ReadFaceKind::ALL {
-                                    ui.selectable_value(
-                                        &mut state.draft.read_face,
-                                        kind,
-                                        kind.label(),
-                                    );
-                                }
-                            })
-                            .response
-                    });
+                    // 环境变量压过时这一格改了也不生效：灰掉而不是藏起来，人才看得见现在是哪一面、
+                    // 为什么改不了（与浏览器端「网格目录」那一行同一条房规）。
+                    let read_face_lock = state.read_face_lock.clone();
+                    setting_row(
+                        ui,
+                        t,
+                        "供数模式",
+                        "模型树 / 属性 / 搜索 / 三维实例从哪儿读；保存后清场并重装已加载范围",
+                        |ui| {
+                            let combo = ui.add_enabled_ui(read_face_lock.is_none(), |ui| {
+                                ComboBox::from_id_salt("plant-read-face")
+                                    .selected_text(state.draft.read_face.label())
+                                    .width(160.0)
+                                    .show_ui(ui, |ui| {
+                                        for kind in ReadFaceKind::ALL {
+                                            ui.selectable_value(
+                                                &mut state.draft.read_face,
+                                                kind,
+                                                kind.label(),
+                                            );
+                                        }
+                                    })
+                                    .response
+                            });
+                            if let Some(lock) = read_face_lock.as_deref() {
+                                combo.inner.on_disabled_hover_text(lock);
+                            }
+                        },
+                    );
                     if let Some(lock) = read_face_lock.as_deref() {
-                        combo.inner.on_disabled_hover_text(lock);
+                        // 同「网格目录」的校验提示：外面这层 `horizontal` 挡住 `with_layout` 吃掉
+                        // 剩余竖直空间，这一行才贴在它解释的那个下拉底下。
+                        ui.horizontal(|ui| {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(RichText::new(lock).small().color(t.warn));
+                            });
+                        });
                     }
-                },
-            );
-            if let Some(lock) = read_face_lock.as_deref() {
-                // 同「网格目录」的校验提示：外面这层 `horizontal` 挡住 `with_layout` 吃掉
-                // 剩余竖直空间，这一行才贴在它解释的那个下拉底下。
-                ui.horizontal(|ui| {
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new(lock).small().color(t.warn));
-                    });
                 });
-            }
         });
 
     if cancel || !open {

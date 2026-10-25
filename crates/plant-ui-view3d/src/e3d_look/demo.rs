@@ -5,7 +5,12 @@
 //! `ModelRoot` / `ModelMesh` 路径，所以拾取、选中、换外观、换配色都照常——只是网格不来自文件。
 //! debug 构建总编进去，release 构建要开 `look-demo` feature；宿主见到 `--look-demo`（浏览器端 `?look_demo=1`）就插一枚 [`LookDemo`] 资源。演示厂开着时每隔一阵往控制台
 //! 打一行平均帧时间（[`report_frame_time`]），是计划里「用 FrameTimeDiagnostics 量帧时间」那一条的落点。
+//!
+//! `--look-demo=far`（`?look_demo=far`）再多摆一件远景检验件（[`FAR_PARTS`]：安全壳尺寸的筒体 + 穹顶，厂区北面 250 m 外）
+//! 并只框它取景：相机离它 150 m 上下、远端面 200 m 开外，是 2026-10-25 整库全视在浏览器里撞上「筒体条纹 / 穹顶同心环」
+//! 的最小复现（ND 深度存 f16 时百米外的量化步长超过边线阈值），不要模型库也能在两端复查。
 
+use std::collections::HashMap;
 use std::f32::consts::FRAC_PI_2;
 
 use aios_core::RefU64;
@@ -72,7 +77,10 @@ pub(crate) fn report_frame_time(
 
 /// 宿主插上它，`PostStartup` 就把演示厂摆进场景。
 #[derive(Resource, Debug, Default, Clone, Copy)]
-pub struct LookDemo;
+pub struct LookDemo {
+    /// 再摆远景检验件（[`FAR_PARTS`]）并只框它取景（`--look-demo=far` / `?look_demo=far`）。
+    pub far: bool,
+}
 
 /// 演示厂的构件编号从这里起：高到不与任何真 refno 撞车。
 const FIRST_REFNO: u64 = 9_000_000_001;
@@ -94,6 +102,10 @@ enum DemoShape {
     },
     /// 盒子：三边长（PDMS X / Y / Z）。
     Box { size: [f32; 3] },
+    /// 立筒（沿 PDMS Z）：直径、高；128 段，远景检验件用。
+    Tower { diameter: f32, height: f32 },
+    /// 球（穹顶）：直径；经纬球，远景检验件用。
+    Dome { diameter: f32 },
 }
 
 /// 演示厂的一件构件。
@@ -172,6 +184,30 @@ const PARTS: &[DemoPart] = &[
     },
 ];
 
+/// 远景检验件（`far`）：Ø 60 m × 70 m 的筒体顶着 Ø 60 m 的穹顶，摆在厂区北面 250 m 外。框它取景时
+/// `frame_bounds` 把相机放在半对角线的 2.8 倍处（约 180 m），近面 150 m、远面 210 m：都在 1024 单位（102 m）之外，
+/// ND 深度若是 f16，量化步长 1–2 单位 > 50 mm 边线阈值，筒体上就打出条纹、穹顶上是同心环。
+const FAR_PARTS: &[DemoPart] = &[
+    DemoPart {
+        generic: "STRU",
+        shape: DemoShape::Tower {
+            diameter: 60_000.0,
+            height: 70_000.0,
+        },
+        centre: [0.0, 250_000.0, 35_000.0],
+        alpha: 255,
+    },
+    DemoPart {
+        generic: "STRU",
+        shape: DemoShape::Dome { diameter: 60_000.0 },
+        centre: [0.0, 250_000.0, 70_000.0],
+        alpha: 255,
+    },
+];
+
+/// 远景检验件的构件编号从这里起（演示厂的排在 [`FIRST_REFNO`] 后面，隔开一段）。
+const FIRST_FAR_REFNO: u64 = FIRST_REFNO + 1_000;
+
 /// aids 蓝球：直径与位置（PDMS 毫米）。
 const AIDS_SPHERE_DIAMETER: f32 = 400.0;
 const AIDS_SPHERE_CENTRE: [f32; 3] = [-600.0, -600.0, 200.0];
@@ -208,11 +244,78 @@ impl DemoShape {
                     size * 0.5,
                 )
             }
+            DemoShape::Tower { diameter, height } => {
+                let radius = diameter * 0.5;
+                (
+                    Cylinder::new(radius, height).mesh().resolution(128).build(),
+                    Quat::from_rotation_x(FRAC_PI_2),
+                    Vec3::new(radius, radius, height * 0.5),
+                )
+            }
+            DemoShape::Dome { diameter } => {
+                let radius = diameter * 0.5;
+                (
+                    Sphere::new(radius).mesh().uv(96, 48),
+                    Quat::IDENTITY,
+                    Vec3::splat(radius),
+                )
+            }
         }
     }
 }
 
-/// 把演示厂摆进场景并取景。没有 [`LookDemo`] 资源就什么都不做。
+/// 把一件构件摆进场景（走与真模型相同的 `ModelRoot` / `ModelMesh` 路径），记入包围盒账，返回它的世界包围盒。
+fn spawn_part(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    bounds: &mut HashMap<RefU64, (Vec3, Vec3)>,
+    scene: Entity,
+    refno: RefU64,
+    part: &DemoPart,
+) -> Option<(Vec3, Vec3)> {
+    let (mesh, rotation, half) = part.shape.build();
+    let centre = Vec3::from_array(part.centre);
+    let world_bounds = scene_bounds_from_mm((centre - half).to_array(), (centre + half).to_array());
+    if let Some((min, max)) = world_bounds {
+        extend_bounds(bounds, refno, min, max);
+    }
+    let mut colour = type_color(part.generic).to_srgba().to_u8_array();
+    colour[3] = part.alpha;
+    let mesh = meshes.add(mesh);
+    commands
+        .spawn((
+            Transform::from_translation(centre).with_rotation(rotation),
+            Visibility::Visible,
+            ModelRoot {
+                refno,
+                owner: refno,
+            },
+            ChildOf(scene),
+        ))
+        .with_children(|element| {
+            element.spawn((
+                Mesh3d(mesh),
+                Transform::IDENTITY,
+                ModelMesh {
+                    refno,
+                    owner: refno,
+                    colour,
+                    line: false,
+                },
+                ModelPickTarget { refno },
+            ));
+        });
+    world_bounds
+}
+
+/// 几个包围盒的并；一个都没有为 `None`。
+fn union_bounds(boxes: impl IntoIterator<Item = (Vec3, Vec3)>) -> Option<(Vec3, Vec3)> {
+    boxes
+        .into_iter()
+        .reduce(|(min_a, max_a), (min_b, max_b)| (min_a.min(min_b), max_a.max(max_b)))
+}
+
+/// 把演示厂摆进场景并取景（`far` 时连远景检验件一起摆，只框它取景）。没有 [`LookDemo`] 资源就什么都不做。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_look_demo(
     demo: Option<Res<LookDemo>>,
@@ -223,52 +326,36 @@ pub(crate) fn spawn_look_demo(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    if demo.is_none() {
+    let Some(demo) = demo else {
         return;
-    }
+    };
     let scene = commands
         .spawn((scene_transform(), Visibility::Visible, SceneRoot))
         .id();
-    let mut all_min = Vec3::splat(f32::INFINITY);
-    let mut all_max = Vec3::splat(f32::NEG_INFINITY);
-    for (index, part) in PARTS.iter().enumerate() {
+    let plant = union_bounds(PARTS.iter().enumerate().filter_map(|(index, part)| {
         let refno = RefU64(FIRST_REFNO + index as u64);
-        let (mesh, rotation, half) = part.shape.build();
-        let centre = Vec3::from_array(part.centre);
-        if let Some((min, max)) =
-            scene_bounds_from_mm((centre - half).to_array(), (centre + half).to_array())
-        {
-            extend_bounds(&mut view.bounds, refno, min, max);
-            all_min = all_min.min(min);
-            all_max = all_max.max(max);
-        }
-        let mut colour = type_color(part.generic).to_srgba().to_u8_array();
-        colour[3] = part.alpha;
-        let mesh = meshes.add(mesh);
-        commands
-            .spawn((
-                Transform::from_translation(centre).with_rotation(rotation),
-                Visibility::Visible,
-                ModelRoot {
-                    refno,
-                    owner: refno,
-                },
-                ChildOf(scene),
-            ))
-            .with_children(|element| {
-                element.spawn((
-                    Mesh3d(mesh),
-                    Transform::IDENTITY,
-                    ModelMesh {
-                        refno,
-                        owner: refno,
-                        colour,
-                        line: false,
-                    },
-                    ModelPickTarget { refno },
-                ));
-            });
-    }
+        spawn_part(
+            &mut commands,
+            &mut meshes,
+            &mut view.bounds,
+            scene,
+            refno,
+            part,
+        )
+    }));
+    let far = demo.far.then(|| {
+        union_bounds(FAR_PARTS.iter().enumerate().filter_map(|(index, part)| {
+            let refno = RefU64(FIRST_FAR_REFNO + index as u64);
+            spawn_part(
+                &mut commands,
+                &mut meshes,
+                &mut view.bounds,
+                scene,
+                refno,
+                part,
+            )
+        }))
+    });
     // aids 蓝球：辅助几何走无光照 StandardMaterial（同地面网格 / 三轴），不挂 `ModelMesh`，
     // 不进选中与可见性账；阶段二起它就是「不进 prepass = 不描边、不接伪阴影」的样本。
     let [r, g, b] = rgb_bytes(E3D_AIDS_COLOUR);
@@ -278,10 +365,10 @@ pub(crate) fn spawn_look_demo(
         Transform::from_translation(Vec3::from_array(AIDS_SPHERE_CENTRE)),
         ChildOf(scene),
     ));
-    if all_min.is_finite()
-        && all_max.is_finite()
+    // 远景检验件在场时只框它（演示厂落在相机背后），否则框整座演示厂。
+    if let Some((min, max)) = far.flatten().or(plant)
         && let Ok((mut camera, mut projection)) = camera.single_mut()
     {
-        frame_bounds(all_min, all_max, &mut orbit, &mut camera, &mut projection);
+        frame_bounds(min, max, &mut orbit, &mut camera, &mut projection);
     }
 }

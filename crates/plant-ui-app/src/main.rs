@@ -1,7 +1,9 @@
 //! plant-ui-app：Bevy 宿主（bevy_egui35 + plant-ui + plant-ui-data）。
 //! 默认进入主工作台 S1；`--gallery` 进入 M0 组件画廊；`--look-demo`（浏览器端 `?look_demo=1`；debug 构建或
 //! `look-demo` feature）在主工作台里摆一座
-//! 演示厂，不要后端也能看三维外观（E3D 外观移植计划）。
+//! 演示厂，不要后端也能看三维外观（E3D 外观移植计划）；`--look-demo=far`（`?look_demo=far`）只框远景检验件取景。
+//! `--look-debug=<模式>`（`?look_debug=<模式>`，任何构建都带）把 E3D 后处理链的中间量直出到视口，模式名见
+//! `plant_ui_view3d::e3d_look::post::SglLookDebugView::parse`。
 
 mod command;
 mod data;
@@ -419,34 +421,81 @@ fn run(canvas: &str, asset_root: String) {
                 .before(EguiPostUpdateSet::ProcessOutput),
         ),
     );
-    // `--look-demo`（桌面）/ `?look_demo=1`（浏览器）：E3D 外观移植计划的演示厂，不要后端也能看三维外观。
-    // debug 构建总带着，release 构建要开 `look-demo` feature。
+    // `--look-demo`（桌面）/ `?look_demo=1`（浏览器）：E3D 外观移植计划的演示厂，不要后端也能看三维外观；
+    // `--look-demo=far` / `?look_demo=far` 再摆远景检验件并只框它取景。debug 构建总带着，release 构建要开 `look-demo` feature。
     #[cfg(any(debug_assertions, feature = "look-demo"))]
-    if look_demo_requested() {
-        app.insert_resource(plant_ui_view3d::e3d_look::demo::LookDemo);
+    if let Some(demo) = look_demo_requested() {
+        app.insert_resource(demo);
+    }
+    // `--look-debug=<模式>` / `?look_debug=<模式>`：E3D 后处理链的中间量直出到视口（查两端画面差异用），任何构建都带。
+    if let Some(view) = look_debug_requested() {
+        app.insert_resource(view);
     }
     app.run();
 }
 
+/// 命令行 / 地址栏里的 `look_demo` 值 → 演示厂资源：`1` 演示厂，`far` 连远景检验件。别的值当没写。
+#[cfg(any(debug_assertions, feature = "look-demo"))]
+fn look_demo_from(value: &str) -> Option<plant_ui_view3d::e3d_look::demo::LookDemo> {
+    use plant_ui_view3d::e3d_look::demo::LookDemo;
+    match value {
+        "1" => Some(LookDemo { far: false }),
+        "far" => Some(LookDemo { far: true }),
+        _ => None,
+    }
+}
+
+/// `--look-demo`（= `--look-demo=1`）/ `--look-demo=far`。
 #[cfg(all(
     not(target_arch = "wasm32"),
     any(debug_assertions, feature = "look-demo")
 ))]
-fn look_demo_requested() -> bool {
-    std::env::args().any(|a| a == "--look-demo")
+fn look_demo_requested() -> Option<plant_ui_view3d::e3d_look::demo::LookDemo> {
+    std::env::args().find_map(|a| {
+        if a == "--look-demo" {
+            return look_demo_from("1");
+        }
+        a.strip_prefix("--look-demo=").and_then(look_demo_from)
+    })
 }
 
-/// 浏览器端看页面地址的查询串：`?look_demo=1`（可与别的参数并列）。
+/// 浏览器端看页面地址的查询串：`?look_demo=1` / `?look_demo=far`（可与别的参数并列）。
 #[cfg(all(target_arch = "wasm32", any(debug_assertions, feature = "look-demo")))]
-fn look_demo_requested() -> bool {
+fn look_demo_requested() -> Option<plant_ui_view3d::e3d_look::demo::LookDemo> {
+    query_value(&location_search(), "look_demo").and_then(|value| look_demo_from(&value))
+}
+
+/// `--look-debug=<模式>`（桌面）。
+#[cfg(not(target_arch = "wasm32"))]
+fn look_debug_requested() -> Option<plant_ui_view3d::e3d_look::post::SglLookDebugView> {
+    std::env::args().find_map(|a| {
+        a.strip_prefix("--look-debug=")
+            .and_then(plant_ui_view3d::e3d_look::post::SglLookDebugView::parse)
+    })
+}
+
+/// `?look_debug=<模式>`（浏览器）。
+#[cfg(target_arch = "wasm32")]
+fn look_debug_requested() -> Option<plant_ui_view3d::e3d_look::post::SglLookDebugView> {
+    query_value(&location_search(), "look_debug")
+        .and_then(|value| plant_ui_view3d::e3d_look::post::SglLookDebugView::parse(&value))
+}
+
+/// 页面地址的查询串（带 `?`）；拿不到就是空串。
+#[cfg(target_arch = "wasm32")]
+fn location_search() -> String {
     web_sys::window()
         .and_then(|window| window.location().search().ok())
-        .is_some_and(|search| {
-            search
-                .trim_start_matches('?')
-                .split('&')
-                .any(|pair| pair == "look_demo=1")
-        })
+        .unwrap_or_default()
+}
+
+/// 查询串里某个键的值（第一个；带不带 `?` 都行）。
+#[cfg(any(test, target_arch = "wasm32"))]
+fn query_value(search: &str, key: &str) -> Option<String> {
+    search.trim_start_matches('?').split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == key).then(|| v.to_owned())
+    })
 }
 
 /// 绘制层要的渲染目标尺寸是不是真的装得进窗口（物理像素）。窗口尺寸还不知道就放行。
@@ -7695,6 +7744,35 @@ mod tests {
         assert!(
             viewport_fits_window([6154, 6839], None),
             "没有窗口尺寸就放行"
+        );
+    }
+
+    /// 地址栏的 `look_demo` / `look_debug`：取第一个同名键的值；`1` 演示厂、`far` 连远景检验件，别的值当没写。
+    #[test]
+    fn look_demo_and_look_debug_come_from_the_query_string() {
+        use plant_ui_view3d::e3d_look::post::SglLookDebugView;
+
+        assert_eq!(
+            super::query_value("?look_demo=far&look_debug=edges", "look_demo").as_deref(),
+            Some("far")
+        );
+        assert_eq!(
+            super::query_value("look_debug=edges", "look_debug").as_deref(),
+            Some("edges")
+        );
+        assert_eq!(super::query_value("?look=pbr", "look_debug"), None);
+        assert_eq!(
+            super::query_value("?look_debug", "look_debug"),
+            None,
+            "没有等号当没写"
+        );
+        assert!(!super::look_demo_from("1").unwrap().far);
+        assert!(super::look_demo_from("far").unwrap().far);
+        assert!(super::look_demo_from("yes").is_none());
+        assert_eq!(
+            super::query_value("?look_debug=depth_error", "look_debug")
+                .and_then(|value| SglLookDebugView::parse(&value)),
+            Some(SglLookDebugView::DepthError)
         );
     }
 

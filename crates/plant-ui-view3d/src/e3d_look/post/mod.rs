@@ -3,7 +3,9 @@
 //! 从计划里那个已验证的 prepass spike 长出来（spike 的 example 已删，它的两段着色器就是这里的正文）：一个
 //! [`ViewNode`] 插在 `Core3d` 图的 `EndMainPass → Tonemapping` 之间，读 Bevy prepass 的法线纹理（`SglLookMaterial`
 //! 的 prepass 片元把线性深度写进 RGB、参与标记写进 alpha），依次跑 ND → HBAO → 双边模糊×2 → HLR → 去杂 → 合成，
-//! 中间纹理由 `TextureCache` 按视图分配。全部片元着色器，不碰 compute（WebGL2 没有）。
+//! 中间纹理由 `TextureCache` 按视图分配。全部片元着色器，不碰 compute（WebGL2 没有）。ND 纹理用 `Rgba32Float`
+//!（同来源 `_ndType = canFloat ? FloatType : HalfFloatType`）：它的 a 通道是各段比对的线性深度，f16 在百米外的量化步长
+//! 就超过 50 mm 的边线阈值（见 [`nd_texture_format`]）。
 //!
 //! 参数全部照搬 plant3d-web `sglLookPipeline.ts`（E3D 3.1 sglDx11 逆向），毫米换成世界单位（1 单位 = 100 mm）。
 //! 相机上的 [`SglLookPost`] 是开关与参数：PBR 外观时不提取到渲染世界，节点整个不跑；E3D 外观下两样效果
@@ -129,6 +131,51 @@ pub struct SglLookPost {
     /// egui 就不再参与混合——它在线性空间里混，会把落在背景上的边线压浅，还会对预乘色再乘一次 alpha。
     pub bg_top: Vec4,
     pub bg_bottom: Vec4,
+    /// x = 调试直出模式（[`SglLookDebugView`] 的编号，0 关），其余留空。
+    pub debug: UVec4,
+}
+
+/// 合成段的调试直出：把后处理链的中间量当颜色画到视口里，查两端（PC / Web）画面差异用。宿主按
+/// `--look-debug=<名>`（桌面）/ `?look_debug=<名>`（浏览器）插进来，缺省 [`Self::Off`]；不进设置、不落盘。
+/// 编号与 `sgl_look_post.wgsl` 的 `debug_colour` 一一对应。
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SglLookDebugView {
+    #[default]
+    Off = 0,
+    /// prepass 里的线性深度，1 m 一个锯齿周期。
+    Depth = 1,
+    /// ND 纹理存回的深度相对 prepass 30 bit 深度的误差，按边线深度阈值归一（绿 0 → 红 ≥ 1 个阈值）：
+    /// ND 是 f16 时百米外一片红，f32 时全绿。
+    DepthError = 2,
+    /// ND 眼空间面法线。
+    Normal = 3,
+    /// 参与标记：边线红、伪阴影绿、都参与黄、都不参与白。
+    Flags = 4,
+    /// 去杂前的 HLR 边线（0 = 边）。
+    Edges = 5,
+    /// 模糊后的伪阴影。
+    Ao = 6,
+}
+
+impl SglLookDebugView {
+    /// 地址栏 / 命令行里的名字：`depth`、`depth_error`、`normal`、`flags`、`edges`、`ao`；`off` / `0` 关。认不出的为 `None`。
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name.trim().to_ascii_lowercase().as_str() {
+            "off" | "0" => Self::Off,
+            "depth" => Self::Depth,
+            "depth_error" | "depth-error" => Self::DepthError,
+            "normal" | "normals" => Self::Normal,
+            "flags" => Self::Flags,
+            "edges" | "hlr" => Self::Edges,
+            "ao" => Self::Ao,
+            _ => return None,
+        })
+    }
+
+    /// uniform 里的编号。
+    pub fn index(self) -> u32 {
+        self as u32
+    }
 }
 
 impl SglLookPost {
@@ -164,8 +211,15 @@ impl SglLookPost {
             ),
             bg_top: Vec4::ZERO,
             bg_bottom: Vec4::ZERO,
+            debug: UVec4::ZERO,
         }
         .with_background(e3d_background(false))
+    }
+
+    /// 换上调试直出模式（[`SglLookDebugView::Off`] = 正常合成）。
+    pub fn with_debug(mut self, view: SglLookDebugView) -> Self {
+        self.debug = UVec4::new(view.index(), 0, 0, 0);
+        self
     }
 
     /// 换上视口背景（[`e3d_background`] 给的顶 / 底两色）。
@@ -237,6 +291,7 @@ impl Plugin for SglLookPostPlugin {
             "sgl_look_post.wgsl",
             Shader::from_wgsl
         );
+        app.init_resource::<SglLookDebugView>();
         app.add_plugins((
             ExtractComponentPlugin::<SglLookPost>::default(),
             UniformComponentPlugin::<SglLookPost>::default(),
@@ -268,7 +323,7 @@ impl Plugin for SglLookPostPlugin {
 struct SglLookLabel;
 
 /// 每个视图的中间纹理。`nd` / `hlr` 全分辨率；`ao` / `blur` / `ao_blurred` / `declutter` 按 `ao_scale` 缩小
-/// （超采样时 = 屏幕分辨率）。`nd`：rgb = 面法线 × 标记长度、a = 线性深度；其余单通道 0..1。
+/// （超采样时 = 屏幕分辨率）。`nd`：rgb = 面法线 × 标记长度、a = 线性深度，格式见 [`nd_texture_format`]；其余单通道 0..1。
 #[derive(Component)]
 struct SglLookTextures {
     nd: CachedTexture,
@@ -283,6 +338,7 @@ fn prepare_textures(
     mut commands: Commands,
     mut texture_cache: ResMut<TextureCache>,
     render_device: Res<RenderDevice>,
+    pipelines: Res<SglLookPipelines>,
     views: Query<(Entity, &ViewTarget, &SglLookPost)>,
 ) {
     for (entity, target, post) in &views {
@@ -308,7 +364,7 @@ fn prepare_textures(
                 },
             )
         };
-        let nd = make("sgl look nd", TextureFormat::Rgba16Float, size);
+        let nd = make("sgl look nd", pipelines.nd_format, size);
         let ao = make("sgl look ao", TextureFormat::R8Unorm, ao_size);
         let blur = make("sgl look blur", TextureFormat::R8Unorm, ao_size);
         let ao_blurred = make("sgl look ao blurred", TextureFormat::R8Unorm, ao_size);
@@ -334,6 +390,27 @@ pub(crate) fn float_targets_supported(adapter: &RenderAdapter) -> bool {
         .contains(TextureUsages::RENDER_ATTACHMENT)
 }
 
+/// ND 纹理的格式：能当颜色附件就用 `Rgba32Float`，否则退 `Rgba16Float`（同来源 `_ndType = canFloat ? FloatType :
+/// HalfFloatType`）。a 通道是 HLR / HBAO / 模糊比对的线性深度：f16 只有 11 bit 尾数，百米外（> 1024 单位）量化步长 ≥ 1 单位，
+/// 超过 50 mm 的边线深度阈值，每跨一个台阶判据③就打一条边，在子像素格上打成条纹 / 同心环（2026-10-25 整库全视）。
+/// 原生后端恒可；WebGL2 的 `EXT_color_buffer_float` 两种都给，只有 `EXT_color_buffer_half_float` 的设备才退 f16。
+pub(crate) fn nd_texture_format(adapter: &RenderAdapter) -> TextureFormat {
+    nd_format_for(
+        adapter
+            .get_texture_format_features(TextureFormat::Rgba32Float)
+            .allowed_usages
+            .contains(TextureUsages::RENDER_ATTACHMENT),
+    )
+}
+
+fn nd_format_for(rgba32_renderable: bool) -> TextureFormat {
+    if rgba32_renderable {
+        TextureFormat::Rgba32Float
+    } else {
+        TextureFormat::Rgba16Float
+    }
+}
+
 /// 六段全屏管线的编号。设备不支持半浮点颜色附件时整组都不排：`PipelineCache` 是排了就编的，ND 那条会在
 /// 创建时被 wgpu 校验打回（“Format Rgba16Float is not renderable”），Bevy 的错误处理把它当 panic——阶段四模拟缺扩展时踩到。
 struct SglLookPipelineIds {
@@ -354,6 +431,8 @@ struct SglLookPipelines {
     hlr_layout: BindGroupLayout,
     declutter_layout: BindGroupLayout,
     composite_layout: BindGroupLayout,
+    /// ND 纹理的格式（[`nd_texture_format`]）：纹理与 ND 管线的目标格式都用它。
+    nd_format: TextureFormat,
     /// `None` = 这台设备跑不了（见 [`float_targets_supported`]），节点不跑。
     queued: Option<SglLookPipelineIds>,
 }
@@ -437,6 +516,7 @@ impl FromWorld for SglLookPipelines {
                 (uniform_buffer::<SglLookPost>(true), plain_texture()),
             ),
         );
+        // 合成：设置、颜色、去杂后边线、模糊后伪阴影，再加调试直出读的 ND / 去杂前 HLR / prepass 法线纹理
         let composite_layout = device.create_bind_group_layout(
             "sgl look composite layout",
             &BindGroupLayoutEntries::sequential(
@@ -446,11 +526,16 @@ impl FromWorld for SglLookPipelines {
                     plain_texture(),
                     plain_texture(),
                     plain_texture(),
+                    plain_texture(),
+                    plain_texture(),
+                    plain_texture(),
                 ),
             ),
         );
 
-        if !float_targets_supported(world.resource::<RenderAdapter>()) {
+        let adapter = world.resource::<RenderAdapter>();
+        let nd_format = nd_texture_format(adapter);
+        if !float_targets_supported(adapter) {
             return Self {
                 nd_layout,
                 ao_layout,
@@ -458,17 +543,12 @@ impl FromWorld for SglLookPipelines {
                 hlr_layout,
                 declutter_layout,
                 composite_layout,
+                nd_format,
                 queued: None,
             };
         }
         let cache = world.resource::<PipelineCache>();
-        let nd = queue_pipeline(
-            cache,
-            "sgl look nd",
-            &nd_layout,
-            &["SGL_ND"],
-            TextureFormat::Rgba16Float,
-        );
+        let nd = queue_pipeline(cache, "sgl look nd", &nd_layout, &["SGL_ND"], nd_format);
         let ao = queue_pipeline(
             cache,
             "sgl look ao",
@@ -518,6 +598,7 @@ impl FromWorld for SglLookPipelines {
             hlr_layout,
             declutter_layout,
             composite_layout,
+            nd_format,
             queued: Some(SglLookPipelineIds {
                 nd,
                 ao,
@@ -732,7 +813,7 @@ impl ViewNode for SglLookNode {
         }
 
         // ④ 合成：source → destination，画背景、字节域合成与超采样平均（关着的通道由 toggles 在着色器里忽略，
-        // 纹理照绑不读）。
+        // 纹理照绑不读）；后三张只有调试直出（`debug.x ≠ 0`）读。
         let post = target.post_process_write();
         let composite_bind_group = device.create_bind_group(
             "sgl look composite bind group",
@@ -742,6 +823,9 @@ impl ViewNode for SglLookNode {
                 post.source,
                 &textures.declutter.default_view,
                 &textures.ao_blurred.default_view,
+                &textures.nd.default_view,
+                &textures.hlr.default_view,
+                normal,
             )),
         );
         draw_fullscreen(
@@ -903,6 +987,51 @@ mod tests {
         ] {
             assert!(SHADER.contains(&format!("#ifdef {def}")), "{def}");
         }
+        assert!(
+            SHADER.contains("debug: vec4<u32>,")
+                && SHADER.contains("if (settings.debug.x != 0u) {"),
+            "调试直出走 uniform 的 debug.x，合成段开头分流"
+        );
+    }
+
+    /// ND 纹理能当浮点颜色附件就用 f32（同来源 `_ndType = canFloat ? FloatType : HalfFloatType`），否则退 f16；
+    /// 调试直出的名字 ↔ 编号 ↔ uniform ↔ 着色器分支。
+    #[test]
+    fn nd_is_f32_when_renderable_and_debug_views_parse_by_name() {
+        assert_eq!(nd_format_for(true), TextureFormat::Rgba32Float);
+        assert_eq!(nd_format_for(false), TextureFormat::Rgba16Float);
+        assert_eq!(
+            SglLookDebugView::parse("depth_error"),
+            Some(SglLookDebugView::DepthError)
+        );
+        assert_eq!(
+            SglLookDebugView::parse(" Edges "),
+            Some(SglLookDebugView::Edges)
+        );
+        assert_eq!(SglLookDebugView::parse("off"), Some(SglLookDebugView::Off));
+        assert_eq!(SglLookDebugView::parse("bogus"), None);
+        assert_eq!(SglLookDebugView::default(), SglLookDebugView::Off);
+        let post = SglLookPost::new(true, true, 1.0, 2);
+        assert_eq!(post.debug, UVec4::ZERO);
+        assert_eq!(
+            post.with_debug(SglLookDebugView::Ao).debug,
+            UVec4::new(6, 0, 0, 0)
+        );
+        for (view, index) in [
+            (SglLookDebugView::Depth, 1),
+            (SglLookDebugView::DepthError, 2),
+            (SglLookDebugView::Normal, 3),
+            (SglLookDebugView::Flags, 4),
+            (SglLookDebugView::Edges, 5),
+        ] {
+            assert_eq!(view.index(), index);
+            assert!(SHADER.contains(&format!("case {index}u: {{")), "{view:?}");
+        }
+        assert_eq!(
+            SglLookDebugView::Ao.index(),
+            6,
+            "ao 是 switch 的 default 分支"
+        );
     }
 
     /// prepass 把线性深度拆成 3 × 10 bit 存进 Rgb10a2Unorm，ND 再拼回来：按两段着色器同样的算式在 f32 里走一遍

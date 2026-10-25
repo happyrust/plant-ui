@@ -2,6 +2,10 @@
 // 同一个文件按 shader_def 分六条管线，每条自己一套绑定：
 //   SGL_ND         prepass 法线纹理（RGB = 线性深度 3×10 bit、a = 标记）→ ND（rgb = 眼空间面法线 × 标记长度，
 //                  a = 线性深度，背景 0）。不读硬件深度：WebGL2 的 GLSL 后端做不了深度纹理的 textureLoad。
+//                  ND 纹理是 Rgba32Float（同来源 `_ndType = canFloat ? FloatType : HalfFloatType`）：f16 只有 11 bit
+//                  尾数，百米外（> 1024 单位）的量化步长 ≥ 1 单位，超过 50 mm 的边线深度阈值，每跨一个量化台阶
+//                  HLR 判据③就打一条边——2026-10-25 整库全视里筒体上的条纹、穹顶上的同心环就是它与子像素格的莫尔纹。
+//                  设备只有半浮点颜色附件时才退回 Rgba16Float（百米外照旧会出条纹，同来源）。
 //   SGL_AO         HBAO（NVIDIA 同款参数，法线模式）
 //   SGL_BLUR       深度感知的可分离模糊（SGL_BLUR_Y 定义时走纵向）
 //   SGL_HLR        边线（逐句照 sglDx11 HLR PS）
@@ -31,6 +35,8 @@ struct SglLookPost {
     // 背景渐变在视口顶 / 底的两色（sRGB 字节 / 255；渐变关时两色相同）
     bg_top: vec4<f32>,
     bg_bottom: vec4<f32>,
+    // x = 调试直出模式（0 关；见 SGL_COMPOSITE 段的 debug_colour），其余留空
+    debug: vec4<u32>,
 }
 
 fn is_background(depth: f32) -> bool {
@@ -51,12 +57,6 @@ fn shadow_participant(n: vec3<f32>) -> bool {
     return effect_code(n) >= 2;
 }
 
-// ---------------------------------------------------------------------------
-#ifdef SGL_ND
-
-@group(0) @binding(0) var<uniform> view: View;
-@group(0) @binding(1) var normal_tex: texture_2d<f32>;
-
 // 与 sgl_look.wgsl 的 encode_linear_depth 是一对：法线纹理 RGB 的 3 × 10 bit 定点 → 线性眼空间深度（世界单位）。
 // 清零的纹理（没画过的像素）解出 0 = 背景。
 const ND_DEPTH_RANGE: f32 = 65504.0;
@@ -65,6 +65,12 @@ fn decode_linear_depth(rgb: vec3<f32>) -> f32 {
     let q = round(rgb * 1023.0);
     return (q.x / 1024.0 + q.y / 1048576.0 + q.z / 1073741824.0) * ND_DEPTH_RANGE;
 }
+
+// ---------------------------------------------------------------------------
+#ifdef SGL_ND
+
+@group(0) @binding(0) var<uniform> view: View;
+@group(0) @binding(1) var normal_tex: texture_2d<f32>;
 
 fn is_perspective() -> bool {
     return view.clip_from_view[2][3] != 0.0;
@@ -415,6 +421,54 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
 @group(0) @binding(1) var colour_tex: texture_2d<f32>;
 @group(0) @binding(2) var edge_tex: texture_2d<f32>;
 @group(0) @binding(3) var ao_tex: texture_2d<f32>;
+// 下面三张只给调试直出读：ND、去杂前的 HLR、prepass 法线纹理（都是 ND 分辨率）
+@group(0) @binding(4) var nd_tex: texture_2d<f32>;
+@group(0) @binding(5) var hlr_tex: texture_2d<f32>;
+@group(0) @binding(6) var normal_tex: texture_2d<f32>;
+
+// 调试直出（`?look_debug=…` / `--look-debug=…`，Rust 侧 `SglLookDebugView`）：把后处理链的中间量当颜色画出来，
+// 查两端画面差异用。px 是 ND 分辨率的像素，block 是它所在的屏幕像素；背景一律黑。两样效果都关时 ND / HLR 没跑，
+// 直出的是纹理缓存里上一次的内容。
+fn debug_colour(mode: u32, px: vec2<i32>, block: vec2<i32>) -> vec3<f32> {
+    let nd = textureLoad(nd_tex, px, 0);
+    let depth = decode_linear_depth(textureLoad(normal_tex, px, 0).rgb);
+    if (is_background(depth)) {
+        return vec3(0.0);
+    }
+    switch mode {
+        // 1 depth：prepass 里的线性深度，10 单位（1 m）一个锯齿周期
+        case 1u: {
+            return vec3(fract(depth / 10.0));
+        }
+        // 2 depth_error：ND 纹理存回的深度相对 prepass 30 bit 深度的误差，按边线深度阈值归一（绿 0 → 红 ≥ 1 个阈值）
+        case 2u: {
+            let e = clamp(abs(nd.a - depth) / settings.hlr.x, 0.0, 1.0);
+            return vec3(e, 1.0 - e, 0.0);
+        }
+        // 3 normal：ND 眼空间面法线
+        case 3u: {
+            return normalize(nd.rgb) * 0.5 + 0.5;
+        }
+        // 4 flags：参与标记——边线红、伪阴影绿、都参与黄、都不参与白
+        case 4u: {
+            let code = effect_code(nd.rgb);
+            return select(
+                vec3(f32(code == 1 || code == 3), f32(code >= 2), 0.0),
+                vec3(1.0),
+                code == 0,
+            );
+        }
+        // 5 edges：去杂前的 HLR 边线（0 = 边）
+        case 5u: {
+            return vec3(textureLoad(hlr_tex, px, 0).r);
+        }
+        // 6 ao：模糊后的伪阴影（屏幕分辨率）
+        default: {
+            let ao_size = vec2<i32>(textureDimensions(ao_tex));
+            return vec3(textureLoad(ao_tex, min(block, ao_size - vec2(1)), 0).r);
+        }
+    }
+}
 
 fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
     let lo = c * 12.92;
@@ -437,7 +491,11 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let s = max(i32(settings.toggles.w), 1);
     let size = vec2<i32>(textureDimensions(colour_tex));
     let screen = (size + vec2(s - 1)) / s;
-    let block = vec2<i32>(in.position.xy) / s;
+    let px = vec2<i32>(in.position.xy);
+    let block = px / s;
+    if (settings.debug.x != 0u) {
+        return vec4(debug_colour(settings.debug.x, px, block), 1.0);
+    }
     // 背景：视口顶 → 底在字节域里线性插值（同 E3D 的 D2D 渐变），按本屏幕像素的行取
     let t = (f32(block.y) + 0.5) / f32(screen.y);
     let bg = mix(settings.bg_top.rgb, settings.bg_bottom.rgb, t);
