@@ -81,7 +81,7 @@ ND 纹理是 `Rgba32Float`（能当颜色附件就用；同来源 `_ndType = can
 6. **调试开关** 没用 `PLANT_UI_LOOK_DEBUG` 这个名字：`--look-debug=<模式>` / `?look_debug=<模式>`（`SglLookDebugView`，任何构建都带）把后处理链的中间量
    直出到视口（ND 深度 / ND 深度相对 prepass 30 bit 深度的误差 / 面法线 / 参与标记 / 去杂前边线 / 伪阴影）；`--look-demo` / `?look_demo=1` 演示厂（debug 构建总带，
    release 要开 `look-demo` feature），`=far` 再多摆一件远景检验件（安全壳尺寸的筒体 + 穹顶，相机 180 m 外）并只框它取景。
-7. **Web 端出厂 AA** 暂留 SSAA 2×2：整库全视在浏览器里只有 9–10 fps（evidence §4.3），但 FXAA 能不能救回来还没量成，先不按 `cfg!(wasm32)` 分出厂位；站点要换在 `config.json` 写 `"look": {"aa": "fxaa"}`。
+7. **Web 端出厂 AA** 留 SSAA 2×2：整库全视在浏览器里只有 9–10 fps（evidence §4.3）；2026-10-25 晚同场对照，FXAA 全视 9–11 fps vs SSAA 6–7 fps，省三成帧时间但救不回 24 fps（提交端在卡），所以不按 `cfg!(wasm32)` 分出厂位；站点要换在 `config.json` 写 `"look": {"aa": "fxaa"}`。
 8. **ND 纹理**从计划里的 `Rgba16Float` 改为能当颜色附件时 `Rgba32Float`（D6）：计划只论了 f16 的范围够用，没论精度；百米外 f16 的量化步长超过边线阈值，
    是 2026-10-25 整库全视条纹 / 同心环的根因。来源本来就是 `canFloat ? FloatType : HalfFloatType`，这是回到来源。
 9. **GPU 间接绘制的逃生口** `PLANT_UI_INDIRECT_DRAW=0`（主相机挂 Bevy `NoIndirectDrawing`，退到 `PreprocessingOnly`），计划里没有：2026-10-25 本机 RX 590 + Vulkan 上
