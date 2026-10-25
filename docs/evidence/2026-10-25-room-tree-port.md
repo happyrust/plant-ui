@@ -58,6 +58,21 @@
   全部由同一套 serde 类型解开并上屏；非空树的形状按 plant3d-web `genModelV1Api.ts` 的类型一字不增减地照搬，并用服务端形状的 JSON 单测钉住。
   等有一套房间归属算完的库，补一次逐行核对即可，不改代码。
 
+## 3b. Web 端（阶段四前半；release wasm，headless Chrome / ANGLE D3D11 / WebGL2）
+
+做法：按 `scripts/build-wasm.ps1` 的工具链（zig 给 ring）编 `cargo build -p rs-plant --target wasm32-unknown-unknown --release` + `wasm-bindgen --target web`，
+产物放临时目录（**没动仓里的 `web/public/pkg`**，重发产物是单独的 `chore(web)`）；一个临时 node 静态服务器供页面并把 `/api/*` 同源转发到
+本机 gen-model 8023；`config.json` 的 `db` 指 ns 1516 / AvevaMarineSample / `/ALL`；Playwright 1.58 驱动安装的 Chrome（视口 1600×1000，DPR 1，
+`--use-angle=d3d11`），点页签 / 箭头 / 右键的坐标与 PC 探针同一套逻辑点。
+
+- 浏览器发出的两条请求（Playwright 抓的响应）：
+  `200 /api/v1/spatial/rooms?project=AvevaMarineSample&mdb=%2FALL&namespace=1516` → `status=ready rooms=215`；
+  `200 /api/v1/spatial/rooms/24381_5062/tree?project=…&tubes=1` → `total=0 tubes=0 room=L505`。身份三格、`tubes=1` 与 PC 端同。
+- `web-01-roots.png`：「在册 215 间房」、自然序、空房标记，与 PC 图 12 同。`web-02-room-expanded.png`：L505 展开「0 个构件 · 0 条直段」。
+  `web-04-context-menu.png`：房间行右键菜单（聚焦 · 聚焦房间（房间视图）· 显示房间模型 · 隔离 · 取消隔离 ｜ 显示 · 隐藏 · 加载模型（…））。
+- 控制台没有 panic / WebGL 错误（只有临时目录里没有的 `e3d.project.ron` / 字体资源 404）。
+- 与 PC 端同一句话：这台 gen-model 的房间归属边没算，树为空；非空树的展开、直段行、补叶子走的是同一份契约层代码（见 §2 独立壳）。
+
 ## 4. 复跑要点
 
 - 探针坐标 = 截图像素（1600 宽）；从缩过的图上估坐标要换算回去。dock 页签、箭头、眼睛、工具钮是自绘控件，不进 AccessKit 树，

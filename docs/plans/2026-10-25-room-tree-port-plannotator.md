@@ -86,4 +86,6 @@
   （清掉属性面板只会让人以为点空了）。来源是「只有单选一行才写全局」，这边 `Selection` 本来就是多选集，不必缩成单选。
 - **外部选中联动的「在前台」**：`WorkbenchState::is_pane_active(Pane)`（egui_dock `find_tab` + 所在叶的 `active`），不是 `active_pane()`（那个是拿焦点的那一格）。
 - **模拟剧本**：`sim.rs` 两间有树的房 + 一间空房壳；第二条 BRAN 与 PANE 组叶子不内联（走 `unit=` / `other_noun=`），PANE 230 个让房间根的「加载模型」过 200 阈值。
-- **验收里没有做的**：阶段四（逐段眼睛、Web）按计划单立；探针 `inspect click` 注不进修饰键状态（模型树同样），Ctrl / Shift 多选只有单测证据。
+- **验收里没有做的**：探针 `inspect click` 注不进修饰键状态（模型树同样），Ctrl / Shift 多选只有单测证据。
+- **阶段四前半（Web）已做**（2026-10-25，用户「按推荐继续」）：release wasm + headless Chrome 连本机 gen-model，两条路由在浏览器里同样发出、同样上屏
+  （证据 §3b）；仓里的 `web/public/pkg` 没重发。后半（直段逐段眼睛）见下一条进度。
