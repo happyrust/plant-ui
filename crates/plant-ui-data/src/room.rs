@@ -490,16 +490,21 @@ fn room_panels_sql(room_key: &str) -> String {
     format!("SELECT VALUE out FROM room_panel_relate WHERE in = {room_key};")
 }
 
-/// 面板集先用 `LET` 物化一次再喂给 `IN`：写成 `IN (SELECT …)` 时 SurrealDB 2.1 会对
-/// `room_relate` 的每一行重算那个子查询——AMS 两库 64k 条边实测 146.6 s，改成变量后 0.44 s
-/// （同一结果集，2026-09-19 f20 隔离部署测出）。
+/// 成员边按记录 id 图遍历收（`{panel}->room_relate`），**不写 `WHERE in IN $panels`**。
+///
+/// SurrealDB 2.1 在只有复合索引 `(in, out)` 的边表上执行 `in IN [数组]` 会静默返回 0 行：
+/// `room_relate` 实测 0 行，而同一批边 `in = pe:…` 是 225 行、`->room_relate` 也是 225 行
+/// （2026-10-25，ams 7997 现场；`room_panel_relate` / `pe_owner` 同样中招）。有单独 `in`
+/// 索引的边表（`inst_relate` / `tubi_relate`）不受影响，别拿那两张当反例。
+/// `IN (SELECT …)` 结果是对的，但对 `room_relate` 每行重算那个子查询：225 行实测 23 s
+/// （2026-09-19 f20 曾记 146.6 s），同样不能用。图遍历同一份数据 2–3 ms。
 fn room_detail_sql(room_key: &str) -> String {
     format!(
         "LET $panels = (SELECT VALUE out FROM room_panel_relate WHERE in = {room_key}); \
          SELECT VALUE name FROM {room_key}; \
          SELECT VALUE out FROM room_panel_relate WHERE in = {room_key}; \
-         SELECT VALUE [out, inside_count, center_dist] FROM room_relate \
-         WHERE in IN $panels;"
+         SELECT VALUE [out, inside_count, center_dist] \
+         FROM array::flatten(SELECT VALUE ->room_relate FROM $panels);"
     )
 }
 
@@ -701,8 +706,17 @@ mod tests {
         assert!(detail.contains("SELECT VALUE name FROM pe:1_5"));
         assert!(detail.contains("FROM room_panel_relate WHERE in = pe:1_5"));
         assert!(detail.starts_with("LET $panels = (SELECT VALUE out FROM room_panel_relate WHERE in = pe:1_5);"));
-        assert!(detail.contains("FROM room_relate WHERE in IN $panels;"));
-        assert!(!detail.contains("IN (SELECT"));
+        // 成员边按边目标图遍历收。`WHERE in IN $panels` 在这张边表上恒 0 行（见渲染函数的注释），
+        // 而它曾经是「成员 0 / 截断 0 段」的成因，钉住这个形状就是钉住那个回归。
+        assert!(
+            detail.contains(
+                "SELECT VALUE [out, inside_count, center_dist] \
+                 FROM array::flatten(SELECT VALUE ->room_relate FROM $panels);"
+            ),
+            "{detail}"
+        );
+        assert!(!detail.contains("WHERE in IN"), "{detail}");
+        assert!(!detail.contains("IN (SELECT"), "{detail}");
 
         let follow = detail_follow_up_sql(&[(refno(7), 8, 1.0), (refno(8), 7, 2.0)], &[refno(9)]);
         // 名称按记录 id 直选，不许再写 WHERE id IN（SurrealDB 2.1 会全表扫 pe）。

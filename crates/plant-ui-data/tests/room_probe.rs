@@ -4,6 +4,13 @@
 //!
 //! 前置条件：工作目录（workspace 根）有指向本地库的 `DbOption.toml`，
 //! 且该项目跑过 gen-model 的房间构建（`room_relate` 非空才有验证价值）。
+//!
+//! 库里那台不是 8009（gen-model 的 rocksdb 落在别的端口）时，给
+//! `PLANT_TEST_DB_PORT`（与 `mesh_compat.rs` 同一格）压过 `DbOption.toml`。
+//!
+//! 「成员数」这条断言是 `room_detail` 的回归网：`room_relate` 上按数组取 `in`
+//! 曾静默返回 0 行，成员数整间变 0、截断候选跟着空（2026-10-25 修复，见
+//! `room.rs::room_detail_sql`）。总览走全表扫不受影响，两边一比就现形。
 
 use plant_ui_data::room;
 
@@ -12,6 +19,20 @@ use plant_ui_data::room;
 async fn probe_room_queries_round_trip() {
     // cargo 给集成测试的 CWD 是 crate 目录，而 DbOption.toml 在 workspace 根。
     std::env::set_current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")).unwrap();
+    // 指到别的库（如 gen-model 的 rocksdb 端口）时显式造一份配置，压过 DbOption.toml。
+    if let Ok(port) = std::env::var("PLANT_TEST_DB_PORT") {
+        let port: u16 = port.parse().expect("PLANT_TEST_DB_PORT 不是有效端口");
+        let mut db = aios_core::options::DbOption::default();
+        db.v_ip = "ws://127.0.0.1".into();
+        db.v_port = port;
+        db.v_user = "root".into();
+        db.v_password = "root".into();
+        db.surreal_ns = std::env::var("PLANT_TEST_DB_NS").unwrap_or_else(|_| "1516".into());
+        db.project_name =
+            std::env::var("PLANT_TEST_DB_NAME").unwrap_or_else(|_| "AvevaMarineSample".into());
+        db.mdb_name = std::env::var("PLANT_TEST_MDB").unwrap_or_else(|_| "ALL".into());
+        aios_core::set_db_option(db).expect("数据库配置设置失败");
+    }
     plant_ui_data::connect().await.expect("连接本地库失败");
 
     let overview = room::rooms_overview().await.expect("rooms_overview 失败");
