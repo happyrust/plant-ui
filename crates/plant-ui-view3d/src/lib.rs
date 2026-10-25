@@ -42,7 +42,7 @@ use bevy::render::render_resource::{
     TextureUsages, VertexFormat,
 };
 use bevy::render::renderer::{RenderAdapter, RenderDevice};
-use bevy::render::view::RenderLayers;
+use bevy::render::view::{NoIndirectDrawing, RenderLayers};
 use bevy::render::{Render, RenderApp, RenderSystems, renderer::render_system};
 use bevy::transform::TransformSystems;
 use bevy_egui35::{EguiUserTextures, egui};
@@ -171,6 +171,30 @@ fn parse_world_axes_flag(value: Option<&str>) -> bool {
     })
 }
 
+/// GPU 间接绘制（Bevy 的 GPU 预处理 + indirect multi-draw）的逃生口，缺省开；`PLANT_UI_INDIRECT_DRAW=0`
+/// 关掉——主相机挂 `NoIndirectDrawing`，退到 `PreprocessingOnly`（变换仍在 GPU 上算，绘制改直接 draw）。
+/// 2026-10-25 本机 RX 590 + Vulkan：间接路径下 prepass 整段不落笔（边线 / 伪阴影全无），直接绘制或
+/// DX12 都正常；Bevy 0.16 的机器相关缺陷（bevy#18904 / #19000）。与 `PLANT_UI_WORLD_AXES` 同一类开关。
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq)]
+struct IndirectDrawing(bool);
+
+impl Default for IndirectDrawing {
+    fn default() -> Self {
+        Self(parse_indirect_draw_flag(
+            std::env::var("PLANT_UI_INDIRECT_DRAW").ok().as_deref(),
+        ))
+    }
+}
+
+fn parse_indirect_draw_flag(value: Option<&str>) -> bool {
+    !value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    })
+}
+
 const INVALID_TUBI_LINE_SHADER: Handle<Shader> =
     weak_handle!("fd65ad9b-1e39-4c83-8f44-d03b65fb443d");
 
@@ -194,6 +218,7 @@ impl Plugin for View3dPlugin {
         );
         app.init_resource::<ViewportResizeSync>()
             .init_resource::<WorldAxesEnabled>()
+            .init_resource::<IndirectDrawing>()
             .init_resource::<room_clip::RoomClip>()
             .init_resource::<LookMaterials>()
             .add_plugins(MaterialPlugin::<InvalidTubiLineMaterial> {
@@ -1205,6 +1230,7 @@ fn setup(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut line_materials: ResMut<Assets<InvalidTubiLineMaterial>>,
     world_axes: Res<WorldAxesEnabled>,
+    indirect: Res<IndirectDrawing>,
     adapter: Option<Res<RenderAdapter>>,
     device: Option<Res<RenderDevice>>,
 ) {
@@ -1330,7 +1356,7 @@ fn setup(
         ViewportRenderCamera,
     ));
 
-    commands.spawn((
+    let mut view_camera = commands.spawn((
         Camera3d::default(),
         Camera {
             target: RenderTarget::Image(image.into()),
@@ -1345,6 +1371,26 @@ fn setup(
         ViewCamera,
         ViewportRenderCamera,
     ));
+    // GPU 间接绘制的逃生口（见 `IndirectDrawing`）：挂了 `NoIndirectDrawing` 这个视图就退到直接绘制。
+    if !indirect.0 {
+        view_camera.insert(NoIndirectDrawing);
+    }
+    // 启动时说一句跑在哪块卡 / 哪条后端上：后端相关的画面问题（如上）排查时第一句就要问这个。
+    if let Some(adapter) = adapter.as_deref() {
+        let info = adapter.get_info();
+        diag(format!(
+            "[渲染] 适配器 {} / {:?} / 驱动 {} {}；GPU 间接绘制 {}",
+            info.name,
+            info.backend,
+            info.driver,
+            info.driver_info,
+            if indirect.0 {
+                "开"
+            } else {
+                "关（PLANT_UI_INDIRECT_DRAW=0）"
+            }
+        ));
+    }
     commands.spawn((
         DirectionalLight {
             illuminance: 1_600.0,
@@ -1624,6 +1670,7 @@ fn publish_camera(
 fn sync_camera_look(
     mut commands: Commands,
     view: Res<View3d>,
+    debug_view: Res<SglLookDebugView>,
     mut cameras: Query<
         (
             Entity,
@@ -1670,7 +1717,7 @@ fn sync_camera_look(
             // AO / 模糊按 1/render_scale 分辨率跑：超采样时正好是屏幕分辨率（E3D 的 halfRes 关）。
             SglLookPost::new(look.hlr, look.ao, sharpness, view.render_scale)
                 .with_background(e3d_look::presets::e3d_background(look.gradient))
-    debug_view: Res<SglLookDebugView>,
+                .with_debug(*debug_view)
         } else {
             SglLookPost::off()
         };
@@ -1717,7 +1764,6 @@ fn ndc_to_texture_uv(ndc: Vec3) -> Option<[f32; 2]> {
 }
 
 /// 把每条尺寸标注文字的毫米锚点过装载变换，再交给 `project`（相机的世界点 → 纹理 UV）；
-                .with_debug(*debug_view)
 /// 锚点非有限直接 None。与 `dimension_labels` 同长同序，egui 侧按下标对回文字。
 fn project_dimension_labels(
     labels: &[DimensionLabel],
@@ -3079,6 +3125,18 @@ mod tests {
             assert!(!parse_world_axes_flag(Some(disabled)), "{disabled}");
         }
         assert!(!parse_world_axes_flag(None));
+    }
+
+    /// GPU 间接绘制缺省开，只有明确的否定值才关；认不出的值不悔改缺省。
+    #[test]
+    fn indirect_drawing_is_on_unless_explicitly_switched_off() {
+        for off in ["0", "false", "FALSE", " off ", "no"] {
+            assert!(!parse_indirect_draw_flag(Some(off)), "{off}");
+        }
+        for on in ["", "1", "true", "on", "unexpected"] {
+            assert!(parse_indirect_draw_flag(Some(on)), "{on}");
+        }
+        assert!(parse_indirect_draw_flag(None));
     }
 
     #[test]
