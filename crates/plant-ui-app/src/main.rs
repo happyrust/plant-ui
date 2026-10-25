@@ -60,8 +60,8 @@ use plant_ui::model_update::{
 use plant_ui::project_picker::{self, State as ProjectPickerState};
 use plant_ui::room_browser::{self, State as RoomBrowserState, Vm as RoomBrowserVm};
 use plant_ui::room_tree::{
-    EyeState, ExpandNeed, LARGE_LOAD_CONFIRM_THRESHOLD, LeafSelector, RoomNodeId, RoomTreeAction,
-    RoomTreeModel, RootsStatus, rooms_status_fallback,
+    EyeSource, EyeState, ExpandNeed, LARGE_LOAD_CONFIRM_THRESHOLD, LeafSelector, RoomNodeId,
+    RoomTreeAction, RoomTreeModel, RootsStatus, rooms_status_fallback,
 };
 use plant_ui::settings::{self, State as SettingsState};
 use plant_ui::style::theme_tokens::{self, set_weight_families_ready};
@@ -620,6 +620,11 @@ fn show_app(
     let render_states = view3d.take_render_states();
     if !render_states.is_empty() {
         app.sync_render_states(render_states);
+    }
+    // 直段的逐段回执（ADR-0033 阶段四）：房间树直段行的眼睛照它画。
+    let tube_states = view3d.take_tube_render_states();
+    if !tube_states.is_empty() {
+        app.sync_tube_render_states(tube_states);
     }
     // 房间视图的截断回执（直段截断计划 M4）：视口上一拍的进度抄给 HUD。
     app.sync_room_clip(view3d.room_clip_status());
@@ -1257,6 +1262,11 @@ struct App {
     /// 树内点选正在写全局选中：`set_selection` 里的联动看到它就不再反过来展开 / 滚动
     /// （plant3d-web 的 `internalSelection` 同法）。
     room_tree_internal_selection: bool,
+    /// 直段的逐段实际可见性（ADR-0033 阶段四）：View3d 按 BRAN 整份回执、这里整份替换；BRAN → 直段身份 → 可见。
+    /// 只有带身份进场景的直段在账上；房间树直段行的眼睛照它画。
+    tube_visibility: HashMap<RefU64, HashMap<plant_ui::TubeSegment, bool>>,
+    /// 直段行点过眼睛、还没落到画面上的方向（与 `TreeModel::pending_direction` 同一套规矩，只是按段记）。
+    tube_pending: HashMap<RefU64, HashMap<plant_ui::TubeSegment, bool>>,
     data_publish_state: DataPublishState,
     manual_data_publish_state: ManualDataPublishState,
     project_picker_state: ProjectPickerState,
@@ -1405,11 +1415,11 @@ struct App {
     /// 还没落地的那一次树定位。同时只留一个：连续定位只完成最后一次。
     pending_locate: Option<PendingLocate>,
     logs: logs::LogBuffer,
-    pending_models: Option<Vec<aios_core::GeomInstQuery>>,
-    pending_incremental_models: Vec<Vec<aios_core::GeomInstQuery>>,
+    pending_models: Option<Vec<plant_ui::ModelRecord>>,
+    pending_incremental_models: Vec<Vec<plant_ui::ModelRecord>>,
     /// 重新生成之后的换装：（场景里要卸掉的旧 refno，重算过的记录），交给 `View3d::refresh`
     /// 同一批先卸后装（ADR-0030 D2 第 3 步）。
-    pending_refreshes: Vec<(Vec<RefU64>, Vec<aios_core::GeomInstQuery>)>,
+    pending_refreshes: Vec<(Vec<RefU64>, Vec<plant_ui::ModelRecord>)>,
     /// tree/container refno -> 实际可见 ModelRoot refno。
     model_scopes: HashMap<RefU64, Vec<RefU64>>,
     model_scope_pending: HashSet<RefU64>,
@@ -2323,6 +2333,8 @@ impl App {
             room_tree_reveal_room: None,
             room_tree_frame: None,
             room_tree_internal_selection: false,
+            tube_visibility: HashMap::new(),
+            tube_pending: HashMap::new(),
             data_publish_state: DataPublishState::default(),
             manual_data_publish_state: ManualDataPublishState::default(),
             project_picker_state: ProjectPickerState::new(Vec::new(), false),
@@ -2863,6 +2875,8 @@ impl App {
                             // 说「已显示」。
                             self.tree.visibility.clear();
                             self.tree.pending_direction.clear();
+                            self.tube_visibility.clear();
+                            self.tube_pending.clear();
                             // 范围目标名单随快照放回来：重装后它们仍是「点过眼睛的
                             // 范围」，下一次取回工作还要以它们为祖先重查（ADR-0030 D3）。
                             if let Some(snapshot) = self.model_reload_restore.as_ref() {
@@ -4147,6 +4161,28 @@ impl App {
         self.settle_hole_retry();
     }
 
+    /// 收下 View3d 的逐段回执（ADR-0033 阶段四）：按 BRAN 整份替换，落了地的在途方向退场；
+    /// 还没落地的（回执是别的指令引起的）继续挂着，段已经不在场景里的也退场。
+    fn sync_tube_render_states(&mut self, states: Vec<plant_ui_view3d::TubeRenderState>) {
+        for state in states {
+            let segments: HashMap<plant_ui::TubeSegment, bool> =
+                state.segments.into_iter().collect();
+            let settled_all = self.tube_pending.get_mut(&state.bran).map(|pending| {
+                pending.retain(|segment, wanted| {
+                    segments
+                        .get(segment)
+                        .is_some_and(|actual| actual != wanted)
+                });
+                pending.is_empty()
+            });
+            if settled_all == Some(true) {
+                self.tube_pending.remove(&state.bran);
+            }
+            self.tube_visibility.insert(state.bran, segments);
+        }
+        self.rebuild_room_tree();
+    }
+
     fn handle_cmds(&mut self, ctx: &egui::Context, cmds: Vec<Cmd>) {
         let mut dirty = false;
         for cmd in cmds {
@@ -5392,6 +5428,8 @@ impl App {
         for refno in &gone_set {
             self.loaded_models.remove(refno);
             self.tree.visibility.remove(refno);
+            self.tube_visibility.remove(refno);
+            self.tube_pending.remove(refno);
             self.model_show_waiting.remove(refno);
             self.tree.pending_direction.remove(refno);
             self.tree.pending_visibility.remove(refno);
@@ -5427,6 +5465,8 @@ impl App {
         for refno in &gone {
             self.loaded_models.remove(refno);
             self.tree.visibility.remove(refno);
+            self.tube_visibility.remove(refno);
+            self.tube_pending.remove(refno);
             self.model_show_waiting.remove(refno);
             self.tree.pending_direction.remove(refno);
             self.tree.pending_visibility.remove(refno);
@@ -6643,6 +6683,8 @@ impl App {
         self.tree.pending_direction.clear();
         self.tree.pending_visibility.clear();
         self.tree.visibility_unavailable.clear();
+        self.tube_visibility.clear();
+        self.tube_pending.clear();
         self.model_progress_until = None;
         if total == 0 {
             self.vm.model_load = None;
@@ -6882,6 +6924,8 @@ impl App {
         self.pending_room_frame = None;
         self.vm.model_load = None;
         self.tree = TreeModel::default();
+        self.tube_visibility.clear();
+        self.tube_pending.clear();
         self.vm.data_source_ok = false;
         self.vm.project.clear();
         self.mdb.clear();
@@ -7084,8 +7128,34 @@ impl App {
                     visibility: tree.visibility_for(refno, scopes),
                     pending: tree.pending_direction.get(&refno).copied(),
                 };
+                // 直段行（阶段四）：按逐段账画；账上没这一段 = 没带身份进场景，所属 BRAN 整根都没画出来时也算未加载。
+                let tube_visibility = &self.tube_visibility;
+                let tube_pending = &self.tube_pending;
+                let tube_eye = |bran: RefU64, segment: &plant_ui::TubeSegment| {
+                    let actual = tube_visibility
+                        .get(&bran)
+                        .and_then(|segments| segments.get(segment));
+                    let visibility = match actual {
+                        _ if tree.visibility_for(bran, scopes) == RowVisibility::Unloaded => {
+                            RowVisibility::Unloaded
+                        }
+                        Some(true) => RowVisibility::Shown,
+                        Some(false) => RowVisibility::Hidden,
+                        None => RowVisibility::Unloaded,
+                    };
+                    EyeState {
+                        visibility,
+                        pending: tube_pending
+                            .get(&bran)
+                            .and_then(|pending| pending.get(segment))
+                            .copied(),
+                    }
+                };
                 RoomTreeVm::Ready(RoomTreeDataVm {
-                    rows: self.room_tree.rows(&eye),
+                    rows: self.room_tree.rows(&EyeSource {
+                        model: &eye,
+                        tube: &tube_eye,
+                    }),
                     total: self.room_tree.total(),
                     matched: self.room_tree.filtered_roots().len(),
                     filter: self.room_tree.filter.clone(),
@@ -7317,6 +7387,11 @@ impl App {
             .unwrap_or_else(|| id.room().to_slash_string());
         match action {
             RoomTreeDeferred::SetVisible(visible) => {
+                // 直段行只动这一段（阶段四），不扩到所属 BRAN。
+                if let Some((bran, segment)) = id.tube_segment() {
+                    self.set_tube_segment_visible(bran, segment, visible, &label);
+                    return;
+                }
                 let refnos = self.room_tree.scene_refnos_under(&id);
                 if refnos.is_empty() {
                     self.logs
@@ -7403,6 +7478,44 @@ impl App {
                 self.settle_room_tree_frame();
             }
         }
+    }
+
+    /// 直段行的眼睛（ADR-0033 阶段四）：只动这一段，落到 `ModelAction::SetTubeSegmentsVisible`。这段还没以
+    /// 身份进场景（所属 BRAN 没显示过，或服务端这批记录没带 `tube`）就说一声、不记方向——没有实体可落，
+    /// 方向只会一直挂着。之后对整根 BRAN 的显隐仍按 refno 整根生效，把逐段结果盖掉（回执会把账对回来）。
+    fn set_tube_segment_visible(
+        &mut self,
+        bran: RefU64,
+        segment: plant_ui::TubeSegment,
+        visible: bool,
+        label: &str,
+    ) {
+        let loaded = self
+            .tube_visibility
+            .get(&bran)
+            .is_some_and(|segments| segments.contains_key(&segment));
+        if !loaded {
+            let hint = if self.loaded_models.contains(&bran) {
+                "这根 BRAN 的记录没带直段身份（老服务端 / 库供数），只能整根显隐"
+            } else {
+                "先对所属 BRAN「显示」把直段装进场景，再逐段显隐"
+            };
+            self.logs.info(
+                &mut self.vm.logs,
+                format!("房间树：直段 {label} 还不能单独显隐——{hint}"),
+            );
+            return;
+        }
+        self.tube_pending
+            .entry(bran)
+            .or_default()
+            .insert(segment.clone(), visible);
+        self.view3d_commands
+            .push(Cmd::Model(plant_ui::ModelAction::SetTubeSegmentsVisible {
+                bran,
+                segments: vec![segment],
+                visible,
+            }));
     }
 
     /// 「加载模型」的取景：目标的范围查询都回来了才 `FocusGroup`（视口的包围盒来自范围回包的

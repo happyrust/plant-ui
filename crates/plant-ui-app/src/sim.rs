@@ -2216,6 +2216,77 @@ fn spatial_room_tree_fixture(
     })
 }
 
+/// 房间树那根 BRAN `/SIM-P1/B1` 的 refno：它是剧本里唯一有三维记录的目标。
+const SIM_TUBE_BRAN: &str = "9001_1010";
+
+/// 眼睛 / 范围查询（`ModelLoad::Scopes`）在剧本里的回答：只有房间树那根 BRAN `/SIM-P1/B1`（[`SIM_TUBE_BRAN`]）
+/// 名下有三条直段记录——按 gen-model `/model/records` 的形状给（`generic = TUBI`、refno = BRAN、带 `tube` 身份，
+/// 身份与 [`spatial_room_tree_fixture`] 的直段行一一对应），都标成「无效直段」好让视口零网格文件就画出虚线
+/// 中心线；它的三个构件各回一条零实例记录（查过、没几何可画，眼睛停「未加载」而不走默认重新生成）。
+/// 别的目标照旧空结果。记录用 JSON 写再经契约类型解——走的是与真服务同一条解析路。
+pub fn model_scope_fixture(target: RefU64) -> crate::model_update_api::ModelRecords {
+    // 直段沿世界 +X 铺：根的局部 Z 是管轴（绕 Y 转 90°），缩放 = (口径, 口径, 长度)，与真 TUBI 记录同形。
+    let tube = |ordinal: u32, from: &str, to: &str, x: f64, length: f64| {
+        serde_json::json!({
+            "refno": SIM_TUBE_BRAN,
+            "old_refno": null,
+            "owner": SIM_TUBE_BRAN,
+            "world_aabb": {"mins": [x, -30.0, -30.0], "maxs": [x + length, 30.0, 30.0]},
+            "world_trans": {
+                "translation": [x, 0.0, 0.0],
+                "rotation": [0.0, 0.707_106_8, 0.0, 0.707_106_8],
+                "scale": [60.0, 60.0, length]
+            },
+            "insts": [{"geo_hash": "", "is_tubi": true, "is_invalid_tubi": true}],
+            "has_neg": false,
+            "generic": "TUBI",
+            "pts": null,
+            "date": null,
+            "tube": {"ordinal": ordinal, "from": from, "to": to}
+        })
+    };
+    let element = |refno: &str, generic: &str, x: f64| {
+        serde_json::json!({
+            "refno": refno,
+            "old_refno": null,
+            "owner": SIM_TUBE_BRAN,
+            "world_aabb": {"mins": [x - 100.0, -100.0, -100.0], "maxs": [x + 100.0, 100.0, 100.0]},
+            "world_trans": {
+                "translation": [x, 0.0, 0.0],
+                "rotation": [0.0, 0.0, 0.0, 1.0],
+                "scale": [1.0, 1.0, 1.0]
+            },
+            "insts": [],
+            "has_neg": false,
+            "generic": generic,
+            "pts": null,
+            "date": null
+        })
+    };
+    let records: Vec<serde_json::Value> = match target.to_string().as_str() {
+        // 三段首尾之间留着弯头 / 阀门的位置；长度与房间树直段行的 141 / 2500 / 320 mm 一致。
+        SIM_TUBE_BRAN => vec![
+            tube(0, "9001_1010", "9001_1011", 0.0, 141.0),
+            tube(1, "9001_1011", "9001_1012", 400.0, 2500.0),
+            tube(2, "9001_1012", "9001_1013", 3200.0, 320.0),
+        ],
+        "9001_1011" => vec![element("9001_1011", "ELBO", 270.0)],
+        "9001_1012" => vec![element("9001_1012", "VALV", 3050.0)],
+        "9001_1013" => vec![element("9001_1013", "FLAN", 3600.0)],
+        _ => Vec::new(),
+    };
+    crate::model_update_api::ModelRecords {
+        records: records
+            .into_iter()
+            .map(|value| {
+                serde_json::from_value::<plant_ui::ModelRecord>(value)
+                    .expect("剧本里的模型记录与 `/model/records` 的契约同形")
+            })
+            .collect(),
+        sources: Vec::new(),
+    }
+}
+
 /// 收口批次的分步账（与 gen-model `task_registry` 的 steps[] 同形）：段名与比例照抄 2026-10-23
 /// 实测的一条 654→655 批次，失败批次的收尾段 `ok = false`。只为增量记录页的阶段耗时条有东西可画。
 fn sim_steps(state: &str) -> Vec<TaskStep> {
@@ -2243,4 +2314,53 @@ fn sim_steps(state: &str) -> Vec<TaskStep> {
     steps.push(step("durable_pending", 0, true));
     steps.push(step("task_end", 35, !failed));
     steps
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 剧本里的直段记录与房间树的直段行是同一套身份：逐段眼睛靠它们对上。构件回零实例记录，别的目标空。
+    #[test]
+    fn sim_tube_records_match_the_room_tree_tubes() {
+        use plant_ui::room_tree::TreeResponse;
+
+        let bran = RefU64::from_two_nums(9001, 1010);
+        let loaded = model_scope_fixture(bran);
+        assert_eq!(loaded.records.len(), 3);
+        assert!(loaded.records.iter().all(|record| {
+            record.generic == "TUBI"
+                && record.refno.refno() == bran
+                && record.insts.len() == 1
+                && record.insts[0].is_invalid_tubi
+        }));
+        let scene_keys: Vec<(u32, String, String)> = loaded
+            .records
+            .iter()
+            .map(|record| {
+                let tube = record.tube.as_ref().unwrap();
+                (tube.ordinal, tube.from.clone(), tube.to.clone())
+            })
+            .collect();
+
+        let tree: TreeResponse =
+            spatial_room_tree_fixture(RefU64::from_two_nums(9001, 501), None).unwrap();
+        let tree_keys: Vec<(u32, String, String)> = tree.rooms[0].specs[0].unit_types[0].units[0]
+            .tubes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|tube| (tube.ordinal, tube.from.clone(), tube.to.clone()))
+            .collect();
+        assert_eq!(scene_keys, tree_keys);
+
+        let elbo = model_scope_fixture(RefU64::from_two_nums(9001, 1011));
+        assert_eq!(elbo.records.len(), 1);
+        assert!(elbo.records[0].insts.is_empty() && elbo.records[0].tube.is_none());
+        assert!(
+            model_scope_fixture(RefU64::from_two_nums(9001, 501))
+                .records
+                .is_empty()
+        );
+    }
 }

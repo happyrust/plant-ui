@@ -7,7 +7,7 @@
 //! 就不正常了——那是翻面正好夹在两次请求之间，两页算的可能不是同一版文件。
 //! 这里沿用「不混纪元」的纪律：按 dbnum 分桶，一个桶只认一个源，混了直接报错，
 //! 让调用点整趟重来，而不是把两版几何拼成一个内部不一致的视口。
-use aios_core::GeomInstQuery;
+use plant_ui::ModelRecord;
 use plant_ui::task_queue::ModelSource;
 use std::collections::HashMap;
 
@@ -32,7 +32,7 @@ impl RecordScope {
 
 #[derive(Default)]
 pub(super) struct ModelRecordUnion {
-    records: Vec<GeomInstQuery>,
+    records: Vec<ModelRecord>,
     multiplicity: HashMap<String, usize>,
     /// 每个桶（dbnum）已经认下的源。`None` 键 = 服务端没给 dbnum 的那一桶。
     sources: HashMap<Option<u32>, ModelSource>,
@@ -42,7 +42,7 @@ impl ModelRecordUnion {
     pub(super) fn extend_scope(
         &mut self,
         scope: RecordScope,
-        records: Vec<GeomInstQuery>,
+        records: Vec<ModelRecord>,
     ) -> anyhow::Result<()> {
         if let Some(source) = scope.source {
             match self.sources.get(&scope.dbnum) {
@@ -63,7 +63,8 @@ impl ModelRecordUnion {
             }
         }
         // A BRAN and its members overlap. Refno alone is not an identity:
-        // separate implied tubes share the BRAN refno but have different transforms.
+        // separate implied tubes share the BRAN refno but have different transforms
+        // (and, from gen-model's records route, their own `tube` identity).
         // Preserve the maximum multiplicity per scope, including coincident records.
         let mut scope_counts = HashMap::<String, usize>::new();
         for record in records {
@@ -95,7 +96,7 @@ impl ModelRecordUnion {
         out
     }
 
-    pub(super) fn finish(self) -> Vec<GeomInstQuery> {
+    pub(super) fn finish(self) -> Vec<ModelRecord> {
         self.records
     }
 }
@@ -104,10 +105,37 @@ impl ModelRecordUnion {
 mod tests {
     use super::*;
 
-    fn fixture() -> Vec<GeomInstQuery> {
+    fn fixture() -> Vec<ModelRecord> {
         let page: serde_json::Value =
             serde_json::from_str(include_str!("fixtures/pipe26229-deleted-records.json")).unwrap();
         serde_json::from_value(page["items"].clone()).unwrap()
+    }
+
+    /// 两条几何完全重合、只差直段身份的管身记录是两条记录：身份进了去重键，跨范围重复时各自只留一份。
+    #[test]
+    fn tube_identity_takes_part_in_the_dedup_key() {
+        let mut tubes = fixture();
+        tubes.retain(|record| record.generic == "TUBI");
+        let mut first = serde_json::to_value(&tubes[0]).unwrap();
+        let mut second = first.clone();
+        first["tube"] = serde_json::json!({"ordinal": 0, "from": "24384_1", "to": "24384_2"});
+        second["tube"] = serde_json::json!({"ordinal": 1, "from": "24384_1", "to": "24384_2"});
+        let pair = || -> Vec<ModelRecord> {
+            vec![
+                serde_json::from_value(first.clone()).unwrap(),
+                serde_json::from_value(second.clone()).unwrap(),
+            ]
+        };
+        let mut union = ModelRecordUnion::default();
+        union.extend_scope(RecordScope::legacy(), pair()).unwrap();
+        union.extend_scope(RecordScope::legacy(), pair()).unwrap();
+        let kept = union.finish();
+        assert_eq!(kept.len(), 2);
+        let ordinals: Vec<u32> = kept
+            .iter()
+            .map(|record| record.tube.as_ref().unwrap().ordinal)
+            .collect();
+        assert_eq!(ordinals, vec![0, 1]);
     }
 
     fn scope(dbnum: u32, source: ModelSource) -> RecordScope {
@@ -121,7 +149,7 @@ mod tests {
     fn overlapping_branch_and_members_keep_fourteen_not_twenty_five() {
         let records = fixture();
         assert_eq!(records.len(), 14);
-        let members: Vec<Vec<GeomInstQuery>> =
+        let members: Vec<Vec<ModelRecord>> =
             serde_json::from_str(include_str!("fixtures/pipe26229-member-records.json")).unwrap();
         assert_eq!(members.len(), 11);
         let mut union = ModelRecordUnion::default();

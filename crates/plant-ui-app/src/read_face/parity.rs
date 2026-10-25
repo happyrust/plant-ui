@@ -499,7 +499,7 @@ pub struct Bucket {
 /// 一条实例的身份：`(refno, geo_hash)`；没有网格实例的记录 geo_hash 为空串，只算元素本身。
 pub type InstanceKey = (RefU64, String);
 
-pub fn instance_keys(records: &[aios_core::GeomInstQuery]) -> Vec<InstanceKey> {
+pub fn instance_keys(records: &[plant_ui::ModelRecord]) -> Vec<InstanceKey> {
     let mut keys = Vec::new();
     for record in records {
         let refno = record.refno.refno();

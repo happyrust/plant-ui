@@ -15,6 +15,12 @@
 - `cargo test -p rs-plant`：**208 passed / 0 failed**（`spatial_api::tests` 2 例新增：路径带身份三格与 `tubes=1`、`unit=` / `other_noun=` 选择器；
   两种 404 分开（清单路由 = 老服务端、树路由 = 这间房没面板模型）、超时归「够不着」）。既有的 `data_rs_reads_only_through_read_face` 等纪律测试照常。
 - `cargo check -p rs-plant -p plant-ui --tests`：通过，新文件无警告。
+- 阶段四后半（逐段眼睛，2026-10-25 10:30–11:00）：`cargo test -p plant-ui -p plant-ui-view3d -p rs-plant` **219 / 108 / 211 passed, 0 failed**
+  （新增：`plant_ui::tests::a_model_record_reads_the_gen_model_shape_with_or_without_a_tube`（`/model/records` 的 flatten + `tube` 形状，老记录无 `tube`）、
+  `room_tree::tests::tube_rows_read_per_segment_eyes_and_loaded_tubes_join_the_bran_aggregate`、view3d 的
+  `tube_roots_carry_their_segment_and_report_per_segment_visibility` / `a_tube_root_visibility_change_lands_in_the_per_segment_account`（无头 Bevy App：
+  带身份的根挂 `TubeSegmentRoot`、回执排序与 settled 门、卸掉连账忘、改 `Visibility` 入账）、`model_record_union::tests::tube_identity_takes_part_in_the_dedup_key`、
+  `sim::tests::sim_tube_records_match_the_room_tree_tubes`）；`cargo clippy --tests` 三个 crate 没有落在新代码上的警告。
 
 ## 2. 独立壳（`PLANT_UI_SIM=1`，剧本里的两间房 + 一间空房壳）
 
@@ -72,6 +78,27 @@
   `web-04-context-menu.png`：房间行右键菜单（聚焦 · 聚焦房间（房间视图）· 显示房间模型 · 隔离 · 取消隔离 ｜ 显示 · 隐藏 · 加载模型（…））。
 - 控制台没有 panic / WebGL 错误（只有临时目录里没有的 `e3d.project.ron` / 字体资源 404）。
 - 与 PC 端同一句话：这台 gen-model 的房间归属边没算，树为空；非空树的展开、直段行、补叶子走的是同一份契约层代码（见 §2 独立壳）。
+
+## 3c. 阶段四后半：直段逐段眼睛（独立壳，ADR-0033 D8）
+
+本机没有一台带非空房间树的 gen-model（§3；8023 那份已收，另一份 18522 的房间体制 degraded、树路由超时），所以端到端证据在独立壳里：
+剧本里房间树 B1（9001_1010）的三条直段按 `/model/records` 的形状给（`generic = TUBI`、refno = BRAN、带 `tube{ordinal,from,to}`，经 `plant_ui::ModelRecord`
+解——与真服务同一条解析路），标成无效直段好让视口零网格文件就画出虚线中心线；三个构件回零实例记录。同一台 debug `rs-plant.exe`（重建后），
+窗口 1707×889 逻辑点，探针同 §2。
+
+| 步骤 | 图 | 看到的 | 判 |
+|---|---|---|---|
+| 展开到 B1，点还没装进场景的直段行的眼睛 | `13-unloaded-tube-eye-hint.png` | 三条直段行有了眼睛列（未加载态）；点「ELBO → VALV」的眼睛只得一句日志「房间树：直段 ELBO → VALV 还不能单独显隐——先对所属 BRAN「显示」把直段装进场景，再逐段显隐」，不记方向 | ✓ |
+| B1 单元行右键 → 显示 | `14-tube-eyes-after-show-unit.png` | 日志「9001_1010 查询到 1 个元素、3 个网格实例」、9001_1011/1012/1013「查询到 1 个元素、0 个网格实例 → 显示完成」、「模型显示完成：1 个目标」；三条直段行的眼睛变「已显示」，构件行仍未加载（零实例），B1 与祖先行半可见；视口自动取景到三段虚线 | ✓ |
+| 直段行右键 → 聚焦，再点它的眼睛 | `15a-tube-focused-viewport-before.png` / `15b-tube-eye-hidden-viewport-after.png` / `15c-tube-eye-hidden-tree.png` | 聚焦后 2.5 m 那段虚线横贯视口；点「ELBO → VALV」的眼睛后只有这一段从视口消失（两端的 141 / 320 mm 两段还在），该行眼睛变「已隐藏」，另两条直段行不动，B1 半可见；没有新的提示日志 | ✓ |
+| 第二条直段行右键 → 隐藏 | `16-second-tube-hidden-via-menu.png` | 「VALV → FLAN」也变「已隐藏」，「BRAN → ELBO」仍已显示；菜单里直段行只有 聚焦 · 显示 / 隐藏 · 查看关联房间 / 属性 / 复制 REFNO | ✓ |
+| 点 B1 单元行的眼睛（半可见 → 显示） | `17-unit-eye-overrides-segments.png` | 整根 BRAN 的 `SetVisible` 把逐段的两段隐藏一并盖掉：三条直段行全部回「已显示」，视口里虚线全回来；日志「模型显示完成：4 个目标」 | ✓ |
+| 视口工具栏 全部隐藏 / 全部显示 | `18a-hide-all.png` / `18b-show-all.png` | 全部隐藏后三条直段行与 B1 / 祖先行全是「已隐藏」；全部显示后直段行回已显示、B1 回半可见（构件未加载）——逐段账是按根的 `Visibility` 变更记的，全局动作也对得上 | ✓ |
+| 逐段把三段全藏了 | `19-all-segments-hidden-bran-dark.png` | B1 单元行与祖先行变「已隐藏」（BRAN 自己的 refno 级实际账跟着记成不可见）；再点 B1 的眼睛整根显示回来（同图 17） | ✓ |
+
+没有验到的：真 gen-model 的 `/model/records` 里 `tube` 那一格进场景——本机此刻没有可用的服务（见上）；形状由 gen-model
+`model_record_reader.rs` 的测试向量（`{"ordinal":0,"from":"24384_1","to":"24384_2"}`）照抄进 `plant_ui::tests`，剧本记录也走同一条 serde 路。
+模型树里 BRAN 行的眼睛跟着逐段全藏变暗这一条在房间树的 B1 行上看到了（图 19，同一份 `tree.visibility`），剧本的模型树里没有 9001_1010 这根。
 
 ## 4. 复跑要点
 

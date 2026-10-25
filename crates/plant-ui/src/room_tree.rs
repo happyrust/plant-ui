@@ -10,7 +10,8 @@
 //! 取数归宿主（`plant-ui-app/src/spatial_api.rs`，只走 gen-model 服务供数，决策 D2）；显隐 /
 //! 聚焦 / 隔离落到既有的 [`crate::ModelAction`]；眼睛读 View3d 的实际可见性（决策 D4，与模型树
 //! 同一条房规），所以本模块不另记勾选表——行的 eye 由宿主给的闭包按 refno 算，父节点按子节点聚合。
-//! 直段行第一版不画眼睛（只读 + 聚焦），逐段眼睛单立阶段四。
+//! 直段行的眼睛是逐段的（阶段四）：按 (所属 BRAN, [`TubeSegment`]) 读 View3d 的逐段实际可见性，点它落到
+//! [`crate::ModelAction::SetTubeSegmentsVisible`]；没带身份进场景的直段（老服务端 / 库供数）停在「未加载」。
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -18,6 +19,7 @@ use std::collections::{HashMap, HashSet};
 use aios_core::RefU64;
 use serde::Deserialize;
 
+use crate::TubeSegment;
 use crate::style::tokens::Status;
 use crate::vm::{RoomTreeErrorVm, RoomTreeRowVm, RoomTreeTagVm, RowVisibility};
 
@@ -298,6 +300,27 @@ impl RoomNodeId {
             Self::OtherNoun { .. } => RoomNodeKind::OtherNoun,
             Self::Element { .. } => RoomNodeKind::Element,
             Self::Tube { .. } => RoomNodeKind::Tube,
+        }
+    }
+
+    /// 直段行的场景键：所属 BRAN + 直段身份（`ModelAction::SetTubeSegmentsVisible` 用）；其他行回 `None`。
+    pub fn tube_segment(&self) -> Option<(RefU64, TubeSegment)> {
+        match self {
+            Self::Tube {
+                unit,
+                from,
+                to,
+                ordinal,
+                ..
+            } => Some((
+                *unit,
+                TubeSegment {
+                    ordinal: *ordinal,
+                    from: from.clone(),
+                    to: to.clone(),
+                },
+            )),
+            _ => None,
         }
     }
 }
@@ -1015,6 +1038,13 @@ pub struct EyeState {
     pub pending: Option<bool>,
 }
 
+/// 行眼睛的两路来源（都由宿主按 View3d 的实际状态给）：`model` 按 refno（构件 / 单元 / BRAN 自己），
+/// `tube` 按 (所属 BRAN, 直段身份)（直段行，阶段四）。
+pub struct EyeSource<'a> {
+    pub model: &'a dyn Fn(RefU64) -> EyeState,
+    pub tube: &'a dyn Fn(RefU64, &TubeSegment) -> EyeState,
+}
+
 /// 「房间树」的全部状态：根清单、各房取回的树、展开 / 在途 / 失败、过滤词、树内选中。
 /// 不做 IO：宿主拿 [`ExpandNeed`] / 收集器去取数、去发 `ModelAction`，取回来再喂进来。
 #[derive(Debug, Default)]
@@ -1315,9 +1345,10 @@ impl RoomTreeModel {
             .collect()
     }
 
-    /// 按展开状态展平成行。`eye` 按 refno 给实际可见性；父节点按子节点聚合（全 / 半 / 无），
-    /// BRAN 单元另算上它自己（直管挂在它名下）；直段行没有眼睛。
-    pub fn rows(&self, eye: &dyn Fn(RefU64) -> EyeState) -> Vec<RoomTreeRowVm> {
+    /// 按展开状态展平成行。`eyes.model` 按 refno 给实际可见性；父节点按子节点聚合（全 / 半 / 无），
+    /// BRAN 单元另算上它自己（直管挂在它名下）；直段行按 `eyes.tube` 逐段给（阶段四），已装进场景的
+    /// 直段也计入所属 BRAN 单元的聚合，没装的不计（否则老服务端的整根已显示会被说成半可见）。
+    pub fn rows(&self, eyes: &EyeSource<'_>) -> Vec<RoomTreeRowVm> {
         let mut rows = Vec::new();
         let primary = self.anchor.as_ref();
         for room in self.filtered_roots() {
@@ -1327,7 +1358,7 @@ impl RoomTreeModel {
             let Some(node) = self.nodes.get(&refno) else {
                 continue;
             };
-            self.walk(node, 0, eye, primary, &mut rows);
+            self.walk(node, 0, eyes, primary, &mut rows);
         }
         rows
     }
@@ -1336,11 +1367,11 @@ impl RoomTreeModel {
         &self,
         node: &RoomTreeNode,
         depth: u16,
-        eye: &dyn Fn(RefU64) -> EyeState,
+        eyes: &EyeSource<'_>,
         primary: Option<&RoomNodeId>,
         rows: &mut Vec<RoomTreeRowVm>,
     ) {
-        let state = eye_of(node, eye);
+        let state = eye_of(node, eyes);
         let expandable = node
             .has_children()
             .then(|| self.expanded.contains(&node.id));
@@ -1366,7 +1397,7 @@ impl RoomTreeModel {
         });
         if expandable == Some(true) {
             for child in &node.children {
-                self.walk(child, depth + 1, eye, primary, rows);
+                self.walk(child, depth + 1, eyes, primary, rows);
             }
         }
     }
@@ -1508,21 +1539,30 @@ impl RoomTreeModel {
 
 /// 一个节点的 eye：构件按 refno；BRAN 单元 = 它自己（直管）+ 构件；其余分组按子节点聚合；
 /// 直段行没有（`None`）。
-fn eye_of(node: &RoomTreeNode, eye: &dyn Fn(RefU64) -> EyeState) -> Option<EyeState> {
+fn eye_of(node: &RoomTreeNode, eyes: &EyeSource<'_>) -> Option<EyeState> {
     match node.kind() {
-        RoomNodeKind::Tube => None,
-        RoomNodeKind::Element => node.refno.map(eye),
+        RoomNodeKind::Tube => node
+            .id
+            .tube_segment()
+            .map(|(bran, segment)| (eyes.tube)(bran, &segment)),
+        RoomNodeKind::Element => node.refno.map(eyes.model),
         kind => {
             let mut states: Vec<EyeState> = node
                 .children
                 .iter()
-                .filter_map(|child| eye_of(child, eye))
+                .filter_map(|child| {
+                    let state = eye_of(child, eyes)?;
+                    // 没装进场景的直段不参与聚合：整根已显示时它的「未加载」只说明没有逐段身份。
+                    (child.kind() != RoomNodeKind::Tube
+                        || state.visibility != RowVisibility::Unloaded)
+                        .then_some(state)
+                })
                 .collect();
             if kind == RoomNodeKind::Unit
                 && node.noun.eq_ignore_ascii_case("BRAN")
                 && let Some(refno) = node.refno
             {
-                states.push(eye(refno));
+                states.push((eyes.model)(refno));
             }
             Some(aggregate(&states))
         }
@@ -1718,6 +1758,107 @@ mod tests {
         EyeState::default()
     }
 
+    fn no_tube(_: RefU64, _: &TubeSegment) -> EyeState {
+        EyeState::default()
+    }
+
+    /// 只给 refno 那一路、直段一律没装的眼睛来源。
+    fn eyes(model: &dyn Fn(RefU64) -> EyeState) -> EyeSource<'_> {
+        EyeSource {
+            model,
+            tube: &no_tube,
+        }
+    }
+
+    /// 阶段四：直段行按 (BRAN, 直段身份) 读逐段可见性；装进场景的直段计入所属 BRAN 单元的聚合，没装的不计。
+    #[test]
+    fn tube_rows_read_per_segment_eyes_and_loaded_tubes_join_the_bran_aggregate() {
+        let mut model = RoomTreeModel::default();
+        model.set_roots(sample_roots());
+        let room = r(1, 100);
+        model.set_tree(room, sample_tree()).unwrap();
+        for id in [
+            RoomNodeId::Room(room),
+            RoomNodeId::Spec { room, spec: 1 },
+            RoomNodeId::UnitType {
+                room,
+                spec: 1,
+                noun: "BRAN".into(),
+            },
+            RoomNodeId::Unit {
+                room,
+                unit: r(1, 10),
+            },
+        ] {
+            model.expanded.insert(id);
+        }
+        let shown = |_: RefU64| EyeState {
+            visibility: RowVisibility::Shown,
+            pending: None,
+        };
+        // 第 0 段显示、第 1 段藏了；身份要对得上（所属 BRAN + 序号 + 两端）。
+        let tube = |bran: RefU64, segment: &TubeSegment| {
+            assert_eq!(bran, r(1, 10));
+            assert_eq!(
+                segment.from,
+                if segment.ordinal == 0 { "1_10" } else { "1_11" }
+            );
+            EyeState {
+                visibility: if segment.ordinal == 0 {
+                    RowVisibility::Shown
+                } else {
+                    RowVisibility::Hidden
+                },
+                pending: None,
+            }
+        };
+        let rows = model.rows(&EyeSource {
+            model: &shown,
+            tube: &tube,
+        });
+        let tubes: Vec<_> = rows
+            .iter()
+            .filter(|row| row.kind == RoomNodeKind::Tube)
+            .collect();
+        assert_eq!(tubes.len(), 2);
+        assert_eq!(tubes[0].visibility, Some(RowVisibility::Shown));
+        assert!(!tubes[0].next_visible, "已显示的直段再点就是隐藏");
+        assert_eq!(tubes[1].visibility, Some(RowVisibility::Hidden));
+        assert!(tubes[1].next_visible);
+        assert_eq!(
+            tubes[1].id.tube_segment(),
+            Some((
+                r(1, 10),
+                TubeSegment {
+                    ordinal: 1,
+                    from: "1_11".into(),
+                    to: "1_12".into(),
+                }
+            ))
+        );
+        let bran = rows
+            .iter()
+            .find(|row| row.kind == RoomNodeKind::Unit)
+            .unwrap();
+        assert_eq!(
+            bran.visibility,
+            Some(RowVisibility::Partial),
+            "构件与 BRAN 自己都显示、一段直段藏了 = 半可见"
+        );
+        // 直段没装进场景（老服务端没给身份）：不拖累整根的聚合。
+        let rows = model.rows(&eyes(&shown));
+        let bran = rows
+            .iter()
+            .find(|row| row.kind == RoomNodeKind::Unit)
+            .unwrap();
+        assert_eq!(bran.visibility, Some(RowVisibility::Shown));
+        assert!(
+            rows.iter()
+                .filter(|row| row.kind == RoomNodeKind::Tube)
+                .all(|row| row.visibility == Some(RowVisibility::Unloaded))
+        );
+    }
+
     #[test]
     fn labels_follow_the_source_wording() {
         assert_eq!(format_distance(3000.0), "3 m");
@@ -1867,12 +2008,12 @@ mod tests {
         let room = r(1, 100);
         model.toggle_expand(&RoomNodeId::Room(room));
         model.set_tree(room, sample_tree()).unwrap();
-        let rows = model.rows(&unloaded);
+        let rows = model.rows(&eyes(&unloaded));
         let labels: Vec<_> = rows.iter().map(|row| row.label.as_str()).collect();
         assert_eq!(labels, ["R101 · 控制室", "管道系统", "结构系统"]);
         assert_eq!(rows[0].expandable, Some(true));
         assert_eq!(rows[0].visibility, Some(RowVisibility::Unloaded));
-        // 展开到 BRAN：构件行与直段行都出来；直段行没有眼睛、refno 指向所属 BRAN。
+        // 展开到 BRAN：构件行与直段行都出来；直段行的眼睛按逐段账给（这里没装 = 未加载）、refno 指向所属 BRAN。
         model.toggle_expand(&RoomNodeId::Spec { room, spec: 1 });
         model.toggle_expand(&RoomNodeId::UnitType {
             room,
@@ -1891,12 +2032,12 @@ mod tests {
             },
             pending: None,
         };
-        let rows = model.rows(&eye);
+        let rows = model.rows(&eyes(&eye));
         let tube_row = rows
             .iter()
             .find(|row| row.kind == RoomNodeKind::Tube)
             .unwrap();
-        assert_eq!(tube_row.visibility, None);
+        assert_eq!(tube_row.visibility, Some(RowVisibility::Unloaded));
         assert_eq!(tube_row.refno, Some(r(1, 10)));
         assert_eq!(tube_row.depth, 4);
         let elbo = rows
@@ -1972,7 +2113,7 @@ mod tests {
             model.expanded.insert(id);
         }
         let order: Vec<_> = model
-            .rows(&unloaded)
+            .rows(&eyes(&unloaded))
             .into_iter()
             .map(|row| row.id)
             .collect();
@@ -2038,7 +2179,7 @@ mod tests {
             assert!(model.expanded.contains(&ancestor), "{ancestor:?} 该展开");
         }
         assert_eq!(model.ancestors(&hit).len(), 4);
-        let rows = model.rows(&unloaded);
+        let rows = model.rows(&eyes(&unloaded));
         assert!(
             rows.iter()
                 .any(|row| row.id == hit && row.selected && row.primary)

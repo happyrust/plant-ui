@@ -731,14 +731,16 @@ async fn room_volume_records(
 }
 
 /// 只留在册面板的记录。房间 FRMW 底下未必只有面板，不在册的面板也不参与归属计算。
+/// 房间体只要几何，直段身份那一格在这儿用不上。
 fn panel_records(
-    records: Vec<aios_core::GeomInstQuery>,
+    records: Vec<plant_ui::ModelRecord>,
     panels: &[RefU64],
 ) -> Vec<aios_core::GeomInstQuery> {
     let wanted: std::collections::HashSet<RefU64> = panels.iter().copied().collect();
     records
         .into_iter()
         .filter(|record| wanted.contains(&record.refno.refno()))
+        .map(|record| record.model)
         .collect()
 }
 
@@ -1454,10 +1456,12 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>, kind: ReadF
                     } => {
                         for target in targets {
                             if crate::sim::enabled() {
+                                // 剧本里只有房间树那根 BRAN 有几条零文件就能画的直段（逐段眼睛的演示料），
+                                // 其余目标照旧空结果。
                                 let _ = model_evt_tx.send(Evt::ModelScope(
                                     epoch,
                                     target,
-                                    Ok(crate::model_update_api::ModelRecords::default()),
+                                    Ok(crate::sim::model_scope_fixture(target)),
                                 ));
                                 model_ctx.request_repaint();
                                 continue;
@@ -1716,7 +1720,7 @@ mod tests {
             "fixtures/pipe26229-deleted-records.json"
         ))
         .unwrap();
-        let records: Vec<aios_core::GeomInstQuery> =
+        let records: Vec<plant_ui::ModelRecord> =
             serde_json::from_value(page["items"].clone()).unwrap();
         let first = records[0].refno.refno();
         let expected = records

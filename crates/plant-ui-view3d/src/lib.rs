@@ -19,7 +19,7 @@ use std::str::FromStr;
 
 use aios_core::pdms_types::PdmsGenericType;
 use aios_core::shape::pdms_shape::PlantMesh;
-use aios_core::{GeomInstQuery, RefU64};
+use aios_core::RefU64;
 use bevy::anti_aliasing::fxaa::Fxaa;
 use bevy::asset::io::Reader;
 use bevy::asset::{
@@ -48,7 +48,7 @@ use bevy::transform::TransformSystems;
 use bevy_egui35::{EguiUserTextures, egui};
 use plant_ui::{
     AntiAlias, CameraGesture, CameraMotion, CameraPose, IsolateMatching, LookMode, ModelAction,
-    ViewportLook,
+    ModelRecord, TubeSegment, ViewportLook,
 };
 
 pub mod e3d_look;
@@ -223,6 +223,8 @@ impl Plugin for View3dPlugin {
                     retry_meshes,
                     apply_resize,
                     apply_commands,
+                    // 直段根的 Visibility 这一帧被谁改过都在这儿记一笔（逐段眼睛，ADR-0033 阶段四）。
+                    track_tube_segments,
                     // 房间体与直段截断排在可见性 / 隔离落地之后、材质刷新之前：补出来的兄弟段
                     // 带着 `ModelMesh` 出生，材质由同帧的 apply_materials 按外观补上。
                     room_clip::apply_room_clip_ops,
@@ -404,6 +406,12 @@ pub struct View3d {
     render_states: HashMap<RefU64, RenderState>,
     /// 实际状态变过、还没被宿主取走的模型。
     render_dirty: HashSet<RefU64>,
+    /// 直段的逐段实际可见性（ADR-0033 阶段四）：BRAN refno → 直段身份 → 这条直段的根此刻可见否。只有带
+    /// [`TubeSegment`] 进场景的根才在账上；`track_tube_segments` 盯着根的 `Visibility` 变更回写，不问是哪条
+    /// 指令改的，所以整根的显隐 / 隔离与逐段的 `SetTubeSegmentsVisible` 记的是同一张账。
+    tube_states: HashMap<RefU64, HashMap<TubeSegment, bool>>,
+    /// 逐段账变过、还没交给宿主的 BRAN。
+    tube_dirty: HashSet<RefU64>,
     pending_resize: Option<(UVec2, Instant)>,
     /// 已经改给离屏相机、但还没交给 egui 的新目标。至少让相机完整画过一帧再切，
     /// 否则窗口相机会采到刚创建、内容尚空的 GPU 纹理。
@@ -450,14 +458,14 @@ pub struct View3d {
 }
 
 impl View3d {
-    pub fn load(&mut self, models: Vec<GeomInstQuery>) {
+    pub fn load(&mut self, models: Vec<ModelRecord>) {
         self.pending_models.clear();
         self.desired_visibility.clear();
         self.pending_models.push_back(ModelBatch::Replace(models));
     }
 
     /// 在当前场景上只追加新模型；调用方负责按 refno 去重。
-    pub fn append(&mut self, models: Vec<GeomInstQuery>) {
+    pub fn append(&mut self, models: Vec<ModelRecord>) {
         if models.is_empty() {
             return;
         }
@@ -473,7 +481,7 @@ impl View3d {
     /// 不能拆成 `model(Unload)` 加 `append`：`Unload` 会把待装批里同 refno 的新模型一并滤掉；
     /// 反过来先卸后追加也不行，`apply_commands` 排在 `load_models` 之后，同一帧刚装上的
     /// 新实体会被它按 refno 一起卸掉。两种次序都是旧的卸了、新的没上。
-    pub fn refresh(&mut self, stale: Vec<RefU64>, models: Vec<GeomInstQuery>) {
+    pub fn refresh(&mut self, stale: Vec<RefU64>, models: Vec<ModelRecord>) {
         let stale: HashSet<_> = stale.into_iter().collect();
         if stale.is_empty() {
             self.append(models);
@@ -660,6 +668,47 @@ impl View3d {
         });
         settled
     }
+
+    /// 取走自上次以来逐段账变过的 BRAN，每根整份交付（ADR-0033 阶段四）。与 [`Self::take_render_states`]
+    /// 同一条纪律：这根的网格还没全有结果就先留着，免得眼睛抢在画面前面说话；整场换掉了的直接丢。
+    pub fn take_tube_render_states(&mut self) -> Vec<TubeRenderState> {
+        if self.tube_dirty.is_empty() {
+            return Vec::new();
+        }
+        let Self {
+            tube_states,
+            tube_dirty,
+            render_states,
+            ..
+        } = self;
+        let mut out = Vec::new();
+        tube_dirty.retain(|bran| {
+            let Some(state) = render_states.get(bran) else {
+                return false;
+            };
+            if !state.settled() {
+                return true;
+            }
+            let mut segments: Vec<(TubeSegment, bool)> = tube_states
+                .get(bran)
+                .map(|segments| {
+                    segments
+                        .iter()
+                        .map(|(segment, visible)| (segment.clone(), *visible))
+                        .collect()
+                })
+                .unwrap_or_default();
+            segments.sort_by(|a, b| {
+                (a.0.ordinal, &a.0.from, &a.0.to).cmp(&(b.0.ordinal, &b.0.from, &b.0.to))
+            });
+            out.push(TubeRenderState {
+                bran: *bran,
+                segments,
+            });
+            false
+        });
+        out
+    }
 }
 
 struct PreparedResize {
@@ -688,6 +737,14 @@ pub struct ModelRenderState {
     pub mesh_total: usize,
     pub mesh_loaded: usize,
     pub mesh_failed: usize,
+}
+
+/// 一根 BRAN 名下全部带身份直段此刻的实际可见性（ADR-0033 阶段四）：整份交付、宿主整份替换。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TubeRenderState {
+    pub bran: RefU64,
+    /// 按 (ordinal, from, to) 排好的（直段身份, 可见）。
+    pub segments: Vec<(TubeSegment, bool)>,
 }
 
 /// 模型的实际渲染结果（视口内部账）。
@@ -789,12 +846,12 @@ impl RetryingMesh {
 }
 
 enum ModelBatch {
-    Replace(Vec<GeomInstQuery>),
-    Append(Vec<GeomInstQuery>),
+    Replace(Vec<ModelRecord>),
+    Append(Vec<ModelRecord>),
     /// 先卸场景里 `stale` 名下的根，再装 `models`，见 [`View3d::refresh`]。
     Refresh {
         stale: HashSet<RefU64>,
-        models: Vec<GeomInstQuery>,
+        models: Vec<ModelRecord>,
     },
 }
 
@@ -811,13 +868,13 @@ impl ModelBatch {
         }
     }
 
-    fn into_models(self) -> Vec<GeomInstQuery> {
+    fn into_models(self) -> Vec<ModelRecord> {
         match self {
             Self::Replace(models) | Self::Append(models) | Self::Refresh { models, .. } => models,
         }
     }
 
-    fn retain(&mut self, keep: impl FnMut(&GeomInstQuery) -> bool) {
+    fn retain(&mut self, keep: impl FnMut(&ModelRecord) -> bool) {
         match self {
             Self::Replace(models) | Self::Append(models) | Self::Refresh { models, .. } => {
                 models.retain(keep)
@@ -907,6 +964,22 @@ fn record_applied_visibility(view: &mut View3d, applied: Vec<RefU64>, visible: b
     }
 }
 
+/// 直段的逐段实际账（ADR-0033 阶段四）：带身份的直段根 `Visibility` 一变就记一笔，不问是谁改的——
+/// 整根的 `SetVisible` / `HideAll` / `ShowAll` / 隔离与逐段的 `SetTubeSegmentsVisible` 记的是同一张账，
+/// 刚出生的根（`Added` 也算 `Changed`）同样在这里入账。排在 `apply_commands` 之后。
+fn track_tube_segments(
+    mut view: ResMut<View3d>,
+    changed: Query<(&ModelRoot, &TubeSegmentRoot, &Visibility), Changed<Visibility>>,
+) {
+    for (root, segment, visibility) in &changed {
+        view.tube_states
+            .entry(root.refno)
+            .or_default()
+            .insert(segment.0.clone(), *visibility != Visibility::Hidden);
+        view.tube_dirty.insert(root.refno);
+    }
+}
+
 /// 只有落进空场景的那一批需要自动取景：首个模型进场时相机多半还停在出厂
 /// 位置，不取景就是一屏空白。整场替换不再取景——取回工作的约定是回到取回
 /// 前的样子，相机也算在内（docs/plans/get-work-clear-and-reload.md 决定 5）。
@@ -972,6 +1045,11 @@ struct ModelRoot {
     refno: RefU64,
     owner: RefU64,
 }
+
+/// 直段根的身份（ADR-0033 阶段四）：与 [`ModelRoot`] 同挂在一条带身份的直段记录的根上，
+/// `SetTubeSegmentsVisible` 按它点名；没带身份的老记录不挂。
+#[derive(Component, Clone)]
+struct TubeSegmentRoot(TubeSegment);
 
 /// 模型网格的身份与颜色键。材质不存在这里：两种外观是两种组件类型，这一刻该挂哪枚由
 /// `apply_materials` 按外观 × 配色方案 × 状态在 [`LookMaterials`] 里现挑（E3D 外观移植计划）。
@@ -1172,6 +1250,8 @@ fn setup(
         desired_visibility: HashMap::new(),
         render_states: HashMap::new(),
         render_dirty: HashSet::new(),
+        tube_states: HashMap::new(),
+        tube_dirty: HashSet::new(),
         pending_resize: None,
         prepared_resize: None,
         retired_resize: VecDeque::new(),
@@ -1841,6 +1921,8 @@ fn forget_model_state(view: &mut View3d, removed: &HashSet<RefU64>) {
     view.render_states
         .retain(|refno, _| !removed.contains(refno));
     view.render_dirty.retain(|refno| !removed.contains(refno));
+    view.tube_states.retain(|refno, _| !removed.contains(refno));
+    view.tube_dirty.retain(|refno| !removed.contains(refno));
     view.bounds.retain(|refno, _| !removed.contains(refno));
     view.loading_meshes
         .retain(|mesh| !removed.contains(&mesh.refno));
@@ -1901,6 +1983,8 @@ fn load_models(
         view.mesh_progress = None;
         view.render_states.clear();
         view.render_dirty.clear();
+        view.tube_states.clear();
+        view.tube_dirty.clear();
     }
     let scene_transform = scene_transform();
     for model in &models {
@@ -1953,7 +2037,8 @@ fn load_models(
     let mut loading_meshes = Vec::new();
     let mut spawned: Vec<(RefU64, bool, usize, usize)> = Vec::new();
     commands.entity(scene).with_children(|scene| {
-        for model in models {
+        for record in models {
+            let ModelRecord { model, tube } = record;
             let refno = model.refno.refno();
             let owner = model.owner.refno();
             let color = type_color(&model.generic);
@@ -1986,71 +2071,74 @@ fn load_models(
                     })
                     .clone()
             });
-            scene
-                .spawn((model.world_trans, visibility, ModelRoot { refno, owner }))
-                .with_children(|element| {
-                    for inst in model.insts {
-                        if inst.is_invalid_tubi {
-                            // 这里使用 Bevy 原生 LineList，而不是自定义屏幕带。后者的材质
-                            // bind group / 离屏管线一旦失配会整段不画；LineList 已在同一实库
-                            // 场景验证过，且仍保留正确的起点、方向、深度遮挡和选择状态。
-                            let axis_length_mm =
-                                (model.world_trans.scale.z * inst.transform.scale.z).abs();
-                            let mesh = fallback_line_mesh_cache
-                                .entry(axis_length_mm.to_bits())
-                                .or_insert_with(|| {
-                                    meshes.add(invalid_tubi_fallback_line_mesh(axis_length_mm))
-                                })
-                                .clone();
-                            // 房间视图截断直段时从这里记下的原样出发（直段截断计划 M3）。
-                            let tube = room_clip::TubeBody::invalid(
+            let mut root = scene.spawn((model.world_trans, visibility, ModelRoot { refno, owner }));
+            // 带身份的直段根挂上身份：房间树的逐段眼睛按它点名（ADR-0033 阶段四）。
+            if let Some(segment) = tube {
+                root.insert(TubeSegmentRoot(segment));
+            }
+            root.with_children(|element| {
+                for inst in model.insts {
+                    if inst.is_invalid_tubi {
+                        // 这里使用 Bevy 原生 LineList，而不是自定义屏幕带。后者的材质
+                        // bind group / 离屏管线一旦失配会整段不画；LineList 已在同一实库
+                        // 场景验证过，且仍保留正确的起点、方向、深度遮挡和选择状态。
+                        let axis_length_mm =
+                            (model.world_trans.scale.z * inst.transform.scale.z).abs();
+                        let mesh = fallback_line_mesh_cache
+                            .entry(axis_length_mm.to_bits())
+                            .or_insert_with(|| {
+                                meshes.add(invalid_tubi_fallback_line_mesh(axis_length_mm))
+                            })
+                            .clone();
+                        // 房间视图截断直段时从这里记下的原样出发（直段截断计划 M3）。
+                        let tube = room_clip::TubeBody::invalid(
+                            inst.transform,
+                            model.world_trans,
+                            mesh.clone(),
+                        );
+                        element.spawn((
+                            Mesh3d(mesh),
+                            inst.transform,
+                            ModelMesh {
+                                refno,
+                                owner,
+                                colour,
+                                line: true,
+                            },
+                            ModelPickTarget { refno },
+                            NotShadowCaster,
+                            NotShadowReceiver,
+                            tube,
+                        ));
+                    } else {
+                        let path = mesh_source::asset_path(&inst.geo_hash);
+                        let handle = assets.load(path.clone());
+                        loading_meshes.push(LoadingMesh {
+                            refno,
+                            path,
+                            handle: handle.clone(),
+                        });
+                        let mut mesh_entity = element.spawn((
+                            Mesh3d(handle),
+                            inst.transform,
+                            ModelMesh {
+                                refno,
+                                owner,
+                                colour,
+                                line: false,
+                            },
+                            ModelPickTarget { refno },
+                        ));
+                        // 直段：房间视图截断时从这里记下的原样出发（直段截断计划 M3）。
+                        if inst.is_tubi || tube_record {
+                            mesh_entity.insert(room_clip::TubeBody::solid(
                                 inst.transform,
                                 model.world_trans,
-                                mesh.clone(),
-                            );
-                            element.spawn((
-                                Mesh3d(mesh),
-                                inst.transform,
-                                ModelMesh {
-                                    refno,
-                                    owner,
-                                    colour,
-                                    line: true,
-                                },
-                                ModelPickTarget { refno },
-                                NotShadowCaster,
-                                NotShadowReceiver,
-                                tube,
                             ));
-                        } else {
-                            let path = mesh_source::asset_path(&inst.geo_hash);
-                            let handle = assets.load(path.clone());
-                            loading_meshes.push(LoadingMesh {
-                                refno,
-                                path,
-                                handle: handle.clone(),
-                            });
-                            let mut mesh_entity = element.spawn((
-                                Mesh3d(handle),
-                                inst.transform,
-                                ModelMesh {
-                                    refno,
-                                    owner,
-                                    colour,
-                                    line: false,
-                                },
-                                ModelPickTarget { refno },
-                            ));
-                            // 直段：房间视图截断时从这里记下的原样出发（直段截断计划 M3）。
-                            if inst.is_tubi || tube_record {
-                                mesh_entity.insert(room_clip::TubeBody::solid(
-                                    inst.transform,
-                                    model.world_trans,
-                                ));
-                            }
                         }
                     }
-                });
+                }
+            });
         }
     });
     // 新模型先记账再等 mesh：`settled()` 在这一刻还是 false，所以宿主取不到它，
@@ -2299,6 +2387,7 @@ fn apply_commands(
         With<ViewCamera>,
     >,
     mut roots: Query<(Entity, &ModelRoot, &mut Visibility)>,
+    tube_roots: Query<&TubeSegmentRoot>,
     meshes: Query<&ModelPickTarget>,
     mut mesh_params: ParamSet<(MeshRayCast, ResMut<Assets<Mesh>>)>,
     background: Res<BackgroundMesh>,
@@ -2464,6 +2553,37 @@ fn apply_commands(
                         }
                     }
                     record_applied_visibility(&mut view, applied, visible);
+                }
+                ModelAction::SetTubeSegmentsVisible {
+                    bran,
+                    segments,
+                    visible,
+                } => {
+                    // 只动点名的那几条直段根；逐段账由 `track_tube_segments` 按 `Visibility` 变更回写。
+                    let wanted: HashSet<&TubeSegment> = segments.iter().collect();
+                    let mut touched = false;
+                    let mut any_visible = false;
+                    for (entity, root, mut visibility) in &mut roots {
+                        if root.refno != bran {
+                            continue;
+                        }
+                        if let Ok(TubeSegmentRoot(segment)) = tube_roots.get(entity)
+                            && wanted.contains(segment)
+                        {
+                            *visibility = if visible {
+                                Visibility::Visible
+                            } else {
+                                Visibility::Hidden
+                            };
+                            touched = true;
+                        }
+                        any_visible |= *visibility != Visibility::Hidden;
+                    }
+                    // 整根的实际账 = 这根 refno 名下还有没有根可见：逐段藏光了，BRAN 的眼睛也该暗下去，
+                    // 再点它就是整根显示回来。
+                    if touched {
+                        record_applied_visibility(&mut view, vec![bran], any_visible);
+                    }
                 }
                 ModelAction::HideAll => {
                     let mut applied = Vec::new();
@@ -2897,6 +3017,8 @@ pub(crate) fn blank_view() -> View3d {
         desired_visibility: HashMap::new(),
         render_states: HashMap::new(),
         render_dirty: HashSet::new(),
+        tube_states: HashMap::new(),
+        tube_dirty: HashSet::new(),
         pending_resize: None,
         prepared_resize: None,
         retired_resize: VecDeque::new(),
@@ -2941,6 +3063,7 @@ mod tests {
     }
 
     use super::*;
+    use aios_core::GeomInstQuery;
     use bevy::asset::AssetPlugin;
     use bevy::render::mesh::VertexAttributeValues;
 
@@ -3705,7 +3828,7 @@ mod tests {
         assert!(!should_frame_batch(false));
     }
 
-    fn test_model(refno: RefU64, owner: RefU64) -> GeomInstQuery {
+    fn test_model(refno: RefU64, owner: RefU64) -> ModelRecord {
         GeomInstQuery {
             refno: refno.into(),
             old_refno: None,
@@ -3718,6 +3841,122 @@ mod tests {
             pts: None,
             date: None,
         }
+        .into()
+    }
+
+    /// 一条带身份的直段记录（服务供数的 `generic = TUBI`，refno = 所属 BRAN）。
+    fn test_tube(bran: RefU64, ordinal: u32) -> ModelRecord {
+        let mut record = test_model(bran, bran);
+        record.model.generic = "TUBI".into();
+        record.tube = Some(TubeSegment {
+            ordinal,
+            from: "9001_1010".into(),
+            to: "9001_1011".into(),
+        });
+        record
+    }
+
+    /// 逐段眼睛（ADR-0033 阶段四）：带身份的直段根出生就挂 [`TubeSegmentRoot`]，它的 `Visibility`
+    /// 一变就进逐段账；回执按 BRAN 整份、按 (ordinal, from, to) 排，等这根的网格有了结果才发；没带
+    /// 身份的记录不上账；卸掉这根就连账一起忘。
+    #[test]
+    fn tube_roots_carry_their_segment_and_report_per_segment_visibility() {
+        let bran = RefU64::from(1010);
+        let other = RefU64::from(1);
+        let mut view = test_view();
+        view.append(vec![
+            test_tube(bran, 1),
+            test_tube(bran, 0),
+            test_model(other, other),
+        ]);
+        let mut app = load_models_app(view);
+        app.add_systems(Update, track_tube_segments.after(load_models));
+        app.world_mut()
+            .spawn((Transform::default(), Visibility::Visible, SceneRoot));
+        app.update();
+        app.update();
+
+        let tagged: Vec<(RefU64, u32)> = {
+            let world = app.world_mut();
+            world
+                .query::<(&ModelRoot, &TubeSegmentRoot)>()
+                .iter(world)
+                .map(|(root, segment)| (root.refno, segment.0.ordinal))
+                .collect()
+        };
+        assert_eq!(tagged.len(), 2, "只有带身份的两根挂身份：{tagged:?}");
+        assert!(tagged.iter().all(|(refno, _)| *refno == bran));
+
+        let mut view = app.world_mut().resource_mut::<View3d>();
+        let states = view.take_tube_render_states();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].bran, bran);
+        let ordinals: Vec<(u32, bool)> = states[0]
+            .segments
+            .iter()
+            .map(|(segment, visible)| (segment.ordinal, *visible))
+            .collect();
+        assert_eq!(ordinals, vec![(0, true), (1, true)]);
+        assert!(
+            view.take_tube_render_states().is_empty(),
+            "取过一次就不再重发"
+        );
+        assert!(!view.tube_states.contains_key(&other));
+
+        // 还在装网格的根不先发：账改了也留到 settled 之后。
+        view.tube_dirty.insert(bran);
+        view.render_states.get_mut(&bran).unwrap().mesh_total += 1;
+        assert!(view.take_tube_render_states().is_empty());
+        assert!(view.tube_dirty.contains(&bran));
+        view.render_states.get_mut(&bran).unwrap().mesh_total -= 1;
+        assert_eq!(view.take_tube_render_states().len(), 1);
+
+        // 整根卸掉：逐段账一起忘。
+        view.tube_dirty.insert(bran);
+        forget_model_state(&mut view, &HashSet::from([bran]));
+        assert!(!view.tube_states.contains_key(&bran));
+        assert!(view.take_tube_render_states().is_empty());
+    }
+
+    /// 逼真直段根的 Visibility 被改（不管是哪条指令改的），逐段账跟着翻。
+    #[test]
+    fn a_tube_root_visibility_change_lands_in_the_per_segment_account() {
+        let bran = RefU64::from(1010);
+        let mut view = test_view();
+        view.append(vec![test_tube(bran, 0), test_tube(bran, 1)]);
+        let mut app = load_models_app(view);
+        app.add_systems(Update, track_tube_segments.after(load_models));
+        app.world_mut()
+            .spawn((Transform::default(), Visibility::Visible, SceneRoot));
+        app.update();
+        app.update();
+        app.world_mut()
+            .resource_mut::<View3d>()
+            .take_tube_render_states();
+
+        {
+            let world = app.world_mut();
+            let hidden: Vec<Entity> = world
+                .query::<(Entity, &TubeSegmentRoot)>()
+                .iter(world)
+                .filter(|(_, segment)| segment.0.ordinal == 1)
+                .map(|(entity, _)| entity)
+                .collect();
+            assert_eq!(hidden.len(), 1);
+            *world.get_mut::<Visibility>(hidden[0]).unwrap() = Visibility::Hidden;
+        }
+        app.update();
+
+        let states = app
+            .world_mut()
+            .resource_mut::<View3d>()
+            .take_tube_render_states();
+        let ordinals: Vec<(u32, bool)> = states[0]
+            .segments
+            .iter()
+            .map(|(segment, visible)| (segment.ordinal, *visible))
+            .collect();
+        assert_eq!(ordinals, vec![(0, true), (1, false)]);
     }
 
     fn spawn_model_root(app: &mut App, refno: RefU64, owner: RefU64) -> Entity {

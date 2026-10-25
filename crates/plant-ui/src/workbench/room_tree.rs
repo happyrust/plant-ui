@@ -295,7 +295,7 @@ fn row_ui(
                     selected: row.selected,
                     primary: row.primary,
                     expandable: row.expandable,
-                    // 直段行第一版没有眼睛（`visibility` 为 None）；没有实时渲染器时整列不出现。
+                    // 直段行的眼睛是逐段的（按所属 BRAN + 直段身份读场景，阶段四）；没有实时渲染器时整列不出现。
                     eye: if live {
                         row.visibility.map(eye_of)
                     } else {
@@ -372,8 +372,9 @@ fn eye_of(vis: RowVisibility) -> Eye {
 }
 
 /// 行的右键菜单（照 plant3d-web `RoomTreePanel.vue`，计划 D5）：聚焦 · 隔离 · 取消隔离 · 显示 / 隐藏 ·
-/// 加载模型 · 查看关联房间 · 查看属性；房间行多「聚焦房间」「显示房间模型」；直段行只有聚焦 /
-/// 查看属性（看所属 BRAN）。模型动作吃 `live` 门禁（没有渲染器就不摆），数据类的两项不吃。
+/// 加载模型 · 查看关联房间 · 查看属性；房间行多「聚焦房间」「显示房间模型」；直段行是聚焦 · 显示 / 隐藏
+/// （只动这一段，阶段四）· 查看关联房间 / 属性（看所属 BRAN），不摆隔离与加载。模型动作吃 `live` 门禁（没有
+/// 渲染器就不摆），数据类的两项不吃。
 fn row_menu(ui: &mut Ui, d: Density, row: &RoomTreeRowVm, live: bool, cmds: &mut Vec<Cmd>) {
     ui.set_min_width(d.px(200.0));
     let id = row.id.clone();
@@ -443,21 +444,31 @@ fn row_menu(ui: &mut Ui, d: Density, row: &RoomTreeRowVm, live: bool, cmds: &mut
                 cmds.push(Cmd::Model(ModelAction::ExitIsolate));
                 ui.close();
             }
-            ui.separator();
-            if ui.button(format!("{}  显示", ph::EYE)).clicked() {
-                cmds.push(Cmd::RoomTree(RoomTreeAction::SetVisible {
-                    id: id.clone(),
-                    visible: true,
-                }));
-                ui.close();
-            }
-            if ui.button(format!("{}  隐藏", ph::EYE_SLASH)).clicked() {
-                cmds.push(Cmd::RoomTree(RoomTreeAction::SetVisible {
-                    id: id.clone(),
-                    visible: false,
-                }));
-                ui.close();
-            }
+        }
+        ui.separator();
+        let show = ui.button(format!("{}  显示", ph::EYE));
+        if show.clicked() {
+            cmds.push(Cmd::RoomTree(RoomTreeAction::SetVisible {
+                id: id.clone(),
+                visible: true,
+            }));
+            ui.close();
+        }
+        let hide = ui.button(format!("{}  隐藏", ph::EYE_SLASH));
+        if hide.clicked() {
+            cmds.push(Cmd::RoomTree(RoomTreeAction::SetVisible {
+                id: id.clone(),
+                visible: false,
+            }));
+            ui.close();
+        }
+        if is_tube {
+            const SEGMENT_HINT: &str =
+                "只动这一段直段（要先显示所属 BRAN）；之后对整根 BRAN 的显示 / 隐藏会把它一并盖掉";
+            show.on_hover_text(SEGMENT_HINT);
+            hide.on_hover_text(SEGMENT_HINT);
+        }
+        if !is_tube {
             let count = row
                 .count
                 .map(|count| format!("（{count} 个构件）"))

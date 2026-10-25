@@ -59,7 +59,7 @@
 
 7. 单测全绿；独立壳（`PLANT_UI_SIM=1`）截图：根清单 / 展开一间房的五层 / 其他构件 / 直段行 / 搜索 / 右键菜单 / 库供数注释态；连本机 gen-model（ams7997 或 ams8000 那套有房间定义的库）对着 plant3d-web 同一间房逐行核：节点数、计数尾巴、直段条数与 `verification/spatial-room-hierarchy-tree-2026-09-20/http/*.json` 一致；显隐 / 聚焦 / 隔离在三维里的结果截图。证据进 `docs/evidence/2026-10-25-room-tree-port.md`，ADR 一条（「房间树是服务端聚合的、只在服务供数下有」），`CONTEXT.md` 补词条「房间树」「最小交付单元」「其他构件」。
 
-### 阶段四（单立，不在本次验收里）：直段逐段眼睛与 Web 端
+### 阶段四（单立；2026-10-25 已做，见「进度」末两条）：直段逐段眼睛与 Web 端
 
 - View3d 按 `model/records` 的 `tube{ordinal, from, to}` 登记 `(BRAN, 段) → 实例`，加 `set_tube_segments_visible(keys, visible)`；对象没装进来提示先加载所属 BRAN；直段行长出眼睛。
 - wasm 构建、浏览器验收。
@@ -88,4 +88,12 @@
 - **模拟剧本**：`sim.rs` 两间有树的房 + 一间空房壳；第二条 BRAN 与 PANE 组叶子不内联（走 `unit=` / `other_noun=`），PANE 230 个让房间根的「加载模型」过 200 阈值。
 - **验收里没有做的**：探针 `inspect click` 注不进修饰键状态（模型树同样），Ctrl / Shift 多选只有单测证据。
 - **阶段四前半（Web）已做**（2026-10-25，用户「按推荐继续」）：release wasm + headless Chrome 连本机 gen-model，两条路由在浏览器里同样发出、同样上屏
-  （证据 §3b）；仓里的 `web/public/pkg` 没重发。后半（直段逐段眼睛）见下一条进度。
+  （证据 §3b）；仓里的 `web/public/pkg` 没重发。
+- **阶段四后半（直段逐段眼睛）已做**（2026-10-25，ADR-0033 D8），与计划这一条的出入：
+  - 身份不是 View3d 另记一张 `(BRAN, 段) → 实体` 的表，而是让 `/model/records` 的 `tube` 一路进场景：`plant_ui::ModelRecord`（`GeomInstQuery`
+    flatten + `tube: Option<TubeSegment>`，与 gen-model 读面同形）换掉装场景这条链上的 `GeomInstQuery`（`Deref` 到它，读字段的代码不动），带身份的
+    直段根挂 `TubeSegmentRoot` 组件。动作名是 `ModelAction::SetTubeSegmentsVisible { bran, segments, visible }`（走 `Cmd::Model`，不另开方法）。
+  - 逐段的实际账靠 Bevy 变更检测（`track_tube_segments` 盯直段根的 `Visibility`），不在每条指令里逐一记账；回执按 BRAN 整份、等网格 settled 才发。
+  - 模拟剧本补了唯一一组三维记录：B1（9001_1010）的三条直段按 records 形状给、标成无效直段（零网格文件就能画虚线），三个构件回零实例记录；
+    本机没有一台带非空房间树的 gen-model，逐段眼睛的端到端证据在独立壳里（证据 §3c）。
+  - 没做：逐段结果不进取回工作的隐藏回放、隔离快照仍按 refno（ADR-0033 D8「不做」）。

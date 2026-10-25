@@ -33,12 +33,12 @@ plant-ui 的面板本身就是 dock 页签，再套一层是两套页签样式�
 「跨 N 房」「无效」走 `tags`。唯一的文案偏差：来源写「M 段直管」「TUBI …」，这边按 `CONTEXT.md` 写「M 条直段」「直段 · 长度」
 （TUBI / 直管段 / 管身都不上界面），计数和层次不变。
 
-### D4　眼睛读三维的实际可见性，不另记勾选表；直段行第一版不画眼睛
+### D4　眼睛读三维的实际可见性，不另记勾选表
 
 构件 / 分组行的眼睛 = `ModelAction::SetVisible{refnos}`，单元级及以上连树里的 BRAN 单元 refno（来源方案 A；直段挂在 BRAN 自己名下）。
 行上画的是 View3d 的实际可见性回执（叶子按 refno 走 `TreeModel::visibility_for`，父节点按子节点聚合成 全 / 半 / 无，BRAN 单元另算上它自己），
 与模型树同一条房规（ADR-0016）；另记一份勾选表会和模型树的眼睛说两套话。没加载的构件在树里是「未加载」，不像 plant3d-web 那样缺省打勾——
-这是有意为之。逐段眼睛要 View3d 长出「按 (BRAN, from, to, ordinal) 只显 / 隐一段」的对象级开关，单立阶段四；直段行第一版只读 + 聚焦。
+这是有意为之。直段行的眼睛第一版没画（只读 + 聚焦），阶段四补上，见 D8。
 
 ### D5　右键落到既有动作上，不另造
 
@@ -57,9 +57,27 @@ plant-ui 的面板本身就是 dock 页签，再套一层是两套页签样式�
 `unit=` / `other_noun=` 补取；显隐 / 聚焦 / 隔离 / 加载先把没内联的组补齐（最多 64 组）再做；取树失败的节点原因列在树上方。
 状态机（`plant_ui::room_tree::RoomTreeModel`）不做 IO，绘制层只拿展平好的行。
 
+### D8　直段逐段眼睛：直段以身份进场景，按身份点名，整根指令盖过逐段（阶段四，2026-10-25）
+
+直段没有自己的 refno：它以所属 BRAN 的 refno 进场景，按 refno 的显隐一动就是整根。gen-model `/model/records` 每条记录本来就带着
+`tube{ordinal, from, to}`（与房间树路由的 `tubes[]` 同一套编码），plant-ui 从前把它丢了。这次让它一路进场景：
+
+- **契约**：`plant_ui::ModelRecord { model: GeomInstQuery (flatten), tube: Option<TubeSegment> }` 与 gen-model 读面的 `ModelRecord` 同形，
+  `/model/records` 的每一页按它解；库供数与老服务端没有 `tube`，记录就只按 refno 认，与从前一样。去重键（`model_record_union`）连身份一起算。
+- **场景**：带身份的直段根挂 `TubeSegmentRoot`；新动作 `ModelAction::SetTubeSegmentsVisible { bran, segments, visible }` 只动点名的那几根；
+  逐段的实际账由 `track_tube_segments` 盯着直段根的 `Visibility` 变更回写——不问是哪条指令改的，所以整根的 `SetVisible` / `HideAll` /
+  `ShowAll` / 隔离与逐段的指令记的是同一张账；回执 `take_tube_render_states` 按 BRAN 整份、等这根的网格有了结果才发（与 refno 级回执同一条纪律）。
+  逐段藏光了，BRAN 自己的 refno 级实际账也记成不可见（模型树里这根的眼睛跟着暗，再点就是整根显示回来）。
+- **房间树**：直段行的眼睛按 (所属 BRAN, 身份) 读逐段账，点它只动这一段；已装进场景的直段计入所属 BRAN 单元的 全 / 半 / 无 聚合，没装的
+  （老服务端没给身份）不计，免得整根已显示被说成半可见。段还没以身份进场景时点眼睛只是一句提示（先显示所属 BRAN / 这批记录没带身份），
+  不记方向。右键菜单的「显示 / 隐藏」对直段行也开放，隔离与加载仍不摆。
+- **不做**：逐段的显隐不进取回工作的隐藏回放快照，隔离一进一出也按 refno 整根恢复——两处快照都是按 refno 记的，逐段结果会被整根盖回去；
+  这是「整根指令盖过逐段」的同一句话，不另开一套按段的快照。
+
 ## 后果
 
 - gen-model / plant3d-web 一字不改；两端看到的是同一棵树。
 - 「孤直段」（管件全在范围外、只有直段穿过）列不出——服务端已知漏洞，照样带过来。
 - 房间体制未就绪时只能显原因，与 plant3d-web 一致。
-- 逐段眼睛、Web 端浏览器验收是阶段四，不在本次验收里（代码从第一行起按两端共用写，`ehttp` / `web_time`）。
+- 阶段四（Web 端浏览器验收、直段逐段眼睛）已做；三维场景的模型记录从 `GeomInstQuery` 换成 `plant_ui::ModelRecord`（`Deref` 到前者），
+  读字段的代码不变，只有装场景的入口换了类型。库供数路径的直段没有身份，房间树里它们的眼睛停「未加载」（房间树本来就只在服务供数下有）。

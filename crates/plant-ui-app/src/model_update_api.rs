@@ -1161,8 +1161,9 @@ fn cleanup_path(
 
 #[derive(Debug, Deserialize)]
 struct ModelRecordsPage {
+    /// 每条 = `GeomInstQuery` 原样 + 直段记录才有的 `tube{ordinal,from,to}`（房间树逐段眼睛的身份，ADR-0033 阶段四）。
     #[serde(default)]
-    items: Vec<aios_core::GeomInstQuery>,
+    items: Vec<plant_ui::ModelRecord>,
     next_cursor: Option<usize>,
     /// `model-memory` / `model-database`——这一页是从哪儿读的（老字段）。
     #[serde(default)]
@@ -1185,7 +1186,7 @@ impl ModelRecordsPage {
 /// 还在吃内存投影」。
 #[derive(Debug, Default)]
 pub struct ModelRecords {
-    pub records: Vec<aios_core::GeomInstQuery>,
+    pub records: Vec<plant_ui::ModelRecord>,
     /// dbnum 升序；老服务端没给 dbnum 的那一桶键为 `None`。
     pub sources: Vec<(Option<u32>, ModelSource)>,
 }

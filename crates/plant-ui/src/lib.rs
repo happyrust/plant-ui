@@ -32,6 +32,15 @@ pub enum ModelAction {
         refnos: Vec<aios_core::RefU64>,
         visible: bool,
     },
+    /// 只显隐一根 BRAN 名下点名的**几条直段**（房间树直段行的眼睛，ADR-0033 阶段四）。直段没有自己的
+    /// refno——它以所属 BRAN 的 refno 进场景，`SetVisible` 按 refno 一动就是整根连同全部管身；这条按
+    /// [`TubeSegment`] 点名其中几条。之后对这根 BRAN 的 `SetVisible` / `HideAll` / `ShowAll` / 隔离照旧
+    /// 整根生效，把逐段的结果一并盖掉；没带直段身份进场景的记录（库供数 / 老服务端）这条点不到。
+    SetTubeSegmentsVisible {
+        bran: aios_core::RefU64,
+        segments: Vec<TubeSegment>,
+        visible: bool,
+    },
     /// 从三维场景中卸载这些模型及其网格。
     ///
     /// 与 `SetVisible(false)` 不同，卸载会同时释放场景实体与渲染状态；用于 GET WORK
@@ -91,6 +100,41 @@ pub enum IsolateMatching {
     /// 分支的 refno 渲染，分支进了目标只说明它的直段是截断候选。按 owner 展开的话，整根分支连同墙外
     /// 的阀门都会亮起来。
     Exact,
+}
+
+/// 一条直段（隐式管身）在所属 BRAN 内的身份：两端构件（`a_b`）+ 同两端之间的序号。与 gen-model
+/// `/model/records` 每条记录的 `tube{ordinal,from,to}` 和 `/spatial/rooms/{room}/tree` 的 `tubes[]`
+/// 同一套编码，房间树的直段行靠它点名场景里的那一根（ADR-0033 阶段四）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct TubeSegment {
+    pub ordinal: u32,
+    pub from: String,
+    pub to: String,
+}
+
+/// 进三维场景的一条模型记录：[`aios_core::GeomInstQuery`] 原样（`serde(flatten)`，与 gen-model 读面的
+/// `ModelRecord` 同形）+ 直段记录才带的身份。库供数与老服务端没有 `tube`，那样的记录在场景里只按
+/// refno 认，与从前一样；`Deref` 到几何记录本身，读字段的代码不必改。
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ModelRecord {
+    #[serde(flatten)]
+    pub model: aios_core::GeomInstQuery,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tube: Option<TubeSegment>,
+}
+
+impl From<aios_core::GeomInstQuery> for ModelRecord {
+    fn from(model: aios_core::GeomInstQuery) -> Self {
+        Self { model, tube: None }
+    }
+}
+
+impl std::ops::Deref for ModelRecord {
+    type Target = aios_core::GeomInstQuery;
+
+    fn deref(&self) -> &Self::Target {
+        &self.model
+    }
 }
 
 /// 三维视口里的一次相机运动。键位见 `view3d::camera`：左键 / 中键平移、
@@ -752,6 +796,51 @@ mod tests {
             !cmd.contains("CleanupConfirm") && !cmd.contains("RegenerateConfirm"),
             "两件事一个确认框、一条回执: {cmd}"
         );
+    }
+
+    /// `/model/records` 的一条按 gen-model 的形状进来：`GeomInstQuery` 的键在顶层（flatten），直段记录
+    /// 多一格 `tube`；没有 `tube` 的老记录照常读成 `None`，序列化回去也不会凭空多出这一格。
+    #[test]
+    fn a_model_record_reads_the_gen_model_shape_with_or_without_a_tube() {
+        let raw = serde_json::json!({
+            "refno": "24384_26229",
+            "old_refno": null,
+            "owner": "24384_26229",
+            "world_aabb": {"mins": [0.0, 0.0, 0.0], "maxs": [30.0, 30.0, 196.5]},
+            "world_trans": {
+                "translation": [0.0, 0.0, 0.0],
+                "rotation": [0.0, 0.0, 0.0, 1.0],
+                "scale": [30.0, 30.0, 196.5]
+            },
+            "insts": [{"geo_hash": "2714441752093137411", "is_tubi": true}],
+            "has_neg": false,
+            "generic": "TUBI",
+            "pts": null,
+            "date": null,
+            "tube": {"ordinal": 2, "from": "24384_1", "to": "24384_2"}
+        });
+        let record: super::ModelRecord = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(record.refno.refno().to_string(), "24384_26229");
+        assert_eq!(record.generic, "TUBI");
+        assert_eq!(record.insts.len(), 1);
+        assert!(record.insts[0].is_tubi);
+        assert_eq!(
+            record.tube,
+            Some(super::TubeSegment {
+                ordinal: 2,
+                from: "24384_1".into(),
+                to: "24384_2".into(),
+            })
+        );
+        let back = serde_json::to_value(&record).unwrap();
+        assert_eq!(back["tube"], raw["tube"]);
+        assert_eq!(back["generic"], "TUBI", "flatten：几何记录的键仍在顶层");
+
+        let mut legacy = raw;
+        legacy.as_object_mut().unwrap().remove("tube");
+        let record: super::ModelRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!(record.tube, None);
+        assert!(serde_json::to_value(&record).unwrap().get("tube").is_none());
     }
 
     use super::{
