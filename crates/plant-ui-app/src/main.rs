@@ -766,9 +766,7 @@ fn show_app(
                     view3d.resize(size);
                 }
             }
-            Cmd::SetViewportBackground { top, bottom, grid } => {
-                view3d.set_background(top, bottom, grid)
-            }
+            Cmd::SetViewportGrid(grid) => view3d.set_grid_color(grid),
             Cmd::SetViewportLook(look) => view3d.set_look(look),
             Cmd::SnapView { forward, up, fit } => view3d.snap(forward, up, fit),
             Cmd::RestoreCamera(pose) => view3d.restore_camera(pose),
@@ -1504,10 +1502,11 @@ struct App {
     #[cfg(not(target_arch = "wasm32"))]
     mesh_dir_pick: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
     font_weights_pending: bool,
-    /// 上一次发给三维视口的主题配色。视口的渐变背景画在宿主侧（拷问定案第 2 题），
-    /// 主题一换就要把新颜色送下去；对着这份留底比对，别把同一套颜色每帧发一遍。
-    sent_viewport_bg: Option<(egui::Color32, egui::Color32, egui::Color32)>,
-    /// 上一次发给三维视口的外观（E3D 外观移植计划）。与 `sent_viewport_bg` 同一条房规：对着已存设置比对，
+    /// 上一次发给三维视口的主题网格线色。网格在三维侧重建、主题只有绘制层认识，
+    /// 主题一换就要把新颜色送下去；对着这份留底比对，别把同一个颜色每帧发一遍。
+    /// 视口底色不经三维侧：绘制层每帧按外观（`look_background`）画在视口纹理底下。
+    sent_viewport_grid: Option<egui::Color32>,
+    /// 上一次发给三维视口的外观（E3D 外观移植计划）。与 `sent_viewport_grid` 同一条房规：对着已存设置比对，
     /// 变了才发一整份；设置的写入口不止设置窗一处（恢复默认值、将来的 URL 覆盖），这里只认结果。
     sent_look: Option<plant_ui::ViewportLook>,
 }
@@ -2474,7 +2473,7 @@ impl App {
             #[cfg(not(target_arch = "wasm32"))]
             mesh_dir_pick: None,
             font_weights_pending,
-            sent_viewport_bg: None,
+            sent_viewport_grid: None,
             sent_look: None,
         };
         // 队列的明细通道进程一起来就开：队列是常驻视图，不像向导那样跟着某一次
@@ -4710,7 +4709,7 @@ impl App {
                 command @ (Cmd::PickViewport(_)
                 | Cmd::Camera(_)
                 | Cmd::ResizeViewport(_)
-                | Cmd::SetViewportBackground { .. }
+                | Cmd::SetViewportGrid(_)
                 | Cmd::SetViewportLook(_)
                 | Cmd::SnapView { .. }
                 | Cmd::RestoreCamera(_)
@@ -10164,16 +10163,11 @@ impl App {
         }
         let t = theme_tokens::current();
         let d = self.settings_state.saved.density;
-        // 首帧与每次换主题，把视口配色送给三维侧。对着当前生效令牌比对而不是
-        // 监听设置变更：主题的写入口不止设置窗一处，这里只认结果。
-        let viewport_bg = (t.viewport_top, t.viewport_bottom, t.viewport_grid);
-        if self.sent_viewport_bg != Some(viewport_bg) {
-            self.sent_viewport_bg = Some(viewport_bg);
-            self.view3d_commands.push(Cmd::SetViewportBackground {
-                top: t.viewport_top,
-                bottom: t.viewport_bottom,
-                grid: t.viewport_grid,
-            });
+        // 首帧与每次换主题，把网格线色送给三维侧（视口底色由绘制层画，不经三维侧）。对着当前生效令牌
+        // 比对而不是监听设置变更：主题的写入口不止设置窗一处，这里只认结果。
+        if self.sent_viewport_grid != Some(t.viewport_grid) {
+            self.sent_viewport_grid = Some(t.viewport_grid);
+            self.view3d_commands.push(Cmd::SetViewportGrid(t.viewport_grid));
         }
         // 同理把三维外观送下去：首帧一次，之后只在已存设置变了时发（设置窗「保存」落到 saved 的那一帧）。
         let look = self.settings_state.saved.look;

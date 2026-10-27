@@ -427,8 +427,8 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
 @group(0) @binding(6) var normal_tex: texture_2d<f32>;
 
 // 调试直出（`?look_debug=…` / `--look-debug=…`，Rust 侧 `SglLookDebugView`）：把后处理链的中间量当颜色画出来，
-// 查两端画面差异用。px 是 ND 分辨率的像素，block 是它所在的屏幕像素；背景一律黑。两样效果都关时 ND / HLR 没跑，
-// 直出的是纹理缓存里上一次的内容。
+// 查两端画面差异用。px 是 ND 分辨率的像素，block 是它所在的屏幕像素；背景一律黑。两样效果都关时 ND / HLR 没跑、
+// 中间纹理只是 1×1 占位，直出一片黑。
 fn debug_colour(mode: u32, px: vec2<i32>, block: vec2<i32>) -> vec3<f32> {
     let nd = textureLoad(nd_tex, px, 0);
     let depth = decode_linear_depth(textureLoad(normal_tex, px, 0).rgb);

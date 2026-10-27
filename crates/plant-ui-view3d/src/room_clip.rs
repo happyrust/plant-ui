@@ -1470,10 +1470,6 @@ mod tests {
             .init_asset::<crate::e3d_look::material::SglLookMaterial>()
             .init_resource::<crate::look_materials::LookMaterials>()
             .insert_resource(crate::e3d_look::env_cube::SglEnvCube(None))
-            .insert_resource(crate::InvalidTubiLineStateMaterials {
-                highlight: Handle::default(),
-                xray: Handle::default(),
-            })
             .add_systems(Update, crate::apply_materials.after(advance_room_clip));
         // PBR 外观：材质是 StandardMaterial，断口的剖切色也是，一把尺子量到底。
         app.world_mut().resource_mut::<View3d>().look.mode = plant_ui::LookMode::Pbr;

@@ -454,7 +454,7 @@ pub enum Cmd {
     /// 宿主 → 视口：把相机送回一份记下的位姿（导航历史回放）。
     ///
     /// 与 `SnapView` 走同一条 0.3s 插值动画，中途任何手势立即让位。绘制层不会发它
-    /// ——它和 `ResizeViewport` / `SetViewportBackground` 一样，只是借这条队列过路。
+    /// ——它和 `ResizeViewport` / `SetViewportGrid` 一样，只是借这条队列过路。
     RestoreCamera(CameraPose),
     /// 模型树上的选择集变更（Ctrl 加减 / Shift 区间）。
     ///
@@ -648,21 +648,17 @@ pub enum Cmd {
     /// 树范围聚焦：查这个节点下已生成产物的包围盒并取景。只查不生（ADR-0030 D1）：
     /// 范围内没有已生成的模型就相机不动、日志提示右键「重新生成模型」。
     FocusTreeScope(RefU64),
-    /// 主题下发的三维视口配色：渐变背景上下两色与地面网格线色。
+    /// 主题下发的三维视口地面网格线色。
     ///
-    /// 背景渐变画在宿主的全屏背景面片上（拷问定案第 2 题，用户点名 Bevy 内画），
-    /// 而主题只有绘制层认识，所以切主题的当帧由 App 把三个颜色送下去；宿主无状态，
-    /// 不认识「主题」，只认颜色。
-    SetViewportBackground {
-        top: egui::Color32,
-        bottom: egui::Color32,
-        grid: egui::Color32,
-    },
+    /// 网格线是宿主（Bevy）侧重建的网格，而主题只有绘制层认识，所以切主题的当帧由 App 把颜色送下去；
+    /// 宿主无状态，不认识「主题」，只认颜色。视口底色不经这里：它是绘制层画在视口纹理底下的渐变
+    /// （App 每帧经 `look_background()` 按外观填——PBR 外观用主题 tokens，E3D 外观用 E3D 的 grey→白），
+    /// E3D 外观下后处理的合成段还会把同一份底色画进离屏图。
+    SetViewportGrid(egui::Color32),
     /// 设置下发的三维视口外观（E3D 外观移植计划）：外观 / 预设 / 四个子开关 / 元素配色一次整份送下去。
     ///
-    /// 与 [`Self::SetViewportBackground`] 同理：宿主无状态，不认识「设置」，只认结果；首帧与每次设置变更由
-    /// App 发，视口照它换材质、换背景、挂 / 摘后处理。E3D 外观下背景不再跟主题（是 E3D 的 grey→白），
-    /// 但主题色照收照记，切回 PBR 时还原。
+    /// 与 [`Self::SetViewportGrid`] 同理：宿主无状态，不认识「设置」，只认结果；首帧与每次设置变更由
+    /// App 发，视口照它换材质、挂 / 摘后处理。底色随外观走但不归宿主记：切回 PBR 是绘制层重新按主题画。
     SetViewportLook(ViewportLook),
     /// ViewCube 触发的一次视角跳转。
     ///

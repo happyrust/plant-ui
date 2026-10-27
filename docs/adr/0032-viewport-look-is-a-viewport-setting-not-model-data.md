@@ -87,13 +87,19 @@ ND 纹理是 `Rgba32Float`（能当颜色附件就用；同来源 `_ndType = can
 9. **GPU 间接绘制的逃生口** `PLANT_UI_INDIRECT_DRAW=0`（主相机挂 Bevy `NoIndirectDrawing`，退到 `PreprocessingOnly`），计划里没有：2026-10-25 本机 RX 590 + Vulkan 上
    Bevy 0.16 的间接路径让 prepass 整段不落笔（边线 / 伪阴影全无；上游 bevy#18904 / #19000 同类机器相关缺陷），直接 draw 或 DX12 即好。缺省不开：整库直接 draw
    全视 24–26 fps，同场景 DX12 间接绘制 32–34 fps，Vulkan 间接正常那天 47–57 fps；本机首选 `WGPU_BACKEND=dx12`。启动时 `[渲染]` 一行报适配器 / 后端 / 开关（evidence §4.4 末尾）。用户 2026-10-25 拍板：Windows 缺省后端不改。
+10. **视口底色归绘制层，Bevy 不画**（2026-10-26）：拆掉那台从不出图的 Bevy 背景相机（`order −1`、`is_active: false`，连同 `BACKGROUND_LAYER` 上的渐变面片与 `BackgroundMesh`）。视口底色一直是 egui 在纹理底下画的那层（E3D 下再由合成段把背景渐变画进离屏图），那条路只是每帧占着一个相机实体、一张 mesh 和一条只改顶点色、谁也看不见的命令。
+   主题送三维侧的只剩网格线色：`Cmd::SetViewportBackground { top, bottom, grid }` → `Cmd::SetViewportGrid(grid)`，`View3d::set_background` → `set_grid_color`，`ViewCommand::Background` → `GridColor`。
+   这推翻了计划阶段「拷问定案第 2 题」里「用户点名在 Bevy 内画背景」的原始口径——那条从未真正生效过（相机自 2026-10-22 起就 `is_active: false`），本条件把现状写进定案，画面不变。
+11. **legacy 的屏幕空间无效 TUBI 带**（2026-10-26）：拆掉 `InvalidTubiLineMaterial` + `invalid_tubi_line.wgsl`、`InvalidTubiLine` 组件、`InvalidTubiLineMesh` / `InvalidTubiLineStateMaterials` 资源、`MaterialState::choose` 与五个 `*_PX` 常量。
+   生产里无效 TUBI 早已是 `ModelMesh { line: true }` 经 `LookMaterials` 取材质，那条路径没有任何 spawn 点，只剩测试在自己造实体。`invalid_tubi_fallback_line_mesh`（按真实长度切段的 `LineList`）与 `INVALID_TUBI_DASH_MM / GAP_MM` 是生产路径，照留。
+12. **两样效果都关时不挂 prepass**（2026-10-26）：legacy 下相机不再挂 `NormalPrepass`，后处理的中间纹理只分配 1×1 占位——那时 ND / HBAO / HLR 一段都不跑、法线纹理没人读，整库场景白跑的那一遍 prepass（§4.2 量过 3–5 ms）与超采样下几十 MB 的 ND 都省下来；`SglLookNode` 的 `ViewPrepassTextures` 改为可选，合成照跑。
 
 ## 后果
 
 - **老用户第一眼就不一样**：升级即 E3D 外观。补偿是设置窗一键回 web PBR、启动日志一句、CHANGELOG 第一条。
 - **两套材质类型并存**：换外观是换组件类型不是改 uniform，所以任何「自己持 `Handle<StandardMaterial>` 换材质」的新代码都会在 E3D 外观下出错；
   一律经 `LookMaterials::resolve`。
-- **显存**：超采样下 1500×800 视口的离屏图 + ND + HLR + 去杂 + AO / 模糊 ≈ 100 MB（ND 从 f16 换 f32 多出约 40 MB；下游读它的带宽也翻倍）；超宽窗的物理尺寸夹在 `max_texture_dimension_2d`。
+- **显存**：超采样下 1500×800 视口（离屏图 3000×1600）粗算 ≈ 180 MB：离屏图 19 + Bevy 主纹理 a/b 38 + prepass 深度 / 法线 38 + ND f32 77 + HLR 5 + 屏幕分辨率的 AO / 模糊 / 去杂四张 5（ND 从 f16 换 f32 多出约 38 MB；下游读它的带宽也翻倍）；两样效果都关时不挂 prepass、中间纹理只是 1×1 占位，只剩离屏图 + 主纹理。超宽窗的物理尺寸夹在 `max_texture_dimension_2d`。
 - **浏览器端头几帧**：egui 在 bevy_egui 算好相机前按 10000×10000 布局，宿主按「视口不可能比窗口大」挡掉那一帧的渲染目标请求；
   离屏图不带 CPU 数据（WebGL2 不收 BGRA 上传）。这两条与外观无关，但是超采样把它们从「报错一行」放大成「丢上下文」。
 - **已知偏差要说出口**：半透明不进边线 / 伪阴影（D4）、SSAA 代 MSAA（D5）、没做 autocolour / Laser / SHINY 分支（来源侧也没做）。

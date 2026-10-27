@@ -23,8 +23,11 @@ const WEB_MESH_DIR_HINT: &str = "浏览器端的网格与字体贴图一样由�
 /// WebGL2 降级）还不可用，翻成 false 就把那格灰掉并悬停说明；设置里的值照存照发。
 const POST_EFFECTS_AVAILABLE: bool = true;
 const ANTI_ALIAS_AVAILABLE: bool = true;
-const PENDING_HINT: &str =
-    "这一格的实现还在路上（见 docs/plans/2026-10-22-e3d-look-port-plannotator.md），落地前不生效";
+const PENDING_HINT: &str = "这一格在这个端还没落地，落地前不生效";
+/// 设备跑不了后处理时「抗锯齿」那一行的悬停说明：超采样与 FXAA 都跟着边线 / 伪阴影那条链走
+///（`render_scale_for` / `sync_camera_look` 看的是同一个能力位），那台设备上留的是 MSAA 4×。
+const AA_LOCK_HINT: &str =
+    "这台设备没有半浮点颜色附件，超采样与 FXAA 在这里不生效，抗锯齿走默认的 MSAA 4×；设置照存，换台机器就有";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Theme {
@@ -513,8 +516,10 @@ fn look_rows(
         "抗锯齿",
         "E3D 出厂是 4× MSAA；这里用整帧 2×2 超采样代替（颜色与边线都是 4 样本平均），FXAA 更便宜",
         |ui| {
+            // 超采样 / FXAA 与边线 / 伪阴影同一把锁：设备跑不了后处理时它们也不生效（留 MSAA 4×）。
+            let aa_ok = ANTI_ALIAS_AVAILABLE && post_effects_lock.is_none();
             let response = ui
-                .add_enabled_ui(e3d && ANTI_ALIAS_AVAILABLE, |ui| {
+                .add_enabled_ui(e3d && aa_ok, |ui| {
                     widgets::segmented(
                         ui,
                         t,
@@ -529,7 +534,11 @@ fn look_rows(
                 })
                 .response;
             if e3d {
-                response.on_disabled_hover_text(PENDING_HINT);
+                response.on_disabled_hover_text(if post_effects_lock.is_some() {
+                    AA_LOCK_HINT
+                } else {
+                    PENDING_HINT
+                });
             }
         },
     );
@@ -887,9 +896,11 @@ mod tests {
         );
     }
 
-    /// 渲染器说这台设备没有半浮点颜色附件：边线 / 伪阴影两格灰掉，其它格照旧；锁撤了就亮回来。
+    /// 渲染器说这台设备没有半浮点颜色附件：边线 / 伪阴影两格连同「抗锯齿」那一行灰掉（超采样 / FXAA 在那台设备上
+    /// 同样不生效），其它格照旧；锁撤了就亮回来。抗锯齿是分段控件，egui 给它登记几个控件矩形是实现细节，
+    /// 所以只夹在「比两格多」与「比切到 web PBR 整节灰掉少」之间，不钉死数目。
     #[test]
-    fn a_device_without_float_targets_greys_the_two_effect_rows() {
+    fn a_device_without_float_targets_greys_the_effect_rows_and_anti_alias() {
         let ctx = egui::Context::default();
         let mut state = State::default();
         state.open();
@@ -903,12 +914,25 @@ mod tests {
         for _ in 0..3 {
             one_frame(&ctx, &mut state);
         }
-        assert_eq!(disabled_widgets(&ctx), baseline + 2, "边线与伪阴影两格灰掉");
+        let locked = disabled_widgets(&ctx);
+        assert!(
+            locked > baseline + 2,
+            "边线、伪阴影两格之外抗锯齿那一行也该灰：{locked} ≤ {baseline} + 2"
+        );
 
         state.post_effects_lock = None;
         for _ in 0..3 {
             one_frame(&ctx, &mut state);
         }
-        assert_eq!(disabled_widgets(&ctx), baseline);
+        assert_eq!(disabled_widgets(&ctx), baseline, "锁一撤全亮回来");
+
+        state.draft.look.mode = LookMode::Pbr;
+        for _ in 0..3 {
+            one_frame(&ctx, &mut state);
+        }
+        assert!(
+            disabled_widgets(&ctx) > locked,
+            "锁只灰三行；切到 web PBR 整节（预设 / 配色 / 渐变 / 恢复按钮）都灰，必须更多"
+        );
     }
 }

@@ -9,7 +9,8 @@
 //!
 //! 参数全部照搬 plant3d-web `sglLookPipeline.ts`（E3D 3.1 sglDx11 逆向），毫米换成世界单位（1 单位 = 100 mm）。
 //! 相机上的 [`SglLookPost`] 是开关与参数：PBR 外观时不提取到渲染世界，节点整个不跑；E3D 外观下两样效果
-//! 都关也照跑合成——背景渐变与超采样的字节域平均都在合成里做。
+//! 都关也照跑合成——背景渐变与超采样的字节域平均都在合成里做（那时相机不挂 prepass、中间纹理只是 1×1 占位，
+//! ND / HBAO / HLR 一段都不跑）。
 
 use std::f32::consts::FRAC_PI_6;
 
@@ -324,6 +325,7 @@ struct SglLookLabel;
 
 /// 每个视图的中间纹理。`nd` / `hlr` 全分辨率；`ao` / `blur` / `ao_blurred` / `declutter` 按 `ao_scale` 缩小
 /// （超采样时 = 屏幕分辨率）。`nd`：rgb = 面法线 × 标记长度、a = 线性深度，格式见 [`nd_texture_format`]；其余单通道 0..1。
+/// 两样效果都关时全是 1×1 占位：没人写也没人读，只为合成的绑定组存在。
 #[derive(Component)]
 struct SglLookTextures {
     nd: CachedTexture,
@@ -342,7 +344,17 @@ fn prepare_textures(
     views: Query<(Entity, &ViewTarget, &SglLookPost)>,
 ) {
     for (entity, target, post) in &views {
-        let size = target.main_texture().size();
+        // 两样效果都关（legacy）：ND / HBAO / HLR 一段都不跑，合成只读颜色；中间纹理只为绑定组存在，给 1×1 占位，
+        // 别按全分辨率白占显存（超采样下 ND 一张 f32 就是几十 MB）。调试直出在这个口径下本来就没有东西可看。
+        let size = if post.effects_off() {
+            Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            }
+        } else {
+            target.main_texture().size()
+        };
         let scale = post.ao_scale();
         let ao_size = Extent3d {
             width: size.width.div_ceil(scale).max(1),
@@ -643,7 +655,8 @@ struct SglLookNode;
 impl ViewNode for SglLookNode {
     type ViewQuery = (
         &'static ViewTarget,
-        &'static ViewPrepassTextures,
+        // 两样效果都关时相机不挂 prepass（`sync_camera_look`），合成照跑，所以是可选的。
+        Option<&'static ViewPrepassTextures>,
         &'static ViewUniformOffset,
         &'static SglLookTextures,
         &'static DynamicUniformIndex<SglLookPost>,
@@ -687,9 +700,11 @@ impl ViewNode for SglLookNode {
         else {
             return Ok(());
         };
-        let Some(normal) = prepass.normal_view() else {
+        // 法线纹理只在至少开一样效果时存在；两样都关时合成不读它，调试直出那一格绑 ND 顶位。
+        let normal = prepass.and_then(ViewPrepassTextures::normal_view);
+        if normal.is_none() && !settings.effects_off() {
             return Ok(());
-        };
+        }
         let Some(view_binding) = world.resource::<ViewUniforms>().uniforms.binding() else {
             return Ok(());
         };
@@ -705,7 +720,7 @@ impl ViewNode for SglLookNode {
 
         // ① ND：prepass 法线纹理（线性深度 + 标记）→ 面法线 × 标记长度、线性深度（两样效果都关时没人读，不跑）。
         // 不读硬件深度纹理：WebGL2 的 GLSL 后端做不了深度纹理的 textureLoad（阶段四 spike 实测）。
-        if !settings.effects_off() {
+        if let Some(normal) = normal.filter(|_| !settings.effects_off()) {
             let nd_bind_group = device.create_bind_group(
                 "sgl look nd bind group",
                 &pipelines.nd_layout,
@@ -825,7 +840,7 @@ impl ViewNode for SglLookNode {
                 &textures.ao_blurred.default_view,
                 &textures.nd.default_view,
                 &textures.hlr.default_view,
-                normal,
+                normal.unwrap_or(&textures.nd.default_view),
             )),
         );
         draw_fullscreen(
