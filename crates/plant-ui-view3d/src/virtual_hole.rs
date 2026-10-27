@@ -106,6 +106,8 @@ enum InstanceState {
         status: BooleanStatus,
         mesh: Option<MeshData>,
         error: Option<String>,
+        /// 后端报的耗时；没进过后端（粗筛 / 超时 / 卸载）为 0。
+        elapsed_ms: u64,
     },
 }
 
@@ -161,7 +163,9 @@ pub(crate) struct HolePreview {
     /// 当前层上的孔洞（与宿主 `SetLayer` 同序）。
     holes: Vec<VirtualHole>,
     selected: Option<String>,
-    backend: Box<dyn BooleanPreviewBackend>,
+    /// 布尔后端，第一次要提作业才建（[`Self::backend`]）：浏览器端建它 = 起一个 module Worker 并下载 manifold 的
+    /// wasm，没导过孔洞表的页面不该为它买单；原生端是一条工作线程，晚起也没损失。
+    backend: Option<Box<dyn BooleanPreviewBackend>>,
     /// 进行中的布尔作业。
     pending: Vec<PendingJob>,
     /// 已落地的预览，按目标归堆。
@@ -180,12 +184,24 @@ impl HolePreview {
             layer: None,
             holes: Vec::new(),
             selected: None,
-            backend: plant_csg::backend(),
+            backend: None,
             pending: Vec::new(),
             previews: HashMap::new(),
             show_original: false,
             xray: false,
             next_job: 1,
+        }
+    }
+}
+
+impl HolePreview {
+    /// 让后端忘掉一个网格键。后端还没建过就什么都没缓存过，不为了忘记而把它建起来；键 0 = 还没算过，也没什么可忘。
+    fn forget(&mut self, mesh_key: u64) {
+        if mesh_key == 0 {
+            return;
+        }
+        if let Some(backend) = &mut self.backend {
+            backend.forget(mesh_key);
         }
     }
 }
@@ -349,10 +365,11 @@ fn preview_render_mesh(data: &MeshData) -> Mesh {
     mesh
 }
 
-/// 恢复一个目标的全部替换：网格句柄换回原始，记账清掉，后端缓存按内容键清。
+/// 恢复一个目标的全部替换：网格句柄换回原始，记账清掉，后端缓存按内容键清。`preview` 已从 `holes.previews`
+/// 里摘出来，这里只借 `holes` 去碰后端。
 fn restore_preview(
     commands: &mut Commands,
-    backend: &mut dyn BooleanPreviewBackend,
+    holes: &mut HolePreview,
     preview: &mut TargetPreview,
     mesh3ds: &mut Query<&mut Mesh3d>,
 ) {
@@ -365,7 +382,7 @@ fn restore_preview(
         }
     }
     for key in preview.mesh_keys.drain(..) {
-        backend.forget(key);
+        holes.forget(key);
     }
 }
 
@@ -455,20 +472,13 @@ pub(crate) fn apply_virtual_hole_ops(
             } => {
                 // 重发同一目标：旧的预览先整批恢复，在途作业丢掉（回执靠帧号作废）。
                 if let Some(mut old) = holes.previews.remove(&target) {
-                    restore_preview(
-                        &mut commands,
-                        &mut *holes.backend,
-                        &mut old,
-                        &mut mesh_params.p1(),
-                    );
+                    restore_preview(&mut commands, &mut holes, &mut old, &mut mesh_params.p1());
                 }
                 let (keep, removed): (Vec<PendingJob>, Vec<PendingJob>) =
                     holes.pending.drain(..).partition(|job| job.target != target);
                 for job in &removed {
                     for instance in &job.instances {
-                        if instance.mesh_key != 0 {
-                            holes.backend.forget(instance.mesh_key);
-                        }
+                        holes.forget(instance.mesh_key);
                     }
                 }
                 holes.pending = keep;
@@ -563,18 +573,11 @@ pub(crate) fn apply_virtual_hole_ops(
                 let previews: Vec<TargetPreview> =
                     holes.previews.drain().map(|(_, preview)| preview).collect();
                 for mut preview in previews {
-                    restore_preview(
-                        &mut commands,
-                        &mut *holes.backend,
-                        &mut preview,
-                        &mut mesh_params.p1(),
-                    );
+                    restore_preview(&mut commands, &mut holes, &mut preview, &mut mesh_params.p1());
                 }
                 for job in std::mem::take(&mut holes.pending) {
                     for instance in &job.instances {
-                        if instance.mesh_key != 0 {
-                            holes.backend.forget(instance.mesh_key);
-                        }
+                        holes.forget(instance.mesh_key);
                     }
                 }
                 if let Some(layer) = holes.layer.take() {
@@ -599,6 +602,10 @@ pub(crate) fn advance_virtual_hole(
     mut meshes: ResMut<Assets<Mesh>>,
     mut mesh3ds: Query<&mut Mesh3d>,
 ) {
+    // 没有在途作业也没有已落地的预览时什么都不用做——尤其别在这儿把后端建起来（浏览器端 = 起 Worker + 下载 wasm）。
+    if holes.pending.is_empty() && holes.previews.is_empty() {
+        return;
+    }
     // 字段级拆借：`pending` 与 `backend`/`next_job` 要在同一循环里交叉访问，
     // 不能对 `ResMut` 各拿各的（DerefMut 拿走的是整个资源）。
     let HolePreview {
@@ -608,6 +615,7 @@ pub(crate) fn advance_virtual_hole(
         previews,
         ..
     } = &mut *holes;
+    let backend = backend.get_or_insert_with(plant_csg::backend);
     // 1. 等网格的实例：拿到网格就做粗筛、提交作业；超时按失败落账。
     for job in pending.iter_mut() {
         for instance in &mut job.instances {
@@ -619,6 +627,7 @@ pub(crate) fn advance_virtual_hole(
                     status: BooleanStatus::Failed,
                     mesh: None,
                     error: Some("实例已卸载".into()),
+                    elapsed_ms: 0,
                 };
                 continue;
             };
@@ -628,6 +637,7 @@ pub(crate) fn advance_virtual_hole(
                         status: BooleanStatus::Failed,
                         mesh: None,
                         error: Some("网格加载超时".into()),
+                        elapsed_ms: 0,
                     };
                 }
                 continue;
@@ -637,6 +647,7 @@ pub(crate) fn advance_virtual_hole(
                     status: BooleanStatus::Failed,
                     mesh: None,
                     error: Some("网格不是三角形列表".into()),
+                    elapsed_ms: 0,
                 };
                 continue;
             };
@@ -657,6 +668,7 @@ pub(crate) fn advance_virtual_hole(
                     status: BooleanStatus::NoIntersection,
                     mesh: None,
                     error: None,
+                    elapsed_ms: 0,
                 };
                 continue;
             }
@@ -699,11 +711,13 @@ pub(crate) fn advance_virtual_hole(
                 status: BooleanStatus::Failed,
                 mesh: None,
                 error: Some("布尔后端反复索要网格".into()),
+                elapsed_ms: outcome.elapsed_ms,
             },
             status => InstanceState::Done {
                 status,
                 mesh: outcome.mesh,
                 error: outcome.error,
+                elapsed_ms: outcome.elapsed_ms,
             },
         };
     }
@@ -724,15 +738,19 @@ pub(crate) fn advance_virtual_hole(
         let mut all_no_intersection = true;
         let mut swapped: HashMap<Entity, SwappedMesh> = HashMap::new();
         let mut mesh_keys = Vec::new();
+        // 耗时按实例累加：一个目标的几个实例在同一条工作线程上排队算，和就是它占的总时间。
+        let mut elapsed: u64 = 0;
         for instance in &job.instances {
             let InstanceState::Done {
                 status,
                 mesh,
                 error: instance_error,
+                elapsed_ms,
             } = &instance.state
             else {
                 continue;
             };
+            elapsed = elapsed.saturating_add(*elapsed_ms);
             match status {
                 BooleanStatus::Failed => {
                     error = Some(
@@ -812,7 +830,7 @@ pub(crate) fn advance_virtual_hole(
             } else {
                 None
             }),
-            elapsed_ms: 0,
+            elapsed_ms: elapsed.min(u64::from(u32::MAX)) as u32,
         });
     }
 
@@ -982,7 +1000,7 @@ mod tests {
                     .chain(),
             );
         // 把真后端换成假后端。
-        app.world_mut().resource_mut::<HolePreview>().backend = Box::new(backend);
+        app.world_mut().resource_mut::<HolePreview>().backend = Some(Box::new(backend));
         (app, outbox)
     }
 
@@ -1208,6 +1226,10 @@ mod tests {
         assert_eq!(receipts[0].hole_ids, vec!["H1".to_string()]);
         assert!(!receipts[0].no_instances);
         assert!(!receipts[0].dropped);
+        assert_eq!(
+            receipts[0].elapsed_ms, 3,
+            "后端报的耗时要进回执，日志里那句「N ms」靠它"
+        );
     }
 
     /// 清掉预览：原始网格整批恢复，切削体层撤掉，标记摘掉。

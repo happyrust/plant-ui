@@ -84,9 +84,18 @@ export function cacheGet(cache, key) {
   return solid;
 }
 
+// 换掉 / 淘汰的实体要 delete()：manifold-3d 是 Emscripten 绑定，不删就留在 WASM 堆里。
 export function cacheSet(cache, key, solid) {
-  if (cache.has(key)) cache.delete(key);
-  else if (cache.size >= CACHE_CAP) cache.delete(cache.keys().next().value);
+  const old = cache.get(key);
+  if (old) {
+    cache.delete(key);
+    if (old !== solid && old.delete) old.delete();
+  } else if (cache.size >= CACHE_CAP) {
+    const oldest = cache.keys().next().value;
+    const evicted = cache.get(oldest);
+    cache.delete(oldest);
+    if (evicted && evicted.delete) evicted.delete();
+  }
   cache.set(key, solid);
 }
 
@@ -112,6 +121,16 @@ function affine4x3ToMat4(affine) {
 export function runJob(mod, input) {
   const started = performance.now();
   const done = (result) => ({ elapsedMs: performance.now() - started, ...result });
+  // manifold-3d 是 Emscripten 绑定：Manifold 实体要显式 delete() 才释放 WASM 堆。作业里临时造的基元、
+  // 摆好位的切削体、差集结果都记在这儿，出口统一释放；只有进了缓存的目标实体留着（由 cacheSet / cacheDelete 管）。
+  // getMesh() 拷出来的 typed array 不随 result 一起没。
+  const transient = [];
+  const release = () => {
+    for (const solid of transient) {
+      if (solid && solid.delete) solid.delete();
+    }
+    transient.length = 0;
+  };
   try {
     let target = input.target;
     if (!target) {
@@ -125,6 +144,7 @@ export function runJob(mod, input) {
       // 状态非 NoError 会抛 ManifoldError——与原生端 ingest 失败同口径。
       target = mod.Manifold.ofMesh(mesh);
       if (input.cache) cacheSet(input.cache, input.meshKey, target);
+      else transient.push(target);
     }
     const volumeBefore = target.volume();
     const triBefore = target.numTri();
@@ -136,14 +156,16 @@ export function runJob(mod, input) {
         c.shape === 'Circle'
           ? mod.Manifold.cylinder(1.0, 0.5, 0.5, Math.max(3, c.segments | 0), true)
           : mod.Manifold.cube(1.0, 1.0, 1.0, true);
-      group.push(prim.transform(affine4x3ToMat4(c.affine)));
+      const placed = prim.transform(affine4x3ToMat4(c.affine));
+      transient.push(prim, placed);
+      group.push(placed);
     }
     const result = mod.Manifold.difference(group); // DifferenceN：头减其余
+    transient.push(result);
     const status = result.status();
     if (status !== 'NoError') throw new mod.ManifoldError(status);
     if (result.isEmpty()) {
       // ADR-029：空结果不覆盖原网格。
-      if (result.delete) result.delete();
       return done({ status: 'Failed', error: 'difference result is empty', volumeBefore });
     }
     const volumeAfter = result.volume();
@@ -153,12 +175,10 @@ export function runJob(mod, input) {
         NO_INTERSECTION_VOLUME_EPS * Math.max(1.0, Math.abs(volumeBefore)) &&
       triCount === triBefore;
     if (unchanged) {
-      if (result.delete) result.delete();
       return done({ status: 'NoIntersection', volumeBefore, volumeAfter, triCount });
     }
     const mesh = result.getMesh();
     const indices = dropDegenerateTris(mesh.vertProperties, mesh.triVerts);
-    if (result.delete) result.delete();
     return done({
       status: 'Changed',
       positions: mesh.vertProperties,
@@ -169,5 +189,7 @@ export function runJob(mod, input) {
     });
   } catch (err) {
     return done({ status: 'Failed', error: String((err && err.message) || err) });
+  } finally {
+    release();
   }
 }

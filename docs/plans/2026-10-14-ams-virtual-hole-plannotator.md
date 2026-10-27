@@ -210,3 +210,16 @@ trait BooleanPreviewBackend {
 实现层面的调整（不改变用户可见行为）：阶段三「统一接口」原定的 SolidHandle 句柄跨不过线程与 Worker 边界，降为按作业提交 + 轮询（submit / poll / forget），见 crates/plant-csg/src/lib.rs 的接口文档。
 
 验收记录：docs/evidence/2026-10-14-ams-virtual-hole.md。决策沉淀：ADR-0031（docs/adr/0031-virtual-hole-preview-is-memory-only.md）。
+
+## 审核修正（2026-10-26）
+
+1. **映射帧号只留会话那一份**：宿主曾另记 `hole_map_epoch`，换库 / 重连（`reset_for_reconnect`）时只加自己那份、会话 `reset()` 不加，之后每次导入两边都差 1，`Evt::VirtualHoleTargets` 全被会话当过期包丢掉，行永远「确认目标中」。现在请求带 `session.map_epoch()`，整清也进映射帧，有回归测试。
+2. **多个未加载目标的重试**：`hole_retry_pending` 从单个改成集合，谁的网格先落地谁先重发预览；原来同一拍几条 `no_instances` 回执只留最后一个。
+3. **失败行可重试**：`begin_preview` 取 `Ready | Failed`，不再只有「清除」一条出路。
+4. **重映射 / 清场重装后切削体摆回去**：`Clear` 连层一起撒（「清除」按钮说好的），但这两种场合会话里的孔洞还在，改为清完再发一次 `SetLayer`（`restore_hole_layer`）；否则「定位孔洞」静默无效、要重导入才回来。
+5. **Worker 里 manifold 对象释放**：`boolean.js` 的基元、摆好位的切削体、差集结果统一在 `finally` 里 `delete()`，`cacheSet` 淘汰 / 替换的实体也删；原来每次预览都往 WASM 堆里漏。
+6. **姿态解析**：`Ori` 认 PDMS / E3D 罗盘写法（N / S / E / W / U / D，含带负号的），给的是哪两根轴都能补出第三根；原来只认 X/Y/Z 且只认 Y+Z。
+7. **回执耗时**：`VirtualHoleReceipt.elapsed_ms` 按实例累加后端报的耗时，原来写死 0。
+8. **等不到的目标要销账**：「目标没实例 → 显示 → 等网格」那条路上，范围查空 / 网格全没加载成功 / 没有可画的几何时，这个目标下的行落 Failed 并说原因（`hole_target_verdict` / `VirtualHoleSession::fail_target`）；原来只认 `mesh_loaded > 0`，其余情形行永远「已就绪」。结算点从渲染回执改到 `rebuild_tree`（范围回包也过那里）。
+9. **「定位目标」等几何落地再取景**：目标还没加载时先显示、记 `hole_focus_pending`，画出来了再发 `Focus`；原来立刻发，视口手上还没有它的包围盒，相机不动。
+10. **后端懒建**：`HolePreview.backend` 改为第一次有作业要提才建；原来 `setup` 就建，浏览器端页面一开就起 Worker 并下载 manifold 的 wasm，哪怕从没导过孔洞表。没建过的后端不为 `forget` 而建（没算过就没缓存过）。

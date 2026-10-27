@@ -161,32 +161,55 @@ fn parse_vec3(value: &str) -> Result<[f32; 3], String> {
     Ok([p[0], p[1], p[2]])
 }
 
-/// Parse the E3D orientation strings used by the sample file. The supported
-/// form is `Y is <axis> and Z is <axis>`; the missing X axis is derived by a
-/// right-handed cross product.
+/// Parse the E3D orientation strings (`<axis> is <dir> and <axis> is <dir>`). Any two of
+/// X / Y / Z may be given (the sample file gives Y and Z); the third is derived by a
+/// right-handed cross product. Directions accept both axis names and the PDMS compass
+/// words (`N` = +Y, `E` = +X, `U` = +Z; `S` / `W` / `D` negative).
 fn parse_orientation(value: &str) -> Result<[[f32; 3]; 3], String> {
+    let mut x = None;
     let mut y = None;
     let mut z = None;
     for part in value.split(" and ") {
         let Some((lhs, rhs)) = part.split_once(" is ") else { continue };
         let v = axis(rhs.trim()).ok_or_else(|| format!("unsupported orientation {value:?}"))?;
         match lhs.trim().to_ascii_uppercase().as_str() {
+            "X" => x = Some(v),
             "Y" => y = Some(v),
             "Z" => z = Some(v),
             _ => {}
         }
     }
-    let y = y.ok_or_else(|| format!("orientation has no Y axis: {value:?}"))?;
-    let z = z.ok_or_else(|| format!("orientation has no Z axis: {value:?}"))?;
-    let x = y.cross(z).normalize_or_zero();
-    Ok([x.to_array(), y.to_array(), z.to_array()])
+    // 右手系补第三根轴：给了哪两根就叉乘出剩下那根。
+    let (x, y, z) = match (x, y, z) {
+        (Some(x), Some(y), Some(z)) => (x, y, z),
+        (None, Some(y), Some(z)) => (y.cross(z), y, z),
+        (Some(x), None, Some(z)) => (x, z.cross(x), z),
+        (Some(x), Some(y), None) => (x, y, x.cross(y)),
+        _ => {
+            return Err(format!(
+                "orientation needs two axes (e.g. `Y is N and Z is U`): {value:?}"
+            ));
+        }
+    };
+    if [x, y, z].iter().any(|axis| axis.length_squared() < 0.5) {
+        return Err(format!("orientation axes are parallel: {value:?}"));
+    }
+    Ok([
+        x.normalize_or_zero().to_array(),
+        y.normalize_or_zero().to_array(),
+        z.normalize_or_zero().to_array(),
+    ])
 }
 
+/// 一个方向词：轴名（`X` / `-Y` …）或 PDMS / E3D 的罗盘写法（`N` `S` `E` `W` `U` `D`，也认带负号的）。
 fn axis(value: &str) -> Option<glam::Vec3> {
     Some(match value.trim().to_ascii_uppercase().as_str() {
-        "X" => glam::Vec3::X, "-X" => -glam::Vec3::X,
-        "Y" => glam::Vec3::Y, "-Y" => -glam::Vec3::Y,
-        "Z" => glam::Vec3::Z, "-Z" => -glam::Vec3::Z,
+        "X" | "E" | "-W" => glam::Vec3::X,
+        "-X" | "W" | "-E" => -glam::Vec3::X,
+        "Y" | "N" | "-S" => glam::Vec3::Y,
+        "-Y" | "S" | "-N" => -glam::Vec3::Y,
+        "Z" | "U" | "-D" => glam::Vec3::Z,
+        "-Z" | "D" | "-U" => -glam::Vec3::Z,
         _ => return None,
     })
 }
@@ -364,5 +387,22 @@ pub(crate) mod tests {
     #[test]
     fn unsupported_extension_is_rejected() {
         assert!(import_bytes("holes.txt", b"x").is_err());
+    }
+
+    /// PDMS / E3D 的方向串常用罗盘写法（N=+Y、E=+X、U=+Z，S / W / D 取负）；给的是哪两根轴都能补出第三根（右手系）。
+    #[test]
+    fn compass_orientation_and_any_two_axes_are_accepted() {
+        let ori = parse_orientation("Y is N and Z is U").unwrap();
+        assert_eq!(ori, [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+        let ori = parse_orientation("X is E and Z is D").unwrap();
+        assert_eq!(ori, [[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]]);
+        let ori = parse_orientation("X is -Y and Y is X").unwrap();
+        assert_eq!(ori, [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]);
+        assert!(
+            parse_orientation("Y is N and Z is N").is_err(),
+            "两根轴平行推不出第三根"
+        );
+        assert!(parse_orientation("Y is N").is_err(), "只给一根轴不够");
+        assert!(parse_orientation("Y is NE and Z is U").is_err(), "方向词认不出就是行级错误");
     }
 }

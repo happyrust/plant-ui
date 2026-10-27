@@ -1444,16 +1444,17 @@ struct App {
     /// 虚拟孔洞会话（ADR-0031）：孔洞列表、映射与布尔状态的编排账。内存-only，
     /// 布尔结果只换三维画面，不写回正式模型。
     hole_session: VirtualHoleSession,
-    /// 虚拟孔洞映射确认（`Req::VirtualHoleTargets`）的帧号。与会话帧号分开：
-    /// 清预览也会进会话帧，那不该作废还在路上的映射回包（映射在清预览后仍然有效）。
-    hole_map_epoch: u64,
     /// 等着交给视口的虚拟孔洞图层指令（ADR-0031 阶段二 / 阶段四）。
     pending_hole_ops: Vec<VirtualHoleOp>,
     /// 虚拟孔洞表的文件选择：原生端是对话框线程，浏览器端是隐藏 input。
     hole_pick: Option<HoleFilePick>,
     /// 布尔回执「目标一个实例都没有」时的重发等待：宿主先显示模型，等网格落地
-    /// （`sync_render_states` 里看到 `mesh_loaded`）再重发同一批孔洞的预览。
-    hole_retry_pending: Option<RefU64>,
+    /// （`sync_render_states` 里看到 `mesh_loaded`）再重发同一批孔洞的预览。可能同时等好几个目标
+    /// （孔开在几面墙上、一面都没加载），所以是一个集合，谁先落地谁先重发。
+    hole_retry_pending: HashSet<RefU64>,
+    /// 「定位目标」点在还没加载的目标上：先显示它，等几何落地（视口手上才有包围盒）再取景；立刻发 `Focus`
+    /// 相机是不动的。与 `hole_retry_pending` 同一处结算（`settle_hole_waits`）。
+    hole_focus_pending: Option<RefU64>,
     /// 已经为「目标未加载」重试过的目标。每目标只重试一次——模型加载失败时
     /// 再重试也只是第二个 `no_instances`，徒增一轮空转。
     hole_target_retried: HashSet<RefU64>,
@@ -1577,6 +1578,49 @@ fn deferred_step(
         return DeferredStep::Abort;
     }
     DeferredStep::Execute
+}
+
+/// 虚拟孔洞在等的目标此刻的去向（`settle_hole_waits` 的裁决，不碰 IO）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoleTargetVerdict {
+    /// 范围在查 / 网格在装 / 默认重新生成在跑：继续等。
+    Waiting,
+    /// 目标至少有一个模型画出来了：可以做了。
+    Loaded,
+    /// 永远等不到：范围查空 / 网格全没加载成功 / 没有可画的几何。带一句原因（接在「目标 X」后面）。
+    Unavailable(&'static str),
+}
+
+/// `models` = 范围查询解出的模型（没解出过是 `None`），`actual` = 三维的实际回执（只有 settled 的模型在账上）。
+fn hole_target_verdict(
+    scope_pending: bool,
+    scope_unavailable: bool,
+    models: Option<&Vec<RefU64>>,
+    actual: &HashMap<RefU64, ModelVisibility>,
+) -> HoleTargetVerdict {
+    if let Some(models) = models.filter(|models| !models.is_empty()) {
+        let states: Vec<Option<ModelVisibility>> =
+            models.iter().map(|model| actual.get(model).copied()).collect();
+        if states.iter().flatten().any(|state| state.mesh_loaded > 0) {
+            return HoleTargetVerdict::Loaded;
+        }
+        if states.iter().all(Option::is_some) {
+            let failed = states.iter().flatten().any(|state| state.mesh_failed > 0);
+            return HoleTargetVerdict::Unavailable(if failed {
+                "的网格文件没加载成功"
+            } else {
+                "没有可切的几何"
+            });
+        }
+        return HoleTargetVerdict::Waiting;
+    }
+    if scope_pending {
+        return HoleTargetVerdict::Waiting;
+    }
+    if scope_unavailable {
+        return HoleTargetVerdict::Unavailable("在库里没有已生成的模型");
+    }
+    HoleTargetVerdict::Waiting
 }
 
 /// E3D 外观的视口底色（grey→白，渐变关是纯 grey）；PBR 外观还是跟主题，给 `None`。
@@ -2485,10 +2529,10 @@ impl App {
             room_view_epoch: 0,
             pending_room_volume: Vec::new(),
             hole_session: VirtualHoleSession::new(),
-            hole_map_epoch: 0,
             pending_hole_ops: Vec::new(),
             hole_pick: None,
-            hole_retry_pending: None,
+            hole_retry_pending: HashSet::new(),
+            hole_focus_pending: None,
             hole_target_retried: HashSet::new(),
             // 交互通道与模型通道都按这一个供数模式造读面（ADR-0026）。
             bridge: data::spawn(ctx.clone(), tasks, read_face),
@@ -3618,7 +3662,7 @@ impl App {
                 }
                 // 虚拟孔洞映射确认（ADR-0031 阶段一）：帧号对不上是上一份导入的尾巴，丢掉。
                 data::Evt::VirtualHoleTargets { epoch, results } => {
-                    if epoch == self.hole_map_epoch && self.hole_session.apply_targets(epoch, &results) {
+                    if self.hole_session.apply_targets(epoch, &results) {
                         let vm = self.hole_session.vm();
                         let mapped = vm
                             .holes
@@ -4260,8 +4304,6 @@ impl App {
             );
         }
         self.rebuild_tree();
-        // 等重试的虚拟孔洞目标网格落地了就重发预览（ADR-0031 阶段四）。
-        self.settle_hole_retry();
     }
 
     /// 收下 View3d 的逐段回执（ADR-0033 阶段四）：按 BRAN 整份替换，落了地的在途方向退场；
@@ -4361,8 +4403,9 @@ impl App {
                 Cmd::MapVirtualHole { hole_id, refno } => {
                     if self.hole_session.map_manually(&hole_id, refno) {
                         // 映射换了目标，旧的布尔结果（连同被换过的网格）整个作废：
-                        // 清预览层再按新目标来，不留一半新旧混着的画面。
+                        // 清预览层再按新目标来，不留一半新旧混着的画面。切削体摆回去：表还在。
                         self.clear_hole_preview();
+                        self.restore_hole_layer();
                         self.logs.info(
                             &mut self.vm.logs,
                             format!("虚拟孔洞 {hole_id} 已手动映射到 {refno}，预览已清掉请重新发起"),
@@ -4392,7 +4435,7 @@ impl App {
                                 holes,
                             });
                         }
-                        self.hole_retry_pending = None;
+                        self.hole_retry_pending.clear();
                         self.hole_target_retried.clear();
                         self.sync_hole_vm();
                         self.logs.info(
@@ -4415,11 +4458,24 @@ impl App {
                 }
                 Cmd::FocusVirtualHoleTarget(id) => {
                     if let Some(target) = self.hole_session.target_of(&id) {
-                        // 先选中并展开树上那一行，再显示模型、取景到它的包围盒。
+                        // 先选中并展开树上那一行，再取景到它的包围盒。还没加载的先显示，等几何落地再取景
+                        // （`settle_hole_waits`）——范围没回来前视口手上没有它的包围盒，现在发 `Focus` 相机不动。
                         self.handle_cmds(ctx, vec![Cmd::LocateElement(target)]);
+                        // 显示无条件先做：`hole_target_verdict` 只看 `mesh_loaded`，不看 `visible`，
+                        // 目标装过但被眼睛藏着时它是 `Loaded`——只发 `Focus` 会让相机飞向一个看不见的东西。
                         self.set_model_visible(vec![target], true);
-                        self.view3d_commands
-                            .push(Cmd::Model(plant_ui::ModelAction::Focus(target)));
+                        let loaded = hole_target_verdict(
+                            self.model_scope_pending.contains(&target),
+                            self.tree.visibility_unavailable.contains(&target),
+                            self.model_scopes.get(&target),
+                            &self.tree.visibility,
+                        ) == HoleTargetVerdict::Loaded;
+                        if loaded {
+                            self.view3d_commands
+                                .push(Cmd::Model(plant_ui::ModelAction::Focus(target)));
+                        } else {
+                            self.hole_focus_pending = Some(target);
+                        }
                     }
                 }
                 Cmd::ShowVirtualHoleOriginal(on) => {
@@ -5939,8 +5995,8 @@ impl App {
         let error_count = report.row_errors.len();
         // 重导入是整份替换：旧会话进新帧（在途回执作废），切削体层整层换掉。
         self.hole_session.import(report);
-        self.hole_map_epoch = self.hole_map_epoch.wrapping_add(1);
-        self.hole_retry_pending = None;
+        self.hole_retry_pending.clear();
+        self.hole_focus_pending = None;
         self.hole_target_retried.clear();
         let holes = self.hole_session.holes().to_vec();
         self.pending_hole_ops.push(VirtualHoleOp::SetLayer { holes });
@@ -5948,8 +6004,9 @@ impl App {
         // 自动映射：RelyItemREF 解析出的参考号去库里确认真伪。
         let refnos = self.hole_session.pending_mapping_refnos();
         if !refnos.is_empty() {
+            // 映射帧号只有会话那一份：宿主曾另记一份，换库时只加自己那份，从此每次导入都差 1，回包全被当过期丢掉。
             let _ = self.bridge.req.send(data::Req::VirtualHoleTargets {
-                epoch: self.hole_map_epoch,
+                epoch: self.hole_session.map_epoch(),
                 refnos,
             });
         }
@@ -5970,7 +6027,7 @@ impl App {
                 if self.hole_target_retried.insert(refno) {
                     // 只改画面不改库：显示模型，等网格落地再重发预览。
                     self.set_model_visible(vec![refno], true);
-                    self.hole_retry_pending = Some(refno);
+                    self.hole_retry_pending.insert(refno);
                     self.logs.info(
                         &mut self.vm.logs,
                         format!("虚拟孔洞目标 {refno} 未加载，已发起显示，网格落地后自动重试预览"),
@@ -6005,47 +6062,92 @@ impl App {
         self.sync_hole_vm();
     }
 
-    /// 网格落地检查：等重试的虚拟孔洞目标画出来了就重发预览。
-    fn settle_hole_retry(&mut self) {
-        let Some(target) = self.hole_retry_pending else {
-            return;
-        };
-        let loaded = self
-            .tree
-            .visibility
-            .get(&target)
-            .is_some_and(|state| state.mesh_loaded > 0);
-        if !loaded {
+    /// 虚拟孔洞在等目标落地的两笔账（ADR-0031 阶段四）：「目标没实例」的重试预览，与「定位目标」的取景。
+    /// 目标的几何画出来了就做（可能同时等好几面墙，谁先落地谁先做）；范围查空 / 网格全没加载成功就销账并说一声
+    /// ——否则行停在「已就绪」、相机不动，谁也不知道在等什么。裁决见 [`hole_target_verdict`]。
+    fn settle_hole_waits(&mut self) {
+        if self.hole_retry_pending.is_empty() && self.hole_focus_pending.is_none() {
             return;
         }
-        self.hole_retry_pending = None;
-        let holes: Vec<_> = self
-            .hole_session
-            .holes_for_target(target)
-            .into_iter()
-            .cloned()
-            .collect();
-        if holes.is_empty() {
-            return;
+        let mut targets: Vec<RefU64> = self.hole_retry_pending.iter().copied().collect();
+        targets.extend(self.hole_focus_pending);
+        targets.sort();
+        targets.dedup();
+        for target in targets {
+            let verdict = hole_target_verdict(
+                self.model_scope_pending.contains(&target),
+                self.tree.visibility_unavailable.contains(&target),
+                self.model_scopes.get(&target),
+                &self.tree.visibility,
+            );
+            match verdict {
+                HoleTargetVerdict::Waiting => {}
+                HoleTargetVerdict::Loaded => {
+                    if self.hole_retry_pending.remove(&target) {
+                        let holes: Vec<_> = self
+                            .hole_session
+                            .holes_for_target(target)
+                            .into_iter()
+                            .cloned()
+                            .collect();
+                        if !holes.is_empty() {
+                            self.pending_hole_ops.push(VirtualHoleOp::Preview {
+                                epoch: self.hole_session.epoch(),
+                                target,
+                                holes,
+                            });
+                            self.logs.info(
+                                &mut self.vm.logs,
+                                format!("虚拟孔洞目标 {target} 已加载，重试预览"),
+                            );
+                        }
+                    }
+                    if self.hole_focus_pending.take_if(|t| *t == target).is_some() {
+                        self.view3d_commands
+                            .push(Cmd::Model(plant_ui::ModelAction::Focus(target)));
+                    }
+                }
+                HoleTargetVerdict::Unavailable(reason) => {
+                    if self.hole_retry_pending.remove(&target) {
+                        let failed = self.hole_session.fail_target(target);
+                        self.logs.warn(
+                            &mut self.vm.logs,
+                            format!(
+                                "虚拟孔洞目标 {target} {reason}，{} 条记录按失败落账",
+                                failed.len()
+                            ),
+                        );
+                        self.sync_hole_vm();
+                    }
+                    if self.hole_focus_pending.take_if(|t| *t == target).is_some() {
+                        self.logs.warn(
+                            &mut self.vm.logs,
+                            format!("虚拟孔洞：定位目标 {target} 作废——它{reason}"),
+                        );
+                    }
+                }
+            }
         }
-        self.pending_hole_ops.push(VirtualHoleOp::Preview {
-            epoch: self.hole_session.epoch(),
-            target,
-            holes,
-        });
-        self.logs.info(
-            &mut self.vm.logs,
-            format!("虚拟孔洞目标 {target} 已加载，重试预览"),
-        );
     }
 
     /// 清掉虚拟孔洞预览层：恢复原始网格、撤切削体；孔洞列表与映射保留。
     fn clear_hole_preview(&mut self) {
         self.hole_session.clear_preview();
-        self.hole_retry_pending = None;
+        self.hole_retry_pending.clear();
+        self.hole_focus_pending = None;
         self.hole_target_retried.clear();
         self.pending_hole_ops.push(VirtualHoleOp::Clear);
         self.sync_hole_vm();
+    }
+
+    /// 把会话里的孔洞重新摆成切削体层。`Clear` 连层一起撒（「清除」按钮说好的），但重映射一行、清场重装
+    /// 这种只是预览作废的场合，会话里的孔洞还在，切削体不该跟着没——否则「定位孔洞」静默无效，要重导入才回来。
+    fn restore_hole_layer(&mut self) {
+        if self.hole_session.holes().is_empty() {
+            return;
+        }
+        let holes = self.hole_session.holes().to_vec();
+        self.pending_hole_ops.push(VirtualHoleOp::SetLayer { holes });
     }
 
     fn refetch_props(&mut self, refno: RefU64) {
@@ -6776,9 +6878,11 @@ impl App {
         // 换场景清层）。要看就再右键一次。
         self.clear_pipe_dimensions();
         // 场景清空，被替换过的预览网格随实体一起没了：撤掉孔洞预览层，孔洞列表
-        // 与映射保留（重装回来还能再发预览）。
+        // 与映射保留（重装回来还能再发预览）。切削体层与 SceneRoot 平级，清场本不该带走它；
+        // `Clear` 撒了，按会话里的孔洞摆回去。
         if !self.hole_session.is_empty() {
             self.clear_hole_preview();
+            self.restore_hole_layer();
         }
         self.loaded_models.clear();
         self.model_owner.clear();
@@ -7079,8 +7183,8 @@ impl App {
         // 旧库的虚拟孔洞参考号在新库里没意义：整份会话作废，预览层撤掉。
         if !self.hole_session.is_empty() {
             self.hole_session.reset();
-            self.hole_map_epoch = self.hole_map_epoch.wrapping_add(1);
-            self.hole_retry_pending = None;
+            self.hole_retry_pending.clear();
+            self.hole_focus_pending = None;
             self.hole_target_retried.clear();
             self.pending_hole_ops.push(VirtualHoleOp::Clear);
             self.sync_hole_vm();
@@ -7212,6 +7316,8 @@ impl App {
         // 房间树的 eye 读的是同一份实际可见性账，跟着一起重新展平；「加载模型」的取景也在这里等范围回包。
         self.settle_room_tree_frame();
         self.rebuild_room_tree();
+        // 虚拟孔洞在等的目标（重试预览 / 定位目标）同理：范围回包与渲染回执都从这里过，查空也在这里销账。
+        self.settle_hole_waits();
     }
 
     // ------------------------------------------------ 房间树（plant3d-web「房间」页签移植，ADR 0068）
@@ -7886,6 +7992,95 @@ mod tests {
         assert_eq!(deferred_step(true, false, true, true, false), DeferredStep::Wait);
         assert_eq!(deferred_step(true, false, true, false, true), DeferredStep::Abort);
         assert_eq!(deferred_step(true, false, true, false, false), DeferredStep::Execute);
+    }
+
+    /// 虚拟孔洞等目标落地的裁决：范围没解出且在查 → 等；查空 → 作废；解出了但网格还在装 → 等；任一模型画出来 → 做；
+    /// 全部 settled 却一个都没画出来 → 作废（网格失败 / 没有几何分开说）。原来只认 `mesh_loaded > 0`，其余情形行永远「已就绪」。
+    #[test]
+    fn a_hole_target_without_geometry_is_failed_instead_of_waited_for() {
+        use super::{HoleTargetVerdict, hole_target_verdict};
+        let a = RefU64(11);
+        let b = RefU64(12);
+        let scope = vec![a, b];
+        let state = |loaded: usize, failed: usize| ModelVisibility {
+            visible: true,
+            mesh_loaded: loaded,
+            mesh_failed: failed,
+        };
+        let empty: HashMap<RefU64, ModelVisibility> = HashMap::new();
+        assert_eq!(hole_target_verdict(true, false, None, &empty), HoleTargetVerdict::Waiting);
+        assert_eq!(
+            hole_target_verdict(false, false, None, &empty),
+            HoleTargetVerdict::Waiting,
+            "范围还没问过（或默认重新生成在跑）：等"
+        );
+        assert!(matches!(
+            hole_target_verdict(false, true, None, &empty),
+            HoleTargetVerdict::Unavailable(_)
+        ));
+        assert_eq!(
+            hole_target_verdict(false, false, Some(&scope), &empty),
+            HoleTargetVerdict::Waiting,
+            "解出了模型、网格还在装"
+        );
+        let half = HashMap::from([(a, state(0, 2))]);
+        assert_eq!(
+            hole_target_verdict(false, false, Some(&scope), &half),
+            HoleTargetVerdict::Waiting,
+            "另一个模型还没 settled"
+        );
+        let loaded = HashMap::from([(a, state(0, 2)), (b, state(1, 0))]);
+        assert_eq!(
+            hole_target_verdict(false, false, Some(&scope), &loaded),
+            HoleTargetVerdict::Loaded
+        );
+        let all_failed = HashMap::from([(a, state(0, 2)), (b, state(0, 1))]);
+        assert_eq!(
+            hole_target_verdict(false, false, Some(&scope), &all_failed),
+            HoleTargetVerdict::Unavailable("的网格文件没加载成功")
+        );
+        let no_geometry = HashMap::from([(a, state(0, 0)), (b, state(0, 0))]);
+        assert_eq!(
+            hole_target_verdict(false, false, Some(&scope), &no_geometry),
+            HoleTargetVerdict::Unavailable("没有可切的几何")
+        );
+        assert_eq!(
+            hole_target_verdict(true, true, Some(&scope), &loaded),
+            HoleTargetVerdict::Loaded,
+            "已经画出来的不看范围那两位"
+        );
+    }
+
+    /// 「定位目标」先显示再取景：`hole_target_verdict` 只看 `mesh_loaded`、不看 `visible`，
+    /// 目标装过但被眼睛藏着时它是 `Loaded`——只发 `Focus` 会让相机飞向一个看不见的东西。
+    /// 钉住分支内的顺序（显示 → 裁决 → 取景 / 挂起），并钉住 `else` 里不再重复显示。
+    #[test]
+    fn focusing_a_hole_target_shows_it_before_focusing() {
+        let source = include_str!("main.rs");
+        let branch = source
+            .split_once("Cmd::FocusVirtualHoleTarget(id) =>")
+            .expect("定位目标分支")
+            .1
+            .split_once("Cmd::ShowVirtualHoleOriginal(on) =>")
+            .expect("下一个分支")
+            .0;
+        let show = "self.set_model_visible(vec![target], true);";
+        assert!(branch.contains(show), "先显示目标：{branch}");
+        let show_at = branch.find(show).expect("显示语句");
+        let verdict_at = branch.find("hole_target_verdict(").expect("裁决");
+        assert!(show_at < verdict_at, "显示要在裁决之前：{branch}");
+        let else_part = branch
+            .split_once("} else {")
+            .expect("未加载分支")
+            .1;
+        assert!(
+            !else_part.contains("set_model_visible"),
+            "`else` 里不该再显示一次：{else_part}"
+        );
+        assert!(
+            else_part.contains("self.hole_focus_pending = Some(target);"),
+            "未加载的目标挂起等几何落地：{else_part}"
+        );
     }
 
     fn ime_output(cursor: egui::Rect) -> egui::output::IMEOutput {

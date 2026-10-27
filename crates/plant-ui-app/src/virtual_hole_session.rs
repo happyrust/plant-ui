@@ -53,9 +53,10 @@ pub struct VirtualHoleSession {
     statuses: HashMap<String, VirtualHoleStatus>,
     /// 预览帧号：每次清预览 / 重导入 / 整清都进一帧，旧回执拿它丢弃。
     epoch: u64,
-    /// 映射确认帧号：只在重导入时进一帧。清预览**不**进这帧——映射在清掉
-    /// 预览之后仍然有效（ADR-0031 阶段一）。宿主发 `Req::VirtualHoleTargets`
-    /// 时带的是它自己的 `hole_map_epoch`，两帧只随重导入同拍各 +1，始终相等。
+    /// 映射确认帧号：重导入与整清（换库 / 重连）时进一帧。清预览**不**进这帧——映射在清掉
+    /// 预览之后仍然有效（ADR-0031 阶段一）。宿主发 `Req::VirtualHoleTargets` 时带的就是
+    /// [`Self::map_epoch`]，这是唯一的一份——此前宿主另记一份、整清时只加自己那份，两边从此差 1，
+    /// 重连之后的自动映射回包全被当过期丢掉。
     map_epoch: u64,
     selected: Option<String>,
     /// 「看原始网格」开关（只对已出结果的实体有意义）。
@@ -93,6 +94,11 @@ impl VirtualHoleSession {
 
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// 映射确认的帧号：宿主发 `Req::VirtualHoleTargets` 时带它，回包按它认（[`Self::apply_targets`]）。
+    pub fn map_epoch(&self) -> u64 {
+        self.map_epoch
     }
 
     pub fn selected(&self) -> Option<&str> {
@@ -187,7 +193,7 @@ impl VirtualHoleSession {
             .map(str::to_string);
     }
 
-    /// 发起整趟预览：把「已映射且还没进布尔」的行翻成 Calculating，
+    /// 发起整趟预览：把「已映射且还没进布尔、或上一趟失败」的行翻成 Calculating，
     /// 返回需要宿主拿去做布尔的目标名单（去重、保持孔洞顺序）。
     /// 没有可算的行时返回空——宿主据此什么都不发。
     pub fn begin_preview(&mut self) -> Vec<RefU64> {
@@ -202,7 +208,11 @@ impl VirtualHoleSession {
                 .get(&hole.id)
                 .copied()
                 .unwrap_or(VirtualHoleStatus::Ready);
-            if status != VirtualHoleStatus::Ready {
+            // 失败的行也再来一次：网格超时 / 内核失败之后没有别的重试入口（「清除」会连切削体一起撒）。
+            if !matches!(
+                status,
+                VirtualHoleStatus::Ready | VirtualHoleStatus::Failed
+            ) {
                 continue;
             }
             self.statuses
@@ -248,6 +258,21 @@ impl VirtualHoleSession {
         }
     }
 
+    /// 目标在库里没有模型 / 网格没加载成功：这个目标下还在等的行直接落 Failed（进不了布尔，也就永远等不到
+    /// 回执）。回这些行的 id，宿主写日志。
+    pub fn fail_target(&mut self, refno: RefU64) -> Vec<String> {
+        let ids: Vec<String> = self
+            .holes_for_target(refno)
+            .into_iter()
+            .map(|hole| hole.id.clone())
+            .collect();
+        for id in &ids {
+            self.statuses
+                .insert(id.clone(), VirtualHoleStatus::Failed);
+        }
+        ids
+    }
+
     /// 清掉预览层：行状态回拨到 Ready（映射保留），进一帧作废在途回执。
     /// 宿主同时拿这帧号去撤视口的切削体与恢复原始网格。
     pub fn clear_preview(&mut self) {
@@ -266,6 +291,8 @@ impl VirtualHoleSession {
         self.show_original = false;
         self.xray = false;
         self.epoch = self.epoch.wrapping_add(1);
+        // 旧库的映射回包回来也没意义：映射帧一起进。
+        self.map_epoch = self.map_epoch.wrapping_add(1);
     }
 
     pub fn set_show_original(&mut self, on: bool) {
@@ -583,5 +610,62 @@ mod tests {
         assert_eq!(vm.holes[1].target, VirtualHoleTargetVm::Missing);
         // 手动映射的行立刻就能进预览名单。
         assert!(session.begin_preview().contains(&manual));
+    }
+
+    /// 回归（2026-10-26 审核）：整清（换库 / 重连）也进映射帧，宿主只认会话这一份帧号——此前宿主另记一份、
+    /// 整清时只加自己那份，之后每次导入两边都差 1，自动映射回包全被当过期丢掉，行永远「确认目标中」。
+    #[test]
+    fn mapping_epoch_stays_in_step_across_reset() {
+        let mut session = VirtualHoleSession::new();
+        session.import(report(vec![hole("A", 2, "24381_145018")]));
+        let first = session.map_epoch();
+        assert!(session.apply_targets(first, &[(refno("24381_145018"), true)]));
+        session.reset();
+        assert_ne!(session.map_epoch(), first, "整清进映射帧");
+        session.import(report(vec![hole("A", 2, "24381_145018")]));
+        assert!(
+            !session.apply_targets(first, &[(refno("24381_145018"), true)]),
+            "换库前的回包过期"
+        );
+        assert!(
+            session.apply_targets(session.map_epoch(), &[(refno("24381_145018"), true)]),
+            "按会话此刻的映射帧发的请求回来能落地"
+        );
+        assert_eq!(session.target_of("A"), Some(refno("24381_145018")));
+    }
+
+    /// 失败的行再按「全部预览」要能重来：Failed 与 Ready 一样进名单，Changed / NoIntersection 不重算。
+    #[test]
+    fn failed_rows_are_taken_by_the_next_preview() {
+        let mut session = VirtualHoleSession::new();
+        session.import(report(vec![
+            hole("A", 2, "24381_145018"),
+            hole("B", 3, "24381_145019"),
+        ]));
+        session.apply_targets(
+            session.map_epoch(),
+            &[(refno("24381_145018"), true), (refno("24381_145019"), true)],
+        );
+        session.begin_preview();
+        let epoch = session.epoch();
+        let receipt = |refno: RefU64, hole: &str, status: VirtualHoleStatus| VirtualHoleReceipt {
+            epoch,
+            refno,
+            hole_ids: vec![hole.to_string()],
+            status,
+            no_instances: false,
+            dropped: false,
+            error: None,
+            elapsed_ms: 0,
+        };
+        session.apply_receipt(&receipt(refno("24381_145018"), "A", VirtualHoleStatus::Failed));
+        session.apply_receipt(&receipt(refno("24381_145019"), "B", VirtualHoleStatus::Changed));
+        assert_eq!(
+            session.begin_preview(),
+            vec![refno("24381_145018")],
+            "只有失败的 A 再进名单"
+        );
+        assert_eq!(session.vm().holes[0].status, VirtualHoleStatus::Calculating);
+        assert_eq!(session.vm().holes[1].status, VirtualHoleStatus::Changed);
     }
 }
