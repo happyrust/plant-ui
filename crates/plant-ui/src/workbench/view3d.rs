@@ -1291,4 +1291,22 @@ mod tests {
             );
         }
     }
+
+    /// 上一条只钉了映射函数本身：把 :227 或 :467 改回 `Cmd::Model(action)`，它照样是绿的。
+    /// 这里钉两个**调用点**——快捷键与工具栏按钮都必须经过 `model_cmd`，且正文里不许再
+    /// 直接推 `Cmd::Model(action)`（那样容器层级的定位又会静默失效）。
+    #[test]
+    fn both_tool_entry_points_go_through_model_cmd() {
+        let source = include_str!("view3d.rs");
+        let body = source.split_once("#[cfg(test)]").expect("正文").0;
+        assert_eq!(
+            body.matches("super::tree::model_cmd(action)").count(),
+            2,
+            "快捷键与工具栏按钮各一处，都该走 model_cmd"
+        );
+        assert!(
+            !body.contains("cmds.push(Cmd::Model(action))"),
+            "工具栏 / 快捷键不许绕过 model_cmd 直推 ModelAction"
+        );
+    }
 }

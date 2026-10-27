@@ -1764,12 +1764,16 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
         Req::Reconnect | Req::SwitchReadFace(_) => Evt::Ready(Ok(engine.ready_info())),
         Req::Children(refno) => Evt::Children(refno, Ok(engine.children(refno))),
         Req::Props(refno) => Evt::Props(refno, Ok(engine.props(refno))),
-        // 剧本里没有已生成的模型：回 typed 的查空，宿主据此记 INFO 提示（ADR-0030 D1）。
-        // 拼字符串走 anyhow 的话 code 会是 internal，查空就掉进 ERROR「范围定位失败」。
+        // 范围定位：与真服务同口径地算子树包围盒。剧本里确实有几何的目标
+        // （那根 BRAN 及其 SITE / ZONE / PIPE 祖先）照样能飞过去；子树里一条
+        // 已生成记录都没有时回 typed 的查空，宿主记 INFO 提示（ADR-0030 D1）。
         Req::SubtreeBounds { epoch, target } => Evt::SubtreeBounds {
             epoch,
             target,
-            result: Err(anyhow::Error::new(crate::read_face::NoRenderableGeometry)),
+            result: match subtree_bounds(engine, target) {
+                Some(bounds) => Ok(bounds),
+                None => Err(anyhow::Error::new(crate::read_face::NoRenderableGeometry)),
+            },
         },
         // 剧本里没有房间数据：空归属即「无房间归属」，界面照常走 Ready 空态。
         Req::ElementRooms(refno) => Evt::ElementRooms(refno, Ok(Vec::new())),
@@ -2259,6 +2263,12 @@ fn spatial_room_tree_fixture(
 /// 房间树那根 BRAN `/SIM-P1/B1` 的 refno：它是剧本里唯一有三维记录的目标。
 const SIM_TUBE_BRAN: &str = "9001_1010";
 
+/// 剧本元素树里那根 BRAN（`/SIM-PIPE-101/B1`）的 refno 数值。
+///
+/// 与 [`SIM_TUBE_BRAN`] 不是同一个号：树是 `/SIM-SITE-A` 那套 `0_9xxx`，几何记录挂在
+/// `9001_1010` 上。范围定位要把两者对上（见 `subtree_bounds`）。
+const SIM_TREE_BRAN_ID: u64 = 9301;
+
 /// 眼睛 / 范围查询（`ModelLoad::Scopes`）在剧本里的回答：只有房间树那根 BRAN `/SIM-P1/B1`（[`SIM_TUBE_BRAN`]）
 /// 名下有三条直段记录——按 gen-model `/model/records` 的形状给（`generic = TUBI`、refno = BRAN、带 `tube` 身份，
 /// 身份与 [`spatial_room_tree_fixture`] 的直段行一一对应），都标成「无效直段」好让视口零网格文件就画出虚线
@@ -2327,6 +2337,66 @@ pub fn model_scope_fixture(target: RefU64) -> crate::model_update_api::ModelReco
     }
 }
 
+/// 范围定位在剧本里的答案：`target` 子树下已生成几何的并集盒。
+///
+/// 口径与真服务一致——自身 ∪ 后代，按 `model_scope_fixture` 给的 `world_aabb` 求并。
+/// 剧本里只有那根 BRAN 名下有几何，所以它的 SITE / ZONE / PIPE 祖先也能定位；
+/// 子树里一条记录都没有时返回 `None`，由调用方回 typed 查空（ADR-0030 D1：只查不生）。
+fn subtree_bounds(engine: &Engine, target: RefU64) -> Option<crate::read_face::SubtreeBounds> {
+    let mut under = vec![target];
+    let mut cursor = 0;
+    // 剧本树是有限深度的树，广度优先收齐后代即可。
+    while cursor < under.len() {
+        let node = under[cursor];
+        cursor += 1;
+        under.extend(
+            engine
+                .children(node)
+                .into_iter()
+                .map(|child| child.refno.refno()),
+        );
+    }
+    let mut min_mm = [f32::INFINITY; 3];
+    let mut max_mm = [f32::NEG_INFINITY; 3];
+    let mut model_count = 0;
+    for node in under {
+        // 剧本里模型树与几何是两套 refno：树里唯一那根 BRAN（`0_9301`，`/SIM-PIPE-101/B1`）
+        // 名下挂着 [`SIM_TUBE_BRAN`] 的三段直段。真实项目里两者是同一个 refno，这里补一层
+        // 映射，免得演示模式下对着画面上明明有的管子报查空。按 refno 认而不是按 noun 认：
+        // 将来剧本再加一根 BRAN，按 noun 认会把这三段直段算两遍、新 BRAN 也会拿到这根管子。
+        let geometry_target = match engine.tree.nodes.get(&node) {
+            Some(tree_node)
+                if tree_node.noun == "BRAN" && node == RefU64::from(SIM_TREE_BRAN_ID) =>
+            {
+                SIM_TUBE_BRAN.parse().unwrap_or(node)
+            }
+            _ => node,
+        };
+        for record in model_scope_fixture(geometry_target).records {
+            // 零实例的记录在真服务里也不算「可渲染几何」，与 `store.rs` 的过滤同口径。
+            if record.insts.is_empty() {
+                continue;
+            }
+            let aabb = record.world_aabb;
+            let mins = [aabb.mins.x, aabb.mins.y, aabb.mins.z];
+            let maxs = [aabb.maxs.x, aabb.maxs.y, aabb.maxs.z];
+            if (0..3).any(|i| !mins[i].is_finite() || !maxs[i].is_finite() || mins[i] > maxs[i]) {
+                continue;
+            }
+            for axis in 0..3 {
+                min_mm[axis] = min_mm[axis].min(mins[axis]);
+                max_mm[axis] = max_mm[axis].max(maxs[axis]);
+            }
+            model_count += 1;
+        }
+    }
+    (model_count > 0).then_some(crate::read_face::SubtreeBounds {
+        min_mm,
+        max_mm,
+        model_count,
+    })
+}
+
 /// 收口批次的分步账（与 gen-model `task_registry` 的 steps[] 同形）：段名与比例照抄 2026-10-23
 /// 实测的一条 654→655 批次，失败批次的收尾段 `ok = false`。只为增量记录页的阶段耗时条有东西可画。
 fn sim_steps(state: &str) -> Vec<TaskStep> {
@@ -2360,6 +2430,46 @@ fn sim_steps(state: &str) -> Vec<TaskStep> {
 mod tests {
     use super::*;
 
+    /// 剧本里的范围定位按真服务同口径算子树：那根 BRAN 有几何，它的 SITE / ZONE /
+    /// PIPE 祖先因此也能定位——不能因为「剧本没写生成」就一律回查空，那样演示模式
+    /// 下 F 键会对着画面上明明有的模型说「范围内没有已生成的模型」。
+    #[test]
+    fn sim_subtree_bounds_cover_the_ancestors_of_the_only_geometric_branch() {
+        let mut engine = Engine::new(ServiceMode::Legacy);
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        // 四层级各问一次：SITE 根、它下面的 ZONE、ZONE 下的 PIPE、以及那根 BRAN。
+        for (epoch, target) in [
+            (7, RefU64::from(9001)),
+            (8, RefU64::from(9101)),
+            (9, RefU64::from(9201)),
+            (10, RefU64::from(SIM_TREE_BRAN_ID)),
+        ] {
+            handle(
+                &mut engine,
+                crate::data::Req::SubtreeBounds { epoch, target },
+                &tx,
+            );
+            match rx.try_recv() {
+                Ok(Evt::SubtreeBounds {
+                    epoch: echoed,
+                    target: echoed_target,
+                    result: Ok(bounds),
+                }) => {
+                    assert_eq!((echoed, echoed_target), (epoch, target));
+                    assert_eq!(bounds.model_count, 3, "BRAN 名下三段直段：{target}");
+                    assert_eq!(bounds.min_mm, [0.0, -30.0, -30.0], "{target}");
+                    assert_eq!(bounds.max_mm, [3520.0, 30.0, 30.0], "{target}");
+                }
+                Ok(Evt::SubtreeBounds { result, .. }) => {
+                    panic!("{target} 应能定位到那三段直段，实际 {result:?}")
+                }
+                Ok(_) => panic!("{target}：期望 SubtreeBounds 回包，实际是别的 Evt"),
+                Err(error) => panic!("{target}：没收到回包：{error}"),
+            }
+        }
+    }
+
     /// 剧本模式下「范围内没有已生成的模型」是查空，不是失败：宿主用
     /// [`crate::read_face::is_no_renderable_geometry`] 分流，落 INFO 提示而不是
     /// ERROR「范围定位失败」（ADR-0030 D1）。用 anyhow 拼字符串时 code 会是
@@ -2368,7 +2478,8 @@ mod tests {
     fn sim_subtree_bounds_is_a_typed_empty_scope() {
         let mut engine = Engine::new(ServiceMode::Legacy);
         let (tx, rx) = std::sync::mpsc::channel();
-        let target = RefU64::from_two_nums(9001, 1010);
+        // 第二个 SITE 底下一条几何都没有。
+        let target = RefU64::from(9002);
 
         handle(
             &mut engine,
@@ -2389,7 +2500,7 @@ mod tests {
                 );
             }
             Ok(Evt::SubtreeBounds { .. }) => {
-                panic!("SubtreeBounds 回了 Ok，剧本里没有可定位的模型")
+                panic!("SubtreeBounds 回了 Ok，空 SITE 下不该有几何")
             }
             Ok(_) => panic!("期望 SubtreeBounds 回包，实际是别的 Evt"),
             Err(error) => panic!("没收到回包：{error}"),

@@ -1498,6 +1498,12 @@ struct App {
     latest_mesh_progress: Option<plant_ui_view3d::MeshLoadProgress>,
     model_scope_failures: usize,
     model_progress_until: Option<Instant>,
+    /// 范围定位的「正在查询」提示压着的到期时刻：(epoch, target, 到期)。
+    ///
+    /// 记录级目标（选中元件按 F）回包在毫秒级，立刻记一条 INFO 只会和结果那条挤在
+    /// 同一秒里，纯属噪音。压 400 ms 再发：快查询只留结果一条，慢查询（SITE 级）
+    /// 照样有反馈。到期时若请求已被取代或已回包，`accepts_bounds` 为假，这一句自动不发。
+    focus_scope_pending: Option<(u64, RefU64, Instant)>,
     view3d_commands: Vec<Cmd>,
     /// 上一次真的落到文件系统上校验过的那个网格目录草稿。
     ///
@@ -2567,6 +2573,7 @@ impl App {
             latest_mesh_progress: None,
             model_scope_failures: 0,
             model_progress_until: None,
+            focus_scope_pending: None,
             view3d_commands: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             checked_mesh_dir: None,
@@ -4246,6 +4253,32 @@ impl App {
         }
     }
 
+    /// 范围定位的「正在查询」提示到期：只在这一拍仍在途时才说。
+    ///
+    /// 请求已回包（`cancel` 换了 epoch）、被新请求取代、或被别的动作作废时
+    /// `accepts_bounds` 为假，这一句就不发了——400 ms 内就结束的查询只留结果那一条。
+    /// （400 ms 之后才被作废的，那句「正在查询…」已经记下了，没有下文；这是可接受的：
+    /// 定位是异步的，日志里留一条「查过」比什么都不说好。）
+    fn tick_focus_scope(&mut self) {
+        let Some((epoch, target, until)) = self.focus_scope_pending else {
+            return;
+        };
+        // 已回包、已被取代、或已被别的动作作废：这一句就永远不发了。
+        if !self.focus_bounds_request.accepts_bounds(epoch, target) {
+            self.focus_scope_pending = None;
+            return;
+        }
+        if Instant::now() < until {
+            return;
+        }
+        self.focus_scope_pending = None;
+        self.logs.info_of(
+            &mut self.vm.logs,
+            self.tree.element(target),
+            format!("节点 {target}：正在查询模型范围…"),
+        );
+    }
+
     fn sync_mesh_progress(&mut self, progress: plant_ui_view3d::MeshLoadProgress) {
         self.latest_mesh_progress = (!progress.finished()).then(|| progress.clone());
         if progress.finished() {
@@ -4511,6 +4544,10 @@ impl App {
                             &self.tree.visibility,
                         ) == HoleTargetVerdict::Loaded;
                         if loaded {
+                            // 在途的范围查询要就地作废：孔洞是单条已加载记录，相机该听这一条。
+                            // 不作废的话，慢查询回包到达时 `accepts_bounds` 仍为真，相机会被
+                            // 拽回上一次范围定位，日志里还多一句「已定位到 N 个模型」。
+                            self.focus_bounds_request.cancel();
                             self.view3d_commands
                                 .push(Cmd::Model(plant_ui::ModelAction::Focus(target)));
                         } else {
@@ -4802,6 +4839,11 @@ impl App {
                 Cmd::RoomTree(action) => self.room_tree_action(action),
                 Cmd::RevealRoomInTree(room) => self.reveal_room_in_tree(room),
                 Cmd::FocusTreeScope(target) => {
+                    // 用户显式点了定位：先前那笔「等孔洞几何落地再取景」的旧意图就此作废。
+                    // 不清的话，孔洞目标晚一拍落地时会把刚发起的这次范围查询作废，相机飞回
+                    // 旧孔洞，最新这一下被静默吞掉（`hole_focus_pending` 是旧意图，新的定位
+                    // 意图必须能让它失效）。
+                    self.hole_focus_pending = None;
                     let epoch = self.focus_bounds_request.begin(target);
                     if self
                         .bridge
@@ -4812,12 +4854,14 @@ impl App {
                         self.focus_bounds_request.cancel();
                         self.logs.warn(&mut self.vm.logs, "模型服务通道已断开");
                     } else {
-                        // 大范围（SITE 级）这一拍可能要几秒：先说一句「在查」，
-                        // 否则点下去到相机动之间没有任何反馈，看着像没反应。
-                        self.logs.info(
-                            &mut self.vm.logs,
-                            format!("节点 {target}：正在查询模型范围…"),
-                        );
+                        // 大范围（SITE 级）这一拍可能要几秒，得有反馈；但记录级目标
+                        // 毫秒就回来，立刻记一句只是噪音。压 400 ms 再发，快查询只留
+                        // 结果那一条（见 `tick_focus_scope`）。
+                        self.focus_scope_pending =
+                            Some((epoch, target, Instant::now() + Duration::from_millis(400)));
+                        // `ui()` 里的 tick 与 100 ms 重绘判定都在本帧命令产生之前跑过了，
+                        // 这里补一次到期重绘：不补就得指望 egui 在输入事件后再排一帧。
+                        ctx.request_repaint_after(Duration::from_millis(400));
                     }
                     dirty = true;
                 }
@@ -6150,6 +6194,8 @@ impl App {
                         }
                     }
                     if self.hole_focus_pending.take_if(|t| *t == target).is_some() {
+                        // 同 `FocusVirtualHoleTarget`：孔洞的取景优先于在途的范围查询。
+                        self.focus_bounds_request.cancel();
                         self.view3d_commands
                             .push(Cmd::Model(plant_ui::ModelAction::Focus(target)));
                     }
@@ -10236,8 +10282,9 @@ mod tests {
     }
 
     /// 范围定位是异步的：点下去到相机动之间若什么都不说，大层级（SITE）看着就是
-    /// 「没反应」。发起时一句「正在查询」，回来时一句「已定位到 N 个模型」，
-    /// 两句都在 INFO——定位不是错误。
+    /// 「没反应」；但记录级目标毫秒就回，立刻记一句只是噪音。所以「正在查询」
+    /// 压 400 ms 才发（`focus_scope_pending` → `tick_focus_scope`），快查询只留
+    /// 结果那一条；两句都在 INFO——定位不是错误。
     #[test]
     fn focus_scope_reports_start_and_outcome() {
         let source = include_str!("main.rs");
@@ -10251,12 +10298,56 @@ mod tests {
             .0;
         let warn = request.find("模型服务通道已断开").expect("通道断开那一句");
         let start = request
-            .find("正在查询模型范围")
-            .expect("发起时要说一句「在查」");
-        assert!(warn < start, "只在发送成功后才说「在查」：{request}");
+            .find("focus_scope_pending")
+            .expect("发起时登记「在查」的到期时刻");
+        assert!(warn < start, "只在发送成功后才登记「在查」：{request}");
         assert!(
-            request.contains("self.logs.info("),
-            "「在查」是 INFO：{request}"
+            request.contains("Instant::now() + Duration::from_millis(400)"),
+            "「在查」要压 400 ms，别和结果挤在同一秒：{request}"
+        );
+        assert!(
+            request.contains("ctx.request_repaint_after("),
+            "登记了到期时刻就得排一次到期重绘：{request}"
+        );
+        assert!(
+            !request.contains("正在查询模型范围"),
+            "发起臂本身不许直接记「在查」：{request}"
+        );
+        // 新的定位意图必须让「等孔洞几何落地再取景」那笔旧账失效，否则孔洞晚一拍落地时
+        // 会把刚发起的这次查询作废，相机飞回旧孔洞、最新这一下被静默吞掉。
+        assert!(
+            request.contains("self.hole_focus_pending = None"),
+            "发起范围定位要作废在途的孔洞取景意图：{request}"
+        );
+
+        let tick = source
+            .split_once("fn tick_focus_scope(&mut self) {")
+            .expect("到期判定")
+            .1
+            // 拿下一个函数头作结尾，不拿 `\n    }\n`：CRLF 检出时那个字面量永远找不到。
+            .split_once("fn sync_mesh_progress(")
+            .expect("到期判定结尾")
+            .0;
+        assert!(
+            tick.contains("accepts_bounds(") && tick.contains("info_of("),
+            "到期时仍在途才说「在查」，且走 info_of：{tick}"
+        );
+        assert!(
+            !tick.contains("warn_of(") && !tick.contains("error_of("),
+            "「在查」不许记 WARN / ERROR：{tick}"
+        );
+        // 这条钉必须搜**正文里的** `fn ui`，不能搜整个文件：断言的针本身写在这条测试里，
+        // 搜整个文件等于搜到自己，把条件删了照样绿。
+        let body = source
+            .rsplit_once("fn ui(&mut self, ui: &mut egui::Ui) {")
+            .expect("正文里的 fn ui（测试模块之后）")
+            .1;
+        assert!(
+            body.contains(concat!(
+                "self.model_progress_until.is_some()",
+                " || self.focus_scope_pending.is_some()"
+            )),
+            "在途时要按 100 ms 重绘，否则 400 ms 的到期判定等不到下一拍"
         );
 
         let reply = source
@@ -10563,7 +10654,8 @@ impl App {
     fn ui(&mut self, ui: &mut egui::Ui) {
         self.pump_events(ui.ctx());
         self.tick_model_progress();
-        if self.model_progress_until.is_some() {
+        self.tick_focus_scope();
+        if self.model_progress_until.is_some() || self.focus_scope_pending.is_some() {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
         let t = theme_tokens::current();
