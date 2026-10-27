@@ -1407,6 +1407,13 @@ struct App {
     /// 选中 PANEL 后等待房间详情的 X-Ray 请求：(发起时的 PANEL, 房间)。
     /// 选中一换立即清空；晚到的详情只有同时匹配这两个值才可改材质。
     xray_room_pending: Option<(RefU64, RefU64)>,
+    /// 上一次已经记过日志的房间镜像失败，`消息|错误链` 拼成一个键。
+    ///
+    /// 房间归属是随选中预取的：库没起（或端口不通）时，每换一次选中就再失败一次，
+    /// 每次都记一行红底 ERROR，几十次点选就把日志刷成同一句话的复读。同一个原因只
+    /// 记一次，界面上的 `vm.rooms` 照旧每次更新成失败态；换原因、或者镜像恢复之后
+    /// 复位，下次真出事还会说。
+    mirror_error_said: Option<String>,
     xray_active_room: Option<RefU64>,
     /// 已查过的房间 -> 全部在册面板。重复点同一间房不再打一次详情查询。
     room_panel_cache: HashMap<RefU64, Vec<RefU64>>,
@@ -2517,6 +2524,7 @@ impl App {
             refresh_generation_pending: false,
             focus_room_pending: None,
             xray_room_pending: None,
+            mirror_error_said: None,
             xray_active_room: None,
             room_panel_cache: HashMap::new(),
             pending_room_frame: None,
@@ -2724,15 +2732,24 @@ impl App {
                     if self.vm.selection.primary() == Some(refno) =>
                 {
                     self.vm.rooms = match result {
-                        Ok(relations) => RoomVm::Ready(build_rooms(refno, relations)),
+                        Ok(relations) => {
+                            // 镜像回来了：清掉「同一原因只记一次」的记账，下次再断还会说。
+                            self.mirror_error_said = None;
+                            RoomVm::Ready(build_rooms(refno, relations))
+                        }
                         Err(e) if e.downcast_ref::<data::MirrorFeatureUnavailable>().is_some() => {
                             RoomVm::Unavailable(e.to_string())
                         }
                         Err(e) => {
-                            let el = self.tree.element(refno);
-                            self.logs
-                                .error_of(&mut self.vm.logs, el, "房间归属查询失败", &e, None);
-                            RoomVm::Failed(format!("房间归属查询失败：{}", logs::error_chain(&e)))
+                            let text = logs::error_chain(&e);
+                            let key = format!("房间归属查询失败|{text}");
+                            if self.mirror_error_said.as_deref() != Some(key.as_str()) {
+                                let el = self.tree.element(refno);
+                                self.logs
+                                    .error_of(&mut self.vm.logs, el, "房间归属查询失败", &e, None);
+                                self.mirror_error_said = Some(key);
+                            }
+                            RoomVm::Failed(format!("房间归属查询失败：{text}"))
                         }
                     };
                 }
@@ -2801,9 +2818,21 @@ impl App {
                     }
                     Err(e) if self.vm.selection.primary() == Some(refno) => {
                         self.clear_room_xray();
-                        let el = self.tree.element(refno);
-                        self.logs
-                            .error_of(&mut self.vm.logs, el, "PANEL 房间查询失败", &e, None);
+                        // 与房间归属同一条去刷屏规矩：镜像断着的时候，选一块面板就再失败
+                        // 一次，每次一行红底 ERROR 只是同一句话的复读。
+                        let text = logs::error_chain(&e);
+                        let key = format!("PANEL 房间查询失败|{text}");
+                        if self.mirror_error_said.as_deref() != Some(key.as_str()) {
+                            let el = self.tree.element(refno);
+                            self.logs.error_of(
+                                &mut self.vm.logs,
+                                el,
+                                "PANEL 房间查询失败",
+                                &e,
+                                None,
+                            );
+                            self.mirror_error_said = Some(key);
+                        }
                     }
                     Err(_) => {}
                 },

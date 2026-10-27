@@ -39,3 +39,13 @@ vendor/*
 /web/public/assets/meshes/
 /web/public/assets/config/
 
+# 会话临时物（2026-10-26 外观审核收编）：代理会话的截图 / 日志 / 分块暂存补丁与整仓快照，不入库。
+/tmp/
+/.scratch/
+# Word 打开文档时落的锁文件。
+~$*
+# 方案书 / 交付物落点（review 2026-10-27：outputs/ 与 web/pkg/ 是未跟踪残留，不入库）。
+/outputs/
+# 过时的 wasm-bindgen 输出，正本在 web/public/pkg。
+/web/pkg/
+

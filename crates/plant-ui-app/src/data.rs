@@ -55,8 +55,30 @@ fn require_direct_mirror_endpoint(
         .into());
     }
     if !health.mirror.status.eq_ignore_ascii_case("ready") {
+        // 光说「状态 degraded」等于让人自己去翻 /health。把 gen-model 探活失败时记下的
+        // 端点与最后一条错误一并带出来：出问题的几乎总是库没起（或端口换了），
+        // 这两个字段就是那句「连不上 localhost:8009」。
+        let endpoint = health
+            .mirror
+            .endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let last_error = health
+            .mirror
+            .last_error
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let mut detail = String::new();
+        if let Some(endpoint) = endpoint {
+            detail.push_str(&format!("，端点 {endpoint}"));
+        }
+        if let Some(last_error) = last_error {
+            detail.push_str(&format!("，最后错误：{last_error}"));
+        }
         anyhow::bail!(
-            "镜像不可用：{feature} 依赖 SurrealDB（当前状态 {}）",
+            "镜像不可用：{feature} 依赖 SurrealDB（当前状态 {}{detail}）",
             if health.mirror.status.is_empty() {
                 "unknown"
             } else {
@@ -67,7 +89,71 @@ fn require_direct_mirror_endpoint(
     Ok(())
 }
 
+/// 镜像门最近一次失败的记账（门卫短路）。
+///
+/// 房间归属是随选中预取的：镜像不通时，每换一次选中就再走一遍「查 /health + 探活
+/// 2 s 超时」，几十次点选就是几十次白等。10 秒内已经确认过不通，就直接按上一次的
+/// 结论回答，不再问第二遍；冷却过后放一次真请求，通了就清账。
+struct MirrorGateFail {
+    at: web_time::Instant,
+    message: String,
+}
+
+static MIRROR_GATE_FAIL: std::sync::OnceLock<std::sync::Mutex<Option<MirrorGateFail>>> =
+    std::sync::OnceLock::new();
+
+/// 门卫短路的冷却时长。取 10 s：足够吃掉一轮连续点选，又不至于让「库起来了」这件事
+/// 被压太久——房间里没有任何重试钮，用户唯一的动作就是再点一下。
+const MIRROR_GATE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn mirror_gate_slot() -> &'static std::sync::Mutex<Option<MirrorGateFail>> {
+    MIRROR_GATE_FAIL.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// 冷却期内的短路答案；`None` = 该真问一次。
+fn mirror_gate_recent_failure() -> Option<String> {
+    let guard = mirror_gate_slot().lock().unwrap_or_else(|e| e.into_inner());
+    let fail = guard.as_ref()?;
+    (fail.at.elapsed() < MIRROR_GATE_COOLDOWN).then(|| fail.message.clone())
+}
+
+fn mirror_gate_record_failure(message: &str) {
+    let mut guard = mirror_gate_slot().lock().unwrap_or_else(|e| e.into_inner());
+    *guard = Some(MirrorGateFail {
+        at: web_time::Instant::now(),
+        message: message.to_string(),
+    });
+}
+
+fn mirror_gate_clear() {
+    let mut guard = mirror_gate_slot().lock().unwrap_or_else(|e| e.into_inner());
+    *guard = None;
+}
+
 async fn require_mirror_feature(feature: &str) -> anyhow::Result<()> {
+    if let Some(message) = mirror_gate_recent_failure() {
+        anyhow::bail!("{message}");
+    }
+    match require_mirror_feature_uncached(feature).await {
+        Ok(()) => {
+            mirror_gate_clear();
+            Ok(())
+        }
+        Err(error) => {
+            // 只把「镜像这一侧不通」记进冷却：`MirrorFeatureUnavailable` 是能力态
+            // （store_mode=mem），不会因为等 10 秒就变好，也不该被短路成普通失败。
+            if error
+                .downcast_ref::<MirrorFeatureUnavailable>()
+                .is_none()
+            {
+                mirror_gate_record_failure(&crate::logs::error_chain(&error));
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn require_mirror_feature_uncached(feature: &str) -> anyhow::Result<()> {
     let health =
         crate::model_update_api::service_health(&crate::model_update_api::base_url()).await?;
     require_direct_mirror_endpoint(&health, feature)?;
@@ -1709,7 +1795,10 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>, kind: ReadF
 
 #[cfg(test)]
 mod tests {
-    use super::{ModelLoad, Req, panel_records, require_direct_mirror_endpoint, route_model_load};
+    use super::{
+        ModelLoad, Req, mirror_gate_clear, mirror_gate_recent_failure,
+        mirror_gate_record_failure, panel_records, require_direct_mirror_endpoint, route_model_load,
+    };
     use plant_ui::RefU64;
     use std::sync::mpsc;
 
@@ -1759,6 +1848,51 @@ mod tests {
             .split_once("#[cfg(test)]")
             .map(|(body, _)| body)
             .unwrap_or(source)
+    }
+
+    /// 非 ready 的拒绝必须自己说清「连的是哪、最后错在哪」：日志里只有「当前状态 degraded」
+    /// 等于让人再去翻一遍 /health，而现场最常见的成因（库没起、端口换了）恰好就记在这两格。
+    #[test]
+    fn a_degraded_mirror_says_which_endpoint_failed_and_why() {
+        let mut health = plant_ui::task_queue::Health::default();
+        health.mirror.status = "degraded".into();
+        health.mirror.endpoint = Some("localhost:8009".into());
+        health.mirror.last_error = Some("/health 探活 transport failed: 超过 2 秒未响应".into());
+        let error = require_direct_mirror_endpoint(&health, "房间")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("degraded"), "{error}");
+        assert!(error.contains("localhost:8009"), "{error}");
+        assert!(error.contains("超过 2 秒未响应"), "{error}");
+    }
+
+    /// 两格都空（老服务或字段被裁掉）时不能吐出「端点 ，最后错误：」这种断句。
+    #[test]
+    fn a_degraded_mirror_without_details_stays_a_single_clause() {
+        let mut health = plant_ui::task_queue::Health::default();
+        health.mirror.status = "degraded".into();
+        health.mirror.endpoint = Some("   ".into());
+        health.mirror.last_error = None;
+        let error = require_direct_mirror_endpoint(&health, "房间")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "镜像不可用：房间 依赖 SurrealDB（当前状态 degraded）"
+        );
+    }
+
+    /// 门卫短路：记一次失败之后，冷却期内不再问第二遍；清账之后照旧真问。
+    /// （全局 static，所以这一段必须自己收尾，别把状态漏给后面的用例。）
+    #[test]
+    fn the_mirror_gate_short_circuits_for_the_cooldown_window() {
+        mirror_gate_clear();
+        assert!(mirror_gate_recent_failure().is_none());
+        mirror_gate_record_failure("镜像不可用：房间 依赖 SurrealDB（当前状态 degraded）");
+        let cached = mirror_gate_recent_failure().expect("冷却期内应命中");
+        assert!(cached.contains("degraded"), "{cached}");
+        mirror_gate_clear();
+        assert!(mirror_gate_recent_failure().is_none());
     }
 
     #[test]
