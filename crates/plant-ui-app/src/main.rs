@@ -1540,8 +1540,12 @@ enum RoomTreeDeferred {
     Focus,
     Isolate,
     /// 「加载模型」；`confirmed` = 已过确认框（或不超阈值、不需要）。
+    ///
+    /// `frame` = 落地后要不要取景。挂起期间用户又发起了别的取景意图，这条就成了旧账：
+    /// 显隐照做，相机不该再被它拽走（`supersede_camera_intents` 会把它置 false）。
     LoadModels {
         confirmed: bool,
+        frame: bool,
     },
 }
 
@@ -4531,6 +4535,9 @@ impl App {
                 }
                 Cmd::FocusVirtualHoleTarget(id) => {
                     if let Some(target) = self.hole_session.target_of(&id) {
+                        // 点孔洞就是一次取景意图：更早挂着的范围查询 / 房间取景都作废。放在最前，
+                        // 未加载分支（等几何落地）也算数——不然范围回包先到时相机会先飞旧范围。
+                        self.supersede_camera_intents();
                         // 先选中并展开树上那一行，再取景到它的包围盒。还没加载的先显示，等几何落地再取景
                         // （`settle_hole_waits`）——范围没回来前视口手上没有它的包围盒，现在发 `Focus` 相机不动。
                         self.handle_cmds(ctx, vec![Cmd::LocateElement(target)]);
@@ -4544,10 +4551,6 @@ impl App {
                             &self.tree.visibility,
                         ) == HoleTargetVerdict::Loaded;
                         if loaded {
-                            // 在途的范围查询要就地作废：孔洞是单条已加载记录，相机该听这一条。
-                            // 不作废的话，慢查询回包到达时 `accepts_bounds` 仍为真，相机会被
-                            // 拽回上一次范围定位，日志里还多一句「已定位到 N 个模型」。
-                            self.focus_bounds_request.cancel();
                             self.view3d_commands
                                 .push(Cmd::Model(plant_ui::ModelAction::Focus(target)));
                         } else {
@@ -4839,11 +4842,9 @@ impl App {
                 Cmd::RoomTree(action) => self.room_tree_action(action),
                 Cmd::RevealRoomInTree(room) => self.reveal_room_in_tree(room),
                 Cmd::FocusTreeScope(target) => {
-                    // 用户显式点了定位：先前那笔「等孔洞几何落地再取景」的旧意图就此作废。
-                    // 不清的话，孔洞目标晚一拍落地时会把刚发起的这次范围查询作废，相机飞回
-                    // 旧孔洞，最新这一下被静默吞掉（`hole_focus_pending` 是旧意图，新的定位
-                    // 意图必须能让它失效）。
-                    self.hole_focus_pending = None;
+                    // 用户显式点了定位：更早挂着的孔洞取景 / 房间取景 / 房间树取景就此作废，
+                    // 否则它们晚一拍落地时会把这次查询作废，相机飞回旧目标、最新这一下被静默吞掉。
+                    self.supersede_camera_intents();
                     let epoch = self.focus_bounds_request.begin(target);
                     if self
                         .bridge
@@ -4870,7 +4871,8 @@ impl App {
                         action @ (plant_ui::ModelAction::Focus(_)
                         | plant_ui::ModelAction::FocusGroup { .. }
                         | plant_ui::ModelAction::FocusBounds { .. }) => {
-                            self.focus_bounds_request.cancel();
+                            // 取景入口：撤掉更早挂着的取景账，相机只听这一次。
+                            self.supersede_camera_intents();
                             self.view3d_commands.push(Cmd::Model(action));
                         }
                         plant_ui::ModelAction::SetVisible { refnos, visible } => {
@@ -6313,6 +6315,8 @@ impl App {
     /// 下半程在 `Evt::RoomDetail` 到达时展开成隔离 + 取景（有实时渲染器时），
     /// 并把详情填进「房间」页签——同一次往返喂两个消费者。
     fn focus_room(&mut self, room: RefU64) {
+        // 进房间视图也会取景（房间体到了才动相机），算一次意图。
+        self.supersede_camera_intents();
         self.focus_room_pending = Some(room);
         self.room_pane_focus = Some(room);
         self.vm.room_detail.begin_query();
@@ -6638,6 +6642,9 @@ impl App {
             self.restore_room_detail(room);
         }
         if let Some(camera) = entry.camera {
+            // 回到历史位置也是一次取景意图：更早挂着的账（范围查询、孔洞、房间取景）都作废，
+            // 否则它们晚落地时会把相机从刚回退到的位置拽走。
+            self.supersede_camera_intents();
             self.view3d_commands.push(Cmd::RestoreCamera(camera));
         }
         self.nav.navigating = false;
@@ -6694,6 +6701,8 @@ impl App {
     /// `Evt::ModelScope` 回包，包围盒此刻就在视口手上，当场下发；否则记下这间房，
     /// 等范围落地那一刻再补取景。
     fn show_room_model(&mut self, room: RefU64) {
+        // 「显示房间模型」以取景收尾，所以先撤掉更早挂着的账。
+        self.supersede_camera_intents();
         self.set_model_visible(vec![room], true);
         match self.model_scopes.get(&room) {
             Some(refnos) => {
@@ -7560,11 +7569,23 @@ impl App {
             RoomTreeAction::SetVisible { id, visible } => {
                 self.run_room_tree_action(id, RoomTreeDeferred::SetVisible(visible))
             }
-            RoomTreeAction::Focus(id) => self.run_room_tree_action(id, RoomTreeDeferred::Focus),
+            RoomTreeAction::Focus(id) => {
+                // 房间树上的聚焦也是一次取景意图：撤掉更早挂着的账，再挂这一次的。
+                self.supersede_camera_intents();
+                self.run_room_tree_action(id, RoomTreeDeferred::Focus)
+            }
             RoomTreeAction::Isolate(id) => self.run_room_tree_action(id, RoomTreeDeferred::Isolate),
             RoomTreeAction::LoadModels { id, confirmed } => {
                 self.room_tree_confirm = None;
-                self.run_room_tree_action(id, RoomTreeDeferred::LoadModels { confirmed });
+                // 「加载模型」落地后要取景，所以它也算取景意图。
+                self.supersede_camera_intents();
+                self.run_room_tree_action(
+                    id,
+                    RoomTreeDeferred::LoadModels {
+                        confirmed,
+                        frame: true,
+                    },
+                );
             }
             RoomTreeAction::CancelLoadModels => self.room_tree_confirm = None,
         }
@@ -7763,7 +7784,8 @@ impl App {
                     .map(|tube| tube.aabb)
                 {
                     // 直段按服务端给的世界盒飞，不要求已加载。
-                    self.focus_bounds_request.cancel();
+                    // 这里只是**执行**点：作废在途查询与撤旧取景在挂起那一刻（意图点）就做过了，
+                    // 晚执行时不能再作废——那会把挂起期间更新的意图一起吞掉。
                     self.view3d_commands
                         .push(Cmd::Model(plant_ui::ModelAction::FocusBounds {
                             min_mm: [aabb.min[0] as f32, aabb.min[1] as f32, aabb.min[2] as f32],
@@ -7785,13 +7807,13 @@ impl App {
                     );
                     return;
                 }
-                self.focus_bounds_request.cancel();
+                // 同上面那条 FocusBounds：执行点不作废，意图点已经作废过了。
                 self.view3d_commands
                     .push(Cmd::Model(plant_ui::ModelAction::FocusGroup {
                         refnos: loaded,
                     }));
             }
-            RoomTreeDeferred::LoadModels { confirmed } => {
+            RoomTreeDeferred::LoadModels { confirmed, frame } => {
                 let refnos = self.room_tree.refnos_under(&id);
                 if refnos.is_empty() {
                     self.logs
@@ -7811,7 +7833,12 @@ impl App {
                     &mut self.vm.logs,
                     format!("房间树：加载 {label} 下 {} 个构件的模型", refnos.len()),
                 );
-                self.room_tree_frame = Some(refnos.clone());
+                // `frame` 是挂起那一刻记下的：期间用户发起过别的取景意图，这条就只显示不取景。
+                // 只许**写**、不许清：`frame=false` 时 `room_tree_frame` 里可能正躺着更新那次
+                // 「加载模型」登记的账，这里写成 None 就成了执行点作废更新的意图。
+                if frame {
+                    self.room_tree_frame = Some(refnos.clone());
+                }
                 self.set_model_visible(refnos, true);
                 self.settle_room_tree_frame();
             }
@@ -7981,6 +8008,32 @@ impl App {
             data.name = refno.to_string();
         }
         data
+    }
+
+    /// 相机意图只认最新一次：用户又发起了一次取景，把更早的账全撤掉。
+    ///
+    /// 取景是异步的——范围查询要等回包，孔洞 / 房间模型要等几何落地，房间树动作要等树和叶子
+    /// 到齐。这些账各自挂着一个「稍后取景」，互不相识；不管的话，晚落地的那笔会把相机从用户
+    /// 最新那一下上拽走，日志里还多一条与当前画面无关的「已定位到 N 个模型」。
+    ///
+    /// 所以：每个**意图点**（用户刚点下去那一处）先调这个，再登记自己的取景。**执行点 / 落地点**
+    /// 不调——那时手上这笔才是最新意图，反过来作废别人就变成吞掉用户操作了。
+    ///
+    /// 不碰 `focus_room_pending` / `room_view`（房间视图的进视图与取景是同一个门控，拆开要另做）
+    /// 与 `focus_scope_pending`（它到期时会自己问 `accepts_bounds`，被作废即静默丢弃）。
+    fn supersede_camera_intents(&mut self) {
+        self.focus_bounds_request.cancel();
+        self.hole_focus_pending = None;
+        self.pending_room_frame = None;
+        self.room_tree_frame = None;
+        // 挂着的房间树取景：整条丢掉（它只为取景而挂）；挂着的「加载模型」只留显示，不再取景。
+        self.room_tree_deferred
+            .retain(|deferred| deferred.action != RoomTreeDeferred::Focus);
+        for deferred in &mut self.room_tree_deferred {
+            if let RoomTreeDeferred::LoadModels { frame, .. } = &mut deferred.action {
+                *frame = false;
+            }
+        }
     }
 }
 
@@ -10313,11 +10366,11 @@ mod tests {
             !request.contains("正在查询模型范围"),
             "发起臂本身不许直接记「在查」：{request}"
         );
-        // 新的定位意图必须让「等孔洞几何落地再取景」那笔旧账失效，否则孔洞晚一拍落地时
-        // 会把刚发起的这次查询作废，相机飞回旧孔洞、最新这一下被静默吞掉。
+        // 新的定位意图必须让更早挂着的取景账失效，否则它们晚一拍落地时会把刚发起的这次
+        // 查询作废，相机飞回旧目标、最新这一下被静默吞掉。
         assert!(
-            request.contains("self.hole_focus_pending = None"),
-            "发起范围定位要作废在途的孔洞取景意图：{request}"
+            request.contains("self.supersede_camera_intents()"),
+            "发起范围定位要先撤掉更早的取景意图：{request}"
         );
 
         let tick = source
@@ -10371,6 +10424,154 @@ mod tests {
         assert!(
             !ok.contains("warn_of(") && !ok.contains("error_of("),
             "成功不许记 WARN / ERROR：{ok}"
+        );
+    }
+
+    /// 取景是异步的，账有好几本（范围查询、孔洞等几何、房间模型等范围、房间树等树与叶子）。
+    /// 只有一处收口才管得住：**意图点**（用户刚点下去）先撤掉更早的账，**执行点 / 落地点**
+    /// 不许反过来作废别人——那会把挂起期间更新的意图吞掉。
+    #[test]
+    fn every_camera_intent_supersedes_older_deferred_framing() {
+        let source = include_str!("main.rs");
+        // 正文在测试模块之前，取第一处就是真的那个。
+        let helper = source
+            .split_once("fn supersede_camera_intents(&mut self) {")
+            .expect("收口函数")
+            .1
+            .split_once("#[cfg(test)]")
+            .expect("正文结尾")
+            .0;
+        for required in [
+            "self.focus_bounds_request.cancel()",
+            "self.hole_focus_pending = None",
+            "self.pending_room_frame = None",
+            "self.room_tree_frame = None",
+            "RoomTreeDeferred::Focus",
+            "*frame = false",
+        ] {
+            assert!(helper.contains(required), "收口要管 {required}：{helper}");
+        }
+        // 房间视图的进视图与取景是同一个门控，拆开要另做；这里不许顺手碰。
+        assert!(
+            !helper.contains("focus_room_pending") && !helper.contains("room_view"),
+            "房间视图不归这里管：{helper}"
+        );
+        // `focus_scope_pending` 归 `tick_focus_scope` 自己判（到期时问 `accepts_bounds`），
+        // 收口不必碰它——碰了就得在这里同步维护它的到期时刻。
+        assert!(
+            !helper.contains("focus_scope_pending"),
+            "「正在查询」的到期账不归这里管：{helper}"
+        );
+
+        // 八个意图点：都必须在自己的取景槽写入 / 相机命令之前收口。
+        // 每条配一根「登记针」——只断言「切片里含 helper」不够：把 helper 挪到 begin 之后，
+        // 刚发出的查询会被自己作废、按 F 没反应，而那种写法照样是绿的。
+        let intents = [
+            (
+                "孔洞定位",
+                "Cmd::FocusVirtualHoleTarget(id) => {",
+                "Cmd::ShowVirtualHoleOriginal(on) => {",
+                // 拿分叉头作针，不拿未加载分支里的 `hole_focus_pending = Some(target)`：
+                // 后者只覆盖 else 一支，把收口挪进 else 就漏了 if loaded 那一支。
+                "if loaded {",
+            ),
+            (
+                "树上定位",
+                "Cmd::FocusTreeScope(target) => {",
+                "Cmd::Model(action) => {",
+                "self.focus_bounds_request.begin(target)",
+            ),
+            (
+                "取景命令",
+                "action @ (plant_ui::ModelAction::Focus(_)",
+                "plant_ui::ModelAction::SetVisible { refnos, visible } => {",
+                "self.view3d_commands.push(Cmd::Model(action))",
+            ),
+            (
+                "房间树聚焦",
+                "RoomTreeAction::Focus(id) => {",
+                "RoomTreeAction::Isolate(id) =>",
+                "RoomTreeDeferred::Focus)",
+            ),
+            (
+                "房间树加载",
+                "RoomTreeAction::LoadModels { id, confirmed } => {",
+                "RoomTreeAction::CancelLoadModels =>",
+                "frame: true",
+            ),
+            (
+                "显示房间模型",
+                "fn show_room_model(&mut self, room: RefU64) {",
+                "fn set_model_visible(&mut self, refnos: Vec<RefU64>, visible: bool) {",
+                "self.set_model_visible(vec![room], true)",
+            ),
+            (
+                "进房间视图",
+                "fn focus_room(&mut self, room: RefU64) {",
+                "// ------------------------------------------------ 房间视图 · 房间体与直段截断",
+                "self.focus_room_pending = Some(room)",
+            ),
+            (
+                "历史回退",
+                "if let Some(camera) = entry.camera {",
+                "self.nav.navigating = false;",
+                "Cmd::RestoreCamera(camera)",
+            ),
+        ];
+        for (name, head, tail, registered) in intents {
+            let slice = source
+                .split_once(head)
+                .unwrap_or_else(|| panic!("{name} 的意图点还在：{head}"))
+                .1
+                .split_once(tail)
+                .unwrap_or_else(|| panic!("{name} 的切片结尾：{tail}"))
+                .0;
+            let close = slice
+                .find("self.supersede_camera_intents()")
+                .unwrap_or_else(|| panic!("{name} 要先撤掉更早的取景意图：{slice}"));
+            let register = slice
+                .find(registered)
+                .unwrap_or_else(|| panic!("{name} 的登记针没找到：{registered}"));
+            assert!(
+                close < register,
+                "{name} 要先收口、再登记自己的取景（否则会作废刚发出的查询）：{slice}"
+            );
+        }
+
+        // 执行点不许作废：房间树 Focus 是挂起后晚执行的，它手上这笔不一定是用户最新的意图。
+        let execute = source
+            .split_once("RoomTreeDeferred::Focus => {")
+            .expect("房间树聚焦执行臂")
+            .1
+            .split_once("RoomTreeDeferred::LoadModels { confirmed, frame } => {")
+            .expect("加载执行臂")
+            .0;
+        assert!(
+            !execute.contains("supersede_camera_intents")
+                && !execute.contains("focus_bounds_request.cancel()"),
+            "执行点不作废在途查询：{execute}"
+        );
+
+        // 「加载模型」落地时取不取景，看挂起那一刻记下的 frame；而且只许写、不许清——
+        // `frame=false` 时 `room_tree_frame` 里可能正躺着更新那次登记的账。
+        let load = source
+            .split_once("RoomTreeDeferred::LoadModels { confirmed, frame } => {")
+            .expect("加载执行臂")
+            .1
+            .split_once("self.settle_room_tree_frame();")
+            .expect("取景结算")
+            .0;
+        assert!(
+            load.contains("if frame {") && load.contains("self.room_tree_frame = Some("),
+            "加载落地要听挂起时的 frame，且只在 frame 为真时写取景账：{load}"
+        );
+        assert!(
+            !load.contains("frame.then("),
+            "frame 为假时不许把 room_tree_frame 写成 None——那会抹掉更新那次登记的账：{load}"
+        );
+        assert!(
+            !load.contains("self.room_tree_frame = None"),
+            "加载落地只许写、不许清：补一个 else 清空同样会抹掉更新的账：{load}"
         );
     }
 
