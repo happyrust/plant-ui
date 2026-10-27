@@ -826,7 +826,8 @@ pub struct RoomTreeRowVm {
     pub tags: Vec<RoomTreeTagVm>,
     pub expandable: Option<bool>,
     pub loading: bool,
-    /// `None` = 这一行没有眼睛（直段行：第一版只读）。有值时读的是三维的实际可见性，分组行按子行聚合。
+    /// 读的是三维的实际可见性：构件按 refno、直段按（所属 BRAN，直段身份）逐段（ADR-0033 阶段四）、分组行按子行聚合；
+    /// `None` = 这一行没有眼睛（眼下所有行都有，留作身份解不出场景键的兜底）。
     pub visibility: Option<RowVisibility>,
     /// 点眼睛时 `SetVisible` 该带的方向（与 [`TreeRowVm::next_visible`] 同一条理由）。
     pub next_visible: bool,

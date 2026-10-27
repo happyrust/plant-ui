@@ -1296,7 +1296,7 @@ struct App {
     /// 房间树取数的帧号：刷新 / 重连进一帧，晚到的旧回包丢。
     room_tree_epoch: u64,
     /// 等树 / 等叶子补齐再执行的房间树动作（显隐 / 聚焦 / 隔离 / 加载；计划 D7）。
-    room_tree_deferred: Vec<(RoomNodeId, RoomTreeDeferred)>,
+    room_tree_deferred: Vec<DeferredRoomTreeAction>,
     /// 「加载模型」超过阈值时开着的确认框。
     room_tree_confirm: Option<RoomTreeConfirmVm>,
     /// 待滚动的房间树行（外部选中联动 / 「在房间树查看」），行画出来了就收掉（同 `tree_reveal`）。
@@ -1514,7 +1514,7 @@ struct App {
 const COMMAND_CAP: usize = 2000;
 
 /// 库供数下房间树面板的注释（计划 D2；ADR-0026：库供数缺的格要标出来，不许安静空着）。
-const ROOM_TREE_STORE_NOTE: &str = "房间树只在服务供数下有：它由 gen-model 服务端聚合（ADR 0068），库供数没有这一棵。设置 → 供数模式 切回「服务供数」即可";
+const ROOM_TREE_STORE_NOTE: &str = "房间树只在服务供数下有：它由 gen-model 服务端聚合，库供数没有这一棵。设置 → 供数模式 切回「服务供数」即可";
 
 /// 房间树一次动作前最多补几组未内联的叶子（照 plant3d-web `collectRefnos` 的 `maxGroups`）。
 const ROOM_TREE_LEAF_GROUP_CAP: usize = 64;
@@ -1529,6 +1529,54 @@ enum RoomTreeDeferred {
     LoadModels {
         confirmed: bool,
     },
+}
+
+/// 一条挂着的房间树动作。`leaves_requested` = 这条动作有没有替自己补过一轮叶子（最多 64 组）：树还没取时挂起的动作
+/// 没补过，树到了得先补再做——否则 `leaves_inline = false` 的大房间只会按已内联的那一小部分做（隔离会把房间自己的大半
+/// 构件藏掉）；补过一轮之后还没补到的组就按已知的做（来源同）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeferredRoomTreeAction {
+    id: RoomNodeId,
+    action: RoomTreeDeferred,
+    leaves_requested: bool,
+}
+
+/// 回包落地后一条挂着的房间树动作的去向（`settle_room_tree_deferred` 的裁决，不碰 IO）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeferredStep {
+    /// 树或叶子还在途：继续挂。
+    Wait,
+    /// 等的那一条没取回来：作废（原因由调用方取）。
+    Abort,
+    /// 树刚到、这条动作还没替自己补过叶子：先补一轮，补完再做。
+    RequestLeaves,
+    /// 到齐了（或补过一轮了）：做。
+    Execute,
+}
+
+fn deferred_step(
+    leaves_requested: bool,
+    tree_loading: bool,
+    tree_ready: bool,
+    leaves_loading: bool,
+    leaves_failed: bool,
+) -> DeferredStep {
+    if tree_loading {
+        return DeferredStep::Wait;
+    }
+    if !tree_ready {
+        return DeferredStep::Abort;
+    }
+    if !leaves_requested {
+        return DeferredStep::RequestLeaves;
+    }
+    if leaves_loading {
+        return DeferredStep::Wait;
+    }
+    if leaves_failed {
+        return DeferredStep::Abort;
+    }
+    DeferredStep::Execute
 }
 
 /// E3D 外观的视口底色（grey→白，渐变关是纯 grey）；PBR 外观还是跟主题，给 `None`。
@@ -2845,24 +2893,31 @@ impl App {
                     only,
                     result,
                 } if epoch == self.room_tree_epoch => {
-                    if let Some(id) = self.room_tree.loading_node_for(room, only.as_ref()) {
-                        self.room_tree.loading.remove(&id);
+                    // 同一个 noun 在两个专业的「其他构件」下都未内联时，一条 `other_noun=` 回包对应两个节点
+                    //（合并时两组都填），在途集里有几个就收几个；没人在等的是过期回包，丢。
+                    let ids = self.room_tree.loading_nodes_for(room, only.as_ref());
+                    if !ids.is_empty() {
+                        for id in &ids {
+                            self.room_tree.loading.remove(id);
+                        }
                         let outcome = match result {
                             Ok(tree) if only.is_none() => self.room_tree.set_tree(room, tree),
                             Ok(tree) => self.room_tree.merge_leaves(room, tree),
                             Err(error) => Err(error.to_string()),
                         };
                         if let Err(message) = outcome {
-                            let label = self
-                                .room_tree
-                                .node(&id)
-                                .map(|node| node.label.clone())
-                                .unwrap_or_else(|| room.to_slash_string());
-                            self.logs.warn(
-                                &mut self.vm.logs,
-                                format!("房间树：{label} 取数失败——{message}"),
-                            );
-                            self.room_tree.set_error(id, message);
+                            for id in ids {
+                                let label = self
+                                    .room_tree
+                                    .node(&id)
+                                    .map(|node| node.label.clone())
+                                    .unwrap_or_else(|| room.to_slash_string());
+                                self.logs.warn(
+                                    &mut self.vm.logs,
+                                    format!("房间树：{label} 取数失败——{message}"),
+                                );
+                                self.room_tree.set_error(id, message.clone());
+                            }
                         }
                     }
                     self.settle_room_tree_deferred();
@@ -7225,6 +7280,7 @@ impl App {
             self.room_tree_deferred.clear();
             self.room_tree_confirm = None;
             self.room_tree_reveal = None;
+            self.room_tree_reveal_room = None;
             self.room_tree_frame = None;
         } else if matches!(
             self.room_tree.status,
@@ -7236,6 +7292,16 @@ impl App {
         if self.read_face == settings::ReadFaceKind::Store {
             self.room_tree
                 .set_unavailable(ROOM_TREE_STORE_NOTE.to_owned());
+            // 库供数下没有树可定位：等根清单的那条「在房间树查看」作废，别留到将来切回服务供数时突然跳出来。
+            if let Some(room) = self.room_tree_reveal_room.take() {
+                self.logs.warn(
+                    &mut self.vm.logs,
+                    format!(
+                        "房间树：库供数下没有房间树，「在房间树查看」{} 作废",
+                        room.to_slash_string()
+                    ),
+                );
+            }
             return;
         }
         self.room_tree.begin_roots();
@@ -7301,6 +7367,8 @@ impl App {
             }
             RoomTreeAction::CancelLoadModels => self.room_tree_confirm = None,
         }
+        // 刚挂起的动作若它等的请求根本没发出去（数据线程已停），这一拍就作废并说一声，别一直挂着。
+        self.settle_room_tree_deferred();
         self.rebuild_room_tree();
     }
 
@@ -7328,14 +7396,19 @@ impl App {
         }
     }
 
-    /// 按 `unit=` / `other_noun=` 补一组未内联的叶子。
+    /// 按 `unit=` / `other_noun=` 补一组未内联的叶子。同（房间、选择器）已有一条在途（同名 noun 在另一个专业的
+    ///「其他构件」下）时只把这个节点挂进在途集一起等，不再发第二条 HTTP——回包落地时 `loading_nodes_for` 把两个都找回来。
     fn ensure_room_leaves(&mut self, id: RoomNodeId, selector: LeafSelector) {
         let room = id.room();
         if self.room_tree.loading.contains(&id) || !self.room_tree.is_fetched(room) {
             return;
         }
+        let in_flight = self.room_tree.leaves_in_flight(room, &selector);
         self.room_tree.loading.insert(id.clone());
         self.room_tree.clear_error(&id);
+        if in_flight {
+            return;
+        }
         if self
             .bridge
             .req
@@ -7360,68 +7433,84 @@ impl App {
             || self.room_tree.loading.contains(&RoomNodeId::Room(room))
         {
             self.ensure_room_tree(room);
-            self.room_tree_deferred.push((id, action));
+            self.room_tree_deferred.push(DeferredRoomTreeAction {
+                id,
+                action,
+                leaves_requested: false,
+            });
             return;
         }
-        let pending = self.room_tree.pending_leaf_nodes_under(&id);
-        if !pending.is_empty() {
-            for (node, selector) in pending.into_iter().take(ROOM_TREE_LEAF_GROUP_CAP) {
-                self.ensure_room_leaves(node, selector);
-            }
-            self.room_tree_deferred.push((id, action));
-            return;
-        }
-        self.execute_room_tree_action(id, action);
+        self.run_room_tree_action_on_fetched_tree(id, action);
     }
 
-    /// 回包落地后过一遍挂着的动作：还在等的继续挂；等的那一条失败了就作废并说一声；到齐了就做。
-    /// 超过 64 组的尾巴不再补（来源同）：那时候按已知的构件做。
+    /// 树已在手的那一半：叶子未内联的组先补一轮（最多 64 组）再挂起等回包；没有要补的就直接做。
+    /// 树刚到时 `settle_room_tree_deferred` 也走这里，所以在收起的房间根上发起的动作同样会先补叶子。
+    fn run_room_tree_action_on_fetched_tree(&mut self, id: RoomNodeId, action: RoomTreeDeferred) {
+        let pending = self.room_tree.pending_leaf_nodes_under(&id);
+        if pending.is_empty() {
+            self.execute_room_tree_action(id, action);
+            return;
+        }
+        for (node, selector) in pending.into_iter().take(ROOM_TREE_LEAF_GROUP_CAP) {
+            self.ensure_room_leaves(node, selector);
+        }
+        self.room_tree_deferred.push(DeferredRoomTreeAction {
+            id,
+            action,
+            leaves_requested: true,
+        });
+    }
+
+    /// 回包落地后过一遍挂着的动作（裁决见 [`deferred_step`]）：还在等的继续挂；等的那一条失败了就作废并说一声；
+    /// 树刚到、还没替自己补过叶子的先补一轮；到齐了就做。超过 64 组的尾巴不再补（来源同）：那时候按已知的构件做。
     fn settle_room_tree_deferred(&mut self) {
         let deferred = std::mem::take(&mut self.room_tree_deferred);
-        for (id, action) in deferred {
-            let room = id.room();
+        for entry in deferred {
+            let room = entry.id.room();
             let root = RoomNodeId::Room(room);
-            if self.room_tree.loading.contains(&root) {
-                self.room_tree_deferred.push((id, action));
-                continue;
+            let pending = self.room_tree.pending_leaf_nodes_under(&entry.id);
+            let step = deferred_step(
+                entry.leaves_requested,
+                self.room_tree.loading.contains(&root),
+                self.room_tree.is_fetched(room) || self.room_tree.is_empty_room(room),
+                pending
+                    .iter()
+                    .any(|(node, _)| self.room_tree.loading.contains(node)),
+                pending
+                    .iter()
+                    .any(|(node, _)| self.room_tree.error_of(node).is_some()),
+            );
+            match step {
+                DeferredStep::Wait => self.room_tree_deferred.push(entry),
+                DeferredStep::RequestLeaves => {
+                    self.run_room_tree_action_on_fetched_tree(entry.id, entry.action)
+                }
+                DeferredStep::Execute => self.execute_room_tree_action(entry.id, entry.action),
+                DeferredStep::Abort => {
+                    let message = if !self.room_tree.is_fetched(room)
+                        && !self.room_tree.is_empty_room(room)
+                    {
+                        format!(
+                            "房间树：{} 上的动作作废——{}",
+                            room.to_slash_string(),
+                            self.room_tree.error_of(&root).unwrap_or("树没取回来")
+                        )
+                    } else {
+                        let failed = pending
+                            .iter()
+                            .find(|(node, _)| self.room_tree.error_of(node).is_some());
+                        let label = failed
+                            .and_then(|(node, _)| self.room_tree.node(node))
+                            .map(|node| node.label.clone())
+                            .unwrap_or_default();
+                        let reason = failed
+                            .and_then(|(node, _)| self.room_tree.error_of(node))
+                            .unwrap_or_default();
+                        format!("房间树：{label} 的叶子没补回来，这一支上的动作作废——{reason}")
+                    };
+                    self.logs.warn(&mut self.vm.logs, message);
+                }
             }
-            if !self.room_tree.is_fetched(room) && !self.room_tree.is_empty_room(room) {
-                let reason = self
-                    .room_tree
-                    .error_of(&root)
-                    .unwrap_or("树没取回来")
-                    .to_owned();
-                self.logs.warn(
-                    &mut self.vm.logs,
-                    format!("房间树：{} 上的动作作废——{reason}", room.to_slash_string()),
-                );
-                continue;
-            }
-            let pending = self.room_tree.pending_leaf_nodes_under(&id);
-            if pending
-                .iter()
-                .any(|(node, _)| self.room_tree.loading.contains(node))
-            {
-                self.room_tree_deferred.push((id, action));
-                continue;
-            }
-            if let Some((node, _)) = pending
-                .iter()
-                .find(|(node, _)| self.room_tree.error_of(node).is_some())
-            {
-                let reason = self.room_tree.error_of(node).unwrap_or_default().to_owned();
-                let label = self
-                    .room_tree
-                    .node(node)
-                    .map(|n| n.label.clone())
-                    .unwrap_or_default();
-                self.logs.warn(
-                    &mut self.vm.logs,
-                    format!("房间树：{label} 的叶子没补回来，这一支上的动作作废——{reason}"),
-                );
-                continue;
-            }
-            self.execute_room_tree_action(id, action);
         }
     }
 
@@ -7773,6 +7862,30 @@ mod tests {
                 .and_then(|value| SglLookDebugView::parse(&value)),
             Some(SglLookDebugView::DepthError)
         );
+    }
+
+    /// 房间树挂着的动作在回包落地后的去向：树还在途 → 等；树没回来 → 作废；树刚到而这条动作还没替自己补过叶子 →
+    /// 先补一轮（在收起的房间根上发起的动作就是这种，不补就只按已内联的那一小部分做）；补过一轮后叶子在途 → 等、
+    /// 有失败 → 作废、都到齐 → 做。
+    #[test]
+    fn a_deferred_room_tree_action_requests_leaves_before_it_runs() {
+        use super::{DeferredStep, deferred_step};
+        assert_eq!(deferred_step(false, true, false, false, false), DeferredStep::Wait);
+        assert_eq!(deferred_step(true, true, true, false, false), DeferredStep::Wait);
+        assert_eq!(deferred_step(false, false, false, false, false), DeferredStep::Abort);
+        assert_eq!(
+            deferred_step(false, false, true, false, false),
+            DeferredStep::RequestLeaves,
+            "树到了但没补过叶子：先补一轮，不能直接做"
+        );
+        assert_eq!(
+            deferred_step(false, false, true, true, true),
+            DeferredStep::RequestLeaves,
+            "没补过叶子时在途 / 失败都由补那一轮去处理（失败的组会重发）"
+        );
+        assert_eq!(deferred_step(true, false, true, true, false), DeferredStep::Wait);
+        assert_eq!(deferred_step(true, false, true, false, true), DeferredStep::Abort);
+        assert_eq!(deferred_step(true, false, true, false, false), DeferredStep::Execute);
     }
 
     fn ime_output(cursor: egui::Rect) -> egui::output::IMEOutput {

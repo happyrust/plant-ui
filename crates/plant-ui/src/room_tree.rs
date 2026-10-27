@@ -1199,24 +1199,43 @@ impl RoomTreeModel {
             .map(|(_, message)| message.as_str())
     }
 
-    /// 一条取数回包是哪个节点在等：整树 = 房间根；`unit=` = 那个单元；`other_noun=` 的 id 里还有专业值，
-    /// 回包里没有，从在途集里按（房间、noun）找回来。
-    pub fn loading_node_for(
-        &self,
-        room: RefU64,
-        only: Option<&LeafSelector>,
-    ) -> Option<RoomNodeId> {
+    /// 一条取数回包是哪些节点在等：整树 = 房间根；`unit=` = 那个单元；`other_noun=` 的 id 里还有专业值，
+    /// 回包里没有，从在途集里按（房间、noun）找回来——同一个 noun 在两个专业的「其他构件」下都未内联时就是两个
+    /// （回包里两组都内联了，[`merge_tree_leaves`] 也都填），所以一起回，别让另一个永远停在「加载中」。没人在等回空。
+    pub fn loading_nodes_for(&self, room: RefU64, only: Option<&LeafSelector>) -> Vec<RoomNodeId> {
         match only {
-            None => Some(RoomNodeId::Room(room)),
-            Some(LeafSelector::Unit(unit)) => Some(RoomNodeId::Unit { room, unit: *unit }),
-            Some(LeafSelector::OtherNoun(noun)) => self
-                .loading
-                .iter()
-                .find(|id| {
-                    matches!(id, RoomNodeId::OtherNoun { room: r, noun: n, .. } if *r == room && n == noun)
-                })
-                .cloned(),
+            None => vec![RoomNodeId::Room(room)],
+            Some(LeafSelector::Unit(unit)) => vec![RoomNodeId::Unit { room, unit: *unit }],
+            Some(LeafSelector::OtherNoun(noun)) => {
+                let mut ids: Vec<RoomNodeId> = self
+                    .loading
+                    .iter()
+                    .filter(|id| {
+                        matches!(id, RoomNodeId::OtherNoun { room: r, noun: n, .. } if *r == room && n == noun)
+                    })
+                    .cloned()
+                    .collect();
+                ids.sort_by_key(|id| match id {
+                    RoomNodeId::OtherNoun { spec, .. } => *spec,
+                    _ => 0,
+                });
+                ids
+            }
         }
+    }
+
+    /// 同（房间、选择器）的补叶子请求是否已在途：同一个 noun 在两个专业下都未内联时只该发一条 HTTP，
+    /// 第二个节点挂进在途集一起等那条回包（[`Self::loading_nodes_for`] 会把两个都找回来）。
+    pub fn leaves_in_flight(&self, room: RefU64, selector: &LeafSelector) -> bool {
+        self.loading.iter().any(|id| match (id, selector) {
+            (RoomNodeId::Unit { room: r, unit }, LeafSelector::Unit(wanted)) => {
+                *r == room && unit == wanted
+            }
+            (RoomNodeId::OtherNoun { room: r, noun, .. }, LeafSelector::OtherNoun(wanted)) => {
+                *r == room && noun == wanted
+            }
+            _ => false,
+        })
     }
 
     /// 展开过、取树 / 补叶子失败的节点：一句原因列在树上方。
@@ -1537,8 +1556,8 @@ impl RoomTreeModel {
     }
 }
 
-/// 一个节点的 eye：构件按 refno；BRAN 单元 = 它自己（直管）+ 构件；其余分组按子节点聚合；
-/// 直段行没有（`None`）。
+/// 一个节点的 eye：构件按 refno；直段行按（所属 BRAN，直段身份）逐段读 `eyes.tube`（阶段四）；BRAN 单元 =
+/// 它自己（直管）+ 构件 + 已装进场景的直段；其余分组按子节点聚合。`None` 只在身份解不出场景键时出现。
 fn eye_of(node: &RoomTreeNode, eyes: &EyeSource<'_>) -> Option<EyeState> {
     match node.kind() {
         RoomNodeKind::Tube => node
@@ -1606,6 +1625,59 @@ pub fn aggregate(states: &[EyeState]) -> EyeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `other_noun=` 的回包对应在途集里所有同（房间、noun）的「其他构件」组（两个专业各一个），`unit=` 与整树各只对应
+    /// 自己那一个；同（房间、选择器）已在途时第二个节点不该再发一条 HTTP。
+    #[test]
+    fn a_leaf_reply_is_claimed_by_every_group_waiting_for_the_same_noun() {
+        let room = r(9001, 1);
+        let mut model = RoomTreeModel::default();
+        let pane_in_spec_6 = RoomNodeId::OtherNoun {
+            room,
+            spec: 6,
+            noun: "PANE".into(),
+        };
+        let pane_in_spec_5 = RoomNodeId::OtherNoun {
+            room,
+            spec: 5,
+            noun: "PANE".into(),
+        };
+        let pane_elsewhere = RoomNodeId::OtherNoun {
+            room: r(9001, 2),
+            spec: 6,
+            noun: "PANE".into(),
+        };
+        let unit = RoomNodeId::Unit {
+            room,
+            unit: r(9001, 1010),
+        };
+        let pane = LeafSelector::OtherNoun("PANE".into());
+        assert!(!model.leaves_in_flight(room, &pane));
+        model.loading.insert(pane_in_spec_6.clone());
+        assert!(model.leaves_in_flight(room, &pane));
+        assert!(!model.leaves_in_flight(room, &LeafSelector::OtherNoun("SCTN".into())));
+        assert!(!model.leaves_in_flight(r(9001, 2), &pane), "别的房间不算");
+        model.loading.insert(pane_in_spec_5.clone());
+        model.loading.insert(pane_elsewhere);
+        model.loading.insert(unit.clone());
+        assert_eq!(
+            model.loading_nodes_for(room, Some(&pane)),
+            vec![pane_in_spec_5, pane_in_spec_6],
+            "同一个 noun 在两个专业下的组一起回，按专业排；别的房间的不算"
+        );
+        assert_eq!(
+            model.loading_nodes_for(room, Some(&LeafSelector::Unit(r(9001, 1010)))),
+            vec![unit]
+        );
+        assert!(model.leaves_in_flight(room, &LeafSelector::Unit(r(9001, 1010))));
+        assert_eq!(model.loading_nodes_for(room, None), vec![RoomNodeId::Room(room)]);
+        assert!(
+            model
+                .loading_nodes_for(room, Some(&LeafSelector::OtherNoun("SCTN".into())))
+                .is_empty(),
+            "没人在等的回包是过期的"
+        );
+    }
 
     fn r(a: u32, b: u32) -> RefU64 {
         RefU64::from_two_nums(a, b)

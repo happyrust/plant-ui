@@ -237,7 +237,7 @@ fn body(
             let live = vm.view3d.as_ref().is_some_and(|v| v.live);
             area.show_rows(ui, d.row_h(), rows.len(), |ui, range| {
                 for row in &rows[range] {
-                    row_ui(ui, t, d, row, rows, live, cmds);
+                    row_ui(ui, t, d, row, live, cmds);
                 }
             });
         });
@@ -261,7 +261,6 @@ fn row_ui(
     t: &Tokens,
     d: Density,
     row: &RoomTreeRowVm,
-    rows: &[RoomTreeRowVm],
     live: bool,
     cmds: &mut Vec<Cmd>,
 ) {
@@ -356,7 +355,6 @@ fn row_ui(
             modifiers: SelectModifiers::default(),
         }));
     }
-    let _ = rows;
     out.response
         .context_menu(|ui| row_menu(ui, d, row, live, cmds));
 }

@@ -2148,40 +2148,78 @@ fn spatial_room_tree_fixture(
                 ],
             )
         }
-        "9001_502" => (
-            "9001_502",
-            "R102",
-            Some("泵房"),
-            vec![TreeSpec {
-                spec_value: 1,
-                count: 1,
-                tube_count: Some(1),
-                unit_types: vec![TreeUnitType {
-                    noun: "BRAN".into(),
-                    count: 1,
-                    tube_count: Some(1),
-                    units: vec![TreeUnit {
-                        refno: "9001_2010".into(),
-                        noun: "BRAN".into(),
-                        name: Some("/SIM-P2/B1".into()),
+        "9001_502" => {
+            // 同一个 noun（PANE）在两个专业的「其他构件」下都未内联（2026-10-26 审核修正 ②）：展开任一组只该发一条
+            // `other_noun=PANE`，回包里两组一起内联（与服务端同形），两行都要从「加载中…」回来。
+            let pane_inline = wants_noun("PANE");
+            let pane_group = |first: u32| TreeOtherNoun {
+                noun: "PANE".into(),
+                count: 2,
+                min_distance: 40.0,
+                elements: pane_inline.then(|| {
+                    vec![
+                        leaf(&format!("9001_{first}"), "PANE", 40.0),
+                        leaf(&format!("9001_{}", first + 1), "PANE", 90.0),
+                    ]
+                }),
+            };
+            (
+                "9001_502",
+                "R102",
+                Some("泵房"),
+                vec![
+                    TreeSpec {
+                        spec_value: 1,
                         count: 1,
                         tube_count: Some(1),
-                        min_distance: 60.0,
-                        elements: Some(vec![leaf("9001_2011", "GASK", 60.0)]),
-                        tubes: Some(vec![tube(
-                            0,
-                            "9001_2010",
-                            "9001_2011",
-                            "BRAN",
-                            "GASK",
-                            1200.0,
-                            false,
-                        )]),
-                    }],
-                }],
-                others: TreeOthers::default(),
-            }],
-        ),
+                        unit_types: vec![TreeUnitType {
+                            noun: "BRAN".into(),
+                            count: 1,
+                            tube_count: Some(1),
+                            units: vec![TreeUnit {
+                                refno: "9001_2010".into(),
+                                noun: "BRAN".into(),
+                                name: Some("/SIM-P2/B1".into()),
+                                count: 1,
+                                tube_count: Some(1),
+                                min_distance: 60.0,
+                                elements: Some(vec![leaf("9001_2011", "GASK", 60.0)]),
+                                tubes: Some(vec![tube(
+                                    0,
+                                    "9001_2010",
+                                    "9001_2011",
+                                    "BRAN",
+                                    "GASK",
+                                    1200.0,
+                                    false,
+                                )]),
+                            }],
+                        }],
+                        others: TreeOthers::default(),
+                    },
+                    TreeSpec {
+                        spec_value: 5,
+                        count: 2,
+                        tube_count: None,
+                        unit_types: Vec::new(),
+                        others: TreeOthers {
+                            count: 2,
+                            by_noun: vec![pane_group(2501)],
+                        },
+                    },
+                    TreeSpec {
+                        spec_value: 6,
+                        count: 2,
+                        tube_count: None,
+                        unit_types: Vec::new(),
+                        others: TreeOthers {
+                            count: 2,
+                            by_noun: vec![pane_group(2601)],
+                        },
+                    },
+                ],
+            )
+        }
         _ => {
             return Err(crate::spatial_api::SpatialError::RoomNotFound(format!(
                 "剧本里没有 {room} 的面板模型"
