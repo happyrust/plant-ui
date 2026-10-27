@@ -3389,6 +3389,17 @@ impl App {
                     match result {
                         Ok(bounds) => {
                             self.focus_bounds_request.cancel();
+                            // 相机这一动没有别的回声：说一句落到哪儿、框了多少个模型，
+                            // 用户才知道「定位成功」与「框错了范围」的区别。
+                            let element = self.tree.element(target);
+                            self.logs.info_of(
+                                &mut self.vm.logs,
+                                element,
+                                format!(
+                                    "节点 {target}：已定位到 {} 个模型的范围",
+                                    bounds.model_count
+                                ),
+                            );
                             self.view3d_commands.push(Cmd::Model(
                                 plant_ui::ModelAction::FocusBounds {
                                     min_mm: bounds.min_mm,
@@ -4800,6 +4811,13 @@ impl App {
                     {
                         self.focus_bounds_request.cancel();
                         self.logs.warn(&mut self.vm.logs, "模型服务通道已断开");
+                    } else {
+                        // 大范围（SITE 级）这一拍可能要几秒：先说一句「在查」，
+                        // 否则点下去到相机动之间没有任何反馈，看着像没反应。
+                        self.logs.info(
+                            &mut self.vm.logs,
+                            format!("节点 {target}：正在查询模型范围…"),
+                        );
                     }
                     dirty = true;
                 }
@@ -10214,6 +10232,54 @@ mod tests {
         assert_eq!(
             EMPTY_SCOPE_HINT,
             "范围内没有已生成的模型；右键「重新生成模型」可生成"
+        );
+    }
+
+    /// 范围定位是异步的：点下去到相机动之间若什么都不说，大层级（SITE）看着就是
+    /// 「没反应」。发起时一句「正在查询」，回来时一句「已定位到 N 个模型」，
+    /// 两句都在 INFO——定位不是错误。
+    #[test]
+    fn focus_scope_reports_start_and_outcome() {
+        let source = include_str!("main.rs");
+
+        let request = source
+            .split_once("Cmd::FocusTreeScope(target) => {")
+            .expect("范围定位的发起臂")
+            .1
+            .split_once("Cmd::Model(action) => {")
+            .expect("下一臂")
+            .0;
+        let warn = request.find("模型服务通道已断开").expect("通道断开那一句");
+        let start = request
+            .find("正在查询模型范围")
+            .expect("发起时要说一句「在查」");
+        assert!(warn < start, "只在发送成功后才说「在查」：{request}");
+        assert!(
+            request.contains("self.logs.info("),
+            "「在查」是 INFO：{request}"
+        );
+
+        let reply = source
+            .split_once("data::Evt::SubtreeBounds {")
+            .expect("范围回包那一臂")
+            .1
+            .split_once("data::Evt::SubtreeBounds { .. } => {}")
+            .expect("过期回包那一臂")
+            .0;
+        let ok = reply
+            .split_once("Ok(bounds) => {")
+            .expect("成功分支")
+            .1
+            .split_once("Err(error) if read_face::is_no_renderable_geometry(&error) => {")
+            .expect("查空分支")
+            .0;
+        assert!(
+            ok.contains("已定位到") && ok.contains("model_count") && ok.contains("info_of("),
+            "成功要把框了多少个模型说出来：{ok}"
+        );
+        assert!(
+            !ok.contains("warn_of(") && !ok.contains("error_of("),
+            "成功不许记 WARN / ERROR：{ok}"
         );
     }
 

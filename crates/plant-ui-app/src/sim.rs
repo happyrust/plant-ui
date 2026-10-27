@@ -1764,10 +1764,12 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
         Req::Reconnect | Req::SwitchReadFace(_) => Evt::Ready(Ok(engine.ready_info())),
         Req::Children(refno) => Evt::Children(refno, Ok(engine.children(refno))),
         Req::Props(refno) => Evt::Props(refno, Ok(engine.props(refno))),
+        // 剧本里没有已生成的模型：回 typed 的查空，宿主据此记 INFO 提示（ADR-0030 D1）。
+        // 拼字符串走 anyhow 的话 code 会是 internal，查空就掉进 ERROR「范围定位失败」。
         Req::SubtreeBounds { epoch, target } => Evt::SubtreeBounds {
             epoch,
             target,
-            result: Err(anyhow::anyhow!("NO_RENDERABLE_GEOMETRY: {}", target)),
+            result: Err(anyhow::Error::new(crate::read_face::NoRenderableGeometry)),
         },
         // 剧本里没有房间数据：空归属即「无房间归属」，界面照常走 Ready 空态。
         Req::ElementRooms(refno) => Evt::ElementRooms(refno, Ok(Vec::new())),
@@ -2357,6 +2359,42 @@ fn sim_steps(state: &str) -> Vec<TaskStep> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 剧本模式下「范围内没有已生成的模型」是查空，不是失败：宿主用
+    /// [`crate::read_face::is_no_renderable_geometry`] 分流，落 INFO 提示而不是
+    /// ERROR「范围定位失败」（ADR-0030 D1）。用 anyhow 拼字符串时 code 会是
+    /// internal，这条分流就走不到，所以这里钉住 typed 回包。
+    #[test]
+    fn sim_subtree_bounds_is_a_typed_empty_scope() {
+        let mut engine = Engine::new(ServiceMode::Legacy);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let target = RefU64::from_two_nums(9001, 1010);
+
+        handle(
+            &mut engine,
+            crate::data::Req::SubtreeBounds { epoch: 7, target },
+            &tx,
+        );
+
+        match rx.try_recv() {
+            Ok(Evt::SubtreeBounds {
+                epoch,
+                target: echoed,
+                result: Err(error),
+            }) => {
+                assert_eq!((epoch, echoed), (7, target));
+                assert!(
+                    crate::read_face::is_no_renderable_geometry(&error),
+                    "剧本查空必须是 typed 的 NoRenderableGeometry，实际 {error:#}"
+                );
+            }
+            Ok(Evt::SubtreeBounds { .. }) => {
+                panic!("SubtreeBounds 回了 Ok，剧本里没有可定位的模型")
+            }
+            Ok(_) => panic!("期望 SubtreeBounds 回包，实际是别的 Evt"),
+            Err(error) => panic!("没收到回包：{error}"),
+        }
+    }
 
     /// 剧本里的直段记录与房间树的直段行是同一套身份：逐段眼睛靠它们对上。构件回零实例记录，别的目标空。
     #[test]

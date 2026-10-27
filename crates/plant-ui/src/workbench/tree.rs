@@ -294,6 +294,19 @@ pub(super) struct ElementDimensions<'a> {
     pub layer: &'a DimensionsVm,
 }
 
+/// 模型动作 → 命令。菜单、视口工具栏与快捷键共用的唯一映射。
+///
+/// 「定位」走 [`Cmd::FocusTreeScope`]：由服务端按子树范围算包围盒，任意层级
+/// （SITE / ZONE / 单元 / BRAN / 元件）都成立。直接发 [`ModelAction::Focus`]
+/// 只认**已加载**记录的包围盒，容器层级取不到就静默不动——两个入口的语义必须
+/// 一致，所以这里只留一条路。
+pub(super) fn model_cmd(action: ModelAction) -> Cmd {
+    match action {
+        ModelAction::Focus(target) => Cmd::FocusTreeScope(target),
+        action => Cmd::Model(action),
+    }
+}
+
 /// 元素菜单的公共部分：模型动作 + 房间归属 + 尺寸标注 + 复制 REFNO。模型树的行
 /// 菜单与三维视口的右键菜单是同一件事的两个入口，内容必须一致，所以收在一处。
 ///
@@ -338,7 +351,8 @@ pub(super) fn element_menu(
                     visible: false,
                 },
             ),
-            // 定位不带计数：它只把相机带到右键的这一行跟前，见 `ModelAction::Focus`。
+            // 定位不带计数：它只把相机带到右键的这一行跟前。作用对象仍是
+            // `ModelAction::Focus(refno)`，落成哪条命令由 `model_cmd` 决定。
             (
                 ph::CROSSHAIR_SIMPLE,
                 "定位模型".to_owned(),
@@ -346,10 +360,7 @@ pub(super) fn element_menu(
             ),
         ] {
             if ui.button(format!("{icon}  {label}")).clicked() {
-                cmds.push(match action {
-                    ModelAction::Focus(target) => Cmd::FocusTreeScope(target),
-                    action => Cmd::Model(action),
-                });
+                cmds.push(model_cmd(action));
                 ui.close();
             }
         }

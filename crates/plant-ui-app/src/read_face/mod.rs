@@ -38,7 +38,12 @@ impl std::fmt::Display for NoRenderableGeometry {
 impl std::error::Error for NoRenderableGeometry {}
 pub fn is_no_renderable_geometry(error: &anyhow::Error) -> bool {
     error.downcast_ref::<NoRenderableGeometry>().is_some()
-        || crate::model_update_api::failure_of(error).code == "no_renderable_geometry"
+        // 服务端 `QueryError` 里这个 code 是大写 `NO_RENDERABLE_GEOMETRY`，
+        // `web_service::ApiError::from_query` 折成小写再发；老服务端或别的封装
+        // 可能原样透出大写。按 code 大小写不敏感比较，别让「查空」掉进 ERROR。
+        || crate::model_update_api::failure_of(error)
+            .code
+            .eq_ignore_ascii_case("no_renderable_geometry")
 }
 
 /// 对拍探针（计划 §5.4 / D14）：`plant-ui-app --read-face-parity`，无头子命令，两面并存
@@ -248,7 +253,10 @@ impl ReadFace {
 mod tests {
     use plant_ui_data::RefU64;
 
-    use super::{ModelInstancesReq, ReadFace, ReadFaceKind, ServiceIdentity};
+    use super::{
+        ModelInstancesReq, NoRenderableGeometry, ReadFace, ReadFaceKind, ServiceIdentity,
+        is_no_renderable_geometry,
+    };
 
     #[test]
     fn a_face_reports_the_kind_it_was_built_from() {
@@ -282,5 +290,31 @@ mod tests {
         assert_eq!(req.roots, &roots);
         assert_eq!(req.scope_roots, &scope_roots);
         assert_eq!(req.identity.base, "http://127.0.0.1:8022");
+    }
+
+    /// 「范围内没有已生成的模型」不是失败，是查空（ADR-0030 D1）。服务端 `QueryError`
+    /// 里这个 code 大写，`ApiError::from_query` 折成小写才发；两种写法都要认，否则
+    /// 服务面查空会掉进 ERROR「范围定位失败」，与 INFO 提示分道扬镳。
+    #[test]
+    fn an_empty_scope_code_is_recognised_in_either_case() {
+        use crate::model_update_api::ApiError;
+        use plant_ui::model_update::Failure;
+
+        let api = |code: &str| {
+            anyhow::Error::new(ApiError(Failure::new(
+                code,
+                "no published geometry for 24384/23264",
+            )))
+        };
+        assert!(is_no_renderable_geometry(&api("no_renderable_geometry")));
+        assert!(is_no_renderable_geometry(&api("NO_RENDERABLE_GEOMETRY")));
+        assert!(is_no_renderable_geometry(&anyhow::Error::new(
+            NoRenderableGeometry
+        )));
+        // 别的 code 不许冒充查空：message 里出现这个词不算，只看 code。
+        assert!(!is_no_renderable_geometry(&api("internal")));
+        assert!(!is_no_renderable_geometry(&anyhow::anyhow!(
+            "NO_RENDERABLE_GEOMETRY: 24384/23264"
+        )));
     }
 }

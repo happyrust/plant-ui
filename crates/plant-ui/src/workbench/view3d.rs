@@ -224,7 +224,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
             if consume_exact(ui, tool.shortcut())
                 && let Some(action) = tool.action(&vm.selection)
             {
-                cmds.push(Cmd::Model(action));
+                cmds.push(super::tree::model_cmd(action));
             }
         }
     }
@@ -464,7 +464,7 @@ fn tool_buttons(
             // 按过工具栏也算「在视口里操作」，键盘跟着回到视口。
             ui.memory_mut(|m| m.request_focus(viewport));
             if let Some(action) = action {
-                cmds.push(Cmd::Model(action));
+                cmds.push(super::tree::model_cmd(action));
             }
         }
     }
@@ -1263,5 +1263,32 @@ mod tests {
         assert!(!Tool::Hide.shortcut().modifiers.shift);
         assert!(Tool::ShowAll.shortcut().modifiers.shift);
         assert!(!Tool::Show.shortcut().modifiers.shift);
+    }
+
+    /// 工具栏 / 快捷键的「定位」必须和树右键菜单走同一条命令：`FocusTreeScope`
+    /// 由服务端按子树范围算包围盒，任意层级都成立；直接发 `ModelAction::Focus`
+    /// 只认已加载记录的包围盒，SITE / ZONE / PIPE 取不到就静默不动。
+    #[test]
+    fn the_focus_tool_goes_through_the_tree_scope_like_the_menu() {
+        let refno = RefU64(42);
+        assert_eq!(
+            super::super::tree::model_cmd(Tool::Focus.action(&Selection::single(refno)).unwrap()),
+            Cmd::FocusTreeScope(refno)
+        );
+        // 其余五枚仍原样转发给宿主，不经过范围查询。
+        for tool in [
+            Tool::Show,
+            Tool::Hide,
+            Tool::HideAll,
+            Tool::ShowAll,
+            Tool::Fit,
+        ] {
+            let action = tool.action(&Selection::single(refno)).unwrap();
+            assert_eq!(
+                super::super::tree::model_cmd(action.clone()),
+                Cmd::Model(action),
+                "{tool:?}"
+            );
+        }
     }
 }
