@@ -730,7 +730,7 @@ impl PropKind {
 
 /// 房间归属数据状态（跟随 `WorkbenchVm::selection` 的 primary），四态语义与
 /// [`PropsVm`] 相同。有「空」态语义：`Ready` 且 `relations` 为空 = 查过了、
-/// 确实不属于任何房间。
+/// 该元素没有房间归属——这是常态，不是异常，界面上只作中性陈述。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum RoomVm {
     /// 尚未选中任何元素。

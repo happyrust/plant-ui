@@ -509,7 +509,8 @@ fn room_menu_items(
         }
     };
     if data.relations.is_empty() {
-        ui.add_enabled(false, egui::Button::new("无所属房间"));
+        // 没有房间归属是常态，不是错误；按钮照旧禁用，只说事实。
+        ui.add_enabled(false, egui::Button::new("无房间归属"));
         return;
     }
     for (i, rel) in data.relations.iter().enumerate() {

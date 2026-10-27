@@ -1222,7 +1222,7 @@ pub struct UnitResult {
     #[serde(default)]
     pub kind: UnitKind,
     /// 开工前挂在哪些房间（gen-model 2026-10-24 W1：根 + 子树全部构件，按房间 × 面板数构件）。
-    /// `None` = 服务端没拍（老回执 / 读透 / 算不了房间 / 一批太大），不画；`Some([])` = 拍了、不属于任何房间。
+    /// `None` = 服务端没拍（老回执 / 读透 / 算不了房间 / 一批太大），不画；`Some([])` = 拍了、无房间归属（常态）。
     #[serde(default)]
     pub rooms_before: Option<Vec<RoomRef>>,
     /// 收尾后挂在哪些房间（同上）。

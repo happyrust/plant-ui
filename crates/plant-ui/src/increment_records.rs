@@ -1607,7 +1607,7 @@ fn room_change_tooltip(unit: &crate::model_update::UnitResult) -> String {
     let list = |title: &str, rooms: Option<&Vec<crate::model_update::RoomRef>>| {
         let rooms = rooms.map(Vec::as_slice).unwrap_or_default();
         if rooms.is_empty() {
-            return format!("{title}：不属于任何房间");
+            return format!("{title}：无房间归属");
         }
         let lines: Vec<String> = rooms
             .iter()
@@ -2183,7 +2183,7 @@ mod tests {
         assert_eq!(room_change(&unit), Some(("—".into(), "R113, R345".into())));
         let tip = room_change_tooltip(&unit);
         assert!(
-            tip.contains("开工前：不属于任何房间")
+            tip.contains("开工前：无房间归属")
                 && tip.contains("R113 · 面板 24381_1204 · 2 个构件"),
             "{tip}"
         );

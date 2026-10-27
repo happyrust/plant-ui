@@ -58,13 +58,15 @@ fn ready(
     cmds: &mut Vec<Cmd>,
 ) {
     if data.relations.is_empty() {
+        // 无房间归属是常态（场地、支架、跨房间的管道都不在任何一间房里），
+        // 所以这里只是一句中性陈述，不是告警也不是错误。
         note(
             ui,
             t,
             d,
             PaneState::Empty,
             ph::DOOR_OPEN,
-            "该元素不属于任何房间",
+            "该元素没有房间归属",
         );
         return;
     }

@@ -1769,7 +1769,7 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
             target,
             result: Err(anyhow::anyhow!("NO_RENDERABLE_GEOMETRY: {}", target)),
         },
-        // 剧本里没有房间数据：空归属即「无所属房间」，界面照常走 Ready 空态。
+        // 剧本里没有房间数据：空归属即「无房间归属」，界面照常走 Ready 空态。
         Req::ElementRooms(refno) => Evt::ElementRooms(refno, Ok(Vec::new())),
         Req::PanelRoom(refno) => Evt::PanelRoom(refno, Ok(None)),
         Req::RoomPanels(refno) => Evt::RoomPanels(refno, Ok(Vec::new())),

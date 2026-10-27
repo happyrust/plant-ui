@@ -6269,9 +6269,11 @@ impl App {
     /// 取景不在这里做：对准的是房间体，而它要等在册面板的模型记录回来（`Evt::RoomVolume`）。
     fn enter_room_view(&mut self, room: RefU64, detail: plant_ui_data::room::RoomDetail) {
         if detail.panels.is_empty() && detail.member_refnos.is_empty() {
-            self.logs.warn(
+            // 空房壳是正常现象：房间参照模型里有这间房，但它没有面板，也就取不到
+            // 房间体与成员。按信息说一句就走，不升级成警告。
+            self.logs.info(
                 &mut self.vm.logs,
-                format!("房间 {} 没有面板也没有成员，无处取景", detail.room_num),
+                format!("房间 {} 是空房壳（没有面板也没有成员），无处取景", detail.room_num),
             );
             return;
         }
