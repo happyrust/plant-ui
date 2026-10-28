@@ -4548,6 +4548,10 @@ impl App {
                 }
                 Cmd::FocusVirtualHole(id) => {
                     if self.hole_session.hole(&id).is_some() {
+                        // 孔洞面板的「定位」也是显式取景（视口那条 FocusHole 会动相机）：
+                        // 更早挂着的范围查询 / 房间取景 / 房间树取景就此作废，否则它们晚一拍
+                        // 落地时会把相机从这一次上拽走。孔洞不存在就什么都不做。
+                        self.supersede_camera_intents();
                         self.pending_hole_ops.push(VirtualHoleOp::FocusHole(id));
                     }
                 }
@@ -10535,7 +10539,7 @@ mod tests {
             "「正在查询」的到期账不归这里管：{helper}"
         );
 
-        // 八个意图点：都必须在自己的取景槽写入 / 相机命令之前收口。
+        // 九个意图点：都必须在自己的取景槽写入 / 相机命令之前收口。
         // 每条配一根「登记针」——只断言「切片里含 helper」不够：把 helper 挪到 begin 之后，
         // 刚发出的查询会被自己作废、按 F 没反应，而那种写法照样是绿的。
         let intents = [
@@ -10584,6 +10588,12 @@ mod tests {
                 // 登记针取取景账那一行，不取进视图门控：门控不归 helper 管，
                 // 拿它当针会在「helper 挪到门控之后」时照样绿。
                 "self.focus_room_frame = Some(room)",
+            ),
+            (
+                "孔洞切削体定位",
+                "Cmd::FocusVirtualHole(id) => {",
+                "Cmd::FocusVirtualHoleTarget(id) => {",
+                "VirtualHoleOp::FocusHole(id)",
             ),
             (
                 "历史回退",
