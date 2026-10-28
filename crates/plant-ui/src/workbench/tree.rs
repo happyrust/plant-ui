@@ -170,7 +170,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                                     row,
                                     &vm.selection,
                                     &vm.rooms,
-                                    &vm.room_panels,
+                                    &vm.room_refnos,
                                     &vm.dimensions,
                                     live,
                                     vm.regen_busy,
@@ -241,7 +241,7 @@ fn row_menu(
     row: &TreeRowVm,
     selection: &Selection,
     rooms: &RoomVm,
-    room_panels: &std::collections::HashMap<aios_core::RefU64, aios_core::RefU64>,
+    room_refnos: &std::collections::HashSet<aios_core::RefU64>,
     dimensions: &DimensionsVm,
     live: bool,
     regen_busy: bool,
@@ -273,8 +273,8 @@ fn row_menu(
         d,
         row.refno,
         Some(&row.noun),
-        room_panels,
-        row.visibility,
+        room_refnos,
+        row.next_visible,
         &targets,
         rooms,
         ElementDimensions {
@@ -290,33 +290,34 @@ fn row_menu(
 
 /// 右键落点是不是房间节点。
 ///
-/// 两条都要满足：类型是 `FRMW`，且这个 refno 登记在册（`room_panels` 里有一行）。
+/// 两条都要满足：类型是 `FRMW`，且这个 refno 登记在册（`room_refnos` 里有它）。
 /// 只看类型名会把结构框架（`/MDS/FT03H/3-FRMW1` 这类，全库七千多行里的绝大多数）
 /// 也当成房间——点上去什么也取不回来。登记表是唯一权威判据：只有 `room_panel_relate`
 /// 里有的才是房间。表在宿主手上取一次，这里纯内存判定，右键菜单不必等往返。
 pub(super) fn is_room_node(
     noun: Option<&str>,
     refno: aios_core::RefU64,
-    room_panels: &std::collections::HashMap<aios_core::RefU64, aios_core::RefU64>,
+    room_refnos: &std::collections::HashSet<aios_core::RefU64>,
 ) -> bool {
-    noun.is_some_and(|noun| noun.eq_ignore_ascii_case("FRMW")) && room_panels.contains_key(&refno)
+    noun.is_some_and(|noun| noun.eq_ignore_ascii_case("FRMW")) && room_refnos.contains(&refno)
 }
 
 /// 房间那一项出哪一态。抽出来是为了让测试不必起 egui。
 ///
-/// 与眼睛同一个口径（`RowVisibility::on_click`）：只有全显示才轮到「藏起来」，
-/// 未加载 / 已隐藏 / 半可见都该让它出来。
+/// 与眼睛同一个口径：吃的是「点下去会让它出来吗」（`next_click_visible`），不是
+/// 「三维此刻画成什么样」。差一层在途方向——点了「隐藏」到回执落地前，眼睛已经
+/// 翻成「让它出来」，菜单得跟着翻，否则再右键还是「隐藏」，与图标打架。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RoomItem {
     Show,
     Hide,
 }
 
-fn room_menu_action(visibility: RowVisibility) -> RoomItem {
-    if visibility == RowVisibility::Shown {
-        RoomItem::Hide
-    } else {
+fn room_menu_action(next_visible: bool) -> RoomItem {
+    if next_visible {
         RoomItem::Show
+    } else {
+        RoomItem::Hide
     }
 }
 
@@ -348,8 +349,8 @@ pub(super) fn model_cmd(action: ModelAction) -> Cmd {
 /// 菜单与三维视口的右键菜单是同一件事的两个入口，内容必须一致，所以收在一处。
 ///
 /// `refno` 是右键落点那一个元素（定位与房间归属对它），`targets` 是批量动作的
-/// 作用集（显示 / 隐藏 / 复制对它们）。`noun` 与 `room_panels` 一起判「落点是房间」：
-/// 房间节点自己就是一间房，多一项「查看 / 隐藏房间内模型」；`visibility` 决定出哪一态。
+/// 作用集（显示 / 隐藏 / 复制对它们）。`noun` 与 `room_refnos` 一起判「落点是房间」：
+/// 房间节点自己就是一间房，多一项「查看 / 隐藏房间内模型」；`next_visible` 决定出哪一态。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn element_menu(
     ui: &mut Ui,
@@ -357,8 +358,8 @@ pub(super) fn element_menu(
     d: Density,
     refno: aios_core::RefU64,
     noun: Option<&str>,
-    room_panels: &std::collections::HashMap<aios_core::RefU64, aios_core::RefU64>,
-    visibility: RowVisibility,
+    room_refnos: &std::collections::HashSet<aios_core::RefU64>,
+    next_visible: bool,
     targets: &[aios_core::RefU64],
     rooms: &RoomVm,
     dimensions: ElementDimensions<'_>,
@@ -413,13 +414,13 @@ pub(super) fn element_menu(
     //
     // 一项两态，与「查看尺寸标注」同一条理由：显示着就只剩「隐藏」可做，没显示
     // 就只剩「查看」——两项并排总有一项是废的。
-    if is_room_node(noun, refno, room_panels) {
+    if is_room_node(noun, refno, room_refnos) {
         if grouped {
             ui.separator();
         }
-        // 与眼睛同一个口径（`RowVisibility::on_click`）：只有全显示才轮到「藏起来」，
-        // 未加载 / 已隐藏 / 半可见都该让它出来。
-        let (label, hint, cmd) = match room_menu_action(visibility) {
+        // 与眼睛同一个口径：吃「下一次该往哪」，含在途方向（宿主用
+        // `next_click_visible` 把待执行方向与当前态合成这一个布尔）。
+        let (label, hint, cmd) = match room_menu_action(next_visible) {
             RoomItem::Hide => (
                 "隐藏房间内模型",
                 "把这间房的墙面板藏起来；几何留在场景里，再点一次就回来",
@@ -743,44 +744,60 @@ mod tests {
     /// `/MDS/FT03H/3-FRMW1` 那种结构框架，点「查看房间内模型」什么也取不回来。
     #[test]
     fn a_room_node_needs_both_the_frmw_type_and_a_registration() {
-        use std::collections::HashMap;
+        use std::collections::HashSet;
         let parse = |s: &str| s.parse::<RefU64>().expect("refno");
         let room = parse("24381_1008");
         let frame = parse("15516_101");
-        let mut panels = HashMap::new();
-        panels.insert(room, parse("24381_1009"));
+        let mut rooms = HashSet::new();
+        rooms.insert(room);
 
-        assert!(is_room_node(Some("FRMW"), room, &panels), "在册的房间");
+        assert!(is_room_node(Some("FRMW"), room, &rooms), "在册的房间");
         // E3D 的类型名大小写来自 attlib，不保证全大写。
-        assert!(is_room_node(Some("frmw"), room, &panels), "大小写不敏感");
+        assert!(is_room_node(Some("frmw"), room, &rooms), "大小写不敏感");
         assert!(
-            !is_room_node(Some("FRMW"), frame, &panels),
+            !is_room_node(Some("FRMW"), frame, &rooms),
             "结构框架也是 FRMW，但不在册"
         );
         assert!(
-            !is_room_node(Some("BRAN"), room, &panels),
+            !is_room_node(Some("BRAN"), room, &rooms),
             "类型不对就不是房间"
         );
         // 不在已加载的树里就不知道它是什么：宁可不摆，也不摆错。
-        assert!(!is_room_node(None, room, &panels));
+        assert!(!is_room_node(None, room, &rooms));
         // 登记表还没取回来：一律不摆。
-        assert!(!is_room_node(Some("FRMW"), room, &HashMap::new()));
+        assert!(!is_room_node(Some("FRMW"), room, &HashSet::new()));
+    }
+
+    /// 登记集合里装的必须是房间（`room_panel_relate` 的 `in`），不是面板（`out`）。
+    ///
+    /// 边表方向是 `in` = 房间 `FRMW`、`out` = 墙面板 `PANE`。早先把 `(out, in)` 元组
+    /// 直接收成 map，键落在面板上，于是拿房间 refno 去查恒不命中——菜单永远不出现。
+    /// 这条用真实一行边（`pe:24381_1008` 是房间、`pe:24381_1010` 是它的面板）钉住方向。
+    #[test]
+    fn the_registration_set_holds_rooms_not_panels() {
+        use std::collections::HashSet;
+        let parse = |s: &str| s.parse::<RefU64>().expect("refno");
+        let room = parse("24381_1008");
+        let panel = parse("24381_1010");
+        let rows = vec![(panel, room)];
+
+        let rooms: HashSet<RefU64> = rows.into_iter().map(|(_, room)| room).collect();
+        assert!(rooms.contains(&room), "房间那一头要在集合里");
+        assert!(!rooms.contains(&panel), "面板那一头不能进集合");
+        assert!(is_room_node(Some("FRMW"), room, &rooms));
+        // 面板是 PANE，类型这一关就过不去；即便类型对，也不该在册。
+        assert!(!is_room_node(Some("PANE"), panel, &rooms));
     }
 
     /// 房间那一项是一项两态，与「查看尺寸标注」同一条理由：显示着就只剩「隐藏」
     /// 可做，没显示就只剩「查看」——两项并排总有一项是废的。
+    ///
+    /// 判据是「下一次点眼睛会让它出来吗」，不是当前四态：在途方向要算进去，
+    /// 否则点了「隐藏」到回执落地前菜单还停在「隐藏」，与已经翻面的图标打架。
     #[test]
     fn the_room_item_flips_between_show_and_hide() {
-        use crate::vm::RowVisibility;
-        // 只有全显示才轮到「藏起来」；未加载 / 已隐藏 / 半可见都该让它出来。
-        assert_eq!(room_menu_action(RowVisibility::Shown), RoomItem::Hide);
-        for state in [
-            RowVisibility::Unloaded,
-            RowVisibility::Hidden,
-            RowVisibility::Partial,
-        ] {
-            assert_eq!(room_menu_action(state), RoomItem::Show, "{state:?}");
-        }
+        assert_eq!(room_menu_action(true), RoomItem::Show);
+        assert_eq!(room_menu_action(false), RoomItem::Hide);
     }
 
     /// 一项两态：落点这条 BRAN 正显示着（在途也算）→「隐藏」；没显示、或显示着的是

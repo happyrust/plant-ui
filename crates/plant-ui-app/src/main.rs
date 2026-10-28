@@ -2665,9 +2665,9 @@ impl App {
                         self.tree.note_dbnum(site);
                     }
                     self.tree.roots = info.sites;
-                    // 在册面板表：右键菜单靠它认出「这一行是房间」。230 行级，连上就取一次；
+                    // 在册房间表：右键菜单靠它认出「这一行是房间」。230 行级，连上就取一次；
                     // 取不到只是少一项菜单，不进日志——房间树那条路自己会报查询失败。
-                    self.vm.room_panels.clear();
+                    self.vm.room_refnos.clear();
                     let _ = self.bridge.req.send(data::Req::PanelRooms);
                     // 换面之后的重装（ADR-0026 热切，计划 §5.3）：清场前的快照到这儿才
                     // 移进取回工作那一格，随后走取回工作那条现成路——`clear_scene_for_reload`
@@ -3055,11 +3055,12 @@ impl App {
                         }
                     };
                 }
-                // 在册面板表：右键菜单靠它认出「这一行是房间」。取一次就够，失败只是
+                // 在册房间表：右键菜单靠它认出「这一行是房间」。取一次就够，失败只是
                 // 少一项菜单，不打扰用户——房间树那条路自己会说查询失败。
                 data::Evt::PanelRooms(result) => {
                     if let Ok(rows) = result {
-                        self.vm.room_panels = rows.into_iter().collect();
+                        // `all_panel_rooms` 给的是 `(面板, 房间)`；树上判房间用 `in` 那一头。
+                        self.vm.room_refnos = rows.into_iter().map(|(_, room)| room).collect();
                     }
                 }
                 // 场景在点击取回工作那一刻已经清空，查回来的批次一律上屏：它比
@@ -6077,9 +6078,17 @@ impl App {
         self.vm.selection_noun = primary
             .and_then(|refno| self.tree.noun_of(refno))
             .map(str::to_owned);
-        self.vm.selection_visibility = primary
-            .map(|refno| self.tree.visibility_for(refno, &self.model_scopes))
-            .unwrap_or_default();
+        // 视口右键菜单那一项吃的是「下一次点眼睛会让它出来吗」，与树上图标同一句
+        // `next_click_visible`：在途方向要算进去，否则点了「隐藏」到回执落地前，
+        // 图标已经翻面、菜单还停在「隐藏」。无选中时按「让它出来」兜底。
+        self.vm.selection_next_visible = primary
+            .map(|refno| {
+                next_click_visible(
+                    self.tree.pending_direction.get(&refno).copied(),
+                    self.tree.visibility_for(refno, &self.model_scopes),
+                )
+            })
+            .unwrap_or(true);
     }
 
     /// 取这条 BRAN 的尺寸标注并挂到视口上（计划 B2）。一层只挂一条，换目标就是换帧：
@@ -6812,9 +6821,9 @@ impl App {
     /// 没什么可藏，`set_model_visible` 自会把未知目标跳过（它的 `plan.query` 只在
     /// 「显示」方向才排队取数，隐藏方向的查询照旧只查不生）。
     fn hide_room_model(&mut self, room: RefU64) {
-        // 藏起来之后原来挂着的取景账就指向看不见的东西了，一并撤掉。
+        // 藏起来之后原来挂着的取景账就指向看不见的东西了，一并撤掉——`supersede_camera_intents`
+        // 自己会清 `pending_room_frame` 与 `focus_room_frame`，这里不再单写一遍。
         self.supersede_camera_intents();
-        self.pending_room_frame = None;
         self.set_model_visible(vec![room], false);
     }
 
@@ -7399,8 +7408,9 @@ impl App {
         }
         self.vm.selection_branch = None;
         self.vm.selection_noun = None;
-        self.vm.selection_visibility = plant_ui::vm::RowVisibility::default();
-        self.vm.room_panels.clear();
+        // 无选中时按「让它出来」兜底，与 `sync_selection_branch` 的 `.unwrap_or(true)` 同一口径。
+        self.vm.selection_next_visible = true;
+        self.vm.room_refnos.clear();
         // 房间树是旧接入点的：整份丢掉，面板回到 Idle，下次画出来再拉；在途的回包凭帧号作废。
         self.room_tree.clear();
         self.room_tree_epoch = self.room_tree_epoch.wrapping_add(1);
@@ -10595,7 +10605,7 @@ mod tests {
             "「正在查询」的到期账不归这里管：{helper}"
         );
 
-        // 九个意图点：都必须在自己的取景槽写入 / 相机命令之前收口。
+        // 十个意图点：都必须在自己的取景槽写入 / 相机命令之前收口。
         // 每条配一根「登记针」——只断言「切片里含 helper」不够：把 helper 挪到 begin 之后，
         // 刚发出的查询会被自己作废、按 F 没反应，而那种写法照样是绿的。
         let intents = [
@@ -10636,6 +10646,14 @@ mod tests {
                 "fn show_room_model(&mut self, room: RefU64) {",
                 "fn set_model_visible(&mut self, refnos: Vec<RefU64>, visible: bool) {",
                 "self.set_model_visible(vec![room], true)",
+            ),
+            (
+                // 隐藏方向同样是意图点：先撕更早的取景账，再下发。切片终点与上面那组同锚，
+                // 所以这段其实跨过了 hide 的正文；针取 `vec![room], false` 不会与显示混淆。
+                "隐藏房间模型",
+                "fn hide_room_model(&mut self, room: RefU64) {",
+                "fn set_model_visible(&mut self, refnos: Vec<RefU64>, visible: bool) {",
+                "self.set_model_visible(vec![room], false)",
             ),
             (
                 "进房间视图",
@@ -10713,6 +10731,42 @@ mod tests {
             !load.contains("self.room_tree_frame = None"),
             "加载落地只许写、不许清：补一个 else 清空同样会抹掉更新的账：{load}"
         );
+    }
+
+    /// 隐藏房间内模型不取景：藏东西的时候把相机飞过去没有道理。
+    ///
+    /// 它与「显示」共用 `set_model_visible`，方向反过来；两件事必须同时成立——
+    /// ① 先撕更早的取景账（否则在途的房间体 / 范围查询落地时会把相机拽去一个
+    /// 用户刚藏起来的目标）；② 自己不登记任何取景账，也不下发取景命令。
+    #[test]
+    fn hiding_a_room_model_never_frames_it() {
+        let source = include_str!("main.rs");
+        let hide = source
+            .split_once("fn hide_room_model(&mut self, room: RefU64) {")
+            .expect("隐藏房间模型还在")
+            .1
+            .split_once("fn set_model_visible(&mut self, refnos: Vec<RefU64>, visible: bool) {")
+            .expect("下一段")
+            .0;
+        assert!(
+            hide.contains("self.set_model_visible(vec![room], false)"),
+            "隐藏方向要下发给显隐链路：{hide}"
+        );
+        assert!(
+            hide.contains("self.supersede_camera_intents()"),
+            "藏起来之前先撕掉更早的取景账：{hide}"
+        );
+        for forbidden in [
+            "pending_room_frame = Some",
+            "focus_room_frame = Some",
+            "FocusGroup",
+            "FocusBounds",
+        ] {
+            assert!(
+                !hide.contains(forbidden),
+                "隐藏不登记取景账、也不下发取景命令，却出现了 {forbidden}：{hide}"
+            );
+        }
     }
 
     /// 房间视图的取景账拆出来之后（`focus_room_frame`），四处必须同一条口径：意图点登记、

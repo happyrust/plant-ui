@@ -68,15 +68,23 @@ pub struct WorkbenchVm {
     /// 主选中的 PDMS 类型（`FRMW` 等）。视口右键菜单作用于主选中，而「这一行是不是
     /// 房间节点」只有树那侧知道；随选中由宿主填，`None` = 主选中不在已加载的树里。
     pub selection_noun: Option<String>,
-    /// 全部在册 PANEL → 所属房间。右键菜单靠它认出「这一行是房间」。
+    /// 全部在册房间的 refno 集合（`room_panel_relate` 的 `in` 侧去重）。右键菜单靠它
+    /// 认出「这一行是房间」。
     ///
     /// 不能只看 `noun == "FRMW"`：全库 `FRMW` 有七千多行，里头既有房间也有结构框架
     /// （`/MDS/FT03H/3-FRMW1` 这类）。只有登记在 `room_panel_relate` 里的才是房间。
     /// 230 行级，宿主取一次就够，之后纯内存判定——右键菜单要当帧画出来。
-    pub room_panels: std::collections::HashMap<RefU64, RefU64>,
-    /// 主选中在三维里的可见性。视口右键菜单靠它决定房间那一项出「查看」还是「隐藏」。
-    /// 与 `selection_noun` 同源：都由宿主对着已加载的树与三维回执同步。
-    pub selection_visibility: RowVisibility,
+    ///
+    /// **集合里放的是房间，不是面板**：边表方向是 `in` = 房间、`out` = 面板（`PANE`），
+    /// 树上的房间节点是 `in` 那一头。早期版本直接收集 `(out, in)` 元组成 map，键落到了
+    /// 面板上，于是拿房间 refno 去 `contains_key` 恒不命中，菜单永远不出现。
+    pub room_refnos: std::collections::HashSet<RefU64>,
+    /// 主选中下一次点眼睛会让它出来吗。视口右键菜单靠它决定房间那一项出「查看」还是「隐藏」。
+    ///
+    /// 与 [`TreeRowVm::next_visible`] 同一条理由：含在途方向，不只是「三维此刻画成什么样」。
+    /// 与 `selection_noun` 同源，都由宿主在 `sync_selection_branch` 里算好；无选中时默认
+    /// `true`（出「查看」）。
+    pub selection_next_visible: bool,
     /// 命令交互视图。
     pub command: CommandVm,
     /// 标题栏搜索框的查询结果。
