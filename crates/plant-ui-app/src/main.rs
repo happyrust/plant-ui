@@ -1404,6 +1404,13 @@ struct App {
     /// 还没回包的那一次房间视图请求（`Cmd::FocusRoom` -> `Req::RoomDetail`）。
     /// 同时只留一个：连点两间房只聚焦最后一间，晚到的旧详情靠它认出来丢掉。
     focus_room_pending: Option<RefU64>,
+    /// 房间视图的取景账：这一次进视图，房间体落地时要不要把相机对准它。
+    ///
+    /// 与 `focus_room_pending` 分开：那一格管「进不进视图」（详情回包靠它认领，页签与历史
+    /// 都已经切过去了），这一格只管取景。拆开之后，`focus_room` 之后用户又按了 F 或点了
+    /// 别处的定位，`supersede_camera_intents` 撤掉这一格，晚到的房间体照旧进视图、照旧
+    /// 隔离截断挂 HUD，只是不再把相机从用户最新那一下上拽走。
+    focus_room_frame: Option<RefU64>,
     /// 选中 PANEL 后等待房间详情的 X-Ray 请求：(发起时的 PANEL, 房间)。
     /// 选中一换立即清空；晚到的详情只有同时匹配这两个值才可改材质。
     xray_room_pending: Option<(RefU64, RefU64)>,
@@ -2533,6 +2540,7 @@ impl App {
             scope_targets: HashSet::new(),
             refresh_generation_pending: false,
             focus_room_pending: None,
+            focus_room_frame: None,
             xray_room_pending: None,
             mirror_error_said: None,
             xray_active_room: None,
@@ -2884,6 +2892,11 @@ impl App {
                     if for_viewport {
                         self.focus_room_pending = None;
                     }
+                    // 取景账只在真进了视图时才由房间体落地来销；下面四种没进成的情况
+                    // （查不到 / 查询失败 / 没有实时渲染器 / 空房壳）留着它就是个死账，
+                    // 下次房间体落地会莫名其妙动相机。帧号是「进视图」的唯一凭据：
+                    // 空房壳在 `enter_room_view` 里提前返回，帧号根本没推进。
+                    let epoch_before = self.room_view_epoch;
                     match result {
                         Ok(Some(detail)) => {
                             self.room_panel_cache.insert(room, detail.panels.clone());
@@ -2929,6 +2942,11 @@ impl App {
                             self.logs
                                 .error(&mut self.vm.logs, "房间详情查询失败", &e, None);
                         }
+                    }
+                    // 帧号没变 = 这一趟没进成视图（含空房壳、没有实时渲染器）：
+                    // 取景账销掉，免得挂到下一次房间体落地上去。
+                    if for_viewport && self.room_view_epoch == epoch_before {
+                        self.focus_room_frame.take_if(|pending| *pending == room);
                     }
                 }
                 data::Evt::RoomDetail(..) => {}
@@ -6318,6 +6336,7 @@ impl App {
         // 进房间视图也会取景（房间体到了才动相机），算一次意图。
         self.supersede_camera_intents();
         self.focus_room_pending = Some(room);
+        self.focus_room_frame = Some(room);
         self.room_pane_focus = Some(room);
         self.vm.room_detail.begin_query();
         let _ = self.bridge.req.send(data::Req::RoomDetail(room));
@@ -6401,7 +6420,7 @@ impl App {
         }
     }
 
-    /// 房间体回来了：对准它取景，交给视口画成半透明并截断直段。取不到就走兜底。
+    /// 房间体回来了：交给视口画成半透明并截断直段；取景账还立着才对准它。取不到就走兜底。
     fn settle_room_volume(
         &mut self,
         epoch: u64,
@@ -6426,6 +6445,12 @@ impl App {
             }
         };
         let truncate = self.truncate_tubes();
+        // 这一次的房间体要不要动相机：只有进视图那一下登记过账才算。这一句在帧号早退与兜底
+        // 分流之后，过期回包走不到这里，账不会被吃掉。
+        let frame = self
+            .focus_room_frame
+            .take_if(|pending| *pending == room)
+            .is_some();
         let Some(ctx) = self.room_view.as_mut() else {
             return;
         };
@@ -6447,9 +6472,12 @@ impl App {
                 false,
             )));
         }
-        if let Some((min_mm, max_mm)) = plant_ui_view3d::panel_bounds_mm(&records) {
+        if frame && let Some((min_mm, max_mm)) = plant_ui_view3d::panel_bounds_mm(&records) {
             self.view3d_commands
-                .push(Cmd::Model(plant_ui::ModelAction::FocusBounds { min_mm, max_mm }));
+                .push(Cmd::Model(plant_ui::ModelAction::FocusBounds {
+                    min_mm,
+                    max_mm,
+                }));
         }
         self.pending_room_volume
             .push(RoomVolumeUpdate::Set(plant_ui_view3d::RoomVolumeBatch {
@@ -6461,10 +6489,18 @@ impl App {
             }));
     }
 
-    /// 房间体取不到时的兜底：面板照旧进隔离，取景退回面板与成员的并集，HUD 与日志说「不可用」，
-    /// 不装作截断过。
+    /// 房间体取不到时的兜底：面板照旧进隔离，HUD 与日志说「不可用」，不装作截断过。
+    /// 取景账还立着才退回面板与成员的并集。
     fn room_volume_fallback(&mut self, reason: String) {
         let truncate = self.truncate_tubes();
+        let Some(room) = self.room_view.as_ref().map(|ctx| ctx.room) else {
+            return;
+        };
+        // 取景账与 `settle_room_volume` 同一条口径：只有进视图那一下登记过才算。
+        let frame = self
+            .focus_room_frame
+            .take_if(|pending| *pending == room)
+            .is_some();
         let Some(ctx) = self.room_view.as_mut() else {
             return;
         };
@@ -6479,9 +6515,11 @@ impl App {
         )));
         let focus = room_view_fallback_focus(&ctx.detail, &self.model_scopes);
         let room_num = ctx.detail.room_num.clone();
-        if !focus.is_empty() {
+        if frame && !focus.is_empty() {
             self.view3d_commands
-                .push(Cmd::Model(plant_ui::ModelAction::FocusGroup { refnos: focus }));
+                .push(Cmd::Model(plant_ui::ModelAction::FocusGroup {
+                    refnos: focus,
+                }));
         }
         // 半截的旧房间体（重装后重取失败的那种）不能留着冒充这一次的。
         self.pending_room_volume.push(RoomVolumeUpdate::Clear);
@@ -6568,6 +6606,7 @@ impl App {
     fn leave_room_view(&mut self) {
         self.vm.room_view = None;
         self.focus_room_pending = None;
+        self.focus_room_frame = None;
         if self.room_view.take().is_some() {
             self.pending_room_volume.push(RoomVolumeUpdate::Clear);
         }
@@ -7272,6 +7311,7 @@ impl App {
         self.vm.room_detail = RoomDetailVm::Uninit;
         self.vm.room_view = None;
         self.focus_room_pending = None;
+        self.focus_room_frame = None;
         // 房间体属于旧连接：撤层，在途的房间体回包凭帧号作废。
         if self.room_view.take().is_some() {
             self.pending_room_volume.push(RoomVolumeUpdate::Clear);
@@ -8019,13 +8059,16 @@ impl App {
     /// 所以：每个**意图点**（用户刚点下去那一处）先调这个，再登记自己的取景。**执行点 / 落地点**
     /// 不调——那时手上这笔才是最新意图，反过来作废别人就变成吞掉用户操作了。
     ///
-    /// 不碰 `focus_room_pending` / `room_view`（房间视图的进视图与取景是同一个门控，拆开要另做）
-    /// 与 `focus_scope_pending`（它到期时会自己问 `accepts_bounds`，被作废即静默丢弃）。
+    /// 不碰 `focus_room_pending`（进不进视图由详情回包自己认领，页签与历史已经切过去了，
+    /// 在这里清掉会让状态劈叉）与 `focus_scope_pending`（它到期时会自己问 `accepts_bounds`，
+    /// 被作废即静默丢弃）。房间视图的**取景**账 `focus_room_frame` 归这里撤：晚到的房间体
+    /// 照旧隔离截断挂 HUD，只是不再动相机。
     fn supersede_camera_intents(&mut self) {
         self.focus_bounds_request.cancel();
         self.hole_focus_pending = None;
         self.pending_room_frame = None;
         self.room_tree_frame = None;
+        self.focus_room_frame = None;
         // 挂着的房间树取景：整条丢掉（它只为取景而挂）；挂着的「加载模型」只留显示，不再取景。
         self.room_tree_deferred
             .retain(|deferred| deferred.action != RoomTreeDeferred::Focus);
@@ -10446,15 +10489,17 @@ mod tests {
             "self.hole_focus_pending = None",
             "self.pending_room_frame = None",
             "self.room_tree_frame = None",
+            "self.focus_room_frame = None",
             "RoomTreeDeferred::Focus",
             "*frame = false",
         ] {
             assert!(helper.contains(required), "收口要管 {required}：{helper}");
         }
-        // 房间视图的进视图与取景是同一个门控，拆开要另做；这里不许顺手碰。
+        // 房间视图的**进视图**门控不归这里管：详情回包靠它认领，页签与历史已经切过去了，
+        // 在这里清掉会让状态劈叉。取景账（`focus_room_frame`）已经拆出来归这里撤。
         assert!(
             !helper.contains("focus_room_pending") && !helper.contains("room_view"),
-            "房间视图不归这里管：{helper}"
+            "进视图门控与房间视图上下文不归这里管：{helper}"
         );
         // `focus_scope_pending` 归 `tick_focus_scope` 自己判（到期时问 `accepts_bounds`），
         // 收口不必碰它——碰了就得在这里同步维护它的到期时刻。
@@ -10509,7 +10554,9 @@ mod tests {
                 "进房间视图",
                 "fn focus_room(&mut self, room: RefU64) {",
                 "// ------------------------------------------------ 房间视图 · 房间体与直段截断",
-                "self.focus_room_pending = Some(room)",
+                // 登记针取取景账那一行，不取进视图门控：门控不归 helper 管，
+                // 拿它当针会在「helper 挪到门控之后」时照样绿。
+                "self.focus_room_frame = Some(room)",
             ),
             (
                 "历史回退",
@@ -10573,6 +10620,143 @@ mod tests {
             !load.contains("self.room_tree_frame = None"),
             "加载落地只许写、不许清：补一个 else 清空同样会抹掉更新的账：{load}"
         );
+    }
+
+    /// 房间视图的取景账拆出来之后（`focus_room_frame`），四处必须同一条口径：意图点登记、
+    /// 收口撤、落地只认账、没进成视图要销。任何一处写反了，症状都是「按了别处的定位，
+    /// 相机还是被晚到的房间体拽回房间」——或者反过来，「点了房间却不取景」。
+    #[test]
+    fn room_view_framing_waits_for_its_own_ledger() {
+        let source = include_str!("main.rs");
+        let body_of = |head: &str| {
+            source
+                .split(head)
+                .nth(1)
+                .unwrap_or_else(|| panic!("找不到 {head}"))
+                .split("\n    fn ")
+                .next()
+                .unwrap()
+        };
+
+        // a. 房间体落地：先过早退与兜底分流，再取账，再决定取不取景。
+        // 取账若挪到 `room_volume_is_current` 早退或分流之前，过期回包 / 兜底分支会先把账
+        // 吃掉：同一间房重进、或整场重装之后，新帧号的回包就再也不取景了。
+        let settle = body_of("fn settle_room_volume(");
+        let current = settle
+            .find("room_volume_is_current")
+            .expect("房间体落地要认帧号与房间");
+        let routed = settle
+            .rfind("self.room_volume_fallback(")
+            .expect("房间体取不到要走兜底");
+        let take = settle
+            .find("take_if(|pending| *pending == room)")
+            .expect("房间体落地要认取景账");
+        let gate = settle.find("if frame &&").expect("取景要受账门控");
+        let focus = settle
+            .find("plant_ui::ModelAction::FocusBounds")
+            .expect("房间体落地要取景");
+        assert!(current < routed, "帧号早退要在兜底分流之前：{settle}");
+        assert!(routed < take, "取账要在帧号早退与兜底分流之后：{settle}");
+        assert!(take < gate, "先取账、再门控：{settle}");
+        assert!(gate < focus, "先门控、再取景：{settle}");
+        assert!(
+            !settle.contains("supersede_camera_intents"),
+            "落地点不许反过来作废别人：{settle}"
+        );
+
+        // b. 兜底同理，对准的是面板与成员的并集。
+        let fallback = body_of("fn room_volume_fallback(");
+        let take = fallback
+            .find("take_if(|pending| *pending == room)")
+            .expect("兜底要认取景账");
+        let focus = fallback
+            .find("plant_ui::ModelAction::FocusGroup")
+            .expect("兜底要取景");
+        let gate = fallback.find("if frame &&").expect("兜底取景要受账门控");
+        assert!(take < gate, "先取账、再门控：{fallback}");
+        assert!(gate < focus, "先门控、再取景：{fallback}");
+        assert!(
+            !fallback.contains("supersede_camera_intents"),
+            "兜底是落地点，不许反过来作废别人：{fallback}"
+        );
+
+        // 取账必须认房间号：裸 `take()` 会让 A 的房间体吃掉 B 的账——A 的在途回包把相机
+        // 拽回 A，B 的范围到齐后反而不取景。
+        for (name, body) in [("房间体落地", &settle), ("兜底", &fallback)] {
+            assert!(
+                !body.contains("focus_room_frame.take()"),
+                "{name} 取账要认房间号，不许裸 take：{body}"
+            );
+            assert!(
+                !body.contains("focus_room_frame = None"),
+                "{name} 是落地点，只许取、不许清：{body}"
+            );
+        }
+
+        // c. 整场重装不重登记：重装保留相机（`should_frame_batch` 只在空场景取景），
+        // 所以重装后只重新隔离、重取房间体，不再拽相机。
+        assert!(
+            !body_of("fn reapply_room_view_after_reload(").contains("focus_room_frame"),
+            "整场重装不碰取景账（重装保留相机）"
+        );
+        // 写点白名单：生产代码里只有「登记这一次的房间」和「清空」两种写法，各在明处。
+        // 换 `.replace` / `.insert` / `get_or_insert`，或者跑到重装臂里另写一处登记，都要变红。
+        let (production, _) = source.split_once("\nmod tests {").expect("测试模块分界");
+        let mut registered = 0;
+        for line in production.lines() {
+            let Some((_, value)) = line.split_once("self.focus_room_frame = ") else {
+                continue;
+            };
+            let value = value.trim();
+            if value == "Some(room);" {
+                registered += 1;
+            } else {
+                assert_eq!(value, "None;", "取景账只许登记或清空，不许别的写法：{line}");
+            }
+        }
+        assert_eq!(registered, 1, "登记取景账只有进房间视图那一处");
+        for forbidden in [
+            "focus_room_frame.replace(",
+            "focus_room_frame.insert(",
+            "focus_room_frame.get_or_insert",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "取景账只走赋值，不许 {forbidden}"
+            );
+        }
+
+        // d. 退出房间视图与重连复位都要销账。
+        for head in ["fn leave_room_view(", "fn reset_for_reconnect("] {
+            assert!(
+                body_of(head).contains("self.focus_room_frame = None"),
+                "{head} 没有销掉房间取景账"
+            );
+        }
+
+        // e. 详情回包没进成视图（查不到 / 失败 / 没有实时渲染器 / 空房壳）也要销账：
+        // 帧号是「进视图」的唯一凭据，帧号没变就说明这一趟没进。门控也要钉住——
+        // 无条件销账会让每一次正常进视图都立刻丢账，房间视图基本都不取景了。
+        let detail = source
+            .split_once("data::Evt::RoomDetail(room, result)")
+            .expect("房间详情守卫臂")
+            .1
+            .split_once("data::Evt::RoomDetail(..) => {}")
+            .expect("房间详情兜底臂")
+            .0;
+        let epoch = detail
+            .find("let epoch_before = self.room_view_epoch;")
+            .expect("要先记下进视图之前的帧号");
+        let matched = detail.find("match result {").expect("详情分派");
+        let guard = detail
+            .find("for_viewport && self.room_view_epoch == epoch_before")
+            .expect("销账要认「没进成视图」这一条");
+        let take = detail
+            .find("take_if(|pending| *pending == room)")
+            .expect("没进成视图要销账，且要认房间号");
+        assert!(epoch < matched, "帧号要在分派之前记：{detail}");
+        assert!(matched < guard, "门控要在分派之后：{detail}");
+        assert!(guard < take, "销账要在门控之内：{detail}");
     }
 
     #[test]
