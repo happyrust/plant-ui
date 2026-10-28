@@ -4420,6 +4420,8 @@ impl App {
             );
         }
         self.rebuild_tree();
+        // 三维回执改了 eye，也改了主选中在视口右键菜单上该出「查看」还是「隐藏」。
+        self.sync_selection_branch();
     }
 
     /// 收下 View3d 的逐段回执（ADR-0033 阶段四）：按 BRAN 整份替换，落了地的在途方向退场；
@@ -4857,6 +4859,10 @@ impl App {
                 Cmd::FocusRoom(room) => self.focus_room(room),
                 Cmd::ShowRoomModel(room) => {
                     self.show_room_model(room);
+                    dirty = true;
+                }
+                Cmd::HideRoomModel(room) => {
+                    self.hide_room_model(room);
                     dirty = true;
                 }
                 Cmd::ShowRooms(refno) => {
@@ -6071,6 +6077,9 @@ impl App {
         self.vm.selection_noun = primary
             .and_then(|refno| self.tree.noun_of(refno))
             .map(str::to_owned);
+        self.vm.selection_visibility = primary
+            .map(|refno| self.tree.visibility_for(refno, &self.model_scopes))
+            .unwrap_or_default();
     }
 
     /// 取这条 BRAN 的尺寸标注并挂到视口上（计划 B2）。一层只挂一条，换目标就是换帧：
@@ -6796,6 +6805,19 @@ impl App {
         }
     }
 
+    /// 「隐藏房间内模型」：把这间房的墙面板藏起来。
+    ///
+    /// 与 [`Self::show_room_model`] 共用同一条显隐链路，只是方向反过来、也不取景
+    /// ——藏东西的时候把相机飞过去没有道理。隐藏方向**不查范围**：几何没加载过就
+    /// 没什么可藏，`set_model_visible` 自会把未知目标跳过（它的 `plan.query` 只在
+    /// 「显示」方向才排队取数，隐藏方向的查询照旧只查不生）。
+    fn hide_room_model(&mut self, room: RefU64) {
+        // 藏起来之后原来挂着的取景账就指向看不见的东西了，一并撤掉。
+        self.supersede_camera_intents();
+        self.pending_room_frame = None;
+        self.set_model_visible(vec![room], false);
+    }
+
     /// 显示 / 隐藏一批模型：记下方向、把已知范围下发给视口、未知范围排队去查。
     ///
     /// `Cmd::Model(SetVisible)` 与 [`Self::show_room_model`] 共用它——房间模型
@@ -7377,6 +7399,7 @@ impl App {
         }
         self.vm.selection_branch = None;
         self.vm.selection_noun = None;
+        self.vm.selection_visibility = plant_ui::vm::RowVisibility::default();
         self.vm.room_panels.clear();
         // 房间树是旧接入点的：整份丢掉，面板回到 Idle，下次画出来再拉；在途的回包凭帧号作废。
         self.room_tree.clear();

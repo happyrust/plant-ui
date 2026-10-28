@@ -74,6 +74,9 @@ pub struct WorkbenchVm {
     /// （`/MDS/FT03H/3-FRMW1` 这类）。只有登记在 `room_panel_relate` 里的才是房间。
     /// 230 行级，宿主取一次就够，之后纯内存判定——右键菜单要当帧画出来。
     pub room_panels: std::collections::HashMap<RefU64, RefU64>,
+    /// 主选中在三维里的可见性。视口右键菜单靠它决定房间那一项出「查看」还是「隐藏」。
+    /// 与 `selection_noun` 同源：都由宿主对着已加载的树与三维回执同步。
+    pub selection_visibility: RowVisibility,
     /// 命令交互视图。
     pub command: CommandVm,
     /// 标题栏搜索框的查询结果。

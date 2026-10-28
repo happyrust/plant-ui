@@ -274,6 +274,7 @@ fn row_menu(
         row.refno,
         Some(&row.noun),
         room_panels,
+        row.visibility,
         &targets,
         rooms,
         ElementDimensions {
@@ -299,6 +300,24 @@ pub(super) fn is_room_node(
     room_panels: &std::collections::HashMap<aios_core::RefU64, aios_core::RefU64>,
 ) -> bool {
     noun.is_some_and(|noun| noun.eq_ignore_ascii_case("FRMW")) && room_panels.contains_key(&refno)
+}
+
+/// 房间那一项出哪一态。抽出来是为了让测试不必起 egui。
+///
+/// 与眼睛同一个口径（`RowVisibility::on_click`）：只有全显示才轮到「藏起来」，
+/// 未加载 / 已隐藏 / 半可见都该让它出来。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoomItem {
+    Show,
+    Hide,
+}
+
+fn room_menu_action(visibility: RowVisibility) -> RoomItem {
+    if visibility == RowVisibility::Shown {
+        RoomItem::Hide
+    } else {
+        RoomItem::Show
+    }
 }
 
 /// 右键落点与尺寸标注层的关系，菜单据此决定「查看尺寸标注」出不出、出成哪一句。
@@ -330,7 +349,7 @@ pub(super) fn model_cmd(action: ModelAction) -> Cmd {
 ///
 /// `refno` 是右键落点那一个元素（定位与房间归属对它），`targets` 是批量动作的
 /// 作用集（显示 / 隐藏 / 复制对它们）。`noun` 与 `room_panels` 一起判「落点是房间」：
-/// 房间节点自己就是一间房，多一项「查看房间内模型」。
+/// 房间节点自己就是一间房，多一项「查看 / 隐藏房间内模型」；`visibility` 决定出哪一态。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn element_menu(
     ui: &mut Ui,
@@ -339,6 +358,7 @@ pub(super) fn element_menu(
     refno: aios_core::RefU64,
     noun: Option<&str>,
     room_panels: &std::collections::HashMap<aios_core::RefU64, aios_core::RefU64>,
+    visibility: RowVisibility,
     targets: &[aios_core::RefU64],
     rooms: &RoomVm,
     dimensions: ElementDimensions<'_>,
@@ -390,18 +410,34 @@ pub(super) fn element_menu(
     // 房间节点自己就是一间房：这一行没有「归属」，它本身就是归属的落点。
     // 摆在这里而不是塞进「查看所属房间」子菜单——子菜单答的是「这个构件在哪」，
     // 对房间节点只会说「无房间归属」，而它要的是「这间房装了些什么」。
+    //
+    // 一项两态，与「查看尺寸标注」同一条理由：显示着就只剩「隐藏」可做，没显示
+    // 就只剩「查看」——两项并排总有一项是废的。
     if is_room_node(noun, refno, room_panels) {
         if grouped {
             ui.separator();
         }
-        let label = format!("{}  查看房间内模型", ph::CUBE);
+        // 与眼睛同一个口径（`RowVisibility::on_click`）：只有全显示才轮到「藏起来」，
+        // 未加载 / 已隐藏 / 半可见都该让它出来。
+        let (label, hint, cmd) = match room_menu_action(visibility) {
+            RoomItem::Hide => (
+                "隐藏房间内模型",
+                "把这间房的墙面板藏起来；几何留在场景里，再点一次就回来",
+                Cmd::HideRoomModel(refno),
+            ),
+            RoomItem::Show => (
+                "查看房间内模型",
+                "把这间房自己的墙面板几何取回来显示，再取景到它",
+                Cmd::ShowRoomModel(refno),
+            ),
+        };
         if ui
-            .add_enabled(live, egui::Button::new(label))
-            .on_hover_text("把这间房自己的墙面板几何取回来显示，再取景到它")
+            .add_enabled(live, egui::Button::new(format!("{}  {label}", ph::CUBE)))
+            .on_hover_text(hint)
             .on_disabled_hover_text("没有三维渲染器，取回来也没有地方显示")
             .clicked()
         {
-            cmds.push(Cmd::ShowRoomModel(refno));
+            cmds.push(cmd);
             ui.close();
         }
         grouped = true;
@@ -694,7 +730,9 @@ fn note(ui: &mut Ui, t: &Tokens, d: Density, state: PaneState, icon: &str, text:
 
 #[cfg(test)]
 mod tests {
-    use super::{dimension_menu_action, is_room_node, tree_item_accessible_label};
+    use super::{
+        RoomItem, dimension_menu_action, is_room_node, room_menu_action, tree_item_accessible_label,
+    };
     use crate::Cmd;
     use crate::vm::{DimensionsDataVm, DimensionsVm};
     use aios_core::RefU64;
@@ -727,6 +765,22 @@ mod tests {
         assert!(!is_room_node(None, room, &panels));
         // 登记表还没取回来：一律不摆。
         assert!(!is_room_node(Some("FRMW"), room, &HashMap::new()));
+    }
+
+    /// 房间那一项是一项两态，与「查看尺寸标注」同一条理由：显示着就只剩「隐藏」
+    /// 可做，没显示就只剩「查看」——两项并排总有一项是废的。
+    #[test]
+    fn the_room_item_flips_between_show_and_hide() {
+        use crate::vm::RowVisibility;
+        // 只有全显示才轮到「藏起来」；未加载 / 已隐藏 / 半可见都该让它出来。
+        assert_eq!(room_menu_action(RowVisibility::Shown), RoomItem::Hide);
+        for state in [
+            RowVisibility::Unloaded,
+            RowVisibility::Hidden,
+            RowVisibility::Partial,
+        ] {
+            assert_eq!(room_menu_action(state), RoomItem::Show, "{state:?}");
+        }
     }
 
     /// 一项两态：落点这条 BRAN 正显示着（在途也算）→「隐藏」；没显示、或显示着的是

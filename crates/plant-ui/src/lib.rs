@@ -499,6 +499,12 @@ pub enum Cmd {
     /// 从没被加载过，于是那条路走完往往是别的模型全隐藏了、房间本身仍然看不见。
     /// 这条走的是显示模型那条既有链路：范围没缓存过就先去查、把几何取回来。
     ShowRoomModel(aios_core::RefU64),
+    /// 把这间房自己的模型藏起来。与 [`Self::ShowRoomModel`] 成对，走的也是同一条
+    /// 显隐链路——房间 FRMW 当作一个范围目标交给宿主的 `set_model_visible`。
+    ///
+    /// 与 [`ModelAction::SetVisible`] 分开的原因同上面那条：房间 FRMW 从来不在
+    /// 「节点下的构件」里，把它交给按构件收目标的显隐路径是找不到东西的。
+    HideRoomModel(aios_core::RefU64),
     /// 打开「房间」页签并对准该元素：元素不是当前主选中时先把选中切过去
     /// （归属数据跟着选中预取，页签一亮出来就有内容）。
     ShowRooms(aios_core::RefU64),
