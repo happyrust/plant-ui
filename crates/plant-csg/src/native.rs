@@ -216,7 +216,7 @@ impl BooleanPreviewBackend for NativeBackend {
     }
     fn poll(&mut self) -> Vec<BooleanOutcome> {
         let mut out = Vec::new();
-        let mut rx = self.rx.lock().expect("plant-csg recv lock poisoned");
+        let rx = self.rx.lock().expect("plant-csg recv lock poisoned");
         while let Ok(outcome) = rx.try_recv() {
             out.push(outcome);
         }
@@ -292,7 +292,10 @@ mod tests {
         backend.submit(job);
         let deadline = Instant::now() + std::time::Duration::from_secs(30);
         loop {
-            for outcome in backend.poll() {
+            // 一次 poll 可能带回多条结果，但这里一次只提交了一个作业，取第一条就够；
+            // 用 `if let` 而不是 `for ... return`：后者循环体第一拍就返回，clippy 判成
+            // `never_loop`（deny 级）。
+            if let Some(outcome) = backend.poll().into_iter().next() {
                 return outcome;
             }
             assert!(Instant::now() < deadline, "boolean timed out");

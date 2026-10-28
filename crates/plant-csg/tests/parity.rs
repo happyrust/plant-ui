@@ -16,8 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use plant_csg::{
-    BooleanJob, BooleanOutcome, BooleanPreviewBackend, CutterJob, CutterShape, MeshData, backend,
-    mesh_key,
+    BooleanJob, BooleanOutcome, CutterJob, CutterShape, MeshData, backend, mesh_key,
 };
 use serde_json::{Value, json};
 
@@ -137,7 +136,8 @@ fn run_case(case: &Case) -> BooleanOutcome {
     });
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        for outcome in backend.poll() {
+        // 一个用例一个作业：取第一条结果即可（`for ... return` 会被 clippy 判成 never_loop）。
+        if let Some(outcome) = backend.poll().into_iter().next() {
             return outcome;
         }
         assert!(Instant::now() < deadline, "后端 30s 没回结果");
