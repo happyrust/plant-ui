@@ -6232,8 +6232,8 @@ impl App {
                         }
                     }
                     if self.hole_focus_pending.take_if(|t| *t == target).is_some() {
-                        // 同 `FocusVirtualHoleTarget`：孔洞的取景优先于在途的范围查询。
-                        self.focus_bounds_request.cancel();
+                        // 只取景，不撤别人的账：这里是落地点（几何终于到了），手上这笔就是
+                        // 用户那次意图，反过来作废在途的范围查询会吞掉后来的点击。
                         self.view3d_commands
                             .push(Cmd::Model(plant_ui::ModelAction::Focus(target)));
                     }
