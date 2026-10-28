@@ -4900,7 +4900,8 @@ impl App {
                         plant_ui::ModelAction::SetVisible { refnos, visible } => {
                             self.set_model_visible(refnos, visible)
                         }
-                        // 「视图适应」也是一次取景：对准的是可见并集（房间视图里就是房间体），
+                        // 「视图适应」也是一次取景：对准的是可见并集（房间视图里房间体落地之后
+                        // 就是房间体；房间体还在途时先框隔离后的并集，落地那笔账会再纠正），
                         // 更早挂着的范围 / 孔洞 / 房间模型 / 房间树取景就此作废。
                         plant_ui::ModelAction::FitAll => {
                             self.supersede_camera_intents_for_fit();
@@ -8071,8 +8072,14 @@ impl App {
     ///
     /// 房间视图里 Home 对准的框就是房间体（`room_clip.rs` 的 `panel_bounds_mm`，与房间体落地
     /// 取景同源），所以它不跟房间取景抢相机，反而是替用户把那次没落地的取景提前兑现。撤掉
-    /// 房间账就等于「进了房间却永远不取景」。视图正在进（`focus_room_pending` 还挂着、房间账
-    /// 还没登记）时也一样：补回 `focus_room_pending`，房间体到了照常对准它。
+    /// 房间账就等于「进了房间却永远不取景」。房间体还在途时先框隔离后的并集，账留着，落地时
+    /// 再纠正到房间体——终态一致，只是相机动两次。
+    ///
+    /// 补 `focus_room_pending` 是兜住「frame 已经没了、进视图那半还在途」的两种来法：
+    /// (i) 进 R 之后别的意图跑了普通 helper（它清 frame、不碰 pending）；
+    /// (ii) 同一间房连点两次，旧帧号的房间体先把新点击登记的账吃掉。
+    /// 两种情况下补回 pending 都让「进 R → 定位 → Home」等同于「进 R → Home」；不补的话，
+    /// Home 在隔离前框全场景，隔离后房间很小，也没人再取景。
     ///
     /// 视方块点面（`SnapView { fit: false }`）只改朝向，不动焦点与距离，不算取景意图。
     fn supersede_camera_intents_for_fit(&mut self) {
@@ -10741,6 +10748,7 @@ mod tests {
         // 都要变红。
         let (production, _) = source.split_once("\nmod tests {").expect("测试模块分界");
         let mut registered = 0;
+        let mut restored = 0;
         for line in production.lines() {
             let Some((_, value)) = line.split_once("self.focus_room_frame = ") else {
                 continue;
@@ -10748,11 +10756,14 @@ mod tests {
             let value = value.trim();
             if value == "Some(room);" {
                 registered += 1;
-            } else if value != "None;" && value != "room_frame;" {
+            } else if value == "room_frame;" {
+                restored += 1;
+            } else if value != "None;" {
                 panic!("取景账只许登记 / 清空 / 视图适应后放回，不许别的写法：{line}");
             }
         }
         assert_eq!(registered, 1, "登记取景账只有进房间视图那一处");
+        assert_eq!(restored, 1, "视图适应后放回只有 wrapper 那一处");
         for forbidden in [
             "focus_room_frame.replace(",
             "focus_room_frame.insert(",
@@ -10828,12 +10839,14 @@ mod tests {
         assert!(restore < close, "撤账要在留住房间账之后：{wrapper}");
         assert!(close < put_back, "放回要在撤账之后：{wrapper}");
 
-        // b. FitAll 臂：先收口、再下发。
-        let fit_all = source
+        // b. FitAll 臂：先收口、再下发。切片只在生产段里找，尾锚用真正的下一臂 HideAll——
+        // 拿 SetVisible 当尾锚会跨到测试模块里的字面量，切片长到几千行，位置断言就失去意义。
+        let (production, _) = source.split_once("\nmod tests {").expect("测试模块分界");
+        let fit_all = production
             .split_once("plant_ui::ModelAction::FitAll => {")
             .expect("视图适应臂")
             .1
-            .split_once("plant_ui::ModelAction::SetVisible { refnos, visible } => {")
+            .split_once("plant_ui::ModelAction::HideAll => {")
             .expect("下一个臂")
             .0;
         let close = fit_all
@@ -10845,7 +10858,7 @@ mod tests {
         assert!(close < push, "先收口、再下发 FitAll：{fit_all}");
 
         // c. 视方块 Home：`fit: true` 单独一支，先收口、再下发。
-        let home = source
+        let home = production
             .split_once("command @ Cmd::SnapView { fit: true, .. } => {")
             .expect("视方块 Home 臂")
             .1
@@ -10860,8 +10873,17 @@ mod tests {
             .expect("Home 要下发");
         assert!(close < push, "先收口、再下发 Home：{home}");
 
+        // e. 这个 wrapper 只该在这两个臂里被调用：多一处就是没想清楚的新意图点。
+        assert_eq!(
+            production
+                .matches("self.supersede_camera_intents_for_fit()")
+                .count(),
+            2,
+            "视图适应的收口只该在 FitAll 与 Home 两处调用"
+        );
+
         // d. 点面留在直通臂里，且不许撤账。
-        let passthrough = source
+        let passthrough = production
             .split_once("command @ (Cmd::PickViewport(_)")
             .expect("直通臂")
             .1
