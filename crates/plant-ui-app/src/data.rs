@@ -191,6 +191,9 @@ pub enum Req {
     /// 房间浏览器的全表（重查询，全库扫描级；只在打开浮窗或手动刷新时发，
     /// 不进启动路径——计划风险 5）。
     RoomsOverview,
+    /// 全部在册 PANEL → 所属房间（230 行级，轻）。右键菜单靠它认出「这一行是房间」，
+    /// 一次取回放进 Vm，之后纯内存判定。
+    PanelRooms,
     /// 取回工作的三维重装：**只重查**已生成的产物，不先生成（ADR-0030 D3）。
     ///
     /// `roots` 是快照里的模型 refno（库供数按它一根一条 `anc CONTAINS` 查）；`scope_targets`
@@ -475,6 +478,8 @@ pub enum Evt {
     },
     /// 房间浏览器全表。
     RoomsOverview(anyhow::Result<Vec<plant_ui_data::room::RoomOverviewRow>>),
+    /// 全部在册 PANEL → 所属房间。
+    PanelRooms(anyhow::Result<Vec<(RefU64, RefU64)>>),
     /// 取回工作重装的整批模型记录，连同每个库认下的取数源（spec §4.12）：日志据此
     /// 说出哪几个库此刻由 API 从内存供数。
     Models(bool, anyhow::Result<crate::model_update_api::ModelRecords>),
@@ -911,6 +916,13 @@ async fn handle_read(
                 Err(error) => Err(error),
             };
             let _ = evt_tx.send(Evt::RoomsOverview(r));
+        }
+        Req::PanelRooms => {
+            let r = match require_mirror_feature("房间").await {
+                Ok(()) => plant_ui_data::room::all_panel_rooms().await,
+                Err(error) => Err(error),
+            };
+            let _ = evt_tx.send(Evt::PanelRooms(r));
         }
         Req::ResolveName(name) => {
             let result = face.resolve_name(&name).await;

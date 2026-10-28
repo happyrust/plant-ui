@@ -1257,6 +1257,16 @@ impl TreeModel {
         None
     }
 
+    /// 这个元素的 PDMS 类型（`FRMW` / `BRAN` / `SITE`…）。与 `dimension_branch` 一样
+    /// 只看已加载的树：元素不在缓存里就回 `None`，那时候本端确实还不知道它是什么。
+    fn noun_of(&self, refno: RefU64) -> Option<&str> {
+        self.roots
+            .iter()
+            .chain(self.children.values().flatten())
+            .find(|node| node.refno.refno() == refno)
+            .map(|node| node.noun.as_str())
+    }
+
     /// 这个元素能挂尺寸标注的 BRAN（计划 B2 / D3）：自己是 BRAN 就是自己，是 BRAN 的
     /// 成员就顺着父链上溯到所在 BRAN；PIPE / ZONE / EQUI 这些回 None——它们头上没有
     /// BRAN。只看已加载的树：元素不在缓存里就回 None，那时候本端确实还不知道它是什么
@@ -2655,6 +2665,10 @@ impl App {
                         self.tree.note_dbnum(site);
                     }
                     self.tree.roots = info.sites;
+                    // 在册面板表：右键菜单靠它认出「这一行是房间」。230 行级，连上就取一次；
+                    // 取不到只是少一项菜单，不进日志——房间树那条路自己会报查询失败。
+                    self.vm.room_panels.clear();
+                    let _ = self.bridge.req.send(data::Req::PanelRooms);
                     // 换面之后的重装（ADR-0026 热切，计划 §5.3）：清场前的快照到这儿才
                     // 移进取回工作那一格，随后走取回工作那条现成路——`clear_scene_for_reload`
                     // 见已有快照就不重拍（此刻场景是空的，重拍只会拍到空白），
@@ -3040,6 +3054,13 @@ impl App {
                             ))
                         }
                     };
+                }
+                // 在册面板表：右键菜单靠它认出「这一行是房间」。取一次就够，失败只是
+                // 少一项菜单，不打扰用户——房间树那条路自己会说查询失败。
+                data::Evt::PanelRooms(result) => {
+                    if let Ok(rows) = result {
+                        self.vm.room_panels = rows.into_iter().collect();
+                    }
                 }
                 // 场景在点击取回工作那一刻已经清空，查回来的批次一律上屏：它比
                 // 空场景新，也比旧几何新。上屏时若又有新保存落库，后续自动刷新
@@ -6041,12 +6062,15 @@ impl App {
 
     /// 主选中能挂尺寸标注的 BRAN 随选中与树同步（视口右键菜单的靶子，计划 B2）。
     /// 树也是触发点：视口拾取到的成员要等定位把祖先加载回来，才认得出它头上的 BRAN。
+    ///
+    /// 顺带同步主选中的类型：视口右键菜单也要认出「这一行是房间节点」（`FRMW`），
+    /// 才能给房间摆出「查看房间内模型」。与 BRAN 同源同触发点，不另开一条同步路径。
     fn sync_selection_branch(&mut self) {
-        self.vm.selection_branch = self
-            .vm
-            .selection
-            .primary()
-            .and_then(|refno| self.tree.dimension_branch(refno));
+        let primary = self.vm.selection.primary();
+        self.vm.selection_branch = primary.and_then(|refno| self.tree.dimension_branch(refno));
+        self.vm.selection_noun = primary
+            .and_then(|refno| self.tree.noun_of(refno))
+            .map(str::to_owned);
     }
 
     /// 取这条 BRAN 的尺寸标注并挂到视口上（计划 B2）。一层只挂一条，换目标就是换帧：
@@ -7352,6 +7376,8 @@ impl App {
             self.sync_hole_vm();
         }
         self.vm.selection_branch = None;
+        self.vm.selection_noun = None;
+        self.vm.room_panels.clear();
         // 房间树是旧接入点的：整份丢掉，面板回到 Idle，下次画出来再拉；在途的回包凭帧号作废。
         self.room_tree.clear();
         self.room_tree_epoch = self.room_tree_epoch.wrapping_add(1);

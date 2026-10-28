@@ -209,6 +209,29 @@ pub async fn room_panels(room: RefnoEnum) -> Result<Vec<RefU64>> {
     Ok(panels.into_iter().map(|panel| panel.refno()).collect())
 }
 
+/// 全部在册 PANEL → 所属房间。一次往返取回整张登记表。
+///
+/// 「这个 refno 是不是房间」只有这份登记表答得准：`noun = "FRMW"` 在全库有七千多行，
+/// 里头既有房间也有结构框架，光看类型名会把结构框架也当成房间。宿主把它取一次放进
+/// Vm，右键菜单就能在当帧判定，不必为每一次右键再问一趟库。
+pub async fn all_panel_rooms() -> Result<Vec<(RefU64, RefU64)>> {
+    let mut response = SUL_DB.query(ALL_PANEL_ROOMS_SQL).await?.check()?;
+    let rows: Vec<PanelRoomRow> = response.take(0)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.out.refno(), row.room.refno()))
+        .collect())
+}
+
+/// `room_panel_relate` 的一行。字段名对着 SQL 里的 `SELECT out, in`；`in` 是 SurrealQL
+/// 关键字，所以用 `rename` 落到 `room` 上。
+#[derive(Debug, serde::Deserialize)]
+struct PanelRoomRow {
+    out: RefnoEnum,
+    #[serde(rename = "in")]
+    room: RefnoEnum,
+}
+
 /// 一间房的详情。`room` 不是 pe 里的记录时返回 `Ok(None)`。
 ///
 /// `preview` 是成员预览条数上限；`member_count` 始终是去重后的全量。
@@ -489,6 +512,16 @@ fn panel_room_sql(panel_key: &str) -> String {
 fn room_panels_sql(room_key: &str) -> String {
     format!("SELECT VALUE out FROM room_panel_relate WHERE in = {room_key};")
 }
+
+/// 整张登记表：`out` 是在册 PANEL，`in` 是它直属的房间 FRMW。
+///
+/// 边表只有复合索引 `(in, out)`，`WHERE out IN [...]` 会静默回 0 行（见
+/// `room_detail_sql` 上方那段现场记录），所以这里不写任何 `WHERE`——全表就 230 行，
+/// 让它顺序扫比赌索引行为稳。
+///
+/// 写成 `SELECT out, in` 而不是 `SELECT VALUE [out, in]`：后者在 SurrealDB 里会返回
+/// 一条扁平的 `["pe:…","pe:…"]`，230 行只剩两个元素，反序列化成元组直接失败。
+const ALL_PANEL_ROOMS_SQL: &str = "SELECT out, in FROM room_panel_relate;";
 
 /// 成员边按记录 id 图遍历收（`{panel}->room_relate`），**不写 `WHERE in IN $panels`**。
 ///

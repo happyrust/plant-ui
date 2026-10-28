@@ -65,6 +65,15 @@ pub struct WorkbenchVm {
     /// 菜单作用于主选中，而「它是不是管道元素」只有宿主对着已加载的树才答得出，所以随
     /// 选中与树的变化由宿主填。`None` = 主选中不是管道元素，或者它还不在已加载的树里。
     pub selection_branch: Option<RefU64>,
+    /// 主选中的 PDMS 类型（`FRMW` 等）。视口右键菜单作用于主选中，而「这一行是不是
+    /// 房间节点」只有树那侧知道；随选中由宿主填，`None` = 主选中不在已加载的树里。
+    pub selection_noun: Option<String>,
+    /// 全部在册 PANEL → 所属房间。右键菜单靠它认出「这一行是房间」。
+    ///
+    /// 不能只看 `noun == "FRMW"`：全库 `FRMW` 有七千多行，里头既有房间也有结构框架
+    /// （`/MDS/FT03H/3-FRMW1` 这类）。只有登记在 `room_panel_relate` 里的才是房间。
+    /// 230 行级，宿主取一次就够，之后纯内存判定——右键菜单要当帧画出来。
+    pub room_panels: std::collections::HashMap<RefU64, RefU64>,
     /// 命令交互视图。
     pub command: CommandVm,
     /// 标题栏搜索框的查询结果。

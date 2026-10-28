@@ -1777,6 +1777,8 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
         },
         // 剧本里没有房间数据：空归属即「无房间归属」，界面照常走 Ready 空态。
         Req::ElementRooms(refno) => Evt::ElementRooms(refno, Ok(Vec::new())),
+        // 同上：没有在册面板，右键菜单就不摆「查看房间内模型」。
+        Req::PanelRooms => Evt::PanelRooms(Ok(Vec::new())),
         Req::PanelRoom(refno) => Evt::PanelRoom(refno, Ok(None)),
         Req::RoomPanels(refno) => Evt::RoomPanels(refno, Ok(Vec::new())),
         // 同理，任何房间在剧本里都查不到。

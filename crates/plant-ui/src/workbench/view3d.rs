@@ -204,6 +204,8 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                 t,
                 d,
                 primary,
+                vm.selection_noun.as_deref(),
+                &vm.room_panels,
                 &vm.selection.to_vec(),
                 &vm.rooms,
                 // 主选中能挂尺寸标注的 BRAN 由宿主对着已加载的树算好（计划 B2）。

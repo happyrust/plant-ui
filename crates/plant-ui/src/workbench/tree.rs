@@ -170,6 +170,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                                     row,
                                     &vm.selection,
                                     &vm.rooms,
+                                    &vm.room_panels,
                                     &vm.dimensions,
                                     live,
                                     vm.regen_busy,
@@ -240,6 +241,7 @@ fn row_menu(
     row: &TreeRowVm,
     selection: &Selection,
     rooms: &RoomVm,
+    room_panels: &std::collections::HashMap<aios_core::RefU64, aios_core::RefU64>,
     dimensions: &DimensionsVm,
     live: bool,
     regen_busy: bool,
@@ -270,6 +272,8 @@ fn row_menu(
         t,
         d,
         row.refno,
+        Some(&row.noun),
+        room_panels,
         &targets,
         rooms,
         ElementDimensions {
@@ -281,6 +285,20 @@ fn row_menu(
         cmds,
         grouped,
     );
+}
+
+/// 右键落点是不是房间节点。
+///
+/// 两条都要满足：类型是 `FRMW`，且这个 refno 登记在册（`room_panels` 里有一行）。
+/// 只看类型名会把结构框架（`/MDS/FT03H/3-FRMW1` 这类，全库七千多行里的绝大多数）
+/// 也当成房间——点上去什么也取不回来。登记表是唯一权威判据：只有 `room_panel_relate`
+/// 里有的才是房间。表在宿主手上取一次，这里纯内存判定，右键菜单不必等往返。
+pub(super) fn is_room_node(
+    noun: Option<&str>,
+    refno: aios_core::RefU64,
+    room_panels: &std::collections::HashMap<aios_core::RefU64, aios_core::RefU64>,
+) -> bool {
+    noun.is_some_and(|noun| noun.eq_ignore_ascii_case("FRMW")) && room_panels.contains_key(&refno)
 }
 
 /// 右键落点与尺寸标注层的关系，菜单据此决定「查看尺寸标注」出不出、出成哪一句。
@@ -311,13 +329,16 @@ pub(super) fn model_cmd(action: ModelAction) -> Cmd {
 /// 菜单与三维视口的右键菜单是同一件事的两个入口，内容必须一致，所以收在一处。
 ///
 /// `refno` 是右键落点那一个元素（定位与房间归属对它），`targets` 是批量动作的
-/// 作用集（显示 / 隐藏 / 复制对它们）。
+/// 作用集（显示 / 隐藏 / 复制对它们）。`noun` 与 `room_panels` 一起判「落点是房间」：
+/// 房间节点自己就是一间房，多一项「查看房间内模型」。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn element_menu(
     ui: &mut Ui,
     t: &Tokens,
     d: Density,
     refno: aios_core::RefU64,
+    noun: Option<&str>,
+    room_panels: &std::collections::HashMap<aios_core::RefU64, aios_core::RefU64>,
     targets: &[aios_core::RefU64],
     rooms: &RoomVm,
     dimensions: ElementDimensions<'_>,
@@ -363,6 +384,25 @@ pub(super) fn element_menu(
                 cmds.push(model_cmd(action));
                 ui.close();
             }
+        }
+        grouped = true;
+    }
+    // 房间节点自己就是一间房：这一行没有「归属」，它本身就是归属的落点。
+    // 摆在这里而不是塞进「查看所属房间」子菜单——子菜单答的是「这个构件在哪」，
+    // 对房间节点只会说「无房间归属」，而它要的是「这间房装了些什么」。
+    if is_room_node(noun, refno, room_panels) {
+        if grouped {
+            ui.separator();
+        }
+        let label = format!("{}  查看房间内模型", ph::CUBE);
+        if ui
+            .add_enabled(live, egui::Button::new(label))
+            .on_hover_text("把这间房自己的墙面板几何取回来显示，再取景到它")
+            .on_disabled_hover_text("没有三维渲染器，取回来也没有地方显示")
+            .clicked()
+        {
+            cmds.push(Cmd::ShowRoomModel(refno));
+            ui.close();
         }
         grouped = true;
     }
@@ -654,10 +694,40 @@ fn note(ui: &mut Ui, t: &Tokens, d: Density, state: PaneState, icon: &str, text:
 
 #[cfg(test)]
 mod tests {
-    use super::{dimension_menu_action, tree_item_accessible_label};
+    use super::{dimension_menu_action, is_room_node, tree_item_accessible_label};
     use crate::Cmd;
     use crate::vm::{DimensionsDataVm, DimensionsVm};
     use aios_core::RefU64;
+
+    /// 房间节点要两条都满足：类型是 `FRMW`，且登记在册。
+    ///
+    /// 只看类型名会把结构框架也当成房间——全库 `FRMW` 七千多行里绝大多数是
+    /// `/MDS/FT03H/3-FRMW1` 那种结构框架，点「查看房间内模型」什么也取不回来。
+    #[test]
+    fn a_room_node_needs_both_the_frmw_type_and_a_registration() {
+        use std::collections::HashMap;
+        let parse = |s: &str| s.parse::<RefU64>().expect("refno");
+        let room = parse("24381_1008");
+        let frame = parse("15516_101");
+        let mut panels = HashMap::new();
+        panels.insert(room, parse("24381_1009"));
+
+        assert!(is_room_node(Some("FRMW"), room, &panels), "在册的房间");
+        // E3D 的类型名大小写来自 attlib，不保证全大写。
+        assert!(is_room_node(Some("frmw"), room, &panels), "大小写不敏感");
+        assert!(
+            !is_room_node(Some("FRMW"), frame, &panels),
+            "结构框架也是 FRMW，但不在册"
+        );
+        assert!(
+            !is_room_node(Some("BRAN"), room, &panels),
+            "类型不对就不是房间"
+        );
+        // 不在已加载的树里就不知道它是什么：宁可不摆，也不摆错。
+        assert!(!is_room_node(None, room, &panels));
+        // 登记表还没取回来：一律不摆。
+        assert!(!is_room_node(Some("FRMW"), room, &HashMap::new()));
+    }
 
     /// 一项两态：落点这条 BRAN 正显示着（在途也算）→「隐藏」；没显示、或显示着的是
     /// 别的 BRAN →「查看」并带上落点那条。失败态是「查看」= 重试，不是「隐藏」。
