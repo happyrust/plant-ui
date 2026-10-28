@@ -4896,6 +4896,13 @@ impl App {
                         plant_ui::ModelAction::SetVisible { refnos, visible } => {
                             self.set_model_visible(refnos, visible)
                         }
+                        // 「视图适应」也是一次取景：对准的是可见并集（房间视图里就是房间体），
+                        // 更早挂着的范围 / 孔洞 / 房间模型 / 房间树取景就此作废。
+                        plant_ui::ModelAction::FitAll => {
+                            self.supersede_camera_intents_for_fit();
+                            self.view3d_commands
+                                .push(Cmd::Model(plant_ui::ModelAction::FitAll));
+                        }
                         // 全局的两条只作用于**已加载**的模型：eye 照样等 View3d
                         // 回执。在途的那些点击把方向改成全局这一次的——它就是
                         // 最后一次指令，查询回来时得照它走，不然那几个目标会在
@@ -4928,12 +4935,18 @@ impl App {
                     }
                     dirty = true;
                 }
+                // 视方块的 Home 带 `fit: true`：和「视图适应」同一个框，算一次取景意图。
+                // 点面（`fit: false`）只改朝向，不算——落到下面那条直通臂。
+                command @ Cmd::SnapView { fit: true, .. } => {
+                    self.supersede_camera_intents_for_fit();
+                    self.view3d_commands.push(command);
+                }
                 command @ (Cmd::PickViewport(_)
                 | Cmd::Camera(_)
                 | Cmd::ResizeViewport(_)
                 | Cmd::SetViewportGrid(_)
                 | Cmd::SetViewportLook(_)
-                | Cmd::SnapView { .. }
+                | Cmd::SnapView { fit: false, .. }
                 | Cmd::RestoreCamera(_)
                 | Cmd::RetryFailedMeshes) => self.view3d_commands.push(command),
                 Cmd::Navigate(step) => {
@@ -8050,6 +8063,20 @@ impl App {
         data
     }
 
+    /// 视图适应（FitAll / Home 键 / 视方块的 Home）算一次取景意图，但**房间取景账要留住**。
+    ///
+    /// 房间视图里 Home 对准的框就是房间体（`room_clip.rs` 的 `panel_bounds_mm`，与房间体落地
+    /// 取景同源），所以它不跟房间取景抢相机，反而是替用户把那次没落地的取景提前兑现。撤掉
+    /// 房间账就等于「进了房间却永远不取景」。视图正在进（`focus_room_pending` 还挂着、房间账
+    /// 还没登记）时也一样：补回 `focus_room_pending`，房间体到了照常对准它。
+    ///
+    /// 视方块点面（`SnapView { fit: false }`）只改朝向，不动焦点与距离，不算取景意图。
+    fn supersede_camera_intents_for_fit(&mut self) {
+        let room_frame = self.focus_room_frame.take().or(self.focus_room_pending);
+        self.supersede_camera_intents();
+        self.focus_room_frame = room_frame;
+    }
+
     /// 相机意图只认最新一次：用户又发起了一次取景，把更早的账全撤掉。
     ///
     /// 取景是异步的——范围查询要等回包，孔洞 / 房间模型要等几何落地，房间树动作要等树和叶子
@@ -10699,8 +10726,9 @@ mod tests {
             !body_of("fn reapply_room_view_after_reload(").contains("focus_room_frame"),
             "整场重装不碰取景账（重装保留相机）"
         );
-        // 写点白名单：生产代码里只有「登记这一次的房间」和「清空」两种写法，各在明处。
-        // 换 `.replace` / `.insert` / `get_or_insert`，或者跑到重装臂里另写一处登记，都要变红。
+        // 写点白名单：生产代码里只有「登记这一次的房间」「清空」和「视图适应后放回」三种写法，
+        // 各在明处。换 `.replace` / `.insert` / `get_or_insert`，或者跑到重装臂里另写一处登记，
+        // 都要变红。
         let (production, _) = source.split_once("\nmod tests {").expect("测试模块分界");
         let mut registered = 0;
         for line in production.lines() {
@@ -10710,8 +10738,8 @@ mod tests {
             let value = value.trim();
             if value == "Some(room);" {
                 registered += 1;
-            } else {
-                assert_eq!(value, "None;", "取景账只许登记或清空，不许别的写法：{line}");
+            } else if value != "None;" && value != "room_frame;" {
+                panic!("取景账只许登记 / 清空 / 视图适应后放回，不许别的写法：{line}");
             }
         }
         assert_eq!(registered, 1, "登记取景账只有进房间视图那一处");
@@ -10757,6 +10785,87 @@ mod tests {
         assert!(epoch < matched, "帧号要在分派之前记：{detail}");
         assert!(matched < guard, "门控要在分派之后：{detail}");
         assert!(guard < take, "销账要在门控之内：{detail}");
+    }
+
+    /// 「视图适应」与视方块的 Home（`SnapView { fit: true }`）也算取景意图，但房间取景账要留住：
+    /// 房间视图里 Home 对准的就是房间体，撤掉它等于「进了房间却永远不取景」。
+    /// 点面（`fit: false`）只改朝向，不许撤账。
+    #[test]
+    fn fitting_the_view_supersedes_other_intents_but_keeps_the_room() {
+        let source = include_str!("main.rs");
+
+        // a. wrapper 的三步顺序：先留住房间账，再撤别人，最后放回。
+        let wrapper = source
+            .split_once("fn supersede_camera_intents_for_fit(&mut self) {")
+            .expect("视图适应的收口")
+            .1
+            .split_once("\n    fn ")
+            .expect("下一个方法")
+            .0;
+        let keep = wrapper
+            .find("self.focus_room_frame.take()")
+            .expect("要先取走房间取景账");
+        let restore = wrapper
+            .find(".or(self.focus_room_pending)")
+            .expect("视图正在进时也要留住");
+        let close = wrapper
+            .find("self.supersede_camera_intents()")
+            .expect("再撤掉更早的账");
+        let put_back = wrapper
+            .find("self.focus_room_frame = room_frame")
+            .expect("最后放回房间账");
+        assert!(keep < restore, "先取房间账、再兜底问进视图门控：{wrapper}");
+        assert!(restore < close, "撤账要在留住房间账之后：{wrapper}");
+        assert!(close < put_back, "放回要在撤账之后：{wrapper}");
+
+        // b. FitAll 臂：先收口、再下发。
+        let fit_all = source
+            .split_once("plant_ui::ModelAction::FitAll => {")
+            .expect("视图适应臂")
+            .1
+            .split_once("plant_ui::ModelAction::SetVisible { refnos, visible } => {")
+            .expect("下一个臂")
+            .0;
+        let close = fit_all
+            .find("self.supersede_camera_intents_for_fit()")
+            .expect("视图适应要先收口");
+        let push = fit_all
+            .find("Cmd::Model(plant_ui::ModelAction::FitAll)")
+            .expect("视图适应要下发");
+        assert!(close < push, "先收口、再下发 FitAll：{fit_all}");
+
+        // c. 视方块 Home：`fit: true` 单独一支，先收口、再下发。
+        let home = source
+            .split_once("command @ Cmd::SnapView { fit: true, .. } => {")
+            .expect("视方块 Home 臂")
+            .1
+            .split_once("command @ (Cmd::PickViewport(_)")
+            .expect("直通臂")
+            .0;
+        let close = home
+            .find("self.supersede_camera_intents_for_fit()")
+            .expect("Home 要先收口");
+        let push = home
+            .find("self.view3d_commands.push(command)")
+            .expect("Home 要下发");
+        assert!(close < push, "先收口、再下发 Home：{home}");
+
+        // d. 点面留在直通臂里，且不许撤账。
+        let passthrough = source
+            .split_once("command @ (Cmd::PickViewport(_)")
+            .expect("直通臂")
+            .1
+            .split_once("Cmd::Navigate(step) => {")
+            .expect("下一条命令")
+            .0;
+        assert!(
+            passthrough.contains("Cmd::SnapView { fit: false, .. }"),
+            "点面要留在直通臂里：{passthrough}"
+        );
+        assert!(
+            !passthrough.contains("supersede_camera_intents"),
+            "点面只改朝向，不许撤账：{passthrough}"
+        );
     }
 
     #[test]
