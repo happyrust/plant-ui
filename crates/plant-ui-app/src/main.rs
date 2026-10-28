@@ -864,6 +864,10 @@ struct PendingLocate {
     /// 命令会话里已经报过这次定位的结果。发起时就能展开到位的那种当场就报了，
     /// 等祖先链的那种得等真滚过去才报，两者不许都报一遍。
     announced: bool,
+    /// 这次定位顺带换过全局选中（`locate`）还是只把树带过去（`reveal_tree`）。
+    /// 树外元素那条告警要说清到底动了什么——房间视图那种「只滚树」的来路
+    /// 没有换过属性，说「已选中并显示属性」就是假话。
+    selects: bool,
 }
 
 /// 一次树定位的去向。
@@ -4857,7 +4861,7 @@ impl App {
                     });
                 }
                 Cmd::ReconnectQueueFeed => self.reopen_queue_feed(ctx),
-                Cmd::FocusRoom(room) => self.focus_room(room),
+                Cmd::FocusRoom(room) => dirty |= self.focus_room(room),
                 Cmd::ShowRoomModel(room) => {
                     self.show_room_model(room);
                     dirty = true;
@@ -5807,6 +5811,20 @@ impl App {
     /// 不动相机。
     fn locate(&mut self, refno: RefU64, from_command: bool) -> Locate {
         self.select(refno);
+        self.reveal_tree(refno, from_command, true)
+    }
+
+    /// 只把模型树带到目标那一行：展开祖先、滚过去，**不换选中**。
+    ///
+    /// 房间视图（`focus_room`）要的就是它：那里要的是相机与「房间」页签的详情，
+    /// 选中该留在用户原来看的构件上。走 `locate` 会 `select(room)`，把属性面板
+    /// 换成房间 FRMW、清掉 `room_pane_focus`、再多记一条导航历史——三件事都是
+    /// 用户没要的。
+    ///
+    /// 其余行为与 [`Self::locate`] 完全一致（ADR-0014）：祖先链在缓存里这一帧就
+    /// 展开到位，不在就现查一条，滚动等子层回来。不切换 MDB、不生成或显示三维、
+    /// 不动相机。
+    fn reveal_tree(&mut self, refno: RefU64, from_command: bool, selects: bool) -> Locate {
         if let Some(chain) = self.tree.ancestors(refno) {
             // 链来自本端缓存：目标既然在 `tree.parent` 里，它那一行本来就在树上，
             // 没有「父分支比目标还老」这回事，不必重查。
@@ -5816,6 +5834,7 @@ impl App {
                 path: chain,
                 from_command,
                 announced: true,
+                selects,
             });
             self.vm.tree_reveal = Some(refno);
             return Locate::Ready;
@@ -5828,6 +5847,7 @@ impl App {
             path: Vec::new(),
             from_command,
             announced: false,
+            selects,
         });
         let _ = self.bridge.req.send(data::Req::Ancestors(refno));
         Locate::Resolving
@@ -5863,13 +5883,23 @@ impl App {
             // 根层里找不到落脚点：目标在模型本体里，但不在当前 MDB 的树根范围内。
             let pending = self.pending_locate.take();
             let el = self.tree.element(refno);
+            // 只滚树的那条来路（房间视图）没有换过选中，说「已选中并显示属性」是假话。
+            let selects = pending.as_ref().is_some_and(|p| p.selects);
             self.logs.warn_of(
                 &mut self.vm.logs,
                 el.clone(),
-                "树外元素：已选中并显示属性，不切换 MDB",
+                if selects {
+                    "树外元素：已选中并显示属性，不切换 MDB"
+                } else {
+                    "树外元素：不在当前 MDB 的模型树里，树没有跟随"
+                },
             );
             if pending.is_some_and(|p| p.from_command) {
-                self.command_output(format!("{} 是树外元素，只切换了属性", el.label));
+                self.command_output(if selects {
+                    format!("{} 是树外元素，只切换了属性", el.label)
+                } else {
+                    format!("{} 是树外元素，树没有跟随", el.label)
+                });
             }
             return false;
         };
@@ -6392,9 +6422,13 @@ impl App {
     /// 房间视图的上半程：记下在途目标，去数据层解析全量成员集。
     /// 下半程在 `Evt::RoomDetail` 到达时展开成隔离 + 取景（有实时渲染器时），
     /// 并把详情填进「房间」页签——同一次往返喂两个消费者。
-    fn focus_room(&mut self, room: RefU64) {
+    fn focus_room(&mut self, room: RefU64) -> bool {
         // 进房间视图也会取景（房间体到了才动相机），算一次意图。
         self.supersede_camera_intents();
+        // 模型树也跟着过去：只展开 + 滚到那一行，**不换选中**——选中留在用户原来的构件上，
+        // 「房间」页签的详情仍由下面这几行管。树里没有这间房（树外元素）时只记一条告警，
+        // 取景与详情照旧。
+        let located = matches!(self.reveal_tree(room, false, false), Locate::Ready);
         self.focus_room_pending = Some(room);
         self.focus_room_frame = Some(room);
         self.room_pane_focus = Some(room);
@@ -6402,6 +6436,7 @@ impl App {
         let _ = self.bridge.req.send(data::Req::RoomDetail(room));
         // 聚焦一间房也是「到了一个地方」：同一个选中换了房间算另一条历史。
         self.record_nav();
+        located
     }
 
     // ------------------------------------------------ 房间视图 · 房间体与直段截断（2026-09-29 计划 M4）
@@ -10657,7 +10692,7 @@ mod tests {
             ),
             (
                 "进房间视图",
-                "fn focus_room(&mut self, room: RefU64) {",
+                "fn focus_room(&mut self, room: RefU64) -> bool {",
                 "// ------------------------------------------------ 房间视图 · 房间体与直段截断",
                 // 登记针取取景账那一行，不取进视图门控：门控不归 helper 管，
                 // 拿它当针会在「helper 挪到门控之后」时照样绿。
@@ -10767,6 +10802,72 @@ mod tests {
                 "隐藏不登记取景账、也不下发取景命令，却出现了 {forbidden}：{hide}"
             );
         }
+    }
+
+    /// 房间浏览器的「聚焦」只取景，从来不动模型树——相机飞过去了，左边那棵树还停在原处，
+    /// 用户得自己一层层展开去找。修法是让 `focus_room` 也把树带过去，但**不能**直接走
+    /// `locate`：那条路会 `select(room)`，把属性面板换成房间 FRMW、清掉刚设的
+    /// `room_pane_focus`、再多记一条导航历史——三件都不是用户要的。
+    ///
+    /// 所以钉两件事：① `focus_room` 走 `reveal_tree`（只展开 + 滚动），不走 `locate`；
+    /// ② `reveal_tree` 自己不许碰选中，`locate` 才是「选中 + 带树过去」的那一层。
+    #[test]
+    fn focusing_a_room_also_reveals_it_in_the_tree_without_changing_the_selection() {
+        let source = include_str!("main.rs");
+        let body_of = |head: &str| {
+            source
+                .split(head)
+                .nth(1)
+                .unwrap_or_else(|| panic!("找不到 {head}"))
+                .split("\n    fn ")
+                .next()
+                .unwrap()
+        };
+
+        let focus = body_of("fn focus_room(&mut self, room: RefU64) -> bool {");
+        assert!(
+            focus.contains("self.reveal_tree(room, false, false)"),
+            "聚焦房间要顺手把模型树带到那一行：{focus}"
+        );
+        assert!(
+            !focus.contains("self.locate(") && !focus.contains("self.select("),
+            "房间视图不许换全局选中（会把属性面板换成房间、清掉 room_pane_focus）：{focus}"
+        );
+        let close = focus
+            .find("self.supersede_camera_intents()")
+            .expect("聚焦房间仍是一次取景意图");
+        let reveal = focus.find("self.reveal_tree(room").expect("树跟随那一句");
+        assert!(
+            close < reveal,
+            "先收口取景账、再带树过去：反过来会把刚发的定位作废：{focus}"
+        );
+
+        // `reveal_tree` 是「只滚树」的那一半，选中归 `locate`。
+        let reveal_body = body_of("fn reveal_tree(&mut self, refno: RefU64, from_command: bool, selects: bool) -> Locate {");
+        assert!(
+            !reveal_body.contains("self.select("),
+            "reveal_tree 不许换选中，那是 locate 的事：{reveal_body}"
+        );
+        assert!(
+            reveal_body.contains("self.vm.tree_reveal = Some(refno)"),
+            "reveal_tree 要登记滚动请求：{reveal_body}"
+        );
+
+        // `locate` 仍然是「选中 + 带树过去」，两者不许分家。
+        let locate = body_of("fn locate(&mut self, refno: RefU64, from_command: bool) -> Locate {");
+        let select = locate.find("self.select(refno)").expect("locate 要先选中");
+        let delegate = locate
+            .find("self.reveal_tree(refno, from_command, true)")
+            .expect("locate 的树那一半要委托给 reveal_tree");
+        assert!(select < delegate, "先选中、再带树过去：{locate}");
+
+        // 树外元素的两条文案各说各的：只滚树的那条来路没换过属性，不能自称「已选中」。
+        let ancestors = body_of("fn apply_ancestors(&mut self, refno: RefU64, chain: Vec<RefU64>) -> bool {");
+        assert!(
+            ancestors.contains("树外元素：已选中并显示属性，不切换 MDB")
+                && ancestors.contains("树外元素：不在当前 MDB 的模型树里，树没有跟随"),
+            "树外元素要按这次定位有没有换选中分别说：{ancestors}"
+        );
     }
 
     /// 房间视图的取景账拆出来之后（`focus_room_frame`），四处必须同一条口径：意图点登记、
