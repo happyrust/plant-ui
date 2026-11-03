@@ -1140,6 +1140,39 @@ pub struct BatchResult {
     pub modified_elements: u64,
     #[serde(default)]
     pub deleted_elements: u64,
+    /// 凭证前移回执（gen-model `DataBatchResult.credential_advance`，计划 §五 V1）。
+    ///
+    /// `None` = 服务端没给这一格（老服务端 / CATA / SYST 窗口），终态明细整行不画；
+    /// `degraded` 非空说明规划器不信这次的闭包，那一行只说退化原因、不说省了几根。
+    /// 解不动也只丢这一格（[`lenient`]），不许把整条 `/tasks` 回执连坐掉。
+    #[serde(default, deserialize_with = "lenient")]
+    pub credential_advance: Option<CredentialAdvance>,
+}
+
+/// 一个数据批次的凭证前移回执（gen-model `window_root_plan::CredentialAdvanceReceipt`）。
+///
+/// 名单上的根由任务收尾直接盖到 T 的 `model_sesno` 承诺，省掉了整根重生成；`degraded`
+/// 非空时一个根都没省，全部按过期重算。三个字段全部 `serde(default)`：老服务端整格缺席
+/// 时解成 0 / 0 / `None`，由渲染层判成「不画」，绝不画成「0/0 根」（ADR-0027）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct CredentialAdvance {
+    #[serde(default)]
+    pub requested: u64,
+    #[serde(default)]
+    pub advanced: u64,
+    #[serde(default)]
+    pub degraded: Option<String>,
+}
+
+/// 解不动就把这一格丢成 `None`，不毒化整条回执——与 `task_queue::lenient` 同一套理由：
+/// 一条毒行冻住整个队列面板，比少一格明细贵得多。
+fn lenient<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 /// 终态数据段的增 / 删 / 改三数（见 [`BatchResult::change_breakdown`]）。
@@ -1174,6 +1207,31 @@ impl BatchResult {
             deleted: self.deleted_elements,
         };
         (breakdown.total() > 0).then_some(breakdown)
+    }
+
+    /// 终态明细里的「凭证前移」那一行（三形态，见 `architecture.md` §5）。`None` = 整行不画。
+    ///
+    /// 第二个分量是「要不要用警示色」：退化说明规划器不信这次的闭包、全部根按过期重算，
+    /// 那是这一批多花了生成，值得一句警示；正常前移只是省了活，用平常色。
+    ///
+    /// **数字原样取回执**（`advanced` / `requested`），不拿单元表自己数——省了几根是服务端
+    /// 盖的承诺，客户端复算一遍只会算出另一套数。
+    pub fn credential_advance_line(&self) -> Option<(String, bool)> {
+        let advance = self.credential_advance.as_ref()?;
+        if let Some(reason) = advance.degraded.as_deref().filter(|r| !r.is_empty()) {
+            return Some((format!("凭证前移退化：{reason}（全部根按过期重算）"), true));
+        }
+        // `requested == 0` 且没退化：理论上不该出现（规划器对空名单直接给 `None`），
+        // 出现了也整行不画——画「凭证前移 0/0 根」等于说一件没发生的事。
+        (advance.requested > 0).then(|| {
+            (
+                format!(
+                    "凭证前移 {}/{} 根（免了重生成）",
+                    advance.advanced, advance.requested
+                ),
+                false,
+            )
+        })
     }
 
     /// 并入的那几条保存，逐条配上时刻（ADR-0019 Q5）。
@@ -5549,6 +5607,110 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outcome.transform_roots(), 0);
+    }
+
+    /// 凭证前移正常形态：`requested: 12, advanced: 12` 且没有退化原因 → 一行「12/12 根」。
+    /// 数字原样取回执，不拿单元表复算（VAL-ADV-001）。
+    #[test]
+    fn a_normal_credential_advance_says_how_many_roots_were_spared() {
+        let outcome: Outcome = serde_json::from_str(
+            r#"{
+                "batch":{"dbnum":8000,"start_sesno":41,"end_sesno":48,
+                    "status":"applied","changed_elements":85,
+                    "credential_advance":{"requested":12,"advanced":12}}
+            }"#,
+        )
+        .expect("带凭证前移的回执应当能解出来");
+        let batch = outcome.batch.expect("批次摘要应当能解出来");
+        let advance = batch
+            .credential_advance
+            .as_ref()
+            .expect("凭证前移必须解得出来");
+        assert_eq!(
+            (advance.requested, advance.advanced),
+            (12, 12),
+            "{advance:?}"
+        );
+        assert_eq!(advance.degraded, None);
+        assert_eq!(
+            batch.credential_advance_line(),
+            Some(("凭证前移 12/12 根（免了重生成）".to_owned(), false)),
+            "正常前移只说省了几根，不用警示色"
+        );
+    }
+
+    /// 退化形态：一个根都没省，原因原文照抄，正常形态那句不出现（VAL-ADV-002）。
+    #[test]
+    fn a_degraded_credential_advance_says_every_root_is_recomputed() {
+        let outcome: Outcome = serde_json::from_str(
+            r#"{
+                "batch":{"dbnum":8000,"start_sesno":41,"end_sesno":48,
+                    "status":"applied","changed_elements":85,
+                    "credential_advance":{"requested":0,"advanced":0,
+                        "degraded":"candidates_ratio_above_threshold"}}
+            }"#,
+        )
+        .expect("退化回执应当能解出来");
+        let batch = outcome.batch.expect("批次摘要应当能解出来");
+        let (line, danger) = batch.credential_advance_line().expect("退化必须画一行");
+        assert_eq!(
+            line,
+            "凭证前移退化：candidates_ratio_above_threshold（全部根按过期重算）"
+        );
+        assert!(danger, "退化要多花生成，用警示色");
+        assert!(!line.contains("免了重生成"), "正常形态句不许出现：{line}");
+        assert!(!line.contains("0/0"), "不许画成 0/0 根：{line}");
+    }
+
+    /// 整格缺席（老服务端 / CATA / SYST 窗口）→ 一行都不画；同一条回执的其它字段照常（VAL-ADV-003）。
+    #[test]
+    fn a_missing_credential_advance_draws_no_line() {
+        let outcome: Outcome = serde_json::from_str(
+            r#"{
+                "batch":{"dbnum":8000,"start_sesno":41,"end_sesno":48,
+                    "status":"applied","changed_elements":85,
+                    "added_elements":18,"modified_elements":64,"deleted_elements":3}
+            }"#,
+        )
+        .expect("老回执也要解得出来");
+        let batch = outcome.batch.expect("批次摘要应当能解出来");
+        assert_eq!(batch.credential_advance, None, "缺键就是 None");
+        assert_eq!(batch.credential_advance_line(), None, "整行不画");
+        assert_eq!(batch.changed_elements, 85, "其它段落照常");
+        assert_eq!(
+            batch.change_breakdown().map(|b| b.total()),
+            Some(85),
+            "三数分解不受影响"
+        );
+    }
+
+    /// `null` 与字段类型不符都退化成 `None`，不许 panic、不许连坐整条回执（VAL-ADV-004）。
+    #[test]
+    fn a_malformed_credential_advance_decodes_to_none() {
+        for body in [
+            r#""credential_advance":null"#,
+            r#""credential_advance":{"requested":"十二","advanced":12}"#,
+            r#""credential_advance":[]"#,
+        ] {
+            let json = format!(
+                r#"{{"batch":{{"dbnum":8000,"start_sesno":41,"end_sesno":48,
+                    "status":"applied","changed_elements":85,{body}}}}}"#
+            );
+            let outcome: Outcome =
+                serde_json::from_str(&json).unwrap_or_else(|e| panic!("{body} 不该毒化回执：{e}"));
+            let batch = outcome.batch.expect("批次摘要照常解得出来");
+            // 解不动的形状要么整格丢掉，要么退化成全默认；两种都不许画出任何一行。
+            assert!(
+                batch
+                    .credential_advance
+                    .as_ref()
+                    .is_none_or(|a| *a == CredentialAdvance::default()),
+                "{body} 应当退化成缺席或全默认：{:?}",
+                batch.credential_advance
+            );
+            assert_eq!(batch.credential_advance_line(), None, "{body} 整行不画");
+            assert_eq!(batch.changed_elements, 85, "{body} 其它字段照常");
+        }
     }
 
     /// 入队回执是数组不是单个 task_id：一次扫描可能排下好几个库，也可能一行都没排。

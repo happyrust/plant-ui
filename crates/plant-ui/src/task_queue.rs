@@ -3766,6 +3766,13 @@ fn terminal_detail(
             }
         }
 
+        // 凭证前移（计划 §五 V1 / QUEUE-FIELD-MAP §1.5）：名单上的根由任务收尾盖到 T 的
+        // `model_sesno` 承诺，省掉了整根重生成。三形态——正常前移、退化（规划器不信闭包，
+        // 全部根按过期重算）、整格缺席（老服务端 / CATA / SYST 窗口）。数字原样取回执。
+        if let Some((line, danger)) = batch.credential_advance_line() {
+            sub_line(ui, t, d, &line, danger);
+        }
+
         // 增删改三数 + 分布条（计划 §2 / QUEUE-FIELD-MAP §1.5）：拆得出分解就画三数与条，
         // 拆不出（老服务端缺字段）退回一句总数——绝不把缺省的 0/0/0 画成「无变化」。真零时
         // 总数也是 0，`change_breakdown` 同样给 None，整个变化区本来就不画。
@@ -4338,6 +4345,150 @@ mod tests {
             loaded: true,
             ..Default::default()
         }
+    }
+
+    // ------------------------------------------------ 终态明细的渲染取证
+
+    /// 把一帧里画出来的所有文字按绘制顺序收成一串——终态明细是 `ui.label` 画出来的，
+    /// 只有真画一遍才验得了「画了没有 / 顺序对不对」。
+    fn collect_text(shape: &egui::Shape, out: &mut String) {
+        match shape {
+            egui::Shape::Text(text) => {
+                out.push_str(text.galley.text());
+                out.push('\n');
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_text(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 一条终态数据批次行展开之后，明细区实际画出来的全部文字。
+    fn terminal_text(batch: crate::model_update::BatchResult) -> String {
+        let mut task = entry("db-8000-1", 8000, "succeeded");
+        task.start_sesno_time = Some("2026-08-07T09:26:00+08:00".into());
+        task.end_sesno_time = Some("2026-08-07T14:10:00+08:00".into());
+        task.units_done = Some(2);
+        task.total_units = Some(2);
+        task.result = Some(crate::model_update::Outcome {
+            status: crate::model_update::RunStatus::Success,
+            batch: Some(batch),
+            ..Default::default()
+        });
+        let model = vm(Vec::new(), vec![task]);
+
+        let mut state = State::default();
+        // 默认筛选只留有活的行，终态成功行会被筛掉——这里按「全部」看。
+        state.filter = Filter::All;
+        // 终态行默认收起，这里显式展开（与点箭头是同一件事）。
+        state.toggle("db-8000-1");
+
+        let ctx = egui::Context::default();
+        let t = crate::style::theme_tokens::current();
+        let d = Density::Standard;
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1600.0, 1000.0));
+        let mut cmds = Vec::new();
+        let mut text = String::new();
+        // 头一帧字体还没加载，`ui.label` 落成空 galley（Noop）；多跑几帧再取文字。
+        for _ in 0..3 {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            });
+            egui::Area::new("task-queue-test".into())
+                .fixed_pos(screen.min)
+                .show(&ctx, |ui| {
+                    ui.set_min_size(screen.size());
+                    ui.set_max_size(screen.size());
+                    show(ui, &t, d, &model, &mut state, false, &mut cmds);
+                });
+            let output = ctx.end_pass();
+            text.clear();
+            for clipped in &output.shapes {
+                collect_text(&clipped.shape, &mut text);
+            }
+        }
+        text
+    }
+
+    fn batch_with_advance(
+        advance: Option<crate::model_update::CredentialAdvance>,
+    ) -> crate::model_update::BatchResult {
+        crate::model_update::BatchResult {
+            dbnum: 8000,
+            db_type: "DESI".into(),
+            start_sesno: 41,
+            end_sesno: 48,
+            status: BatchStatus::Applied,
+            changed_elements: 85,
+            added_elements: 18,
+            modified_elements: 64,
+            deleted_elements: 3,
+            credential_advance: advance,
+            ..Default::default()
+        }
+    }
+
+    /// 正常前移：终态明细里真画出一行「凭证前移 12/12 根（免了重生成）」，
+    /// 位置在「并入保存」之后、增删改三数之前（VAL-ADV-001）。
+    #[test]
+    fn the_normal_credential_advance_line_is_painted_after_the_save_window() {
+        let text = terminal_text(batch_with_advance(Some(
+            crate::model_update::CredentialAdvance {
+                requested: 12,
+                advanced: 12,
+                degraded: None,
+            },
+        )));
+        assert!(
+            text.contains("凭证前移 12/12 根（免了重生成）"),
+            "正常前移那一行没画出来：{text}"
+        );
+        assert!(!text.contains("凭证前移退化"), "退化句不该出现：{text}");
+        let applied = text.find("已应用").expect("批次终态行");
+        let advance = text.find("凭证前移 12/12").expect("凭证前移行");
+        let changes = text.find("共 85 项变化").expect("增删改三数句");
+        assert!(
+            applied < advance && advance < changes,
+            "凭证前移行必须夹在终态行与增删改三数之间：{text}"
+        );
+    }
+
+    /// 退化：只说原因、说全部根按过期重算，正常形态句不出现（VAL-ADV-002）。
+    #[test]
+    fn the_degraded_credential_advance_line_replaces_the_normal_one() {
+        let text = terminal_text(batch_with_advance(Some(
+            crate::model_update::CredentialAdvance {
+                requested: 0,
+                advanced: 0,
+                degraded: Some("candidates_ratio_above_threshold".into()),
+            },
+        )));
+        assert!(
+            text.contains("凭证前移退化：candidates_ratio_above_threshold（全部根按过期重算）"),
+            "退化那一行没画出来：{text}"
+        );
+        assert!(!text.contains("免了重生成"), "正常形态句不许出现：{text}");
+        assert!(!text.contains("凭证前移 0/0"), "不许画成 0/0 根：{text}");
+        // 其余段落照常。
+        assert!(text.contains("共 85 项变化"), "{text}");
+        assert!(text.contains("2 / 2 个交付单元已生成"), "{text}");
+    }
+
+    /// 整格缺席：渲染结果里没有任何「凭证前移」字样，其余明细段落照旧（VAL-ADV-003）。
+    #[test]
+    fn a_missing_credential_advance_paints_no_such_line() {
+        let text = terminal_text(batch_with_advance(None));
+        assert!(!text.contains("凭证前移"), "缺席时不许出现这行：{text}");
+        assert!(text.contains("已应用"), "批次终态行照常：{text}");
+        assert!(text.contains("共 85 项变化"), "增删改三数照常：{text}");
+        assert!(
+            text.contains("2 / 2 个交付单元已生成"),
+            "单元计数照常：{text}"
+        );
     }
 
     #[test]

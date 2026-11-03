@@ -1016,6 +1016,9 @@ impl Engine {
                 added_elements: batch.added,
                 modified_elements: batch.modified,
                 deleted_elements: batch.deleted,
+                // 凭证前移这一格剧本暂时不给（三形态夹具由 sim 剧本那一步补）；
+                // 缺席即整行不画，正是要演示的老服务端形态。
+                credential_advance: None,
             }),
             units: batch
                 .units
