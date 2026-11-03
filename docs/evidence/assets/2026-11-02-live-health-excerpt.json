@@ -1,0 +1,25 @@
+{
+  "status": "ok",
+  "data_read_mode": "direct",
+  "data_face": "ingest",
+  "worker_alive": true,
+  "queue_paused": false,
+  "startup_autorun": true,
+  "auto_work_armed": true,
+  "version": "0.1.44",
+  "build_id": "0.1.44+ga109aabaaaf8.1793714628.dirty",
+  "project": "AvevaMarineSample",
+  "mdb": "/ALL",
+  "namespace": "1516",
+  "watch_dbnums": [
+    7997,
+    7998,
+    8000
+  ],
+  "watch_dbnums_origin": "命令行 --watch-dbnum",
+  "initialization_status": "model_ready",
+  "mirror_endpoint": "localhost:8009",
+  "mirror_watermark_mirrored_dbnums": 55,
+  "store_reachable": true,
+  "write_behind_worker_alive": true
+}
