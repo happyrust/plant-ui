@@ -2392,7 +2392,12 @@ pub fn model_scope_fixture(target: RefU64) -> crate::model_update_api::ModelReco
             "world_aabb": {"mins": [x, -30.0, -30.0], "maxs": [x + length, 30.0, 30.0]},
             "world_trans": {
                 "translation": [x, 0.0, 0.0],
-                "rotation": [0.0, 0.707_106_8, 0.0, 0.707_106_8],
+                "rotation": [
+                    0.0,
+                    std::f64::consts::FRAC_1_SQRT_2,
+                    0.0,
+                    std::f64::consts::FRAC_1_SQRT_2
+                ],
                 "scale": [60.0, 60.0, length]
             },
             "insts": [{"geo_hash": "", "is_tubi": true, "is_invalid_tubi": true}],
