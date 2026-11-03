@@ -968,6 +968,8 @@ impl Engine {
                         model_chasing_roots: self
                             .late_chasing
                             .and_then(|(n, roots)| (n == db.dbnum).then_some(roots)),
+                        model_caught_up_roots: None,
+                        model_lazy_roots: None,
                         model_dead_roots: None,
                     }
                 })

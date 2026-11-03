@@ -535,8 +535,18 @@ pub struct DbnumStatus {
     pub model_verdict: Option<String>,
     #[serde(default)]
     pub model_verdict_reason: Option<String>,
+    /// 正在追赶的生成根数（`RootQuadrants.chasing`）。`verdict_label()` 用它说
+    /// 「追赶中 N 根」——**那一句不进明细**，明细只补下面两枚。
     #[serde(default)]
     pub model_chasing_roots: Option<u32>,
+    /// 已追平的生成根数（`RootQuadrants.caught_up`）：这批根已经跟上了数据水位。
+    /// 明细里说「已追平 N 根」。老服务端不给 → `None`，那半句整句不画。
+    #[serde(default)]
+    pub model_caught_up_roots: Option<u32>,
+    /// 尚未生成的生成根数（`RootQuadrants.lazy`，契约里可为 `null`）：它们还排着，
+    /// 模型水位越过不去。明细里说「N 根尚未生成」。缺席 → 整句不画。
+    #[serde(default)]
+    pub model_lazy_roots: Option<u32>,
     #[serde(default)]
     pub model_dead_roots: Option<u32>,
 }
@@ -594,11 +604,24 @@ impl DbnumStatus {
     }
 
     /// 明细里跟在判决后面的那半句：模型水位停在哪一次保存（E3D 写入时刻，ADR-0019），
-    /// 已放弃几根。说得出哪格就说哪格，都说不出就 `None`。
+    /// 几根已追平、几根尚未生成、几根已放弃。说得出哪格就说哪格，都说不出就 `None`。
+    ///
+    /// 分句顺序固定（architecture §4）：水位时刻 → 已追平 → 尚未生成 → 已放弃，用 ` · `
+    /// 连接。「追赶中 N 根」**不在这里**——它已经在 `verdict_label()` 里，重复一遍等于同一件事
+    /// 在两处各说一次。每枚根数都是 `Option`：老服务端不给就整句不画，绝不把缺省的 0 画成
+    /// 「已追平 0 根」（ADR-0027）。
     pub fn verdict_note(&self) -> Option<String> {
         let mut parts = Vec::new();
         if let Some(at) = self.model_sesno_time.as_deref().map(e3d_time) {
             parts.push(format!("模型水位在 {at} 那次保存"));
+        }
+        // 追平与未生成都是服务端判出来的根数，客户端只消费字面值（不拿两枚 sesno 自己比）。
+        // 为 0 时不画：0 根已追平不是一条消息，服务端真判 0 也不该占半句。
+        if let Some(caught_up) = self.model_caught_up_roots.filter(|n| *n > 0) {
+            parts.push(format!("已追平 {caught_up} 根"));
+        }
+        if let Some(lazy) = self.model_lazy_roots.filter(|n| *n > 0) {
+            parts.push(format!("{lazy} 根尚未生成"));
         }
         // 只说事实，不指路：重试这件事将来不再由队列面板提供（gen-model 2026-09-08
         // 起失败根只留痕、不排队），而「模型水位越不过它们」在两种服务端上都成立。
@@ -4366,27 +4389,18 @@ mod tests {
         }
     }
 
-    /// 一条终态数据批次行展开之后，明细区实际画出来的全部文字。
-    fn terminal_text(batch: crate::model_update::BatchResult) -> String {
-        let mut task = entry("db-8000-1", 8000, "succeeded");
-        task.start_sesno_time = Some("2026-08-07T09:26:00+08:00".into());
-        task.end_sesno_time = Some("2026-08-07T14:10:00+08:00".into());
-        task.units_done = Some(2);
-        task.total_units = Some(2);
-        task.result = Some(crate::model_update::Outcome {
-            status: crate::model_update::RunStatus::Success,
-            batch: Some(batch),
-            ..Default::default()
-        });
-        let model = vm(Vec::new(), vec![task]);
-
+    /// 把队列面板真画一帧（连画三帧等字体加载），把画出来的文字按绘制顺序收成一串。
+    /// `opened` 里的 task_id 显式展开——终态行默认收起，不展开就验不到明细。
+    fn painted(model: &Vm, opened: &[&str]) -> String {
         // 默认筛选只留有活的行，终态成功行会被筛掉——这里按「全部」看。
         let mut state = State {
             filter: Filter::All,
             ..Default::default()
         };
-        // 终态行默认收起，这里显式展开（与点箭头是同一件事）。
-        state.toggle("db-8000-1");
+        for task_id in opened {
+            // 与点箭头是同一件事。
+            state.toggle(task_id);
+        }
 
         let ctx = egui::Context::default();
         let t = crate::style::theme_tokens::current();
@@ -4405,7 +4419,7 @@ mod tests {
                 .show(&ctx, |ui| {
                     ui.set_min_size(screen.size());
                     ui.set_max_size(screen.size());
-                    show(ui, &t, d, &model, &mut state, false, &mut cmds);
+                    show(ui, &t, d, model, &mut state, false, &mut cmds);
                 });
             let output = ctx.end_pass();
             text.clear();
@@ -4414,6 +4428,40 @@ mod tests {
             }
         }
         text
+    }
+
+    /// 一条终态数据批次行展开之后，明细区实际画出来的全部文字。
+    fn terminal_text(batch: crate::model_update::BatchResult) -> String {
+        let mut task = entry("db-8000-1", 8000, "succeeded");
+        task.start_sesno_time = Some("2026-08-07T09:26:00+08:00".into());
+        task.end_sesno_time = Some("2026-08-07T14:10:00+08:00".into());
+        task.units_done = Some(2);
+        task.total_units = Some(2);
+        task.result = Some(crate::model_update::Outcome {
+            status: crate::model_update::RunStatus::Success,
+            batch: Some(batch),
+            ..Default::default()
+        });
+        let model = vm(Vec::new(), vec![task]);
+        painted(&model, &["db-8000-1"])
+    }
+
+    /// 已经配好 `dbnums` / `read_face` 的 `Vm` 画一帧，返回画出来的文字。
+    fn verdict_text_for(model: &Vm) -> String {
+        painted(model, &["db-8000-1"])
+    }
+
+    /// 一条已完成的终态数据批次行（判决明细就画在它的第二行）。
+    fn terminal_row() -> TaskEntry {
+        let mut task = entry("db-8000-1", 8000, "succeeded");
+        task.start_sesno_time = Some("2026-08-07T09:26:00+08:00".into());
+        task.end_sesno_time = Some("2026-08-07T14:10:00+08:00".into());
+        task.result = Some(crate::model_update::Outcome {
+            status: crate::model_update::RunStatus::Success,
+            batch: Some(batch_with_advance(None)),
+            ..Default::default()
+        });
+        task
     }
 
     fn batch_with_advance(
@@ -4491,6 +4539,175 @@ mod tests {
             text.contains("2 / 2 个交付单元已生成"),
             "单元计数照常：{text}"
         );
+    }
+
+    /// 落后时补「已追平 N 根」：顺序在「模型水位在 <时刻> 那次保存」之后（VAL-VERDICT-001）。
+    /// 「追赶中 N 根」不重复进明细——它在 `verdict_label()` 里。
+    #[test]
+    fn verdict_note_reports_caught_up_roots_after_the_watermark_time() {
+        let db = DbnumStatus {
+            dbnum: 8000,
+            model_verdict: Some("lagging".into()),
+            model_chasing_roots: Some(4),
+            model_caught_up_roots: Some(8),
+            model_dead_roots: Some(1),
+            model_sesno_time: Some("2026-08-07T14:10:00+08:00".into()),
+            ..Default::default()
+        };
+        let note = db.verdict_note().expect("三格都有，note 不该是 None");
+        assert!(note.contains("已追平 8 根"), "{note}");
+        let at = note.find("模型水位在").expect("水位时刻那一句");
+        let caught = note.find("已追平 8 根").expect("追平那一句");
+        let dead = note.find("1 根已放弃").expect("已放弃那一句");
+        assert!(at < caught && caught < dead, "分句顺序错了：{note}");
+        assert!(
+            !note.contains("追赶中"),
+            "追赶中在 label 里，不进 note：{note}"
+        );
+
+        // label 照旧说「追赶中 4 根」，与 note 各说各的半边，不重复。
+        let label = db.verdict_label().unwrap();
+        assert!(label.contains("落后") && label.contains("4 根"), "{label}");
+    }
+
+    /// 不判时补「N 根尚未生成」：不判仍是中性态，label 保持原话（VAL-VERDICT-002）。
+    #[test]
+    fn verdict_note_reports_lazy_roots_without_calling_it_lagging() {
+        let db = DbnumStatus {
+            dbnum: 8000,
+            model_verdict: Some("not_judged".into()),
+            model_verdict_reason: Some("no_generation_roots".into()),
+            model_lazy_roots: Some(3),
+            ..Default::default()
+        };
+        let note = db.verdict_note().expect("lazy 有值就该有一句");
+        assert!(note.contains("3 根尚未生成"), "{note}");
+        assert_eq!(note, "3 根尚未生成", "没有水位时刻就只这一句");
+        assert_eq!(
+            db.verdict_label().as_deref(),
+            Some("模型水位不判（没有生成根）"),
+            "不判仍是中性态"
+        );
+    }
+
+    /// 两枚根数都缺席（老服务端）：两句都不画，原有分句照旧（VAL-VERDICT-003）。
+    #[test]
+    fn verdict_note_omits_root_counts_when_the_server_is_silent() {
+        let db = DbnumStatus {
+            dbnum: 8000,
+            model_verdict: Some("lagging".into()),
+            model_sesno_time: Some("2026-08-07T14:10:00+08:00".into()),
+            ..Default::default()
+        };
+        let note = db.verdict_note().unwrap();
+        assert!(!note.contains("已追平"), "缺席不许画成 0 根：{note}");
+        assert!(!note.contains("尚未生成"), "缺席不许画成 0 根：{note}");
+        assert!(note.starts_with("模型水位在 "), "{note}");
+        assert!(!note.contains(" · "), "只剩一句就没有分隔符：{note}");
+
+        // 真给 0 也不画——0 根已追平不是一条消息。
+        let zero = DbnumStatus {
+            model_caught_up_roots: Some(0),
+            model_lazy_roots: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(zero.verdict_note(), None, "全空就整句不画");
+    }
+
+    /// 契约解码：两枚根数要真解出来，`model_lazy_roots: null` 解成 `None` 而不是 0。
+    #[test]
+    fn dbnum_status_decodes_the_caught_up_and_lazy_roots() {
+        let db: DbnumStatus = serde_json::from_str(
+            r#"{"dbnum":8000,"db_type":"DESI","model_verdict":"lagging",
+                "model_caught_up_roots":8,"model_lazy_roots":null}"#,
+        )
+        .unwrap();
+        assert_eq!(db.model_caught_up_roots, Some(8));
+        assert_eq!(db.model_lazy_roots, None);
+
+        let legacy: DbnumStatus =
+            serde_json::from_str(r#"{"dbnum":8000,"db_type":"DESI"}"#).unwrap();
+        assert_eq!(legacy.model_caught_up_roots, None);
+        assert_eq!(legacy.model_lazy_roots, None);
+    }
+
+    /// 悬停与行内明细第二行消费的是同一份 `verdict_note()` 结果：渲染路径上只有一个
+    /// 调用点（VAL-VERDICT-004）。两处各算一遍就会各说各话。
+    #[test]
+    fn verdict_note_is_computed_once_for_both_consumers() {
+        let source = include_str!("task_queue.rs").replace("\r\n", "\n");
+        let body = source.split_once("mod tests {").expect("正文").0;
+        assert_eq!(
+            body.matches("verdict_note()").count(),
+            1,
+            "verdict_note() 只该在 rows() 的判决索引里算一次"
+        );
+        // 那一处把结果塞进 RowVm，悬停与明细都读同一个字段。
+        assert!(body.contains("db.verdict_note()"), "调用点应在判决索引里");
+        assert!(
+            body.contains("pub verdict_note: Option<String>"),
+            "RowVm 带着它"
+        );
+        let hover = body
+            .split_once("fn queue_row(")
+            .expect("行")
+            .1
+            .split_once("fn early_run_button(")
+            .expect("下一个函数")
+            .0;
+        assert!(
+            hover.contains("row.verdict_note.as_deref()"),
+            "悬停读 RowVm"
+        );
+        let detail = body
+            .split_once("fn row_detail(")
+            .expect("明细")
+            .1
+            .split_once("fn terminal_detail(")
+            .expect("下一个函数")
+            .0;
+        assert!(
+            detail.contains("row.verdict_note.as_deref()"),
+            "行内明细第二行读同一个字段"
+        );
+    }
+
+    /// 判决明细的两枚根数在**两种供数模式**下都真画出来（VAL-VERDICT-004 后半句）：
+    /// 判决说的是服务端模型水位对数据水位，库供数读的 `inst_relate` 正是那份模型。
+    #[test]
+    fn the_caught_up_line_is_painted_in_both_read_faces() {
+        for face in [ReadFaceKind::Service, ReadFaceKind::Store] {
+            let db = DbnumStatus {
+                dbnum: 8000,
+                db_type: "DESI".into(),
+                model_verdict: Some("lagging".into()),
+                model_chasing_roots: Some(4),
+                model_caught_up_roots: Some(8),
+                model_lazy_roots: Some(3),
+                model_sesno_time: Some("2026-08-07T14:10:00+08:00".into()),
+                ..Default::default()
+            };
+            let mut model = vm(Vec::new(), vec![terminal_row()]);
+            model.dbnums = vec![db];
+            model.read_face = face;
+            let text = verdict_text_for(&model);
+            assert!(
+                text.contains("已追平 8 根"),
+                "{face:?} 下追平那句没画出来：{text}"
+            );
+            assert!(
+                text.contains("3 根尚未生成"),
+                "{face:?} 下未生成那句没画出来：{text}"
+            );
+            let at = text.find("模型水位在").expect("水位时刻");
+            let caught = text.find("已追平 8 根").expect("追平");
+            assert!(at < caught, "{face:?} 下顺序错了：{text}");
+            // 两句是同一份 note 用 ` · ` 拼出来的，中间不该被别的分句插队。
+            assert!(
+                text.contains("已追平 8 根 · 3 根尚未生成"),
+                "{face:?} 下两句没连成一句：{text}"
+            );
+        }
     }
 
     #[test]
