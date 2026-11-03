@@ -2127,6 +2127,15 @@ pub struct State {
 }
 
 impl State {
+    /// 指定筛选芯片的一副新状态。宿主的「按失败筛选」入口与渲染取证测试都用它——
+    /// `toggled` / `in_flight` 是私有的，外部拼不出结构体字面量。
+    pub fn new(filter: Filter) -> Self {
+        Self {
+            filter,
+            ..Self::default()
+        }
+    }
+
     /// 复活请求压根没发出去。成功那一半由快照自己收口（见 [`show`]），只有失败
     /// 需要宿主说一声——不然那枚按钮会一直灰着等一个永远不会来的变化。
     pub fn retry_failed(&mut self, root_refno: &str) {
@@ -2149,7 +2158,11 @@ impl State {
         self.toggled.contains(&row.task_id) != row.phase.running()
     }
 
-    fn toggle(&mut self, task_id: &str) {
+    /// 展开 / 收起一行——与点行首那枚箭头是同一件事。
+    ///
+    /// 公开给宿主与渲染取证测试：终态行默认收起，要验它展开后画了什么，只能先程序化
+    /// 展开一次（`library/ui-render-verification.md` 第三个坑）。
+    pub fn toggle(&mut self, task_id: &str) {
         if !self.toggled.remove(task_id) {
             self.toggled.insert(task_id.to_owned());
         }

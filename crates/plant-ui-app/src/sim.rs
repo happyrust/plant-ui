@@ -32,8 +32,8 @@ use std::sync::OnceLock;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 
 use plant_ui::model_update::{
-    BatchResult, BatchStatus, BlockedDbnum, DbPreview, Enqueued, EnqueuedBatch, FileAnomaly,
-    Outcome, PendingModelUnit, Preview, ProgressEvent, RunStatus, SessionPreview,
+    BatchResult, BatchStatus, BlockedDbnum, CredentialAdvance, DbPreview, Enqueued, EnqueuedBatch,
+    FileAnomaly, Outcome, PendingModelUnit, Preview, ProgressEvent, RunStatus, SessionPreview,
     ShadowedCandidate, SitePreview, TransformTargetPreview, UnitKind, UnitPreview, UnitResult,
     UnitStatus, ZonePreview,
 };
@@ -195,6 +195,30 @@ struct SimDb {
     blocked: bool,
     not_in_project: bool,
     initialization_required: bool,
+    /// 这一库的数据批次回执里那格凭证前移（gen-model `DataBatchResult.credential_advance`）。
+    /// 剧本里三档各摆一个库：`Some(正常前移)` / `Some(退化)` / `None`（缺席），
+    /// 正好演示终态明细那三形态——缺席就是老服务端 / CATA / SYST 窗口的样子。
+    credential_advance: Option<CredentialAdvance>,
+    /// 这一库的模型判决夹具（`/dbnums` 的 `model_*` 那一组）。`None` = 老服务端不给，
+    /// 判决整格不画；读透形态下服务端一律判「不判」，剧本的那一份也不生效。
+    verdict: Option<SimVerdict>,
+}
+
+/// 一个库的模型判决夹具：判决三态 + 理由 + 水位时刻 + 两枚根数。
+///
+/// 与 gen-model `dbnum_consistency` 同形——判决只在服务端一处算，剧本只抄结果。
+/// 两枚根数（`caught_up` / `lazy`）就是判决明细里「已追平 N 根」「N 根尚未生成」
+/// 那两句的材料；`None` = 服务端不给，那半句整句不画（ADR-0027）。
+#[derive(Clone, Copy)]
+struct SimVerdict {
+    /// `in_sync` / `lagging` / `not_judged`。
+    verdict: &'static str,
+    /// `not_judged` 的理由（`no_generation_roots` 等）。
+    reason: Option<&'static str>,
+    /// 模型水位那次保存的写入时刻，记成「距剧本纪元几小时前」。
+    at_ago_h: Option<i64>,
+    caught_up: Option<u32>,
+    lazy: Option<u32>,
 }
 
 /// 找到（或新建）一个 SITE 桶，返回下标。
@@ -301,6 +325,9 @@ struct SimBatch {
     /// 界面按下标配对，所以这里也只能一起 push。
     merged_at_ago_h: Vec<Option<i64>>,
     changed_elements: u64,
+    /// 这一批回执里那格凭证前移（`DataBatchResult.credential_advance`）。入队时从库上抄一份，
+    /// 与真服务「批次自己的回执」同口径——跑完之后库的水位变了，回执不该跟着变。
+    credential_advance: Option<CredentialAdvance>,
     /// 增 / 删 / 改三数（`BatchResult` 的分解字段）。取自 SimDb 的 `net`——与
     /// `changed_elements` 同源、三数之和等于它；`net` 全 0 的库（需初始化 / 无分解）
     /// 天然落进「分解缺席」分支，终态明细只报总数、不画 0 / 0 / 0。
@@ -802,6 +829,7 @@ impl Engine {
                 merged_sesnos: Vec::new(),
                 merged_at_ago_h: Vec::new(),
                 changed_elements: db.changed_elements,
+                credential_advance: db.credential_advance.clone(),
                 added: db.net.0 as u64,
                 modified: db.net.1 as u64,
                 deleted: db.net.2 as u64,
@@ -930,6 +958,7 @@ impl Engine {
                     // 读透形态每行 `applied_sesno` 恒 0、不算「已登记」，模型来源恒内存（读透），
                     // 判决恒「不判」（`handlers.rs::append_cold_read_through_dbnums`）。
                     let applied = if read_through { 0 } else { db.applied };
+                    let verdict = db.verdict;
                     DbnumStatus {
                         dbnum: db.dbnum,
                         db_type: db.db_type.into(),
@@ -962,14 +991,24 @@ impl Engine {
                             (applied <= 0).then(|| "data_watermark_unestablished".to_owned())
                         },
                         model_sesno: None,
-                        model_sesno_time: None,
-                        model_verdict: read_through.then(|| "not_judged".to_owned()),
-                        model_verdict_reason: read_through.then(|| "read-through".to_owned()),
+                        model_sesno_time: verdict.and_then(|v| self.e3d_stamp(v.at_ago_h)),
+                        model_verdict: if read_through {
+                            Some("not_judged".to_owned())
+                        } else {
+                            verdict.map(|v| v.verdict.to_owned())
+                        },
+                        model_verdict_reason: if read_through {
+                            Some("read-through".to_owned())
+                        } else {
+                            verdict.and_then(|v| v.reason).map(str::to_owned)
+                        },
                         model_chasing_roots: self
                             .late_chasing
                             .and_then(|(n, roots)| (n == db.dbnum).then_some(roots)),
-                        model_caught_up_roots: None,
-                        model_lazy_roots: None,
+                        // 判决明细的两枚根数（`/dbnums` 的 `RootQuadrants`）：剧本按库静态给出，
+                        // 读透形态下服务端不给判决，根数一并缺席。
+                        model_caught_up_roots: verdict.and_then(|v| v.caught_up),
+                        model_lazy_roots: verdict.and_then(|v| v.lazy),
                         model_dead_roots: None,
                     }
                 })
@@ -1018,9 +1057,9 @@ impl Engine {
                 added_elements: batch.added,
                 modified_elements: batch.modified,
                 deleted_elements: batch.deleted,
-                // 凭证前移这一格剧本暂时不给（三形态夹具由 sim 剧本那一步补）；
-                // 缺席即整行不画，正是要演示的老服务端形态。
-                credential_advance: None,
+                // 凭证前移这一格：剧本按库给三形态（正常前移 / 退化 / 缺席）。缺席即整行
+                // 不画，正是老服务端与 CATA / SYST 窗口的形状（ADR-0027）。
+                credential_advance: batch.credential_advance.clone(),
             }),
             units: batch
                 .units
@@ -1483,6 +1522,23 @@ fn script() -> Vec<SimDb> {
             blocked: false,
             not_in_project: false,
             initialization_required: false,
+            // 凭证前移 · 正常形态（VAL-SIM-002）：名单上的 12 根全部由任务收尾盖到 T 的
+            // `model_sesno` 承诺，一根都不用重生成。终态明细画
+            // 「凭证前移 12/12 根（免了重生成）」。
+            credential_advance: Some(CredentialAdvance {
+                requested: 12,
+                advanced: 12,
+                degraded: None,
+            }),
+            // 判决 · 落后 + 已追平根数（VAL-SIM-001）：模型水位停在上次应用那次保存，
+            // 8 根已追平。明细里说「模型水位在 … 那次保存 · 已追平 8 根」。
+            verdict: Some(SimVerdict {
+                verdict: "lagging",
+                reason: None,
+                at_ago_h: Some(72),
+                caught_up: Some(8),
+                lazy: None,
+            }),
         },
         // 跨 SITE 挪动 + 归属未知桶都在这一库：`/SIM-EQ-305` 从 A 挪到 B，两个桶里
         // 各出现一次（A 记 moved_out、B 记 moved_in）；`unknown_site` 那一笔就是
@@ -1537,6 +1593,23 @@ fn script() -> Vec<SimDb> {
             blocked: false,
             not_in_project: false,
             initialization_required: false,
+            // 凭证前移 · 退化形态（VAL-SIM-002）：规划器不信这次的闭包，一个根都没省，
+            // 全部按过期重算。终态明细只画退化句，正常形态那句不出现——
+            // 「凭证前移退化：candidates_ratio_above_threshold（全部根按过期重算）」。
+            credential_advance: Some(CredentialAdvance {
+                requested: 0,
+                advanced: 0,
+                degraded: Some("candidates_ratio_above_threshold".to_owned()),
+            }),
+            // 判决 · 不判 + 尚未生成根数（VAL-SIM-001 的另一半）：中性态不是落后，
+            // 明细里说「3 根尚未生成」，label 仍是「模型水位不判（没有生成根）」。
+            verdict: Some(SimVerdict {
+                verdict: "not_judged",
+                reason: Some("no_generation_roots"),
+                at_ago_h: None,
+                caught_up: None,
+                lazy: Some(3),
+            }),
         },
         SimDb {
             dbnum: 7003,
@@ -1560,6 +1633,15 @@ fn script() -> Vec<SimDb> {
             blocked: false,
             not_in_project: false,
             initialization_required: false,
+            // 已追平的库不入队，没有终态行；判决照实说「追平」。
+            credential_advance: None,
+            verdict: Some(SimVerdict {
+                verdict: "in_sync",
+                reason: None,
+                at_ago_h: Some(48),
+                caught_up: None,
+                lazy: None,
+            }),
         },
         SimDb {
             dbnum: 7004,
@@ -1589,6 +1671,9 @@ fn script() -> Vec<SimDb> {
             blocked: true,
             not_in_project: false,
             initialization_required: false,
+            // 阻断的库不跑批次：既没有回执，也没有判决。
+            credential_advance: None,
+            verdict: None,
         },
         // MDB 声明、当前项目目录里没有它的文件：本期够不着，不阻断也不执行。
         SimDb {
@@ -1613,6 +1698,8 @@ fn script() -> Vec<SimDb> {
             blocked: false,
             not_in_project: true,
             initialization_required: true,
+            credential_advance: None,
+            verdict: None,
         },
         // 首次导入：契约不为它解会话区间，net 全 0，也没有 pre/post 窗口可分 SITE
         // 桶（`site: None`），但它确实会跑。S2-G 上它退回文件身份行——优雅降级
@@ -1659,6 +1746,17 @@ fn script() -> Vec<SimDb> {
             blocked: false,
             not_in_project: false,
             initialization_required: true,
+            // 首次导入（缺席形态的候选之一）：服务端在这一档不解凭证前移那一格，
+            // 回执里整键没有——终态明细不画「凭证前移」任何字样（VAL-SIM-002 的第三种）。
+            credential_advance: None,
+            // 首次导入前数据水位还没建立：判决是中性态，没有可比的两端。
+            verdict: Some(SimVerdict {
+                verdict: "not_judged",
+                reason: Some("data_watermark_unestablished"),
+                at_ago_h: None,
+                caught_up: None,
+                lazy: None,
+            }),
         },
         SimDb {
             dbnum: 8001,
@@ -1681,6 +1779,9 @@ fn script() -> Vec<SimDb> {
             blocked: false,
             not_in_project: false,
             initialization_required: false,
+            // CATA 不在本期执行范围（`excluded`），既不跑批次也没有判决。
+            credential_advance: None,
+            verdict: None,
         },
     ]
 }
@@ -2436,6 +2537,198 @@ fn sim_steps(state: &str) -> Vec<TaskStep> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 把一帧里画出来的所有文字按绘制顺序收成一串（与 `task_queue` 的取证测试同一做法）。
+    fn collect_text(shape: &egui::Shape, out: &mut String) {
+        match shape {
+            egui::Shape::Text(text) => {
+                out.push_str(text.galley.text());
+                out.push('\n');
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_text(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 剧本推进到「某一库的批次已终态」，再把队列面板真画一帧，返回画出来的全部文字。
+    ///
+    /// 不用 `pump` 等真时间：`APPLY_MS` + 每个单元 `UNIT_MS` 加起来十秒，测试里没必要
+    /// 等。批次状态是本模块的私有字段，测试直接把它摆到 `Finished`——渲染层看到的东西
+    /// 与跑完之后一模一样。
+    ///
+    /// 一帧只摆目标库那一行：三种凭证形态的断言里有「不含某字样」，混在一起就分不清
+    /// 是谁没画。
+    fn painted_terminal(dbnum: u32) -> String {
+        let mut engine = Engine::new(ServiceMode::Legacy);
+        engine.execute(None);
+        engine.batches.retain(|batch| batch.dbnum == dbnum);
+        assert_eq!(engine.batches.len(), 1, "db{dbnum} 应当入队");
+
+        let now = Utc::now();
+        for batch in &mut engine.batches {
+            batch.started_at = Some(now - Duration::seconds(30));
+            batch.finished_at = Some(now);
+            batch.units_done = batch.units.len() as u32;
+            // 有失败单元的库（db7002）照实走 partial——终态行说的是它自己的结局。
+            batch.state = if batch.units.iter().any(|unit| unit.fail.is_some()) {
+                "partial"
+            } else {
+                "succeeded"
+            };
+            batch.stage = Stage::Finished;
+        }
+        let task_id = engine.batches[0].task_id.clone();
+        let poll = engine.poll();
+        let info = engine.ready_info();
+
+        let mut vm = plant_ui::task_queue::Vm::new(plant_ui::settings::ReadFaceKind::Service);
+        vm.project = info.project.clone();
+        vm.mdb = info.mdb.clone();
+        vm.namespace = info.ns.clone();
+        vm.queue = poll.queue;
+        vm.tasks = poll.tasks;
+        vm.health = poll.health;
+        vm.dbnums = poll.dbnums;
+        vm.pending = poll.pending;
+        vm.loaded = true;
+
+        // 默认筛选只留有活的行、终态行默认收起——两条都得先摆平才验得到明细。
+        let mut state = plant_ui::task_queue::State::new(plant_ui::task_queue::Filter::All);
+        state.toggle(&task_id);
+
+        let ctx = egui::Context::default();
+        let t = plant_ui::style::theme_tokens::current();
+        let d = plant_ui::style::tokens::Density::Standard;
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1600.0, 1000.0));
+        let mut cmds = Vec::new();
+        let mut text = String::new();
+        // 头一帧字体还没加载，`ui.label` 落成空 galley；连跑三帧再取文字。
+        for _ in 0..3 {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            });
+            egui::Area::new("sim-queue-render".into())
+                .fixed_pos(screen.min)
+                .show(&ctx, |ui| {
+                    ui.set_min_size(screen.size());
+                    ui.set_max_size(screen.size());
+                    plant_ui::task_queue::show(ui, &t, d, &vm, &mut state, false, &mut cmds);
+                });
+            let output = ctx.end_pass();
+            text.clear();
+            for clipped in &output.shapes {
+                collect_text(&clipped.shape, &mut text);
+            }
+        }
+        text
+    }
+
+    /// 剧本自己得先满足契约（VAL-SIM-002 的前置）：三种凭证形态各一个库、两枚根数各
+    /// 有一个非零值。这条不依赖渲染，先把夹具钉住。
+    #[test]
+    fn the_script_offers_three_credential_shapes_and_two_root_counts() {
+        let dbs = script();
+        let normal: Vec<_> = dbs
+            .iter()
+            .filter(|db| {
+                db.credential_advance.as_ref().is_some_and(|a| {
+                    a.requested > 0 && a.advanced == a.requested && a.degraded.is_none()
+                })
+            })
+            .map(|db| db.dbnum)
+            .collect();
+        assert_eq!(normal, vec![7001], "正常前移只该有一个库");
+
+        let degraded: Vec<_> = dbs
+            .iter()
+            .filter(|db| {
+                db.credential_advance
+                    .as_ref()
+                    .is_some_and(|a| a.degraded.is_some() && a.advanced == 0)
+            })
+            .map(|db| db.dbnum)
+            .collect();
+        assert_eq!(degraded, vec![7002], "退化只该有一个库");
+
+        // 缺席：得有个真的会跑出终态行、又不给这一格的库（首次导入 db7006）。
+        let absent: Vec<_> = dbs
+            .iter()
+            .filter(|db| db.credential_advance.is_none() && db.runnable())
+            .map(|db| db.dbnum)
+            .collect();
+        assert!(absent.contains(&7006), "缺席形态要有会跑的库：{absent:?}");
+
+        assert!(
+            dbs.iter()
+                .any(|db| db.verdict.and_then(|v| v.caught_up).is_some_and(|n| n > 0)),
+            "至少要有一个库给出非零的已追平根数"
+        );
+        assert!(
+            dbs.iter()
+                .any(|db| db.verdict.and_then(|v| v.lazy).is_some_and(|n| n > 0)),
+            "至少要有一个库给出非零的尚未生成根数"
+        );
+    }
+
+    /// 三种凭证形态在真画出来的帧里逐字成立（VAL-SIM-001 / 002 的渲染取证）：
+    /// db7001 画正常前移、db7002 只画退化句、db7006 一个「凭证前移」字样都没有。
+    #[test]
+    fn sim_paints_the_three_credential_advance_shapes() {
+        let normal = painted_terminal(7001);
+        assert!(
+            normal.contains("凭证前移 12/12 根（免了重生成）"),
+            "正常前移那一行没画出来：{normal}"
+        );
+        assert!(!normal.contains("凭证前移退化"), "退化句不该出现：{normal}");
+        assert!(normal.contains("已应用"), "批次终态行照常：{normal}");
+
+        let degraded = painted_terminal(7002);
+        assert!(
+            degraded.contains("凭证前移退化：candidates_ratio_above_threshold（全部根按过期重算）"),
+            "退化那一行没画出来：{degraded}"
+        );
+        assert!(!degraded.contains("免了重生成"), "正常句不许出现：{degraded}");
+        assert!(!degraded.contains("凭证前移 0/0"), "不许画成 0/0 根：{degraded}");
+
+        let absent = painted_terminal(7006);
+        assert!(
+            !absent.contains("凭证前移"),
+            "缺席时不许出现这行：{absent}"
+        );
+        // 其余明细段落照常——缺席只丢这一格，不许把整块明细连坐掉。
+        assert!(
+            absent.contains("2 / 2 个交付单元已生成"),
+            "单元计数照常：{absent}"
+        );
+    }
+
+    /// 判决明细的两枚根数在真画出来的帧里逐字成立（VAL-SIM-001）：db7001 的
+    /// 「已追平 8 根」在「模型水位在 … 那次保存」之后；db7002 的「3 根尚未生成」
+    /// 出现且不把它画成落后。
+    #[test]
+    fn sim_paints_the_caught_up_and_lazy_root_counts() {
+        let lagging = painted_terminal(7001);
+        assert!(lagging.contains("已追平 8 根"), "追平那句没画：{lagging}");
+        let at = lagging.find("模型水位在").expect("水位时刻那一句");
+        let caught = lagging.find("已追平 8 根").expect("追平那一句");
+        assert!(at < caught, "分句顺序错了：{lagging}");
+
+        let neutral = painted_terminal(7002);
+        assert!(
+            neutral.contains("3 根尚未生成"),
+            "未生成那句没画：{neutral}"
+        );
+        assert!(
+            neutral.contains("模型水位不判"),
+            "不判仍是中性态：{neutral}"
+        );
+        assert!(!neutral.contains("已追平"), "这一库没给追平根数：{neutral}");
+    }
 
     /// 剧本里的范围定位按真服务同口径算子树：那根 BRAN 有几何，它的 SITE / ZONE /
     /// PIPE 祖先因此也能定位——不能因为「剧本没写生成」就一律回查空，那样演示模式
