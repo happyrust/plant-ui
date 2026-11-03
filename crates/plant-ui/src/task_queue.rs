@@ -4380,9 +4380,11 @@ mod tests {
         });
         let model = vm(Vec::new(), vec![task]);
 
-        let mut state = State::default();
         // 默认筛选只留有活的行，终态成功行会被筛掉——这里按「全部」看。
-        state.filter = Filter::All;
+        let mut state = State {
+            filter: Filter::All,
+            ..Default::default()
+        };
         // 终态行默认收起，这里显式展开（与点箭头是同一件事）。
         state.toggle("db-8000-1");
 
