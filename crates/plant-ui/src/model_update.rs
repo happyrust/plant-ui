@@ -5644,6 +5644,28 @@ mod tests {
         );
     }
 
+    /// 两个数不相等时，`advanced` 必须在前、`requested` 在后（VAL-ADV-001 的「写反」失败条件）。
+    ///
+    /// 12/12 这种对称值证伪不了写反：`requested` 与 `advanced` 对调仍是同一串。这里用
+    /// 9/12 把顺序钉死。
+    #[test]
+    fn an_asymmetric_credential_advance_keeps_advanced_before_requested() {
+        let outcome: Outcome = serde_json::from_str(
+            r#"{
+                "batch":{"dbnum":8000,"start_sesno":41,"end_sesno":48,
+                    "status":"applied","changed_elements":85,
+                    "credential_advance":{"requested":12,"advanced":9}}
+            }"#,
+        )
+        .expect("带凭证前移的回执应当能解出来");
+        let batch = outcome.batch.expect("批次摘要应当能解出来");
+        assert_eq!(
+            batch.credential_advance_line(),
+            Some(("凭证前移 9/12 根（免了重生成）".to_owned(), false)),
+            "advanced 在前、requested 在后；写反会得到 12/9"
+        );
+    }
+
     /// 退化形态：一个根都没省，原因原文照抄，正常形态那句不出现（VAL-ADV-002）。
     #[test]
     fn a_degraded_credential_advance_says_every_root_is_recomputed() {
@@ -5696,6 +5718,9 @@ mod tests {
             r#""credential_advance":null"#,
             r#""credential_advance":{"requested":"十二","advanced":12}"#,
             r#""credential_advance":[]"#,
+            // 非空数组才是真陷阱：serde 会按位置把它解成 `{requested, advanced, degraded}`，
+            // 得到一个「12/12 根」的假回执。`e6bef468b` 收紧成「只认对象」就是为了这个形状。
+            r#""credential_advance":[12,12]"#,
         ] {
             let json = format!(
                 r#"{{"batch":{{"dbnum":8000,"start_sesno":41,"end_sesno":48,
