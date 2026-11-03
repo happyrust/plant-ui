@@ -1172,7 +1172,12 @@ where
     T: serde::de::DeserializeOwned,
 {
     let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
+    Ok(match value {
+        // 只认对象：数组能被 serde 按位置解成结构体（`[]` → 全默认），那会解出一个
+        // 「0/0 根」的假回执。契约要求解不动就退化成 `None`。
+        Some(value @ serde_json::Value::Object(_)) => serde_json::from_value(value).ok(),
+        _ => None,
+    })
 }
 
 /// 终态数据段的增 / 删 / 改三数（见 [`BatchResult::change_breakdown`]）。
@@ -5699,15 +5704,9 @@ mod tests {
             let outcome: Outcome =
                 serde_json::from_str(&json).unwrap_or_else(|e| panic!("{body} 不该毒化回执：{e}"));
             let batch = outcome.batch.expect("批次摘要照常解得出来");
-            // 解不动的形状要么整格丢掉，要么退化成全默认；两种都不许画出任何一行。
-            assert!(
-                batch
-                    .credential_advance
-                    .as_ref()
-                    .is_none_or(|a| *a == CredentialAdvance::default()),
-                "{body} 应当退化成缺席或全默认：{:?}",
-                batch.credential_advance
-            );
+            // 解不动的形状一律整格丢掉：数组会被 serde 按位置解成全默认，那会画出一句
+            // 「凭证前移 0/0 根」的假话，所以非对象也退化成 `None`。
+            assert_eq!(batch.credential_advance, None, "{body} 应当退化成缺席");
             assert_eq!(batch.credential_advance_line(), None, "{body} 整行不画");
             assert_eq!(batch.changed_elements, 85, "{body} 其它字段照常");
         }
