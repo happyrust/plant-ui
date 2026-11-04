@@ -1,0 +1,393 @@
+step=405904 ppp=1.5 nodes=391
+15007044064253752832 GenericContainer -                      
+5437808450950852606 TextInput 759,707 190x17         7998
+11565294837740219394 GenericContainer -                      
+5839577064677719043 GenericContainer -                      
+10219912128084474877 GenericContainer -                      
+17399670128000625669 TextRun 1387,257 39x15         OWNER
+5206664553223568902 Label 333,840 7x14           >
+2577836188937485321 Label 804,883 103x14         0 / 0 个交付单元已生成
+14143671516895750666 GenericContainer -                      
+10095764722556156939 GenericContainer -                      
+17821980718219917321 Label 23,56 435x36           重新生成全部房间关系？服务端会删除两张房间边表与停放链、换代重建常驻参照模型，再对每个库整库重算房间关系。
+3828816971390917137 GenericContainer -                      
+3538749939494023698 GenericContainer -                      
+4756970750291750419 TreeItem 4,402 310x26           refno =24381/79977; name=SITE 10
+16978710524915883537 Unknown 1152,665 108x30        
+1609263822048868373 GenericContainer -                      
+8938260621811778582 GenericContainer -                      
+14195122643120106007 TextRun 339,868 12x17          
+16273894301495699477 TextRun 1387,365 28x15         FUNC
+938153945456993301 Label 780,793 77x18          房间归属重算
+8857920230960098333 GenericContainer -                      
+15126104518672270370 TextRun 1475,339 36x14         unset
+5456843417898243619 GenericContainer -                      
+64045573713384996 Label 1475,257 51x14         14195/0
+15913740077529328677 Unknown 1375,277 331x30        
+576337807702039077 Label 1475,469 22x14         0/0
+12338253877242064935 TextRun 1475,313 36x14         unset
+17107554635711397416 TextRun 272,13 76x13           项目代号 1516
+10540973198146172457 GenericContainer -                      
+8248734495509985322 GenericContainer -                      
+15619613484564873256 TextRun 1655,869 20x14         元素
+7825535081607385125 GenericContainer -                      
+3260140462684813357 GenericContainer -                      
+4287742720834708527 Unknown 1057,705 50x22         
+12161259229292223536 GenericContainer -                      
+2461243100905820720 GenericContainer -                      
+2416189636639337010 GenericContainer -                      
+11944534795612538419 Label 95,868 227x17          
+16818543325679028277 TextRun 252,871 69x11          项目代号 1516
+13583546751449590839 GenericContainer -                      
+8563350960524251193 Label 1387,257 39x15         OWNER
+7291917441559946297 TextRun 1475,521 36x14         unset
+12537919932712034873 Unknown 959,705 50x22          
+13485270787353873471 Button 383,46 44x26           帮助
+12331882822165560384 Label 339,868 12x17          
+10195133515672065599 Unknown 8,44 30x30             
+11712769009053192255 GenericContainer -                      
+2381010584191002688 Unknown 1437,80 61x32          
+10960683625212374079 GenericContainer -                      
+16989392741490438218 Label 444,869 28x14          队列 0
+8703067944883340875 Button 160,46 63x26           创建  
+16047116509548041803 Label 1387,547 24x15         RLST
+507291576271436876 GenericContainer -                      
+9529704348674647630 TextRun 832,672 31x15          排队 0
+16700404057328127567 GenericContainer -                      
+2493466776190551632 GenericContainer -                      
+12563420957608769105 GenericContainer -                      
+3725433134535232082 GenericContainer -                      
+2345022136746182223 GenericContainer -                      
+5093571771356025934 GenericContainer -                      
+13507326499316554831 Label 759,820 372x15         房间增量开着，但还没有过房间轮记录——待重算的数量随第一轮任务带出来。
+3143458282396392533 GenericContainer -                      
+7504345695115649623 TextRun 444,869 28x14          队列 0
+6375099293387451982 TextRun 766,799 97x14          0 个交付单元全部生成
+15172479085320223834 Label 424,868 12x17          
+6902147240434313821 TextRun 1475,573 22x14         0/0
+412853149561088094 TextRun 95,868 12x17           
+871288188259963485 TextRun 366,134 43x13          实时模型
+6452190794951298144 Label 26,869 52x14           数据源 就绪
+11777976578000348769 Label 1514,11 19x15          dpc
+8309876676887004256 TreeItem 4,142 310x26           refno =14195/2; name=SITE 1
+1434241850962359907 Unknown 74,80 74x32            
+3902441795019330658 Label 1475,599 65x14         1, 644698
+8097579612472743013 TextInput 1178,10 235x18         
+8176900938081709153 GenericContainer -                      
+5453904406847205991 GenericContainer -                      
+8997296292039453288 Label 1387,573 27x15         STMF
+12664044714460511327 ScrollBar 1365,759 10x64         
+18226570518805761643 Label 1475,417 36x14         unset
+12821890321562962540 TextRun 1514,11 19x15          dpc
+1150078713396336749 GenericContainer -                      
+7255448594111567468 TreeItem 4,272 310x26           refno =24381/34109; name=/1RX-ARCHHB
+8748825720607523949 TreeItem 4,506 310x26           refno =24383/66456; name=/1WCC-PIPEBJ
+3026139231489729647 TextRun 1475,495 51x14         0, 0, 0
+8145415439123883633 TreeItem 4,792 310x26           refno =23715/1; name=/MDS/SPECIALS
+15320091772569527404 GenericContainer -                      
+828825518515906675 Unknown 893,629 87x32          
+8035969670637885548 GenericContainer -                      
+8676446283858731637 GenericContainer -                      
+7187567755214226038 GenericContainer -                      
+15692664097457662060 GenericContainer -                      
+4217416049115867768 TreeItem 4,636 310x26           refno =24384/46; name=/1RX03-PIPEBJ
+12202868875064718969 GenericContainer -                      
+8733235728751387770 TextRun 865,795 114x14         跨库 · 不属于任何 dbnum
+2822322326886990971 Label 766,799 97x14          0 个交付单元全部生成
+15526568387453702780 GenericContainer -                      
+16509589888653633665 Label 1212,710 149x11        显示 1 / 队列与历史共 160 条
+12440236115086696066 GenericContainer -                      
+7500735304580645507 Label 1395,164 53x13         =14195/2
+18320776469193287300 GenericContainer -                      
+17716209969945384581 TreeItem 4,376 310x26           refno =24381/76564; name=/1CPV-HVACHB
+1633254303465443974 GenericContainer -                      
+9888350522310648455 TextRun 1387,521 28x15         PURP
+16292758965069763208 GenericContainer -                      
+2158331150448691845 GenericContainer -                      
+1835412411573993603 GenericContainer -                      
+8092997151048513153 GenericContainer -                      
+1324102649958256269 GenericContainer -                      
+2777070123243923087 GenericContainer -                      
+7647906042893016210 GenericContainer -                      
+2725189944130752147 GenericContainer -                      
+2419073908688157842 TextRun 430,134 65x13          相机渲染目标
+2947958172363142805 GenericContainer -                      
+14774607156930676374 TreeItem 4,714 310x26           refno =15201/535; name=/Steel_Template_Site
+3061386580692104855 TreeItem 4,766 310x26           refno =23714/1; name=/MDS/SPECIALS
+12428178166998863511 TextRun 1387,495 21x15         POS
+3596526632789307033 GenericContainer -                      
+10846396366758149788 Unknown 341,360 30x30          
+3358861837470781085 GenericContainer -                      
+14831440781133528222 GenericContainer -                      
+3098435572142723228 GenericContainer -                      
+4119013383423771296 TextRun 763,709 26x13          7998
+14610683731621424289 Label 804,909 163x14         开跑 01:28 · 结束 01:28 · 用时 00:00
+1604703175076823717 Unknown 1665,4 30x30           
+5109488529018797733 Button 288,46 44x26           插件
+12729117457201914537 TreeItem 4,220 310x26           refno =24381/535; name=/仪控ISO测试
+13693857246411297962 Label 1475,339 36x14         unset
+2293876631571453609 GenericContainer -                      
+2177055860197033644 Label 252,871 69x11          项目代号 1516
+6937968764568863402 TextRun 759,820 372x15         房间增量开着，但还没有过房间轮记录——待重算的数量随第一轮任务带出来。
+249347907895688361 Unknown 323,80 3x782           
+18021985176912869040 Unknown 745,629 61x32          
+9820586852818339509 GenericContainer -                      
+10564824930325743285 GenericContainer -                      
+1650261709065279671 GenericContainer -                      
+16264321447943267000 TreeItem 4,480 310x26           refno =24381/177373; name=/1TTU-INST23
+17178935809954739897 TreeItem 4,740 310x26           refno =23716/1; name=/MDS/SPECIALS
+11714953672574610614 GenericContainer -                      
+12988098350104528059 GenericContainer -                      
+91600359472616636 TextRun 1683,871 12x11         39
+9919037388816812220 GenericContainer -                      
+1713860034865971896 GenericContainer -                      
+12588873770784299192 Label 430,134 65x13          相机渲染目标
+8388410742833591482 Unknown 1112,705 40x22         
+4523113934333760696 Unknown 1263,764 44x30         
+10676166166693053634 TreeItem 4,428 310x26           refno =24381/100675; name=/1CUP-HVACHB
+13170112295706301631 GenericContainer -                      
+14526861105725478596 TextRun 1387,573 27x15         STMF
+13659474379474705093 TextRun 1475,231 29x14         SITE
+16805807965721825978 Label 794,848 119x13         模型水位落后于数据水位
+17891477650414290617 GenericContainer -                      
+4583302885149105864 TreeItem 4,844 310x26           refno =23705/289; name=/MDS-Standards-Supports
+5153831811750602441 Label 272,13 76x13           项目代号 1516
+5159561433797047497 Unknown 1498,80 87x32          
+14425071297659190473 GenericContainer -                      
+11866386610377377994 TextRun 1387,391 33x15         MODU
+1457342239167902413 GenericContainer -                      
+10043386187300444878 Label 1475,313 36x14         unset
+4168783041656231631 Label 1475,547 36x14         unset
+10821535868501710027 GenericContainer -                      
+61565205100906193 Button 336,46 44x26           设置
+1542353467309226706 GenericContainer -                      
+2977399706006307538 GenericContainer -                      
+7329104786435791052 GenericContainer -                      
+16739613123217793224 GenericContainer -                      
+10357077370601331926 GenericContainer -                      
+15031115503212573398 Unknown 325,80 87x32           
+11975165225488627416 GenericContainer -                      
+10718796415734086350 Label 891,672 54x15          仅手动扫描
+7115708241807312090 TextRun 115,869 129x14         项目名 AvevaMarineSample
+8979627597946163924 GenericContainer -                      
+16048819198712691402 GenericContainer -                      
+2372156101069910237 GenericContainer -                      
+7795588928261579990 TextRun 23,104 436x15          日常增删改走增量更新，不需要点它；这是「房间数据不对了」的全量重置。 重建期间的普
+1554193022122807519 Button 93,46 63x26            项目  
+4290478147021424864 TextRun 23,74 243x18           参照模型，再对每个库整库重算房间关系。
+10120134996609580257 GenericContainer -                      
+1185790893687544033 Label 832,672 31x15          排队 0
+12380082157028816101 Label 1475,443 51x14         0, 0, 0
+14549081243508131559 Label 359,871 48x11          =14195/2
+12324689138741477611 TextRun 44,10 51x18            布置平台
+14287806841096660715 Unknown 1551,4 30x30           
+2445388583940817132 TreeItem 4,584 310x26           refno =24383/80211; name=/1RX-ELECBJ
+17128314763964421355 Unknown 16,16 436x34           
+3341526994680249583 Label 1387,599 32x15         TYPEX
+14220593650274548979 TextRun 1475,257 51x14         14195/0
+2763599985527407860 Unknown 40,44 30x30            
+1739732799256578803 GenericContainer -                      
+8403815481557930230 Unknown 486,44 30x30           
+5993555885912981242 GenericContainer -                      
+10416277557210997499 GenericContainer -                      
+10095479318152321276 TextRun 1387,417 32x15         NUMB
+11210010927108063997 GenericContainer -                      
+2985224375258239229 Unknown 1311,764 44x30         
+9990869155878065919 Label 23,104 436x31          日常增删改走增量更新，不需要点它；这是「房间数据不对了」的全量重置。 重建期间的普通生成请求会被服务端拒绝（409），稍后再试。
+14420343615525703936 TreeItem 4,662 310x26           refno =24384/24932; name=/1CSV-HVACHB
+869691425997037312 TextInput 348,836 388x22         
+3564556186408843010 Label 1683,871 12x11         39
+8184804664671406338 GenericContainer -                      
+11615865560168526082 Label 1475,573 22x14         0/0
+3240229336781206787 Unknown 325,629 74x32          
+10968703338335031555 Unknown 1014,705 40x22         
+14876602596293225216 Label 794,824 76x13          模型来源：内存
+3338121900282094336 Label 920,824 435x14         由 API 现算供数、活不过服务端重启；初始化发布收口后自动改读 rocksdb，同一版文件，不必重载
+6471648968153078537 TextRun 1212,710 148x11        显示 1 / 队列与历史共 160 条
+6952249301608192271 TextRun 23,56 435x18           重新生成全部房间关系？服务端会删除两张房间边表与停放链、换代重建常驻
+16380497189929038097 GenericContainer -                      
+7952368346247374611 GenericContainer -                      
+4540158327125163795 TextRun 1475,365 36x14         unset
+18003539404981500693 ScrollBar 310,116 10x747         
+1512548267196115221 GenericContainer -                      
+18182644665027948820 GenericContainer -                      
+4172358394524622616 Unknown 1589,4 30x30           
+9010333255555472152 GenericContainer -                      
+8884339000616203546 GenericContainer -                      
+1363855104699591960 GenericContainer -                      
+4438316498161921305 GenericContainer -                      
+12221107224767006996 GenericContainer -                      
+16734586582424667934 Unknown 23,152 121x30          
+15667238781341751583 Label 1387,469 27x15         ORRF
+3124045596805727521 Label 1387,125 16x23         
+15226818821296696098 TreeItem 4,610 310x26           refno =24384/26547; name=/AIOS-INC-20261029-p79-rvm3-P79
+1618025122554645796 TextRun 1387,313 28x15         AREA
+12742559820806053668 TextRun 1475,469 22x14         0/0
+16450366982808349479 Label 1655,869 20x14         元素
+3748881920275485991 Label 1475,365 36x14         unset
+13184226858104558376 Window 16,16 460x173          重新生成房间
+11232469408280484138 GenericContainer -                      
+2380203188053583659 Unknown 520,44 30x30           
+6219926771937986858 Label 1387,495 21x15         POS
+722572314449271595 TextRun 891,672 54x15          仅手动扫描
+13237320897027142446 GenericContainer -                      
+3207766464664685871 Label 1475,495 51x14         0, 0, 0
+3033878000257353008 TreeItem 4,870 310x26           refno =23713/2343; name=/MDS/TEMPLATES
+17248677747869174576 Label 1387,365 28x15         FUNC
+17484586762838369586 TextRun 489,871 32x11          刷新 5
+4307563463207873838 Unknown 745,759 623x34         
+15717448047287542068 GenericContainer -                      
+5813865893771892533 GenericContainer -                      
+13142844629931406133 GenericContainer -                      
+3138898990065058089 TextRun 23,119 235x15          通生成请求会被服务端拒绝（409），稍后再试。
+13183428277296784696 Label 1387,339 27x15         DESC
+10084552293322157881 GenericContainer -                      
+14148326775368900410 GenericContainer -                      
+18426730268102357818 Unknown 1375,195 331x30        
+11772344355458702140 Unknown 0,80 74x32             
+3441258548437285182 TextRun 780,793 77x18          房间归属重算
+2601813764535442240 GenericContainer -                      
+510903778310418241 GenericContainer -                      
+7359563878384033089 Label 1475,521 36x14         unset
+5072522786084383040 TextRun 1475,625 36x14         unset
+8805629477559839553 Unknown 341,326 30x30          
+743718007286037829 GenericContainer -                      
+886223319273992005 GenericContainer -                      
+10268977612861774663 Label 1387,231 22x15         类型
+1909051450660227401 Unknown 341,462 30x30          
+8401252356033127754 TextRun 26,869 52x14           数据源 就绪
+1971693721139591498 GenericContainer -                      
+3026572281550562124 GenericContainer -                      
+7066593110746483018 TreeItem 4,298 310x26           refno =24381/46775; name=/1CAM-HVACHB
+560399350478411089 GenericContainer -                      
+13152219014396207954 TextRun 1475,443 51x14         0, 0, 0
+7531726814560117075 GenericContainer -                      
+13300462105455656279 GenericContainer -                      
+10927725965110798169 Label 1387,313 28x15         AREA
+622356484573347673 TextRun 1387,469 27x15         ORRF
+7380508761043319643 GenericContainer -                      
+11977651535382892378 TextRun 1475,599 65x14         1, 644698
+10356108476589057373 GenericContainer -                      
+18243221474968692574 TextRun 1178,10 0x15           
+4881158033049898847 Label 773,672 31x15          运行 0
+16335105096360294234 GenericContainer -                      
+5742777812096290144 Unknown 152,152 50x30          
+5659094605185856866 TextRun 1387,231 22x15         类型
+8851340094959370083 TextRun 1411,126 87x19         SITE 14195_2
+6002769745987381090 Label 1387,391 33x15         MODU
+2768161816884124515 Unknown 1025,665 121x30        
+4777701882276537704 TreeItem 4,532 310x26           refno =24383/73927; name=/1RCV-PIPEBJ
+18201689600650030954 GenericContainer -                      
+899551852773147498 Unknown 1266,665 95x30         
+14690211639031498092 GenericContainer -                      
+18106934572070009709 GenericContainer -                      
+12938202021220202862 GenericContainer -                      
+17292355070298914157 GenericContainer -                      
+17416099900292361583 Label 1475,231 29x14         SITE
+5933002013304613231 TextRun 1475,391 36x14         unset
+9715842988894341997 GenericContainer -                      
+2308630275080614259 GenericContainer -                      
+8768713239289883508 Unknown 1627,4 30x30           
+2341675722028776308 GenericContainer -                      
+17688257020490695030 GenericContainer -                      
+6950034971185676148 Label 1387,625 36x15         UUIDIA
+11208707446598435704 GenericContainer -                      
+3232715965121564025 GenericContainer -                      
+15778840111210057082 TreeItem 4,454 310x26           refno =24381/101405; name=/1PTU-INST23
+1995694475671715707 Unknown 148,80 61x32           
+17710627733237764476 GenericContainer -                      
+9767342141156327803 GenericContainer -                      
+8079792759413993340 GenericContainer -                      
+12563950923598685563 Label 1387,443 18x15         ORI
+12199500729518842752 GenericContainer -                      
+6693692509116957569 Button 228,46 56x26           元件库
+3899908324080939372 Unknown 341,428 30x30          
+1983289263597318531 Unknown 1375,645 331x30        
+16542265257419693956 GenericContainer -                      
+9451341060017565055 Unknown 1273,126 88x88         
+9320168646393601405 Label 865,795 114x14         跨库 · 不属于任何 dbnum
+17567385353298876790 GenericContainer -                      
+18141570836071355272 Unknown 1604,44 95x30          
+10852066069456324489 TextRun 1387,625 36x15         UUIDIA
+6768456419092714890 Unknown 807,629 87x32          
+4084302623357785984 Unknown 1373,80 3x782          
+12193064888001619340 TreeItem 4,350 310x26           refno =24381/57476; name=/1CCV-HVACHB
+12000111168891201911 GenericContainer -                      
+5683527116371811218 Label 1411,126 87x19         SITE 14195_2
+4551549091922583444 Label 1387,417 32x15         NUMB
+11101696419054615447 GenericContainer -                      
+2638200761207398299 Label 1387,521 28x15         PURP
+14574713797329769372 GenericContainer -                      
+7829139510001798557 GenericContainer -                      
+7419286125415631774 TextRun 1387,443 18x15         ORI
+4439035222713149342 GenericContainer -                      
+11319215252675966368 Unknown 743,629 3x234          
+11830208616491426721 GenericContainer -                      
+18356943641707106210 GenericContainer -                      
+93760876686447010 TextRun 424,868 12x17          
+8048167624744270244 TreeItem 4,168 310x26           refno =24381/42520; name=/1RB-CIVI
+6564146804481702818 Unknown 325,112 1050x515       
+5206516616748777382 GenericContainer -                      
+2543727512044974502 Unknown 452,44 30x30           
+14069487379019196836 Unknown 341,394 30x30          
+14914555874301986219 GenericContainer -                      
+8963630812547982763 GenericContainer -                      
+17495344562196298155 TreeItem 4,324 310x26           refno =24381/48631; name=/1CAV-HVACHB
+9945868315104076209 GenericContainer -                      
+10117451411943109554 GenericContainer -                      
+6856034561574353329 GenericContainer -                      
+17030770146783213492 TextRun 359,871 48x11          =14195/2
+3035695036624257973 GenericContainer -                      
+639255257523114930 GenericContainer -                      
+5127261881447853489 Unknown 1185,764 75x30         
+15538670854198121911 Button 452,26 14x14           Close window
+1982822443814229434 GenericContainer -                      
+4901543322001832893 Label 1475,625 36x14         unset
+12724670229037182400 GenericContainer -                      
+7894170886626224071 TreeItem 4,818 310x26           refno =23705/1; name=/MDS-Standards-Site
+4556709164529793992 TreeItem 4,194 310x26           refno =24381/44873; name=/1RC-CIVI
+11549403792628343753 Label 44,10 51x18            布置平台
+15743964326158225354 TextRun 516,134 55x13          一格 10 m
+4558305291650119115 GenericContainer -                      
+5880788900684311501 GenericContainer -                      
+15081479939046838733 GenericContainer -                      
+7803082751243018703 GenericContainer -                      
+13091255722996484560 Label 115,869 129x14         项目名 AvevaMarineSample
+8335989029147409872 Label 1475,391 36x14         unset
+12922968193746706900 TreeItem 4,116 310x26           refno =9304/2; name=/1RS-CIVI
+5324689466297302997 TextRun 773,672 31x15          运行 0
+198967173668058070 GenericContainer -                      
+9081550788777965017 GenericContainer -                      
+18114775474566860250 GenericContainer -                      
+3116345189110335961 GenericContainer -                      
+3807744887736254428 Unknown 325,626 1050x3         
+15292968607574001629 Unknown 1273,126 16x16         
+8569865754042691039 GenericContainer -                      
+9199621695960746975 GenericContainer -                      
+5520222126365639651 GenericContainer -                      
+13826925289788388 Window -                      
+2719357168462621668 TextRun 1395,164 53x13         =14195/2
+1007999803205658598 Label 489,871 32x11          刷新 5
+5319673245362228708 TextRun 1387,339 27x15         DESC
+9995265208693688808 TreeItem 4,246 310x26           refno =24381/776; name=/SSC测试
+9914351742707569129 GenericContainer -                      
+1003666743043194851 Label 366,134 43x13          实时模型
+12076093866764687846 Unknown 341,292 30x30          
+1044892181992142828 ProgressIndicator 1315,869 320x14        重查模型  4306/4306  100%
+12088286380079560173 TextRun 1387,547 24x15         RLST
+17174722335180682211 TextRun 352,838 0x14           
+4610156868087221744 TextRun 1475,417 36x14         unset
+17065167786118566385 TextRun 1475,547 36x14         unset
+11860457183261894132 Unknown 1375,80 61x32          
+10376256105127377909 GenericContainer -                      
+14456570071772951028 GenericContainer -                      
+5151997885958369783 GenericContainer -                      
+8216408254017617912 TreeItem 4,688 310x26           refno =24384/22399; name=/1RX03-EQUI
+2346302620594079737 TextRun 1387,125 16x23         
+17874492020876519418 Label 516,134 55x13          一格 10 m
+18090448969981470715 TreeItem 4,558 310x26           refno =24383/80151; name=/1AXIS
+1770281371634059771 GenericContainer -                      
+3059291930459738108 TextRun 1387,599 32x15         TYPEX
+2902719110637218294 GenericContainer -                      
+11279156801115838968 TextRun 333,840 7x14           >
+matched 391

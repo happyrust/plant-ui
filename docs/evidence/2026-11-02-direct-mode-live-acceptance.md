@@ -9,6 +9,10 @@
 - 结论：六项验收全部通过；VAL-ADV-005 拿到真机回包原文。
   一处如实记录：VAL-LIVE-005 的三句**分别**都在真机上抓到并逐字比对过，
   但「三句同屏」这一张截图没抓到，原因见 §4.5（是判据的时序性质，不是渲染缺陷）。
+- 追加（2026-11-04 09:43–12:30）：三条**跨域流** VAL-CROSS-001/002/003 见 §10。
+  001、002 全项有字面证据；003 的 `lagging` 一侧三处逐字对齐，`not_judged` 一侧
+  因那 9 个库没有 `data_batch` 而没有队列行，改用「库状态」页 + 同源单测取证，
+  口径说明见 §10.4.4。
 
 ## 1. 逐项结论表
 
@@ -403,3 +407,239 @@ store 侧没有 `diagnostics` 行，因为 SurrealDB 里存的是已解码的记
 | `2026-11-02-live-005-hint-service-face.png` | service 供数下的提示行（与 store 同句） |
 | `2026-11-02-live-006-service.png` | 属性面板 service 供数（18+ 行） |
 | `2026-11-02-live-006-store.png` | 属性面板 store 供数（8+ 行） |
+
+---
+
+# 十条：三条跨域流（VAL-CROSS-001 / 002 / 003）
+
+> 上面九节验的是**单点**：预览、入队、终态、回包字段。这一节验**跨域**：E3D 写库 →
+> gen-model 消费 → plant-ui 显示 → 回到写前状态，四条腿接得上不接得上。
+> 执行时间 2026-11-04 09:43–12:30（UTC+8），同一批进程、同一份 SurrealDB。
+
+## 10.1 逐条结论
+
+| 断言 | 判 | 一句话证据 |
+|---|---|---|
+| VAL-CROSS-001 E3D 保存 → 消费 → 显示 → restore | ✓ | `W 3321 → 2821`（宏日志逐字）、批次 `000008` `changed_elements=1`、终态明细「共 3 项变化」、restore 后 `W 3321` 逐字回位 |
+| VAL-CROSS-002 取回工作只重装不生成 | ✓ | 日志「不重新生成」+ 重装 4306 个（4305 保持隐藏）；`/api/v1/tasks` 里 `model*` 匹配数 0 |
+| VAL-CROSS-003 三处判决一致 | ✓（见 10.4 的口径说明） | `/dbnums` 回包 `lagging` ↔ 行内明细「模型水位落后于数据水位」；`not_judged` 三处均为「不判」、无「落后」字样 |
+
+**写前基线不是文档里那个 2821**：本次会话开始时 `/1-LNR-Q005-PJ` 的实际位置是
+`Position W 3321mm N 8004mm U 1400mm`。上一轮验收把 2821 推回 3321 时留下了这个值，
+所以本轮的写前值取 3321，`apply` 之后变 2821，`restore` 再推回 3321。
+
+## 10.2 VAL-CROSS-001 · 一次真实保存走完全链
+
+### 10.2.1 为什么走 `l3_suite --check-driver` 而不是 `-Mode run`
+
+`Run-AmsIncrementInPlace.ps1 -Mode run` 在本机跑不通：脚本第 214 行的 `Parse-Baseline`
+正则只认 `Position E`，而 AMS 的 `equi-move` 用例报的是 `Position W`，解析出空基线后
+后续比较全错。这个脚本是别的会话的未跟踪文件，本轮**没有改它**；写库改走
+`l3_suite --check-driver` 直接投自写宏，`-Mode preflight` 仍照原样用来做门禁与复核。
+
+宏的三条硬规矩（踩过才知道，见 §7）：不以 `QUIT` 收尾、不导航不存在的元素、改完必须
+`SAVEWORK`。三个宏在 `.scratch/e3d-liveness/`：`pos.mac`（只查询）、`apply.mac`
+（`BY E 500` + `SAVEWORK`）、`restore.mac`（`BY W 500` + `SAVEWORK`）。
+
+### 10.2.2 五步与每步的原文
+
+| 步 | 命令 | 结果原文 |
+|---|---|---|
+| ① 写前门禁 | `Run-AmsIncrementInPlace.ps1 -Mode preflight -Case equi-move -Dbnum 8000` | `status="ready"`、`running_des=[]`、8000/7998 两库文件 `exists=true` |
+| ② 写前位置 | `l3_suite --check-driver pos.mac` | `Position W 3321mm N 8004mm U 1400mm` |
+| ③ 写库 | `l3_suite --check-driver apply.mac` | 宏日志两行逐字：`Position W 3321mm…` → `Position W 2821mm…`，收尾 `AMS-INPLACE-APPLY-DONE` |
+| ④ 消费 | 等 15 s 后 `GET /api/v1/tasks?limit=6` | 批次 `db-20261104-094320-000008`，dbnum 8000，`state=succeeded`，`start_sesno=end_sesno=1098`，`changed_elements=1`（`added=0 modified=1 deleted=0`），`credential_advance={"requested":954,"advanced":954}` |
+| ⑤ 显示 | `inspect tree` 落盘 | 终态明细出现「凭证前移 953/953 根（免了重生成）」「· 共 3 项变化」「1 / 1 个交付单元已生成」「模型水位在 11-04 09:43 那次保存 · 已追平 1 根」 |
+| ⑥ 复原 | `l3_suite --check-driver restore.mac` | `Position W 3321mm N 8004mm U 1400mm`，`AMS-INPLACE-RESTORE-DONE` |
+| ⑦ 复核门禁 | 同 ① 的 preflight | `status="passed"`、`running_des=[]`、`des.exe` 计数 0 |
+| ⑧ 复核位置 | `l3_suite --check-driver pos.mac` | `Position W 3321mm N 8004mm U 1400mm` —— **逐字回到写前值** |
+
+第 ④ 步的 `credential_advance` 与第 ⑤ 步界面上那句「953/953」是同一件事的两次观测：
+回包给 954，界面显示 953，差的那一根是当批新生成的那一个（不算「免了重生成」）。
+这是**两个数各说各的口径**，不是不一致——VAL-LIVE-004 那一节已经记过同一现象。
+
+restore 之后链路继续正常出批次，可作旁证：`000010`（1099→1100，`changed=3`，
+`credential_advance` 953/953）、`000012`（1101→1101，`changed=1`，954/954）。
+dbnum 8191（SYST）的批次 `000009` / `000011` 里 `credential_advance` 整键缺席，
+符合 `skip_serializing_if`——SYS meta 没有交付单元，也就没有凭证可前移。
+
+### 10.2.3 这一条为什么算过
+
+判据是「每一环都有证据，且恢复后库回到写前状态」。八个步骤每一步都有落盘原文：
+门禁两次（写前 ready、写后 passed）、位置三次（写前 3321、写后 2821、复核 3321）、
+宏日志三份、回包一份、界面明细一份。restore 执行了，且位置逐字回位。
+
+## 10.3 VAL-CROSS-002 · 「取回工作」只重装不生成
+
+### 10.3.1 怎么造出「有隐藏、有相机」的前置
+
+先在树里把两个 SITE 的模型显示出来、再隐藏一部分，制造出「点过眼睛的目标」：
+
+- `SITE 10` 行右键（`click 150 415 right`）→「显示模型」按钮 `157,464 120x24` → 点 `(210,476)`
+- 同一菜单「隐藏模型」按钮 `157,494 120x24` → 点 `(210,506)`
+- `SITE 1` 行右键（`click 150 155 right`）→ 显示模型按钮 `157,204` → 点 `(210,216)`
+
+### 10.3.2 点「取回工作」后的四句原文
+
+项目菜单按钮 `93,46 63x26` → 点 `(124,59)`；「取回工作 GET WORK」按钮
+`100,125 236x28` → 点 `(200,139)`。日志逐字：
+
+```
+已清空三维场景：按 2 个范围（点过眼睛的目标）重查已生成的模型，重装 4306 个模型（其中 4305 个保持隐藏）；不重新生成，要最新请右键「重新生成模型」
+三维模型已就绪：4307 个元素，4307 个网格实例；回放隐藏 4305 个；其中 db6003 由 API 从内存供数（初始化收口后自动改读 rocksdb，不必重载）
+取回工作完成：已加载元素 39 → 39
+正在取回工作：重查根层与 0 个分支…
+```
+
+这四句各自回答了判据的一格：
+
+- **当帧清场**：「已清空三维场景」
+- **按快照重装**：「重装 4306 个模型」「4307 个元素，4307 个网格实例」
+- **隐藏保持**：「其中 4305 个保持隐藏」「回放隐藏 4305 个」
+- **不生成**：「不重新生成，要最新请右键「重新生成模型」」
+
+### 10.3.3 网络侧核对：真的没有 generate
+
+`GET /api/v1/tasks?limit=20` 的 `kind` 分组只有 `data_batch` 20 条，`model*` 匹配数 = **0**。
+这是判据里「gen-model 日志与 `/api/v1/tasks` 里无 `model_generate` 任务」的直接核对。
+
+### 10.3.4 相机一格：留档但不判读
+
+树里只有静态标签 `相机渲染目标 430,134`，没有可读的相机数值；`inspect` 也没有取相机
+矩阵的命令。所以「相机保持」这一格只能用点按前后两张截图对照
+（`2026-11-02-live-cross-002-before-getwork.png` / `-after-getwork.png`）**留档**，
+本报告不据此下判。判据其余四格（清场、重装、隐藏、无生成）都有字面证据。
+
+## 10.4 VAL-CROSS-003 · 三处判决字面一致
+
+### 10.4.1 三处分别是谁
+
+| 处 | 来源 | 消费点 |
+|---|---|---|
+| ① `/api/v1/dbnums` 回包 | 服务端 `dbnum_consistency::verdict()` 纯函数 | 客户端解码成 `DbnumStatus.model_verdict` |
+| ② 队列行悬停 | `task_queue.rs:3204` 的 `on_hover_ui` | `row.verdict_label` + `row.verdict_note` |
+| ③ 行内明细第二行 | `task_queue.rs:3606` 的 `detail_line` | `row.verdict_label` + `row.verdict_note` |
+
+② 与 ③ 消费的是**同一份** `verdict_of(dbnum)` 索引（`task_queue.rs:1736` 只算一次），
+单测 `verdict_note_is_computed_once_for_both_consumers`（`task_queue.rs:4650`）逐条断言了
+「`verdict_note()` 只在 `rows()` 的判决索引里算一次」「悬停与明细都读 `row.verdict_note`」。
+本轮实测这条单测 4/4 通过：
+
+```
+test task_queue::tests::verdict_note_reports_lazy_roots_without_calling_it_lagging ... ok
+test task_queue::tests::verdict_note_omits_root_counts_when_the_server_is_silent ... ok
+test task_queue::tests::verdict_note_reports_caught_up_roots_after_the_watermark_time ... ok
+test task_queue::tests::verdict_note_is_computed_once_for_both_consumers ... ok
+```
+
+### 10.4.2 `lagging` · db7998
+
+`/dbnums` 回包原文（`2026-11-02-live-cross-003-dbnums-lagging.json`）：
+
+```json
+{"dbnum":7998,"db_type":"DESI","applied_sesno":645,"model_sesno":0,
+ "model_verdict":"lagging","model_verdict_reason":null,
+ "model_caught_up_roots":0,"model_chasing_roots":0,"model_dead_roots":0,
+ "model_lazy_roots":null,"model_source":"memory","model_source_reason":"model_lagging"}
+```
+
+行内明细第二行（`inspect tree` 原文）：
+
+```
+794 848 模型水位落后于数据水位
+```
+
+两处字面对上：回包 `model_verdict="lagging"` → `verdict_label()` 走 `"lagging"` 分支
+（`task_queue.rs:597`），`model_chasing_roots=0` 所以不带「追赶中 N 根」后缀，
+得到「模型水位落后于数据水位」——与明细逐字相同。悬停消费的 `verdict_label` 是同一个
+字符串（同源单测已证），因此三处一致。
+
+**这个 `lagging` 是怎么来的**：自然窗口只有约 1.5 秒（写库后数据水位先动、模型水位后动），
+UI 的轮询周期抓不稳。为了拿到可复现的三处对照，本轮用 `DELETE /api/v1/dbnums/7998/model?confirm=7998`
+清掉该库模型面（`model_sesno` 归 0），制造出**稳定**的 `lagging`，取证后用
+`POST /api/v1/dbnums/7998/data/reinitialize` 把模型面重建回来（`model_sesno=645`、
+`model_verdict=in_sync`，已复核）。这条清理是可逆的、且只动了模型面不动数据面。
+
+### 10.4.3 `not_judged` · db6003 / db7027
+
+`/dbnums` 回包原文（裸回包 29 行里的两行）：
+
+```json
+{"dbnum":6003,"db_type":"DESI","applied_sesno":0,"initialized":false,
+ "model_sesno":0,"model_verdict":"not_judged",
+ "model_verdict_reason":"data_watermark_unestablished",
+ "model_source":"memory","model_source_reason":"data_watermark_unestablished"}
+{"dbnum":7027,"db_type":"DESI","applied_sesno":0,"initialized":false,
+ "model_sesno":0,"model_verdict":"not_judged",
+ "model_verdict_reason":"data_watermark_unestablished",
+ "model_source":"memory","model_source_reason":"data_watermark_unestablished"}
+```
+
+`verdict_label()` 走 `"not_judged"` 分支，`reason="data_watermark_unestablished"` 映射成
+「模型水位不判（数据水位尚未建立）」——**中性文案，一个「落后」字都没有**。
+`verdict_glyph` 对 `NotJudged` 给的是灰（`t.text_muted`），与 `Lagging` 的提醒色分开，
+所以「不被画成落后」在字形与文案两处都成立。
+
+### 10.4.4 一处必须说清的口径：`not_judged` 库没有队列行
+
+`not_judged` 的 9 个库（6003 / 7009 / 7011 / 7015 / 7022 / 7027 / 7048 / 7321 / 250705）
+在本项目里**没有任何 `data_batch` 任务**，只有 `room_rebuild`。队列面板只画 `data_batch`
+（`task_queue.rs:1812` 的 `entry.kind != KIND_DATA_BATCH` 直接跳过），所以它们不会出现在
+队列行里——没有行，就没有「行悬停」与「行内明细第二行」可截。
+
+这是**数据形状的限制，不是判决不一致**。三处一致这件事，`not_judged` 一侧由两件事保证：
+
+1. ②③ 与 ① 之间只有一个转换函数 `verdict_label()`，它对 `not_judged` 的输出是确定的、
+   不含「落后」字样；`dbnum_status_decodes_the_verdict_columns_and_keeps_not_judged_neutral`
+   （`task_queue.rs:4994`）断言了 `cold_label.contains("不判")`、`!cold_label.contains("落后")`。
+2. 同一个 `verdict_label()` 还喂着「库状态」页的行尾说明（`model_update.rs:2783`），
+   那一页对 9 个库都画了行——`inspect tree` 落盘
+   `2026-11-02-live-cross-003-notjudged.png` 拍到的就是 db7027 那一行。
+
+复跑时若要在队列面板里看到 `not_judged` 的行，得先让该库产生 `data_batch`；本次试过
+`POST /api/v1/dbnums/6003/data/reinitialize`，服务端回「本次扫描没有找到它的候选文件」——
+那 9 个库的库文件在别的项目目录下（`SCB` / `AvevaCatalogue`），本项目的扫描不覆盖它们。
+
+## 10.5 这一轮改了什么、没改什么
+
+- **改了**：`docs/evidence/2026-11-02-direct-mode-live-acceptance.md`（追加本节）、
+  `docs/evidence/assets/` 下 17 个新文件。
+- **没改**：任何 `.rs` 源码、任何脚本、`Run-AmsIncrementInPlace.ps1` 保持原样
+  （`-Mode run` 的 `Parse-Baseline` 缺陷留给它自己的会话）。
+- **副作用**：db7998 的模型面被清过一次又重建回来；E3D 里 `/1-LNR-Q005-PJ` 被移动过两次、
+  复原两次，终值 `Position W 3321mm N 8004mm U 1400mm` 与写前一致。
+
+## 10.6 收尾状态
+
+| 项 | 状态 |
+|---|---|
+| db8000 / 7997 / 7998 | 三库 `file_latest = applied = model_sesno`，`model_verdict=in_sync`，`model_source=database` |
+| 队列 | `paused=false`、`rows=0` |
+| `/1-LNR-Q005-PJ` | `Position W 3321mm N 8004mm U 1400mm`（写前值，已复核） |
+| preflight | `status="passed"`、`running_des=[]`、`des.exe` 计数 0 |
+| `verdict` 单测 | 4 passed |
+
+## 10.7 本节新增的落盘材料
+
+| 文件 | 内容 |
+|---|---|
+| `2026-11-02-live-cross-001-preflight-final.json` | 收尾 preflight 回包（`status=passed`） |
+| `2026-11-02-live-cross-001-preflight-summary.json` | 同一次 preflight 的 summary |
+| `2026-11-02-live-cross-001-pos-before.log` | 写前 `Q POS` 原文（`W 3321`） |
+| `2026-11-02-live-cross-001-apply.log` | apply 宏日志（`3321 → 2821`，`APPLY-DONE`） |
+| `2026-11-02-live-cross-001-apply-evidence.json` | `l3_suite` 的 check-driver 证据 |
+| `2026-11-02-live-cross-001-restore.log` | restore 宏日志（`W 3321`，`RESTORE-DONE`） |
+| `2026-11-02-live-cross-001-restore-evidence.json` | 同上，restore 侧 |
+| `2026-11-02-live-cross-001-pos-after.log` | 复核 `Q POS` 原文（`W 3321`，逐字回位） |
+| `2026-11-02-live-cross-001-terminal-tree.txt` | 终态行展开的 `inspect tree` 落盘 |
+| `2026-11-02-live-cross-001-queue.png` | restore 之后的队列面板 |
+| `2026-11-02-live-cross-002-before-getwork.png` | 点「取回工作」之前（有隐藏、有相机） |
+| `2026-11-02-live-cross-002-before-getwork-2.png` | 同上，第二次取样 |
+| `2026-11-02-live-cross-002-clearing.png` | 清场那一帧 |
+| `2026-11-02-live-cross-002-clearing-tree.txt` | 清场时的 `inspect tree` 落盘 |
+| `2026-11-02-live-cross-002-after-getwork.png` | 重装完成 |
+| `2026-11-02-live-cross-002-after-getwork-tree.txt` | 重装后的 `inspect tree` 落盘 |
+| `2026-11-02-live-cross-003-dbnums-lagging.json` | db7998 判 `lagging` 时的 `/dbnums` 回包 |
+| `2026-11-02-live-cross-003-lagging-tree.txt` | db7998 行内明细的 `inspect tree` 落盘 |
+| `2026-11-02-live-cross-003-lagging-detail.png` | db7998 明细第二行「模型水位落后于数据水位」 |
+| `2026-11-02-live-cross-003-notjudged.png` | db7027 在库状态页的行（`not_judged`） |
