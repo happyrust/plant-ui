@@ -643,3 +643,152 @@ UI 的轮询周期抓不稳。为了拿到可复现的三处对照，本轮用 `
 | `2026-11-02-live-cross-003-lagging-tree.txt` | db7998 行内明细的 `inspect tree` 落盘 |
 | `2026-11-02-live-cross-003-lagging-detail.png` | db7998 明细第二行「模型水位落后于数据水位」 |
 | `2026-11-02-live-cross-003-notjudged.png` | db7027 在库状态页的行（`not_judged`） |
+
+---
+
+# 十一：三条跨域流第二轮复跑（VAL-CROSS-001 / 002 / 003 · 2026-11-04 12:45–14:10）
+
+> 前两轮的进程在上一节收尾时已全部停掉（8009 / 8022 / 5721 复核为 FREE）。这一轮把三件
+> 重新起齐再走一遍：SurrealDB 8009 → gen-model（direct + rocksdb，`--watch-dbnum 7997,7998,8000`）
+> → rs-plant（`PLANT_MODEL_API_URL=http://127.0.0.1:8022`、探针口 5721）。目的：验证 §十
+> 的结论在干净环境下可复现，并补齐上一轮没取到的那格证据（相机射线的点按前后逐字比对）。
+> 资产前缀 `2026-11-04-cross-r3-*`。
+>
+> **本轮的可判读性边界（先声明，免得读者误读截图）**：当前会话的模型读不了 PNG，所有界面
+> 结论都取自 `inspect tree` 的文本落盘，截图只作留档。悬停气泡与「库状态」页的行尾说明都是
+> 自绘（`ui.painter().galley`），不进 AccessKit 树，本轮**没有**取到它们的逐字文本——那两格
+> 仍按源码 + 既有单测判（下文各自标注）。
+
+## 11.0 起跑与环境
+
+| 项 | 值 |
+|---|---|
+| `/api/v1/health` | `status=ok`、`data_read_mode=direct`、`data_face=ingest`、`worker_alive=true`（起后约 60 s 转真）、`queue_paused=false`、`version=0.1.44`、`build_id=0.1.44+ga109aabaaaf8.1793714628.dirty` |
+| watch 范围 | `7997,7998,8000`（命令行 `--watch-dbnum`） |
+| `/dbnums`（裸，29 行） | 7997 `applied=394 model=394 in_sync`；7998 `applied=645 model=645 in_sync`；8000 `applied=1107 model=1106 lagging`（随后消费追平） |
+| des.exe 并发 | 0（preflight `running_des=[]`） |
+
+## 11.1 VAL-CROSS-001 · 真增量驱动显示闭环（第二轮）
+
+写前门禁（`Run-AmsIncrementInPlace.ps1 -Mode preflight -Case equi-move -Dbnum 8000`）：
+`status="passed"`、`running_des=[]`、8000/7998 库文件 `exists=true`
+（`2026-11-04-cross-r3-preflight-before.json`）。写前位置用 `pos.mac` 实测：
+`Position W 3321mm N 8004mm U 1400mm`——与 §十 收尾值一致，说明上一轮的 restore 站住了。
+
+| 步 | 命令 | 结果 |
+|---|---|---|
+| ① 写库 | `l3_suite --check-driver apply.mac`（`BY E 500 WRT /*` + `SAVEWORK`） | 宏日志逐字：`Position W 3321mm N 8004mm U 1400mm` → `Position W 2821mm N 8004mm U 1400mm`，`AMS-INPLACE-APPLY-DONE`（`-cross-r3-apply.log`） |
+| ② 消费 | 15 s 后 `GET /api/v1/tasks?limit=8` | `db-20261104-124722-000001` dbnum 8000 `state=succeeded` `start_sesno=end_sesno=1107` `changed_elements=1`，`credential_advance={"requested":954,"advanced":954}`；同刻 `GET /api/v1/queue` `rows=[]`（已走完）、`paused=false`（`-cross-r3-tasks-after-apply.json` / `-cross-r3-queue-after-apply.json`） |
+| ③ 显示 | `inspect tree` 落盘（db8000 行展开） | 明细里读到「· 共 3 项变化」「模型水位在 11-04 12:48 那次保存 · 已追平 1 根」「1 个交付单元全部生成」。**口径说明**：apply 那一批（`…-000001`）的回包是 `changed_elements=1`，而界面这行「共 3 项变化」对应的是同库紧接着的合并批次 `…-000003`（回包 `changed=3`，1108→1109）——两处数字都从回包取，不本地算。`changed=1` 那批的明细行在本次 tree 里没滚到可视区，故未逐字留档 |
+| ④ 复原 | `l3_suite --check-driver restore.mac`（`BY W 500 WRT /*` + `SAVEWORK`） | `Position W 3321mm N 8004mm U 1400mm`，`AMS-INPLACE-RESTORE-DONE`（`-cross-r3-restore.log`） |
+| ⑤ 复核 | preflight 再跑 + `pos.mac` 再读 | `status="passed"`、`running_des=[]`；`Position W 3321mm N 8004mm U 1400mm` **逐字回位**（`-cross-r3-preflight-after.json` / `-cross-r3-pos-after.log`） |
+
+后续产生的批次（restore 的 SAVEWORK 也产生会话）继续被消费：`db-20261104-124847-000003`
+（1108→1109，`changed=3`，953/953）、`db-20261104-130423-000006`、`db-20261104-131717-000008`
+（`-cross-r3-tasks-final.json`）。dbnum 8191（SYST）的批次 `credential_advance` 整键缺席，
+与 §5 的口径一致。
+
+**界面侧的可见性说明**：这一轮 `rs-plant` 直接起窗后 `inspect shot` 连出 1x1（73 字节），
+原因是 GPU 间接绘制下 `Screenshot::primary_window` 采不到底片；设 `PLANT_UI_INDIRECT_DRAW=0`
+重启后截图恢复 1600x1000。队列明细里那行「重开 Save Work 冻结快照失败： dabacon 冻结目标
+会话 969 的 session/index anchor 已改变」是**服务端**对上一会话冻结重开的告警，与本轮
+写库无关（本批 1107 正常应用、`changed=1`）。
+
+## 11.2 VAL-CROSS-002 · 「取回工作」只重装不生成（第二轮）
+
+前置（有隐藏、有相机）：SITE 10 行右键 → 显示模型（4305 个网格进来）→ 同菜单隐藏模型
+（`模型隐藏完成：4305 个目标`）。点按前视口拾取一次拿相机射线：
+
+```
+[诊断] 射线 origin=Vec3(1632.0305, 1212.7544, 2040.0424) dir=Dir3(Vec3(-0.55763143, -0.4389745, -0.7045201)) … 模型网格实体数=4305
+```
+
+点项目菜单 →「取回工作 GET WORK」：
+
+| 判据 | 证据（`inspect tree` 落盘逐字） |
+|---|---|
+| 当帧清场 | 状态栏 `已清空三维，正在按 1 个范围重查已生成的模型…`（`-002-clearing-tree.txt`） |
+| 按快照重装 | `已清空三维场景：按 1 个范围（点过眼睛的目标）重查已生成的模型，重装 4305 个模型（其中 4305 个保持隐藏）；不重新生成，要最新请右键「重新生成模型」`；随后 `三维模型已就绪：4305 个元素，4305 个网格实例；回放隐藏 4305 个`、`取回工作完成：已加载元素 39 → 39`（`-002-after-getwork-tree.txt`） |
+| 隐藏保持 | 「其中 4305 个保持隐藏」「回放隐藏 4305 个」——本轮隐藏的是全部 4305 个（上一轮是 4305/4306），口径同源 |
+| 不生成 | 日志句尾「不重新生成」；`GET /api/v1/tasks?limit=200` 里 `kind` 分组只有 `data_batch ×103 / room_rebuild ×55 / dbnum_model_ensure ×2`，`model_generate` 匹配数 **0**（两条 `dbnum_model_ensure` 是上一轮 12:09 的遗留，非本次点击产生） |
+| 相机保持 | 点按后视口拾取射线：`origin=Vec3(1632.0305, 1212.7544, 2040.0424) dir=Dir3(Vec3(-0.55763143, -0.4389745, -0.7045201))`——与点按前**逐字相同**（`crates/plant-ui-view3d/src/lib.rs:2864` 的诊断行，与相机同源） |
+
+截图：`-002-before-getwork.png`（隐藏中）→ `-002-after-getwork.png`（重装后，隐藏保持、视角未动）。
+
+## 11.3 VAL-CROSS-003 · 三处判决字面一致（第二轮）
+
+**lagging · db7998**（复用 §10.4.2 的可复现手法）：`DELETE /api/v1/dbnums/7998/model?confirm=7998`
+把模型面清掉（回包 `status="deleted"`），`/dbnums` 立刻给出稳定判决：
+
+```json
+{"dbnum":7998,"applied_sesno":645,"model_sesno":0,"model_verdict":"lagging",
+ "model_verdict_reason":null,"model_caught_up_roots":0,"model_chasing_roots":0,
+ "model_lazy_roots":null,"model_source":"memory","model_source_reason":"model_lagging"}
+```
+
+队列面板搜 `7998` 展开行（`-003-lagging-tree.txt`）：
+
+- 行内明细第二行：`模型水位落后于数据水位`（+ 前一行 `模型来源：内存`）
+- 悬停那一格：**本轮没截到气泡文字**。`task_queue.rs:3202` 的 `on_hover_ui` 挂在 16×16 的
+  判决字形热区上，`inspect` 的 `click` 只发按下/抬起、不产生持续 hover 帧，`tree` 里读不到
+  气泡文本（本页只有 `Unknown` 节点，无 `Label`）。该格的判据仍是源码同源：悬停与明细都读
+  `rows()` 里同一个判决索引的 `row.verdict_label` / `row.verdict_note`（`task_queue.rs:1736`
+  只算一次），单测 `verdict_note_is_computed_once_for_both_consumers` 逐条断言了这一点
+  （§10.4.1 已 4/4 通过，本轮未重复跑）。
+
+三处字面一致：回包 `lagging` → label「模型水位落后于数据水位」→ 明细逐字同句；悬停那一处
+由「同一份 `verdict_label` 字符串」+ 上述单测保证，属源码级核对而非界面截图。
+截图 `-003-lagging-row.png` / `-003-lagging-detail.png`。
+取证后 `POST /api/v1/dbnums/7998/data/reinitialize` 重建模型面（回执
+`db-20261104-140646-000009`，`start_sesno=1 end_sesno=645`），复核 `model_sesno=645`、
+`model_verdict=in_sync`、`model_source=database`（`-003-dbnums-restored.json`）——库面回到写前状态。
+
+服务端日志对这一批的口径要照实说：`dbnum=7998 初始化：没有交付单元根可生成`、收尾
+`根=0 失败根=0 记录=0 … model_sesno=645`。也就是该库重建后**没有交付单元根**（它本来就只有
+WORL + 3 条索引行，`解析任务完成 … 总数量: 3`），水位前移到 645 后判决自然回到 `in_sync`。
+这与写前形状一致（写前也是 `applied=645 model=645`、`model_caught_up_roots=0`），不是「重建失败」。
+
+**not_judged · db6003 / db7027**：本轮两库仍在 `not_judged`
+（`reason=data_watermark_unestablished`，`initialized=false`，`applied_sesno=0`）。
+与 §10.4.4 同一口径：它们没有 `data_batch`，队列面板无行，三处一致由「库状态」页 + 同源函数保证。
+
+本轮打开了模型更新向导 →「库状态」页（`tree` 读到 `Window 280,140 1040x720 模型增量更新`
+与 `显示 29 / 共 29 个库`），截图留档 `-003-notjudged-dbpage.png`。
+**这一页的行尾说明是自绘（`ui.painter().galley`），不进 AccessKit 树**——`inspect tree`
+在整页里 grep「不判 / 落后」均为 0 命中（`r3-tree-70.txt` 可核），所以那一格的逐字证据只能
+来自源码与单测，不能来自 tree：
+
+- `/dbnums` 回包：`model_verdict="not_judged"`、`model_verdict_reason="data_watermark_unestablished"`；
+- `verdict_label()` 对该组合的输出是「模型水位不判（数据水位尚未建立）」，`verdict_glyph`
+  给 `NotJudged` 灰（`t.text_muted`），与 `Lagging` 的提醒色分开；
+- 单测 `dbnum_status_decodes_the_verdict_columns_and_keeps_not_judged_neutral`（`task_queue.rs:4994`）
+  断言 `contains("不判") && !contains("落后")`——§10.4.4 已引。
+
+因此「`not_judged` 在三处都不被画成落后」这一条，本轮**没有**新增可直接判读的界面字面证据，
+结论仍建立在「同一函数 + 同一回包 + 已有单测」三者之上（与 §10.4.4 的判法一致）。
+截图只作留档，不据以下判。
+
+## 11.4 本节新增的落盘材料（前缀 `2026-11-04-cross-r3-`）
+
+| 文件 | 内容 |
+|---|---|
+| `-preflight-before.json` / `-preflight-after.json` | 写前 / 写后 preflight summary（均 `passed`） |
+| `-pos-before.log` / `-pos-after.log` | 写前 / 复核 `Q POS`（均 `W 3321`，逐字回位） |
+| `-apply.log` / `-apply-evidence.json` | apply 宏日志（`3321 → 2821`）与 check-driver 证据 |
+| `-restore.log` / `-restore-evidence.json` | restore 宏日志（`W 3321`）与证据 |
+| `-tasks-after-apply.json` / `-tasks-final.json` / `-queue-after-apply.json` | 消费批次回包 |
+| `-002-before-getwork.png` / `-002-after-getwork.png` | 取回工作前后对比 |
+| `-002-clearing-tree.txt` / `-002-after-getwork-tree.txt` | 清场帧 / 完成后的日志面板落盘 |
+| `-003-dbnums-lagging.json` / `-003-dbnums-restored.json` | 清模型面时 / 重建后的 `/dbnums` 回包 |
+| `-003-lagging-row.png` / `-003-lagging-detail.png` / `-003-lagging-tree.txt` | db7998 行与明细第二行 |
+| `-003-notjudged-dbpage.png` | 库状态页整表截图（29 行）。行尾说明为自绘、不进树，**仅留档，不据以下判**（判据见 §11.3 末段） |
+
+## 11.5 收尾状态
+
+| 项 | 状态 |
+|---|---|
+| `/1-LNR-Q005-PJ` | `Position W 3321mm N 8004mm U 1400mm`（写前值，`pos.mac` 复核） |
+| db7998 模型面 | 已重建，`in_sync`、`model_source=database` |
+| preflight | `status="passed"`、`running_des=[]` |
+| gen-model 队列 | `paused=false`，无排队行 |
+| 三条流 | ① 全链八步均有第二轮独立原文；② 五格判据里四格有字面证据（相机射线点按前后逐字相同），「不生成」由 `tasks` 分组核对；③ `lagging` 的回包与明细第二行逐字对齐，悬停与「库状态」行尾说明两格为自绘、不进树，按源码 + 既有单测判（见 §11.3） |
