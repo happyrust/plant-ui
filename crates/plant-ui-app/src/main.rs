@@ -508,7 +508,12 @@ fn viewport_fits_window(size: [u32; 2], window_px: Option<bevy::prelude::UVec2>)
 fn setup_ui_camera(mut commands: Commands, mut egui: ResMut<EguiGlobalSettings>) {
     // 三维插件也会创建摄像机；明确绑定，避免 egui 把主界面画进离屏纹理。
     egui.auto_create_primary_context = false;
-    commands.spawn((Camera2d, PrimaryEguiContext));
+    // egui 自己按羽化做边缘抗锯齿；界面相机再开 MSAA 只是把整窗多算几遍（空闲时 GPU 大头就在这）。
+    commands.spawn((
+        Camera2d,
+        bevy::render::view::Msaa::Off,
+        PrimaryEguiContext,
+    ));
 }
 
 #[cfg(not(target_arch = "wasm32"))]
