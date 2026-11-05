@@ -486,6 +486,8 @@ pub const E3D_BACKGROUND_GREY: u32 = 0x828282;
 pub const E3D_CE_COLOUR: u32 = 0xffff00;
 /// 其它选中（highlight）= PDMS `white` #ffffff。
 pub const E3D_HIGHLIGHT_COLOUR: u32 = 0xffffff;
+/// 悬停预选（E3D 的 active）= PDMS `orange` #ffbe00。真机上鼠标掠过未选中元素时它就是这一色。
+pub const E3D_ACTIVE_COLOUR: u32 = 0xffbe00;
 /// 辅助对象（aids）= PDMS `blue` #0000ff。
 pub const E3D_AIDS_COLOUR: u32 = 0x0000ff;
 

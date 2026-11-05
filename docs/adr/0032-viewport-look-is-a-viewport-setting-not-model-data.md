@@ -35,6 +35,7 @@
 E3D 外观下主选中染 CE 黄、其它选中染 highlight 白，整体换色、没有描边；web PBR 下仍是橙红。
 CE = 宿主 `Selection::primary()`（属性面板跟随的那一个），经 `View3d::set_selection(refnos, primary)` 一并下发；
 视口不自己按前后两集之差猜。X-Ray 照旧压过选中（它是辅助态，E3D 没有对应物）。
+选中态**颜色直出**（不打光不反射）且**一律不透明**——2026-10-29 修订，见文末「修订」第 1、2 条。
 
 ### D4　辅助几何与半透明几何不进边线 / 伪阴影
 
@@ -102,7 +103,8 @@ ND 纹理是 `Rgba32Float`（能当颜色附件就用；同来源 `_ndType = can
 - **显存**：超采样下 1500×800 视口（离屏图 3000×1600）粗算 ≈ 180 MB：离屏图 19 + Bevy 主纹理 a/b 38 + prepass 深度 / 法线 38 + ND f32 77 + HLR 5 + 屏幕分辨率的 AO / 模糊 / 去杂四张 5（ND 从 f16 换 f32 多出约 38 MB；下游读它的带宽也翻倍）；两样效果都关时不挂 prepass、中间纹理只是 1×1 占位，只剩离屏图 + 主纹理。超宽窗的物理尺寸夹在 `max_texture_dimension_2d`。
 - **浏览器端头几帧**：egui 在 bevy_egui 算好相机前按 10000×10000 布局，宿主按「视口不可能比窗口大」挡掉那一帧的渲染目标请求；
   离屏图不带 CPU 数据（WebGL2 不收 BGRA 上传）。这两条与外观无关，但是超采样把它们从「报错一行」放大成「丢上下文」。
-- **已知偏差要说出口**：半透明不进边线 / 伪阴影（D4）、SSAA 代 MSAA（D5）、没做 autocolour / Laser / SHINY 分支（来源侧也没做）。
+- **已知偏差要说出口**：半透明不进边线 / 伪阴影（D4）、SSAA 代 MSAA（D5）、没做 autocolour / Laser / SHINY 分支（来源侧也没做）、
+  选中色与真机逐像素值脱钩（修订 1：真机 CE 是 `(255,255,79)`、highlight 是 `(249,249,249)`，现在是纯黄 / 纯白）。
 - **vendor Bevy 带一处本地补丁**（`vendor/registry/bevy_core_pipeline/src/tonemapping/mod.rs`，`.cargo-checksum.json` 同步，补丁头上的注释写明来历）：
   重新 vendor / 升级 Bevy 前先把 `vendor/patches/0001-bevy_core_pipeline-….patch` `git am` 到 happydpc/bevy 并推上去（或确认上游已不给非 HDR 视图排那条管线）；
   cargo 不跟踪 vendor 源码改动，改完要 `cargo clean -p bevy_core_pipeline`。
@@ -115,3 +117,46 @@ ND 纹理是 `Rgba32Float`（能当颜色附件就用；同来源 `_ndType = can
   代价是 D4 的半透明偏差。
 - **MSAA**：WebGL2 读不了多重采样 prepass 纹理，两端就得两套代码；整帧 2×2 一刀切，结构上与 E3D 的 4 采样一致。
 - **定点 ND 的第二套管线**（没有半浮点附件的设备）：多一套着色器要养，而现代浏览器都有这个扩展；灰掉并说明就够。
+
+## 修订（2026-10-29）
+
+计划：`docs/plans/2026-10-29-selection-highlight-visibility-plannotator.md`。起因：用户「对比 e3d 里高亮选中的效果，
+目前 plant-ui 里这里高亮的效果并不是特别好」。查下来不是配色错，是配色被画法洗淡了。
+
+1. **选中态直出颜色**（`look_materials.rs::sgl` 的 `flat` 从「只有 X-Ray」扩到「X-Ray / XraySelected / CE / Highlight」）。
+   出厂预设 `Kr = 0.8`，CE 黄的蓝通道被环境反射抬到约 0.4，屏上从纯黄变成 `(255,255,79)`；highlight 白被 `0.7 + 0.8·env`
+   顶到 `(249,249,249)`，与常态 `(189,189,189)` 只差 60 个灰阶——**选中几乎看不出**。直出后屏上字节等于配色表字节。
+   **代价**：与 E3D 3.1 真机的逐像素值脱钩（真机那两组数见 `docs/evidence/2026-10-22-e3d-look.md:110`）。
+   取舍理由：CONTEXT 把「CE 高亮 / 其它选中」定义为界面语义，没承诺逐像素复刻；可见性优先。
+   要复刻真机值时改回 `flat` 判定即可，不改公式与常数。
+2. **选中态 alpha 归一到 255**（`e3d_colour` 的 `Ce` / `Highlight` 分支）。原来沿用元素自己的 alpha，
+   半透明件选中后既被稀释、又落进 `AlphaMode::Blend`——半透明网格不进 prepass，于是**选中件没有边线与伪阴影**，
+   等于「选了像没选」。这一条修的是 D4 记的那个缺口的一半（E3D `EnhancedEdgesTranslucent = ON`），
+   另一半（未选中半透明件也描边）仍不做，仍要另开一条半透明 prepass。
+3. **第五态 `XraySelected`**：X-Ray 命中且同时在选中集里时，颜色换 CE 黄、alpha 从 64 抬到 160，仍 `flat + Blend`。
+   优先级不变（X-Ray 仍压过 CE / Highlight），只是命中后再看是不是选中——房间视图里点中什么不再只是一片淡蓝。
+   PBR 外观不区分这两态（仍落那枚共享的半透明蓝），画面与改动前一致。`virtual_hole` 的孔洞 X-Ray 同口径。
+4. **悬停预选（阶段四）**：新增 `MaterialState::Hover`，颜色取 PDMS `orange` #ffbe00（E3D 的 active），
+   同样直出、不透明；优先级 `X-Ray > CE > Highlight > Hover > Base`——悬停只落在未选中件上，与 plant3d-web
+   `SelectionManager` 的「选中件不被悬停色覆盖」同口径。宿主侧新增 `Cmd::HoverViewport(Option<[f32;2]>)`，
+   与 `PickViewport` 分开（悬停是连续动作、拾取是一次性语义动作）；**节流在绘制层**（`HOVER_STEP_PX = 5`，
+   指针不在视口 / 落在浮层 / 拖拽中不发，离开时发一次 `None`），视口侧只在目标真的换了才翻 `hover_dirty`。
+   悬停的射线拾取走 `surface_hit(..., quiet: true)`，不打诊断日志（否则每次移动两行）。
+   PBR 外观下悬停不另配色（仍是类型色），改动前的画面不变。
+5. **悬停走增量刷，不整库重刷**（`apply_materials` 拆两条路径）。第 4 条最初把悬停接到了 `selection_dirty` 上，
+   而那个旗子意味着「整库重挑材质」——悬停一次拖动会掠过几十上百个构件，等于每移动几个像素就把五万网格的
+   `material_state` 与 `LookMaterials` 重算一遍。现在 `hover_dirty` 单立，`hover_applied` 记「上一帧刷过的悬停
+   目标」，`apply_materials` 只重挑 refno / owner 命中「旧目标 + 新目标」的实体。选择集 / 外观 / 新网格出生仍走全场刷。
+6. **背景渐变与选中白的对比度不改**（阶段二判定为不做）。背景两端字节（159 / 242）与选中色都是常量，按 WCAG 算：
+   highlight 白落在背景底是 **1.12 : 1**，CE 黄是 1.04 : 1。把渐变下端拉回 grey 会同时把常态件的对比度从 1.68 压到 1.10，
+   方向是错的；加粗选中轮廓要扩 prepass 标记位（`Rgb10a2Unorm` 的 2 bit 已被边线 / 伪阴影占满）并重跑整库远景 A/B，
+   收益不抵风险。真机同样是 1.12 : 1，可见性靠 HLR 黑轮廓——`flat` 只关颜色项，轮廓本来就在。
+   若日后仍判定不够，该做的是「选中描边」独立议题，不是改背景色。
+7. **悬停的输入侧两条修正**：节流阈值改成两个轴各自折算（原式用视口宽度统一归一，扁视口里竖直阈值会掉到
+   2 pt 以下，一抖就发一发射线）；滚轮缩放期间撤掉悬停色（指针不动、相机在动，留着会指着错的元素）。
+   `surface_hit` 的遍历代价已核：Bevy 的 `MeshRayCast::cast_ray` 先并行做 AABB 求交再只对命中者求三角，
+   不再自己加预筛。
+8. **悬停账随构件卸载一起忘**（`forget_model_state`）。`hovered` / `hover_applied` 是新增的按 refno 记的状态，
+   不进卸载清单就会泄漏：同一个 refno 的模型重新装回来时一出生就是 active orange，而鼠标不在那儿。
+   孔洞预览的 `apply_hole_materials` 不需要脏标（它的 query 只匹配被布尔替换过网格的那几十个实例，
+   `attach` 内部先比句柄）；`room_clip` 没有独立的材质裁决分支（房间面板与断口截面都不参与三态裁决）。

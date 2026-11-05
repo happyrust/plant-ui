@@ -11,6 +11,7 @@ pub mod props;
 pub mod room;
 pub mod room_tree;
 pub mod search;
+pub mod spooling;
 pub mod tree;
 pub mod view3d;
 pub mod viewcube;
@@ -65,7 +66,7 @@ impl DockVisibility {
 /// 常驻视图归在哪一侧 dock；三维视图在中央，不归任何一侧。
 fn dock_side_of(pane: Pane) -> Option<DockSide> {
     match pane {
-        Pane::ModelTree | Pane::RoomTree => Some(DockSide::Left),
+        Pane::ModelTree | Pane::RoomTree | Pane::Spooling => Some(DockSide::Left),
         // 虚拟孔洞与属性 / 房间同一格页签：都是「选中一条记录看详情」的右侧面板。
         Pane::Properties | Pane::Room | Pane::VirtualHoles => Some(DockSide::Right),
         Pane::CommandLine | Pane::Logs | Pane::TaskQueue | Pane::IncrementRecords => {
@@ -84,6 +85,11 @@ use crate::vm::WorkbenchVm;
 
 /// PDMS 类型 -> 图标。模型树行首与属性面板头共用一套，同一个元素在两处
 /// 不能是两个形状。挑常见层级给可辨识的形状，其余统一立方体。
+///
+/// spool 一族单独给形状：`SPLDRG`（卷管图）是容器、`SPOOL` / `PSPOOL` / `HSPOOL`
+/// 是成品管段、`FIELD` 是现场段、`PPIECE` 是管段内的制造件。它们在树上会同时
+/// 出现（E3D 3.1 的 pipe fabrication 与老 spooler 并存），混成同一个立方体就分不出
+/// 「这是图、这是段、这是件」。
 pub fn noun_icon(noun: &str) -> &'static str {
     match noun {
         "SITE" => ph::FACTORY,
@@ -94,6 +100,13 @@ pub fn noun_icon(noun: &str) -> &'static str {
         "NOZZ" => ph::PLUGS_CONNECTED,
         "STRU" | "FRMW" => ph::WALL,
         "HANG" | "SUPPO" => ph::ANCHOR,
+        // 卷管图与两个列表层：装 spool 的容器。
+        "SPLDRG" | "PSLIST" | "HSLIST" => ph::STACK,
+        // 成品管段：车间段与现场段分开，制造件再分一层。
+        "SPOOL" | "PSPOOL" => ph::PACKAGE,
+        "HSPOOL" => ph::FAN,
+        "FIELD" => ph::TRUCK,
+        "PPIECE" => ph::SCISSORS,
         _ => ph::CUBE,
     }
 }
@@ -138,9 +151,13 @@ fn build_dock(vis: DockVisibility) -> DockState<Pane> {
         let mut center = NodeIndex::root();
         if vis.left {
             // 房间树跟在模型树后面同一组：都是「浏览库里有什么」的左侧导航，与 plant3d-web
-            // 把它做成模型树里的子页签是同一个位置感。
-            let [c, _left] =
-                surface.split_left(center, 0.19, vec![Pane::ModelTree, Pane::RoomTree]);
+            // 把它做成模型树里的子页签是同一个位置感。Spooling 也归这一组——它同样在回答
+            // 「库里有哪几段管」，只是走另一条层级（不经过 SITE）。
+            let [c, _left] = surface.split_left(
+                center,
+                0.19,
+                vec![Pane::ModelTree, Pane::RoomTree, Pane::Spooling],
+            );
             center = c;
         }
         if vis.right {

@@ -15,13 +15,17 @@ use bevy::prelude::*;
 use plant_ui::{ColourScheme, LookMode, ViewportLook};
 
 use crate::e3d_look::colour_table::{
-    E3D_CE_COLOUR, E3D_DEFAULT_ELEMENT_COLOUR, E3D_HIGHLIGHT_COLOUR, rgb_bytes,
+    E3D_ACTIVE_COLOUR, E3D_CE_COLOUR, E3D_DEFAULT_ELEMENT_COLOUR, E3D_HIGHLIGHT_COLOUR, rgb_bytes,
 };
 use crate::e3d_look::material::{EFFECT_ALL, SglLookMaterial};
 use crate::e3d_look::presets::preset_light;
 use crate::{
     MaterialState, ModelMesh, SELECT_COLOR, XRAY_COLOR, fallback_line_material, model_material,
 };
+
+/// `XraySelected` 的 alpha 字节：比房间 X-Ray 的 64 实得多（穿透还看得见，但一眼能认出点中了谁），
+/// 又没到不透明（不透明会把房间体内部挡死，那正是 X-Ray 存在的理由）。
+const XRAY_SELECTED_ALPHA: u8 = 160;
 
 /// 一枚挑好的模型材质。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,11 +127,15 @@ impl LookMaterials {
         }
         match look.mode {
             // PBR 外观 = 改动前的画面：常态按类型色（含半透明），CE 与其它选中都是橙红 `SELECT_COLOR`。
+            // X-Ray 命中且选中时仍是那枚共享的 X-Ray 材质——PBR 外观不改 X-Ray 的观感（只有 E3D 外观叠黄）。
             LookMode::Pbr => {
                 let colour = match state {
                     MaterialState::Base => bytes_colour(mesh.colour),
                     MaterialState::Ce | MaterialState::Highlight => SELECT_COLOR,
-                    MaterialState::XRay => XRAY_COLOR,
+                    // 悬停预选在 PBR 外观下不另配色：沿用今天的行为（未选中件就是类型色），
+                    // 免得动改动前的画面。
+                    MaterialState::Hover => bytes_colour(mesh.colour),
+                    MaterialState::XRay | MaterialState::XraySelected => XRAY_COLOR,
                 };
                 ModelMaterial::Pbr(self.standard(colour, mesh.line, state, assets))
             }
@@ -154,7 +162,8 @@ impl LookMaterials {
         state: MaterialState,
         assets: &mut MaterialAssets<'_>,
     ) -> Handle<StandardMaterial> {
-        if state == MaterialState::XRay {
+        // PBR 外观不区分「X-Ray 命中且选中」：两态都落那枚共享的半透明蓝，画面与改动前一致。
+        if matches!(state, MaterialState::XRay | MaterialState::XraySelected) {
             return assets.xray.clone();
         }
         let key = MaterialKey {
@@ -199,12 +208,19 @@ impl LookMaterials {
                     assets.env.clone(),
                     EFFECT_ALL,
                 );
-                // X-Ray 是辅助态：与 PBR 外观那枚一样不打光，半透明蓝直出。
-                let material = if state == MaterialState::XRay {
-                    material.flat()
-                } else {
-                    material
-                };
+                // 选中态与 X-Ray 都直出颜色：选中是界面语义，不该被头灯 / 环境反射洗淡
+                // （出厂预设 Kr 0.8，CE 黄的蓝通道会被抬到约 0.4，屏上从纯黄变成 (255,255,79)；
+                // highlight 白被顶到 (249,249,249)，与常态 189 只差 60 个灰阶）。直出只关颜色项，
+                // 合成段的 bytes = col · hlr · ao 照旧，边线与伪阴影都还在。
+                let flat = matches!(
+                    state,
+                    MaterialState::XRay
+                        | MaterialState::XraySelected
+                        | MaterialState::Ce
+                        | MaterialState::Highlight
+                        | MaterialState::Hover
+                );
+                let material = if flat { material.flat() } else { material };
                 assets.sgl.add(material)
             })
             .clone()
@@ -213,7 +229,12 @@ impl LookMaterials {
 
 /// E3D 外观下一个状态的颜色（PDMS `0xRRGGBB`）与 alpha 字节：X-Ray 用房间 X-Ray 的半透明蓝；
 /// CE 黄、其它选中白（`E3D_GRAPHICS_COLOUR_DEFAULTS`）；常态按配色方案——E3D 出厂一色 lightgrey，
-/// 按类型沿用类型色。半透明始终跟着元素自己：半透明是显示属性，不是颜色。
+/// 按类型沿用类型色。
+///
+/// **常态**的半透明跟着元素自己：半透明是显示属性，不是颜色。**选中态**不继承它——选中是界面语义，
+/// 元素自己的 alpha 会把 CE 黄稀释、还会让它掉进 `AlphaMode::Blend`（半透明网格不进 prepass，于是
+/// 选中件没有边线与伪阴影，等于「选了像没选」）。所以 CE / Highlight 一律 alpha 255；
+/// 这也是 E3D `EnhancedEdgesTranslucent = ON` 想要的观感。
 fn e3d_colour(look: ViewportLook, colour: [u8; 4], state: MaterialState) -> (u32, u8) {
     let [r, g, b, a] = colour;
     match state {
@@ -221,8 +242,13 @@ fn e3d_colour(look: ViewportLook, colour: [u8; 4], state: MaterialState) -> (u32
             let [xr, xg, xb, xa] = XRAY_COLOR.to_srgba().to_u8_array();
             (pack_rgb(xr, xg, xb), xa)
         }
-        MaterialState::Ce => (E3D_CE_COLOUR, a),
-        MaterialState::Highlight => (E3D_HIGHLIGHT_COLOUR, a),
+        MaterialState::Ce => (E3D_CE_COLOUR, 255),
+        MaterialState::Highlight => (E3D_HIGHLIGHT_COLOUR, 255),
+        // 悬停预选：E3D 的 active orange，同样直出、不透明（未选中件本来也不该被半透明稀释）。
+        MaterialState::Hover => (E3D_ACTIVE_COLOUR, 255),
+        // X-Ray 命中且同时在选中集里：保留穿透（仍是 Blend），但颜色换成 CE 黄、alpha 抬到 160
+        // ——否则房间视图里点中什么都只是那片淡蓝，「点了谁」看不出来。
+        MaterialState::XraySelected => (E3D_CE_COLOUR, XRAY_SELECTED_ALPHA),
         MaterialState::Base => match look.colour_scheme {
             ColourScheme::E3dFactory => (E3D_DEFAULT_ELEMENT_COLOUR, a),
             ColourScheme::ByType => (pack_rgb(r, g, b), a),
@@ -352,6 +378,11 @@ mod tests {
             bench.resolve(pbr_look(), &pipe, MaterialState::XRay),
             ModelMaterial::Pbr(bench.xray.clone())
         );
+        // PBR 外观不区分「X-Ray 命中且选中」：两态同落那枚共享的半透明蓝，画面与改动前一致。
+        assert_eq!(
+            bench.resolve(pbr_look(), &pipe, MaterialState::XraySelected),
+            ModelMaterial::Pbr(bench.xray.clone())
+        );
         let material = bench.standard.get(match &base {
             ModelMaterial::Pbr(handle) => handle,
             _ => unreachable!(),
@@ -362,8 +393,8 @@ mod tests {
         assert!(material.double_sided);
     }
 
-    /// E3D 外观：实体是 `SglLookMaterial`，出厂配色一色 lightgrey（不同类型共用一枚）、CE 黄、其它选中白，
-    /// 半透明跟着元素自己；按类型配色才回到类型色。
+    /// E3D 外观：实体是 `SglLookMaterial`，出厂配色一色 lightgrey（不同类型共用一枚）、CE 黄、其它选中白；
+    /// 常态的半透明跟着元素自己，选中态归一成不透明；按类型配色才回到类型色。
     #[test]
     fn e3d_look_paints_lightgrey_ce_yellow_highlight_white() {
         let mut bench = Bench::new();
@@ -383,14 +414,34 @@ mod tests {
         assert_eq!(bench.sgl_colour(&ce), ([255, 255, 0], 1.0));
         let highlight = bench.resolve(look, &pipe, MaterialState::Highlight);
         assert_eq!(bench.sgl_colour(&highlight), ([255, 255, 255], 1.0));
-        // 半透明元素（类型色 alpha 200）：颜色换、透明度留。
+        // 选中态直出颜色（不打光不反射）：合成段的 col 才是配色表里的字节，不被 Kr 0.8 洗淡。
+        for material in [&ce, &highlight] {
+            let ModelMaterial::Sgl(handle) = material else {
+                unreachable!()
+            };
+            assert_eq!(
+                bench.sgl.get(handle).unwrap().params.flags.z,
+                1,
+                "选中态直出颜色"
+            );
+        }
+        // 半透明元素（类型色 alpha 200）：常态保留透明度，选中态归一成不透明——否则 CE 黄被稀释，
+        // 而且材质会落进 Blend（半透明网格不进 prepass，选中件就没有边线与伪阴影）。
         let ce_type = mesh("CE", false);
         let translucent = bench.resolve(look, &ce_type, MaterialState::Base);
         let (_, opacity) = bench.sgl_colour(&translucent);
-        assert!((opacity - 200.0 / 255.0).abs() < 1e-6);
+        assert!((opacity - 200.0 / 255.0).abs() < 1e-6, "常态保留半透明");
         let translucent_ce = bench.resolve(look, &ce_type, MaterialState::Ce);
-        let (_, opacity) = bench.sgl_colour(&translucent_ce);
-        assert!((opacity - 200.0 / 255.0).abs() < 1e-6);
+        assert_eq!(
+            bench.sgl_colour(&translucent_ce),
+            ([255, 255, 0], 1.0),
+            "选中态不继承元素的半透明"
+        );
+        let translucent_highlight = bench.resolve(look, &ce_type, MaterialState::Highlight);
+        assert_eq!(
+            bench.sgl_colour(&translucent_highlight),
+            ([255, 255, 255], 1.0)
+        );
         // X-Ray：半透明蓝、不打光。
         let xray = bench.resolve(look, &pipe, MaterialState::XRay);
         let ([r, g, b], opacity) = bench.sgl_colour(&xray);
@@ -400,6 +451,27 @@ mod tests {
             unreachable!()
         };
         assert_eq!(bench.sgl.get(handle).unwrap().params.flags.z, 1);
+        // X-Ray 叠选中：仍是半透明（穿透保留），但换成 CE 黄、alpha 抬到 160。
+        let xray_selected = bench.resolve(look, &pipe, MaterialState::XraySelected);
+        let ([r, g, b], opacity) = bench.sgl_colour(&xray_selected);
+        assert_eq!([r, g, b], [255, 255, 0], "X-Ray 命中且选中 = CE 黄");
+        assert!((opacity - 160.0 / 255.0).abs() < 1e-6, "比纯 X-Ray 实得多");
+        assert_ne!(xray_selected, xray, "与纯 X-Ray 不是同一枚");
+        let ModelMaterial::Sgl(handle) = &xray_selected else {
+            unreachable!()
+        };
+        assert_eq!(bench.sgl.get(handle).unwrap().params.flags.z, 1);
+        // 悬停预选：E3D 的 active orange，同样直出、不透明。
+        let hover = bench.resolve(look, &pipe, MaterialState::Hover);
+        assert_eq!(bench.sgl_colour(&hover), ([255, 190, 0], 1.0));
+        let ModelMaterial::Sgl(handle) = &hover else {
+            unreachable!()
+        };
+        assert_eq!(
+            bench.sgl.get(handle).unwrap().params.flags.z,
+            1,
+            "悬停态直出"
+        );
 
         let mut by_type = look;
         by_type.colour_scheme = ColourScheme::ByType;
@@ -431,6 +503,10 @@ mod tests {
         }
         assert_eq!(
             bench.resolve(ViewportLook::default(), &line, MaterialState::XRay),
+            ModelMaterial::Pbr(bench.xray.clone())
+        );
+        assert_eq!(
+            bench.resolve(ViewportLook::default(), &line, MaterialState::XraySelected),
             ModelMaterial::Pbr(bench.xray.clone())
         );
     }

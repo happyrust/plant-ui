@@ -146,3 +146,9 @@ gen_history_model = false
 # debug_root_refnos = []
 
 # debug_root_refnos = ["17496_195578"]
+
+#【新增 2026-11-01】extra_element_dbnums —— 模型树补充根，默认不写 = 不追加
+# 与 gen-model 同名键同一语义（gen-model ADR-095，只增不减）：这里列的库的 SITE 追加在
+# MDB `mdb_name` 的 SITE 之后。251095 /PIPE_4DK_FWD、251137 /HVAC_2DK_FWD 不在 /ALL 的 CURD 里，
+# Spooling 要定位到它们。走资产根下旧版项目配置时只读工作目录这份；删掉此键即恢复原行为。
+extra_element_dbnums = [251095, 251137]

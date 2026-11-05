@@ -66,6 +66,7 @@ use plant_ui::room_tree::{
     RoomTreeAction, RoomTreeModel, RootsStatus, rooms_status_fallback,
 };
 use plant_ui::settings::{self, State as SettingsState};
+use plant_ui::spooling::{self as spooling_ui, SpoolingAction};
 use plant_ui::style::theme_tokens::{self, set_weight_families_ready};
 use plant_ui::style::tokens::{Density, Tokens};
 use plant_ui::task_queue;
@@ -74,8 +75,9 @@ use plant_ui::vm::{
     DimensionsVm, LogElement, ModelLoadVm, NavEntryVm, NavHistoryVm, PropKind, PropRowVm,
     PropsDataVm, PropsVm, RoomDetailDataVm, RoomDetailVm, RoomMemberVm, RoomRelationVm,
     RoomTreeConfirmVm, RoomTreeDataVm, RoomTreeVm, RoomViewVm, RoomVm, RoomsDataVm,
-    RowVisibility, SearchHitVm, SearchRunVm, SearchVm, Selection, SubIndexVm, TreeRowVm, TreeVm,
-    TruncationVm, View3dVm, WorkbenchVm,
+    RowVisibility, SearchHitVm, SearchRunVm, SearchVm, Selection, SpoolingDataVm,
+    SpoolingGroupVm, SpoolingMemberVm, SpoolingMembersVm, SpoolingRowVm, SpoolingVm, SubIndexVm,
+    TreeRowVm, TreeVm, TruncationVm, View3dVm, WorkbenchVm,
 };
 use plant_ui::virtual_hole::{VirtualHoleOp, VirtualHoleReceipt, VirtualHoleStatus};
 use plant_ui::workbench::{self, Pane, WorkbenchState};
@@ -757,6 +759,7 @@ fn show_app(
     for command in app.view3d_commands.drain(..) {
         match command {
             Cmd::PickViewport(uv) => view3d.pick(uv),
+            Cmd::HoverViewport(uv) => view3d.hover(uv),
             Cmd::Camera(gesture) => view3d.camera(gesture),
             Cmd::Model(action) => view3d.model(action),
             // 视口不可能比窗口大：比窗口还大的请求来自 egui 还没拿到真窗口尺寸的头几帧（浏览器里按缺省的
@@ -1295,6 +1298,77 @@ impl TreeModel {
     }
 }
 
+/// 「Spooling」面板的状态机：六类分组统计、当前分组、行、成员。
+///
+/// 不做 IO：取数走 `data::Req::Spooling*`，回包喂进来。分成「统计」「行」「成员」三段
+/// 而不是一个整包，因为它们各自有独立的在途与失败：行取失败不该把已经拿到的
+/// 分组统计打成失败态（那会让用户看不到「六类各有多少」这个最有用的信息）。
+#[derive(Debug, Default)]
+struct SpoolingModel {
+    /// 分组统计走到哪一步。
+    status: SpoolingStatus,
+    /// 当前选中的分组 noun。`None` = 还没点过，按第一个非空组自动选。
+    active: Option<String>,
+    /// 当前分组的行。
+    rows: Vec<SpoolingRowVm>,
+    rows_loading: bool,
+    rows_error: Option<String>,
+    /// 点开的那个 spool 的成员。
+    members: Option<SpoolingMembersVm>,
+}
+
+#[derive(Debug, Default, Clone)]
+enum SpoolingStatus {
+    #[default]
+    Idle,
+    Loading,
+    Ready(Vec<SpoolingGroupVm>),
+    Failed(String),
+}
+
+impl SpoolingModel {
+    /// 统计就绪时第一个有数据的分组；全 0 时退回第一个（界面上仍能点，只是没行）。
+    fn first_non_empty(groups: &[SpoolingGroupVm]) -> Option<String> {
+        groups
+            .iter()
+            .find(|g| g.count > 0)
+            .or_else(|| groups.first())
+            .map(|g| g.noun.clone())
+    }
+
+    /// 状态机展平成绘制层的 `vm.spooling`。
+    fn to_vm(&self, selection: &Selection) -> SpoolingVm {
+        match &self.status {
+            SpoolingStatus::Idle => SpoolingVm::Idle,
+            SpoolingStatus::Loading => SpoolingVm::Loading,
+            SpoolingStatus::Failed(reason) => SpoolingVm::Failed(reason.clone()),
+            SpoolingStatus::Ready(groups) => {
+                let primary = selection.primary();
+                SpoolingVm::Ready(SpoolingDataVm {
+                    groups: groups.clone(),
+                    active: self.active.clone(),
+                    rows_loading: self.rows_loading,
+                    rows: self
+                        .rows
+                        .iter()
+                        .map(|row| SpoolingRowVm {
+                            selected: selection.contains(row.refno),
+                            primary: primary == Some(row.refno),
+                            ..row.clone()
+                        })
+                        .collect(),
+                    // 取满 `SPOOL_ROW_LIMIT` 就当「后面还有」——精确总数要多一次
+                    // `count()` 查询，而这一层在 AMS 上是 0 条，为它多打一次库不划算。
+                    rows_truncated_at: (self.rows.len() >= data::SPOOL_ROW_LIMIT)
+                        .then_some(data::SPOOL_ROW_LIMIT),
+                    rows_error: self.rows_error.clone(),
+                    members: self.members.clone(),
+                })
+            }
+        }
+    }
+}
+
 struct App {
     vm: WorkbenchVm,
     state: WorkbenchState,
@@ -1328,6 +1402,12 @@ struct App {
     tube_visibility: HashMap<RefU64, HashMap<plant_ui::TubeSegment, bool>>,
     /// 直段行点过眼睛、还没落到画面上的方向（与 `TreeModel::pending_direction` 同一套规矩，只是按段记）。
     tube_pending: HashMap<RefU64, HashMap<plant_ui::TubeSegment, bool>>,
+    /// 「Spooling」面板（卷管 / 管段）的状态：六类分组统计、当前分组、行、成员。
+    ///
+    /// 不做 IO：取数走 `data::Req::Spooling*`，回包喂进来。分组统计在面板第一次
+    /// 成为活动页签时才拉（与房间树同一条规矩）。spool 的 owner 链不经过 `SITE`，
+    /// 所以它不在模型树里——这一层自成一套入口。
+    spooling: SpoolingModel,
     data_publish_state: DataPublishState,
     manual_data_publish_state: ManualDataPublishState,
     project_picker_state: ProjectPickerState,
@@ -2513,6 +2593,7 @@ impl App {
             room_tree_internal_selection: false,
             tube_visibility: HashMap::new(),
             tube_pending: HashMap::new(),
+            spooling: SpoolingModel::default(),
             data_publish_state: DataPublishState::default(),
             manual_data_publish_state: ManualDataPublishState::default(),
             project_picker_state: ProjectPickerState::new(Vec::new(), false),
@@ -3067,6 +3148,129 @@ impl App {
                         self.vm.room_refnos = rows.into_iter().map(|(_, room)| room).collect();
                     }
                 }
+                // Spooling：六类分组统计回包。
+                data::Evt::SpoolingOverview(result) => {
+                    match result {
+                        Ok(groups) => {
+                            let groups: Vec<SpoolingGroupVm> = groups
+                                .into_iter()
+                                .map(|g| SpoolingGroupVm {
+                                    noun: g.noun,
+                                    label: g.label,
+                                    count: g.count,
+                                })
+                                .collect();
+                            // 还没选过分组就自动选第一个非空的：这一层在 AMS 上六类全 0，
+                            // 那就选第一个，面板仍然给出「六类都在、计数都是 0」这句话。
+                            if self.spooling.active.is_none() {
+                                self.spooling.active = SpoolingModel::first_non_empty(&groups);
+                            }
+                            // 当前分组有数据才去拉行；全 0 时不必白打一次库。
+                            let fetch = self
+                                .spooling
+                                .active
+                                .as_ref()
+                                .and_then(|noun| groups.iter().find(|g| &g.noun == noun))
+                                .is_some_and(|g| g.count > 0);
+                            self.spooling.status = SpoolingStatus::Ready(groups);
+                            if fetch && let Some(noun) = self.spooling.active.clone() {
+                                self.spooling_fetch_rows(&noun, true);
+                            } else {
+                                self.spooling.rows.clear();
+                                self.spooling.rows_loading = false;
+                            }
+                        }
+                        Err(e) => {
+                            self.spooling.status = SpoolingStatus::Failed(logs::error_chain(&e));
+                            self.logs.error(&mut self.vm.logs, "管段统计取数失败", &e, None);
+                        }
+                    }
+                    self.rebuild_spooling();
+                }
+                // Spooling：某一类分组行回包。`noun` 对不上当前分组 = 切走的旧回包，丢。
+                data::Evt::SpoolRows(noun, result)
+                    if self.spooling.active.as_deref() == Some(noun.as_str()) =>
+                {
+                    self.spooling.rows_loading = false;
+                    match result {
+                        Ok(rows) => {
+                            self.spooling.rows = rows
+                                .into_iter()
+                                .map(|row| SpoolingRowVm {
+                                    refno: row.refno,
+                                    noun: row.noun.clone(),
+                                    label: spooling_ui::row_label(&row.noun, &row.name, row.refno),
+                                    meta: spooling_ui::row_meta(
+                                        &row.owner_noun,
+                                        row.dbnum,
+                                        row.children_count,
+                                    ),
+                                    owner: Some(row.owner),
+                                    dbnum: row.dbnum,
+                                    children_count: row.children_count,
+                                    selected: false,
+                                    primary: false,
+                                    // 可见性快照由后续 host 侧 feature 填；行刚到时还没算过它
+                                    // 名下几何，按未加载起步（与模型树行同一套四态）。
+                                    ..SpoolingRowVm::default()
+                                })
+                                .collect();
+                            self.spooling.rows_error = None;
+                        }
+                        Err(e) => {
+                            self.spooling.rows.clear();
+                            self.spooling.rows_error = Some(logs::error_chain(&e));
+                        }
+                    }
+                    self.rebuild_spooling();
+                }
+                data::Evt::SpoolRows(..) => {}
+                // Spooling：成员回包。`of` 对不上当前展开的那一段 = 旧回包，丢。
+                data::Evt::SpoolMembers(of, result)
+                    if self
+                        .spooling
+                        .members
+                        .as_ref()
+                        .is_some_and(|m| m.of == Some(of)) =>
+                {
+                    let via = |via: plant_ui_data::spooling::MemberVia| match via {
+                        plant_ui_data::spooling::MemberVia::Owner => "结构成员",
+                        plant_ui_data::spooling::MemberVia::Attribute => "断点引用",
+                    };
+                    let members = match result {
+                        Ok(rows) => SpoolingMembersVm {
+                            of: Some(of),
+                            loading: false,
+                            rows: rows
+                                .into_iter()
+                                .map(|m| SpoolingMemberVm {
+                                    refno: m.refno,
+                                    noun: m.noun.clone(),
+                                    label: spooling_ui::row_label(&m.noun, &m.name, m.refno),
+                                    via: via(m.via),
+                                    // 成员行的可见性快照同样由后续 host 侧 feature 填，
+                                    // 刚到时按未加载起步。
+                                    ..SpoolingMemberVm::default()
+                                })
+                                .collect(),
+                            error: None,
+                        },
+                        Err(e) => SpoolingMembersVm {
+                            of: Some(of),
+                            loading: false,
+                            rows: Vec::new(),
+                            error: Some(logs::error_chain(&e)),
+                        },
+                    };
+                    self.spooling.members = Some(members);
+                    self.rebuild_spooling();
+                }
+                data::Evt::SpoolMembers(..) => {}
+                // Spooling：spool → 几何的翻译回包。本 feature 只把通道接通，
+                // 显隐转发（登记 `model_scopes` + 按挂起方向 `set_model_visible`）
+                // 归下一个 feature。这里不落任何状态，但字段要显式接住——回包带了
+                // refno 与结果，谁读都得先认下它们。
+                data::Evt::SpoolGeometry(_refno, _result) => {}
                 // 场景在点击取回工作那一刻已经清空，查回来的批次一律上屏：它比
                 // 空场景新，也比旧几何新。上屏时若又有新保存落库，后续自动刷新
                 // 照旧只换树并在日志里提示再点取回工作——不再整包丢弃结果，否则
@@ -4894,6 +5098,12 @@ impl App {
                     }
                 }
                 Cmd::RoomTree(action) => self.room_tree_action(action),
+                // 定位要走 `LocateElement` 与 `Model(Focus)` 两条既有入口，它们都要 ctx，
+                // 所以在这里展开，而不是进 `spooling_action`。
+                Cmd::Spooling(SpoolingAction::Locate(refno)) => {
+                    self.handle_cmds(ctx, plant_ui::spooling::locate_cmds(refno));
+                }
+                Cmd::Spooling(action) => self.spooling_action(action),
                 Cmd::RevealRoomInTree(room) => self.reveal_room_in_tree(room),
                 Cmd::FocusTreeScope(target) => {
                     // 用户显式点了定位：更早挂着的孔洞取景 / 房间取景 / 房间树取景就此作废，
@@ -4979,6 +5189,7 @@ impl App {
                     self.view3d_commands.push(command);
                 }
                 command @ (Cmd::PickViewport(_)
+                | Cmd::HoverViewport(_)
                 | Cmd::Camera(_)
                 | Cmd::ResizeViewport(_)
                 | Cmd::SetViewportGrid(_)
@@ -6095,6 +6306,9 @@ impl App {
             self.room_tree_reveal = Some(id);
             self.rebuild_room_tree();
         }
+        // Spooling 行的选中态跟着全局选择集走（与房间树同一条：绘制层只读）。
+        // 这里无条件重展平——别处选中了一个 spool 元素时，那一行也该亮起来。
+        self.rebuild_spooling();
     }
 
     /// 主选中能挂尺寸标注的 BRAN 随选中与树同步（视口右键菜单的靶子，计划 B2）。
@@ -7632,6 +7846,128 @@ impl App {
             }
         };
         self.vm.room_tree = next;
+    }
+
+    // ------------------------------------------------ Spooling（卷管 / 管段）
+
+    /// 把状态机展平成绘制层的 `vm.spooling`。选中态在这里叠（与房间树同一条规矩：
+    /// 绘制层不碰全局选择集）。
+    fn rebuild_spooling(&mut self) {
+        self.vm.spooling = self.spooling.to_vm(&self.vm.selection);
+    }
+
+    fn spooling_action(&mut self, action: SpoolingAction) {
+        match action {
+            SpoolingAction::Load => self.spooling_load(false),
+            // 刷新只重拉统计：行由统计回包按当前分组触发一次，不在这里再发一次
+            // ——同一个 noun 打两遍库，后到的还会把先到的覆盖掉。
+            SpoolingAction::Refresh => self.spooling_load(true),
+            SpoolingAction::SelectGroup(noun) => {
+                if self.spooling.active.as_deref() == Some(noun.as_str()) {
+                    return;
+                }
+                // 统计说这一类是 0 条时不必打库：直接清空，界面照样说「这一类没有元素」。
+                let count = match &self.spooling.status {
+                    SpoolingStatus::Ready(groups) => groups
+                        .iter()
+                        .find(|g| g.noun == noun)
+                        .map(|g| g.count)
+                        .unwrap_or(0),
+                    _ => 0,
+                };
+                self.spooling.active = Some(noun.clone());
+                self.spooling.members = None;
+                if count == 0 {
+                    self.spooling.rows.clear();
+                    self.spooling.rows_loading = false;
+                    self.spooling.rows_error = None;
+                } else {
+                    self.spooling_fetch_rows(&noun, true);
+                }
+            }
+            // `handle_cmds` 先截走了这一支（要 ctx）；走到这里说明有人绕过了它。
+            SpoolingAction::Locate(_) => {}
+            // 绘制层已经把方向算好了（`row.next_visible`），但把 spool 翻译成几何、
+            // 再走 `set_model_visible` 这条唯一显隐路径要由 host 侧的 feature 接线。
+            // 在那之前只记一句，不留 panic 分支——点了眼睛没反应，日志里能看出为什么。
+            SpoolingAction::SetVisible { refno, visible } => {
+                self.logs.warn(
+                    &mut self.vm.logs,
+                    format!(
+                        "管段面板：显示 / 隐藏 {refno}（visible={visible}）还没有接线，这一下被丢弃"
+                    ),
+                );
+                return;
+            }
+            SpoolingAction::SelectRow(refno) => {
+                // 点行：写进全局选择集（属性面板跟着走），同时展开它的成员。
+                // 两种身份都可能点进来——spool 行自己，或者它下面的成员行；
+                // 成员行没有自己的 spool 可展开，就不发成员查询。
+                self.set_selection(Selection::single(refno));
+                let is_spool_row = self.spooling.rows.iter().any(|row| row.refno == refno);
+                if is_spool_row {
+                    if self
+                        .spooling
+                        .members
+                        .as_ref()
+                        .is_some_and(|m| m.of == Some(refno) && !m.loading)
+                    {
+                        // 再点一次收起。
+                        self.spooling.members = None;
+                    } else {
+                        self.spooling.members = Some(SpoolingMembersVm {
+                            of: Some(refno),
+                            loading: true,
+                            rows: Vec::new(),
+                            error: None,
+                        });
+                        let _ = self.bridge.req.send(data::Req::SpoolMembers(refno));
+                    }
+                }
+            }
+        }
+        self.rebuild_spooling();
+    }
+
+    /// 拉六类分组统计。`force` = 刷新钮：在途 / 已就绪都重来；否则只在 Idle 或
+    /// 失败态时发——失败态上的「重试」走的也是这一条，不重发就永远停在错误页。
+    fn spooling_load(&mut self, force: bool) {
+        if !force
+            && !matches!(
+                self.spooling.status,
+                SpoolingStatus::Idle | SpoolingStatus::Failed(_)
+            )
+        {
+            return;
+        }
+        self.spooling.status = SpoolingStatus::Loading;
+        // 刷新时先把行标成在途：统计回包会按当前分组重拉行，中间那一拍不该让
+        // 上一批行看着像新的。
+        if force {
+            self.spooling.rows_loading = true;
+        }
+        if self.bridge.req.send(data::Req::SpoolingOverview).is_err() {
+            self.spooling.status = SpoolingStatus::Failed("数据查询线程已停止".to_owned());
+            self.spooling.rows_loading = false;
+        }
+    }
+
+    /// 拉某一类的行。切分组时 `reset` 清掉上一组的行，刷新时不清（同组数据，留着防闪）。
+    fn spooling_fetch_rows(&mut self, noun: &str, reset: bool) {
+        self.spooling.rows_loading = true;
+        self.spooling.rows_error = None;
+        if reset {
+            self.spooling.rows.clear();
+        }
+        if self
+            .bridge
+            .req
+            .send(data::Req::SpoolRows(noun.to_string()))
+            .is_err()
+        {
+            self.spooling.rows_loading = false;
+            self.spooling.rows_error = Some("数据查询线程已停止".to_owned());
+        }
     }
 
     /// 拉根清单。`force` = 刷新钮：丢掉全部缓存重来；否则在途 / 已就绪就不重发。

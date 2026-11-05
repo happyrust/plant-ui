@@ -11,6 +11,9 @@ pub mod project_picker;
 pub mod room_browser;
 pub mod room_tree;
 pub mod settings;
+/// Spooling 面板的动作与纯计算。数据查询在 `plant_ui_data::spooling`，
+/// 状态在 `vm::SpoolingVm`。与模型树分开：spool 不挂在 SITE 下。
+pub mod spooling;
 pub mod style;
 pub mod task_queue;
 pub mod vm;
@@ -516,6 +519,12 @@ pub enum Cmd {
     /// （专业 / 单元类型 / 其他构件）没有 refno，模型树那套按 refno 的命令套不上。宿主把节点下的
     /// refno 收齐（单元级及以上连所属 BRAN）再转成既有的 [`ModelAction`]，没有第二套显隐路径。
     RoomTree(room_tree::RoomTreeAction),
+    /// 「Spooling」面板（卷管 / 管段）的动作：拉六类统计、切分组、取行、取成员、点选。
+    ///
+    /// 这一层的数据面与模型树同一个（`pe` / `pe_owner`），但**入口不同**：spool 的
+    /// owner 链不经过 `SITE`，从 SITE 根出发的树永远走不到它。所以在 AMS 上这六类
+    /// 全 0 是数据现状（带 spool 的库不在 `/ALL` 的 `CURD` 名单里），不是查询坏了。
+    Spooling(spooling::SpoolingAction),
     /// 「房间」页签上的「在房间树查看」：切到房间树面板，取这间房的树、展开到第一层、滚到它。
     /// 带的是房间 FRMW 的 refno；不在册（服务端清单里没有）时宿主在日志里说一句。
     RevealRoomInTree(aios_core::RefU64),
@@ -636,6 +645,11 @@ pub enum Cmd {
     /// 点击三维视口；坐标是离屏渲染纹理的归一化 UV。
     /// 测量态下宿主把它当取点，否则当模型拾取——判断哪一种归宿主。
     PickViewport([f32; 2]),
+    /// 指针掠过三维视口；坐标同 [`Self::PickViewport`]。`None` = 指针离开视口或落在浮层上。
+    ///
+    /// 与 `PickViewport` 分开：悬停是连续动作（E3D 的 active 预选色），拾取是一次性语义动作。
+    /// **节流归绘制层**：每发一次都要在宿主侧走一遍射线，整库五万网格按 60 Hz 发不起。
+    HoverViewport(Option<[f32; 2]>),
     /// 三维视口上的相机操作。与 `PickViewport` 分开：点是一次性的语义动作，
     /// 而相机是一段连续运动，两者的生命周期对不上。
     Camera(CameraGesture),

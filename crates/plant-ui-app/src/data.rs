@@ -31,6 +31,12 @@ use crate::search_index::{Scope, SearchIndex, SearchIndexState, SubstringHits};
 /// 那条慢路多扫一会儿。取满这个数就等于「后面还有」，界面据此提示缩小范围。
 pub const SEARCH_LIMIT: usize = 20;
 
+/// Spooling 面板一次最多列多少条。
+///
+/// 一整套 AMS 的 `PPIECE` 是万级，全画出来既滚不动也没人看。500 条够定位到目标，
+/// 超出时面板上会说「仅显示前 N 条」——不是静默截断。
+pub const SPOOL_ROW_LIMIT: usize = 500;
+
 /// Expected transport capability, not a failed query or an empty result.
 #[derive(Debug)]
 pub(crate) struct MirrorFeatureUnavailable(pub String);
@@ -194,6 +200,22 @@ pub enum Req {
     /// 全部在册 PANEL → 所属房间（230 行级，轻）。右键菜单靠它认出「这一行是房间」，
     /// 一次取回放进 Vm，之后纯内存判定。
     PanelRooms,
+    /// Spooling 面板的六类分组统计（`pe` 上按 noun 分组计数，轻）。
+    ///
+    /// 与模型树同一个数据面，但入口不同：spool 的 owner 链不经过 `SITE`，
+    /// 从 SITE 根出发的树永远走不到它（见 `plant_ui_data::spooling`）。
+    SpoolingOverview,
+    /// 某一类 spool 元素的列表。`noun` 必须是 `SPOOL_GROUPS` 里的一个。
+    SpoolRows(String),
+    /// 一个 spool 元素的成员：`pe_owner` 结构边 + spool 自己的引用属性
+    /// （`SPLMEM` / `PSARFA` / `AELRFA` …）两路合并。
+    SpoolMembers(RefU64),
+    /// 一个 spool 元素名下的几何 refno 列表。
+    ///
+    /// spool 节点自己没有几何（`PSPOOL:…_1000` 在 `inst_relate` 里命中 0 行），
+    /// 翻译规则见 `plant_ui_data::spooling::spool_geometry`。眼睛要显隐 spool，
+    /// 就得先经这一臂把它换成真正能 `SetVisible` 的几何。
+    SpoolGeometry(RefU64),
     /// 取回工作的三维重装：**只重查**已生成的产物，不先生成（ADR-0030 D3）。
     ///
     /// `roots` 是快照里的模型 refno（库供数按它一根一条 `anc CONTAINS` 查）；`scope_targets`
@@ -480,6 +502,21 @@ pub enum Evt {
     RoomsOverview(anyhow::Result<Vec<plant_ui_data::room::RoomOverviewRow>>),
     /// 全部在册 PANEL → 所属房间。
     PanelRooms(anyhow::Result<Vec<(RefU64, RefU64)>>),
+    /// Spooling 六类分组统计。
+    SpoolingOverview(anyhow::Result<Vec<plant_ui_data::spooling::SpoolGroup>>),
+    /// 某一类 spool 元素的行。`noun` 原样带回，晚到的旧分组结果要认得出来才好丢。
+    SpoolRows(
+        String,
+        anyhow::Result<Vec<plant_ui_data::spooling::SpoolRow>>,
+    ),
+    /// 一个 spool 元素的成员。`of` 原样带回，理由同上。
+    SpoolMembers(
+        RefU64,
+        anyhow::Result<Vec<plant_ui_data::spooling::SpoolMember>>,
+    ),
+    /// 一个 spool 元素名下的几何 refno。`refno` 原样带回，理由同上：晚到的旧结果
+    /// 要认得出来才好丢。
+    SpoolGeometry(RefU64, anyhow::Result<Vec<RefU64>>),
     /// 取回工作重装的整批模型记录，连同每个库认下的取数源（spec §4.12）：日志据此
     /// 说出哪几个库此刻由 API 从内存供数。
     Models(bool, anyhow::Result<crate::model_update_api::ModelRecords>),
@@ -923,6 +960,40 @@ async fn handle_read(
                 Err(error) => Err(error),
             };
             let _ = evt_tx.send(Evt::PanelRooms(r));
+        }
+        Req::SpoolingOverview => {
+            // 走同一条镜像就绪闸：没连上库时给的是「镜像这一侧不通」那句注释，
+            // 而不是一条 SurrealQL 报错。
+            let r = match require_mirror_feature("管段").await {
+                Ok(()) => plant_ui_data::spooling::spooling_overview().await,
+                Err(error) => Err(error),
+            };
+            let _ = evt_tx.send(Evt::SpoolingOverview(r));
+        }
+        Req::SpoolRows(noun) => {
+            let r = match require_mirror_feature("管段").await {
+                Ok(()) => {
+                    plant_ui_data::spooling::spool_rows(&noun, SPOOL_ROW_LIMIT).await
+                }
+                Err(error) => Err(error),
+            };
+            let _ = evt_tx.send(Evt::SpoolRows(noun, r));
+        }
+        Req::SpoolMembers(refno) => {
+            let r = match require_mirror_feature("管段").await {
+                Ok(()) => plant_ui_data::spooling::spool_members(refno.into()).await,
+                Err(error) => Err(error),
+            };
+            let _ = evt_tx.send(Evt::SpoolMembers(refno, r));
+        }
+        Req::SpoolGeometry(refno) => {
+            // 与上面三臂同一个镜像就绪闸：没连上库时给的是「镜像这一侧不通」那句
+            // 注释，而不是一条 SurrealQL 报错。
+            let r = match require_mirror_feature("管段").await {
+                Ok(()) => plant_ui_data::spooling::spool_geometry(refno.into()).await,
+                Err(error) => Err(error),
+            };
+            let _ = evt_tx.send(Evt::SpoolGeometry(refno, r));
         }
         Req::ResolveName(name) => {
             let result = face.resolve_name(&name).await;
@@ -2453,6 +2524,55 @@ mod tests {
         assert!(
             !production.contains("std::time::Instant"),
             "数据线程的计时要用 web_time::Instant"
+        );
+    }
+
+    /// spool → 几何那一臂必须与 `SpoolMembers` 同构：同一个镜像就绪闸、同一个
+    /// 「refno 原样带回」的回包形状。
+    ///
+    /// 这条钉住三件事：闸门用的是 `"管段"`（不是别的特性名），查询走的是
+    /// `spool_geometry`（不是 `spool_members`），回包把请求里的 refno 原样带回
+    /// ——晚到的旧结果要靠它认出来才好丢。
+    #[test]
+    fn the_spool_geometry_lane_mirrors_spool_members() {
+        let arm = body()
+            .split_once("Req::SpoolGeometry(refno) => {")
+            .expect("spool → 几何那一臂")
+            .1
+            .split_once("Req::ResolveName(name) => {")
+            .expect("下一臂")
+            .0;
+        assert!(
+            arm.contains("require_mirror_feature(\"管段\")"),
+            "必须走「管段」这条镜像就绪闸：{arm}"
+        );
+        assert!(
+            arm.contains("plant_ui_data::spooling::spool_geometry(refno.into())"),
+            "必须查 spool_geometry：{arm}"
+        );
+        assert!(
+            arm.contains("Evt::SpoolGeometry(refno, r)"),
+            "refno 要原样带回：{arm}"
+        );
+        // 镜像不通时回的是那句注释，不是一条 SurrealQL 报错：这一臂不许自己造错误。
+        assert!(
+            !arm.contains("anyhow::anyhow!") && !arm.contains("bail!"),
+            "这一臂不该自己拼错误，闸门已经给了人话：{arm}"
+        );
+    }
+
+    /// 通道两头的形状：`Req::SpoolGeometry(RefU64)` 与
+    /// `Evt::SpoolGeometry(RefU64, Result<Vec<RefU64>>)`，与 `SpoolMembers` 逐字同构。
+    #[test]
+    fn the_spool_geometry_ipc_pair_keeps_the_refno() {
+        let production = body();
+        assert!(
+            production.contains("SpoolGeometry(RefU64),"),
+            "Req 变体必须是单参数的 refno"
+        );
+        assert!(
+            production.contains("SpoolGeometry(RefU64, anyhow::Result<Vec<RefU64>>),"),
+            "Evt 变体必须是「refno + 几何集结果」"
         );
     }
 }

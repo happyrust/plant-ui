@@ -35,7 +35,7 @@ use bevy::render::render_resource::{
     Extent3d, Shader, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
 };
 use bevy::render::renderer::{RenderAdapter, RenderDevice};
-use bevy::render::view::NoIndirectDrawing;
+use bevy::render::view::{NoIndirectDrawing, VisibilitySystems};
 use bevy::render::{Render, RenderApp, RenderSystems, renderer::render_system};
 use bevy::transform::TransformSystems;
 use bevy_egui35::{EguiUserTextures, egui};
@@ -47,6 +47,7 @@ use plant_ui::{
 pub mod e3d_look;
 mod look_materials;
 pub mod mesh_source;
+mod render_gate;
 mod room_clip;
 mod virtual_hole;
 
@@ -190,6 +191,8 @@ impl Plugin for View3dPlugin {
         app.init_resource::<ViewportResizeSync>()
             .init_resource::<WorldAxesEnabled>()
             .init_resource::<IndirectDrawing>()
+            .init_resource::<render_gate::ViewportRenderGate>()
+            .init_resource::<render_gate::PipelinesPending>()
             .init_resource::<room_clip::RoomClip>()
             .init_resource::<LookMaterials>()
             // E3D 外观的实体材质：prepass 开着，阶段二的边线 / 伪阴影读它写的深度与标记；
@@ -240,6 +243,15 @@ impl Plugin for View3dPlugin {
                     publish_camera.after(TransformSystems::Propagate),
                     // 后处理的深度范围同理用本帧的相机位姿。
                     sync_camera_look.after(TransformSystems::Propagate),
+                    // 空闲停画：相机姿态、显隐与外观件都定了之后才判；相机被唤醒的这一帧要赶上可见性检查。
+                    render_gate::gate_viewport_render
+                        .after(TransformSystems::Propagate)
+                        .after(VisibilitySystems::VisibilityPropagate)
+                        .after(sync_camera_look)
+                        .before(VisibilitySystems::CheckVisibility),
+                    render_gate::freeze_view_visibility_while_idle
+                        .after(render_gate::gate_viewport_render)
+                        .in_set(VisibilitySystems::CheckVisibility),
                 ),
             );
         // `--look-demo` / `?look_demo=1`（E3D 外观移植计划的演示厂）：宿主插了 `LookDemo` 资源才摆场景。
@@ -247,10 +259,17 @@ impl Plugin for View3dPlugin {
         #[cfg(any(debug_assertions, feature = "look-demo"))]
         app.add_systems(PostStartup, e3d_look::demo::spawn_look_demo)
             .add_systems(Update, e3d_look::demo::report_frame_time);
+        let pipelines_pending = app
+            .world()
+            .resource::<render_gate::PipelinesPending>()
+            .clone();
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
-            render_app.add_systems(
+            render_app.insert_resource(pipelines_pending).add_systems(
                 Render,
-                acknowledge_viewport_render
+                (
+                    acknowledge_viewport_render,
+                    render_gate::publish_pending_pipelines,
+                )
                     .after(render_system)
                     .in_set(RenderSystems::Render),
             );
@@ -364,6 +383,16 @@ pub struct View3d {
     /// 它染 CE yellow，其余选中染 highlight white；PBR 外观下两者同色。总在 `selected` 里。
     primary: Option<RefU64>,
     selection_dirty: bool,
+    /// 悬停目标换了、还没刷进材质。与 `selection_dirty` 分开：选择集变了要全场重挑，悬停变了
+    /// 只动「旧目标 + 新目标」那一两个实体，分开记才不用为一次鼠标移动付全场遍历。
+    hover_dirty: bool,
+    /// 鼠标此刻掠过的那一个（E3D 的 active）。宿主按指针位置下发；只对未选中件生效
+    /// （选中件不被悬停色覆盖）。与 `picked` 分开：那个是「点中了」，这个是「指着」。
+    hovered: Option<RefU64>,
+    /// 上一帧已经刷进材质的悬停目标。悬停是连续动作，每换一件都全场重挑一遍材质太贵
+    /// （整库五万网格），所以 `apply_materials` 只重挑「旧目标 + 新目标」命中的实体——这个字段
+    /// 就是那个「旧目标」。其余实体的悬停态没变，句柄原样留着。
+    hover_applied: Option<RefU64>,
     /// 当前完整的 X-Ray 目标集；同时匹配模型 refno 与 owner。
     xray: HashSet<RefU64>,
     material_dirty: bool,
@@ -471,6 +500,14 @@ impl View3d {
         // TODO(诊断): 拾取排查完删除。
         diag(format!("[诊断] UI 发出拾取 uv={uv:?}"));
         self.commands.push_back(ViewCommand::Pick(uv));
+    }
+
+    /// 指针掠过视口（E3D 的 active 预选）。`None` = 指针离开视口或落在浮层上，撤掉悬停色。
+    ///
+    /// 与 [`Self::pick`] 分开：那个是「点中了」，这个是「指着」；绘制层自己节流（每次射线
+    /// 都要走一遍 `MeshRayCast`，整库五万网格按 60 Hz 发不起），这里只保证「同一目标不重复翻脏标」。
+    pub fn hover(&mut self, uv: Option<[f32; 2]>) {
+        self.commands.push_back(ViewCommand::Hover(uv));
     }
 
     /// 下发当前选择集与主选中（宿主 `Selection::primary()`，最后一次点中的那一个 = E3D 口径的 CE）。
@@ -944,6 +981,9 @@ enum ViewCommand {
     Camera(CameraGesture),
     Model(ModelAction),
     Pick([f32; 2]),
+    /// 指针掠过视口：`Some(uv)` 按该位置求命中，`None` 撤掉悬停色。与 `Pick` 分开——
+    /// 悬停是连续动作、拾取是一次性语义动作。
+    Hover(Option<[f32; 2]>),
     GridColor(Color),
     Snap {
         forward: Vec3,
@@ -1166,6 +1206,9 @@ fn setup(
         selected: HashSet::new(),
         primary: None,
         selection_dirty: false,
+        hover_dirty: false,
+        hovered: None,
+        hover_applied: None,
         xray: HashSet::new(),
         material_dirty: false,
         bounds: HashMap::new(),
@@ -1405,7 +1448,10 @@ fn aim_headlight(
         return;
     };
     for mut light in &mut lights {
-        light.look_to(aim, Vec3::Y);
+        let mut aimed = *light;
+        aimed.look_to(aim, Vec3::Y);
+        // 相机不动时朝向不变，不写就不触发变更检测；空闲停画靠它判断场景静止。
+        light.set_if_neq(aimed);
     }
 }
 
@@ -1700,33 +1746,49 @@ fn xray_material() -> StandardMaterial {
     }
 }
 
-/// 一块网格此刻的显示状态。E3D 外观下四态四色（常态 / highlight 白 / CE 黄 / X-Ray 蓝），
-/// PBR 外观只有三枚材质，CE 与 Highlight 落到同一枚高亮（都由 `LookMaterials` 裁决）。
+/// 一块网格此刻的显示状态。E3D 外观下六态六色（常态 / 悬停预选橙 / highlight 白 / CE 黄 / X-Ray 蓝 /
+/// X-Ray 叠选中黄），PBR 外观只有三枚材质，CE 与 Highlight 落到同一枚高亮、X-Ray 两态落到同一枚半透明蓝
+/// （都由 `LookMaterials` 裁决）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum MaterialState {
     Base,
+    /// 鼠标掠过、还没选中（E3D 的 active）。只落在未选中件上——选中件不被悬停色覆盖。
+    Hover,
     /// 选中但不是主选中。
     Highlight,
     /// 主选中（E3D 的 CE）。
     Ce,
     XRay,
+    /// X-Ray 命中且同时在选中集里：穿透保留，颜色换成 CE 黄、alpha 抬到 160——
+    /// 否则房间视图里点中什么都只是那片淡蓝，「点了谁」看不出来。
+    XraySelected,
 }
 
-/// 普通实体与无效 TUBI 共用的唯一状态裁决：X-Ray > CE > Highlight > Base，且 refno / owner
-/// 任一命中都生效。
+/// 普通实体与无效 TUBI 共用的唯一状态裁决：X-Ray > CE > Highlight > Hover > Base，且 refno / owner
+/// 任一命中都生效。X-Ray 命中时再看它是不是选中：是就升成 `XraySelected`（穿透 + 黄），
+/// 不是才是纯 X-Ray 蓝。悬停只给未选中件——「选中件不被悬停色覆盖」与 plant3d-web 的
+/// `SelectionManager` 同口径。
 fn material_state(
     selected: &HashSet<RefU64>,
     primary: Option<RefU64>,
     xray: &HashSet<RefU64>,
+    hovered: Option<RefU64>,
     refno: RefU64,
     owner: RefU64,
 ) -> MaterialState {
+    let selected_hit = selected.contains(&refno) || selected.contains(&owner);
     if xray.contains(&refno) || xray.contains(&owner) {
-        MaterialState::XRay
+        if selected_hit {
+            MaterialState::XraySelected
+        } else {
+            MaterialState::XRay
+        }
     } else if primary == Some(refno) || primary == Some(owner) {
         MaterialState::Ce
-    } else if selected.contains(&refno) || selected.contains(&owner) {
+    } else if selected_hit {
         MaterialState::Highlight
+    } else if hovered.is_some_and(|hovered| hovered == refno || hovered == owner) {
+        MaterialState::Hover
     } else {
         MaterialState::Base
     }
@@ -1752,6 +1814,19 @@ fn forget_model_state(view: &mut View3d, removed: &HashSet<RefU64>) {
         view.primary = None;
     }
     view.xray.retain(|refno| !removed.contains(refno));
+    // 悬停账：被卸掉的那个如果正是悬停目标，账要忘。留着的话，同 refno 的模型重新装回来时
+    // 会立刻被涂成 active orange，而鼠标根本不在那儿——状态泄漏，不是缓存。
+    // `hover_applied` 一起清：它指向的实体已经没了，留着只会让下一轮增量刷去重挑一个死 refno。
+    // 只清 `hover_applied` 不翻脏标是安全的——那个实体已经 despawn，没有材质要刷。
+    if view.hovered.is_some_and(|refno| removed.contains(&refno)) {
+        view.hovered = None;
+        view.hover_applied = None;
+    } else if view
+        .hover_applied
+        .is_some_and(|refno| removed.contains(&refno))
+    {
+        view.hover_applied = None;
+    }
     if let Some(snapshot) = &mut view.isolate_restore {
         snapshot.retain(|refno, _| !removed.contains(refno));
     }
@@ -2243,6 +2318,7 @@ fn apply_commands(
                     camera_global,
                     &meshes,
                     &mut mesh_params.p0(),
+                    false,
                 );
                 // TODO(诊断): 拾取排查完删除。
                 diag(format!(
@@ -2250,6 +2326,25 @@ fn apply_commands(
                     hit.as_ref().map(|(refno, point)| (refno.0, *point))
                 ));
                 view.picked = hit.map(|(refno, _)| refno);
+            }
+            ViewCommand::Hover(uv) => {
+                // 静默拾取：悬停是连续动作，每移动一次打两行会把日志刷满。
+                let hovered = uv.and_then(|uv| {
+                    surface_hit(
+                        uv,
+                        camera_component,
+                        camera_global,
+                        &meshes,
+                        &mut mesh_params.p0(),
+                        true,
+                    )
+                    .map(|(refno, _)| refno)
+                });
+                // 只有目标真的换了才翻脏标：悬停只重挑被波及的那一两个实体（见 `apply_materials`）。
+                if view.hovered != hovered {
+                    view.hovered = hovered;
+                    view.hover_dirty = true;
+                }
             }
             ViewCommand::GridColor(grid_color) => {
                 if grid.color != grid_color {
@@ -2513,6 +2608,7 @@ fn apply_commands(
                             camera_global,
                             &meshes,
                             &mut mesh_params.p0(),
+                            false,
                         ) {
                             orbit.focus = point;
                         }
@@ -2539,6 +2635,7 @@ fn apply_commands(
                             camera_global,
                             &meshes,
                             &mut mesh_params.p0(),
+                            false,
                         ) {
                             orbit.focus = point;
                         }
@@ -2565,8 +2662,12 @@ fn orbit_camera(camera: &mut Transform, focus: Vec3, x: f32, y: f32) {
 }
 
 /// 全场材质刷新：选择集 / X-Ray / 外观变了，或有新的 `ModelMesh` 出生（装模型、房间截断补的兄弟段），
-/// 就按 `material_state` 四态从 [`LookMaterials`] 取句柄挂上。模型网格出生时不带材质，材质只在
+/// 就按 `material_state` 各态从 [`LookMaterials`] 取句柄挂上。模型网格出生时不带材质，材质只在
 /// 这里给——一个出处，两种外观才不会各漏一处。
+///
+/// 悬停是例外：它一帧能换好几件，而「指着谁」只影响被指的那一两个实体，全场遍历没必要。所以悬停
+/// 目标变了只重挑「旧目标 + 新目标」命中的实体，其余实体的悬停态没变、句柄原样留着。要重挑谁由
+/// `hover_applied` 记账，`hover_dirty` 只是「该算一次增量」的旗子。
 #[allow(clippy::too_many_arguments)]
 fn apply_materials(
     mut commands: Commands,
@@ -2584,11 +2685,24 @@ fn apply_materials(
         Option<&mut MeshMaterial3d<SglLookMaterial>>,
     )>,
 ) {
-    if !view.selection_dirty && !view.material_dirty && born.is_empty() {
+    // 全场刷的条件：选择集 / 外观脏了，或有新网格要补材质。悬停只脏时不走全场。
+    let full = view.selection_dirty || view.material_dirty || !born.is_empty();
+    if !full && !view.hover_dirty {
         return;
     }
+    // 悬停增量要重挑的 refno：旧目标回常态、新目标上悬停色。全场刷时不用这份（全都刷）。
+    let hover_targets: Vec<RefU64> = if full {
+        Vec::new()
+    } else {
+        [view.hover_applied, view.hovered]
+            .into_iter()
+            .flatten()
+            .collect()
+    };
     view.selection_dirty = false;
     view.material_dirty = false;
+    view.hover_dirty = false;
+    view.hover_applied = view.hovered;
     let look = view.look;
     let mut assets = MaterialAssets {
         standard: &mut standard,
@@ -2597,10 +2711,18 @@ fn apply_materials(
         xray: xray.0.clone(),
     };
     for (entity, mesh, pbr, sgl_material) in &mut meshes {
+        if !full
+            && !hover_targets
+                .iter()
+                .any(|target| *target == mesh.refno || *target == mesh.owner)
+        {
+            continue;
+        }
         let state = material_state(
             &view.selected,
             view.primary,
             &view.xray,
+            view.hovered,
             mesh.refno,
             mesh.owner,
         );
@@ -2724,16 +2846,21 @@ fn frame_bounds(
     camera.look_at(orbit.focus, Vec3::Y);
 }
 
+/// 拾取：屏幕上一点 → 命中的模型 refno 与落点。`quiet` = 不打诊断日志——悬停是连续动作，
+/// 每次移动都打两行会把日志刷满；点击是一次性动作，日志留着排查。
 fn surface_hit(
     uv: [f32; 2],
     camera: &Camera,
     camera_transform: &GlobalTransform,
     meshes: &Query<&ModelPickTarget>,
     ray_cast: &mut MeshRayCast,
+    quiet: bool,
 ) -> Option<(RefU64, Vec3)> {
     // TODO(诊断): 拾取排查完把日志删掉、恢复 `?` 链。
     let Some(size) = camera.logical_viewport_size() else {
-        diag("[诊断] 拾取失败：logical_viewport_size = None".into());
+        if !quiet {
+            diag("[诊断] 拾取失败：logical_viewport_size = None".into());
+        }
         return None;
     };
     let ray = match camera
@@ -2741,9 +2868,11 @@ fn surface_hit(
     {
         Ok(ray) => ray,
         Err(error) => {
-            diag(format!(
-                "[诊断] 拾取失败：viewport_to_world {error:?}（size={size:?} uv={uv:?}）"
-            ));
+            if !quiet {
+                diag(format!(
+                    "[诊断] 拾取失败：viewport_to_world {error:?}（size={size:?} uv={uv:?}）"
+                ));
+            }
             return None;
         }
     };
@@ -2752,13 +2881,15 @@ fn surface_hit(
         .with_visibility(RayCastVisibility::Visible)
         .with_filter(&is_model);
     let hits = ray_cast.cast_ray(ray, &settings);
-    diag(format!(
-        "[诊断] 射线 origin={:?} dir={:?} size={size:?} 模型网格实体数={} 命中数={}",
-        ray.origin,
-        ray.direction,
-        meshes.iter().count(),
-        hits.len()
-    ));
+    if !quiet {
+        diag(format!(
+            "[诊断] 射线 origin={:?} dir={:?} size={size:?} 模型网格实体数={} 命中数={}",
+            ray.origin,
+            ray.direction,
+            meshes.iter().count(),
+            hits.len()
+        ));
+    }
     let (entity, hit) = hits.first()?;
     Some((meshes.get(*entity).ok()?.refno, hit.point))
 }
@@ -2802,6 +2933,9 @@ pub(crate) fn blank_view() -> View3d {
         selected: HashSet::new(),
         primary: None,
         selection_dirty: false,
+        hover_dirty: false,
+        hovered: None,
+        hover_applied: None,
         xray: HashSet::new(),
         material_dirty: false,
         bounds: HashMap::new(),
@@ -3001,8 +3135,16 @@ mod tests {
         let refno = RefU64::from(42);
         let owner = RefU64::from(7);
         let mut view = test_view();
-        let state =
-            |view: &View3d| material_state(&view.selected, view.primary, &view.xray, refno, owner);
+        let state = |view: &View3d| {
+            material_state(
+                &view.selected,
+                view.primary,
+                &view.xray,
+                view.hovered,
+                refno,
+                owner,
+            )
+        };
 
         assert_eq!(state(&view), MaterialState::Base);
         view.set_selection(vec![owner], None);
@@ -3014,8 +3156,13 @@ mod tests {
         view.set_selection(vec![owner], Some(owner));
         assert_eq!(state(&view), MaterialState::Ce, "owner 是主选中 = CE");
         view.xray.insert(refno);
-        assert_eq!(state(&view), MaterialState::XRay, "X-Ray 压过一切");
+        assert_eq!(
+            state(&view),
+            MaterialState::XraySelected,
+            "X-Ray 命中且选中 = 穿透 + 黄，不是纯 X-Ray 蓝"
+        );
         view.xray.clear();
+        assert_eq!(state(&view), MaterialState::Ce, "撤掉 X-Ray 回到 CE");
         view.set_selection(vec![refno], Some(refno));
         assert_eq!(state(&view), MaterialState::Ce);
         view.set_selection(vec![refno, owner], Some(owner));
@@ -3027,7 +3174,54 @@ mod tests {
         view.set_selection(vec![refno, owner], None);
         assert_eq!(state(&view), MaterialState::Highlight);
         view.xray.insert(owner);
-        assert_eq!(state(&view), MaterialState::XRay);
+        assert_eq!(
+            state(&view),
+            MaterialState::XraySelected,
+            "X-Ray 命中（owner 侧）且选中"
+        );
+        view.set_selection(Vec::new(), None);
+        assert_eq!(state(&view), MaterialState::XRay, "只 X-Ray 没选中才是纯蓝");
+    }
+
+    /// 悬停预选（阶段四）：只落在未选中件上——选中件不被悬停色覆盖（同 plant3d-web 的
+    /// `SelectionManager`）；命中按 refno 或 owner，与选中 / X-Ray 同一套命中口径。
+    #[test]
+    fn hover_only_paints_unselected_elements_and_matches_refno_or_owner() {
+        let refno = RefU64::from(42);
+        let owner = RefU64::from(7);
+        let mut view = test_view();
+        let state = |view: &View3d| {
+            material_state(
+                &view.selected,
+                view.primary,
+                &view.xray,
+                view.hovered,
+                refno,
+                owner,
+            )
+        };
+
+        assert_eq!(state(&view), MaterialState::Base, "没指着谁");
+        view.hovered = Some(refno);
+        assert_eq!(state(&view), MaterialState::Hover, "指着 = active");
+        view.hovered = Some(owner);
+        assert_eq!(state(&view), MaterialState::Hover, "owner 侧命中同样算");
+
+        view.set_selection(vec![owner], None);
+        assert_eq!(
+            state(&view),
+            MaterialState::Highlight,
+            "选中件不被悬停色覆盖"
+        );
+        view.set_selection(vec![owner], Some(owner));
+        assert_eq!(state(&view), MaterialState::Ce, "主选中也不被覆盖");
+        view.set_selection(Vec::new(), None);
+        view.xray.insert(refno);
+        assert_eq!(
+            state(&view),
+            MaterialState::XRay,
+            "X-Ray 压过悬停（悬停不是选中）"
+        );
     }
 
     #[test]
@@ -3585,6 +3779,9 @@ mod tests {
             view.selected.insert(refno);
             view.xray.insert(refno);
         }
+        // 悬停指向「要被卸掉的那一个」，与保留件分开：卸掉之后这两笔账都得忘干净。
+        view.hovered = Some(removed);
+        view.hover_applied = Some(removed);
         view.isolate_restore = Some(HashMap::from([(removed, true), (kept, false)]));
 
         record_model_visibility(
@@ -3601,6 +3798,8 @@ mod tests {
         assert!(!view.bounds.contains_key(&removed));
         assert!(!view.selected.contains(&removed));
         assert!(!view.xray.contains(&removed));
+        assert_eq!(view.hovered, None, "卸掉的构件不该还挂着悬停");
+        assert_eq!(view.hover_applied, None, "增量刷的旧目标一起忘");
         assert!(
             !view
                 .isolate_restore
@@ -4229,6 +4428,16 @@ mod tests {
         ]
     }
 
+    fn sgl_material_value<'a>(
+        app: &'a App,
+        handle: &Handle<SglLookMaterial>,
+    ) -> &'a SglLookMaterial {
+        app.world()
+            .resource::<Assets<SglLookMaterial>>()
+            .get(handle)
+            .unwrap()
+    }
+
     /// PBR 外观 = 改动前：选中换成橙红高亮，取消回到同一枚类型色材质。网格出生不带材质，
     /// 第一帧靠 `Added<ModelMesh>` 补上。
     #[test]
@@ -4310,16 +4519,22 @@ mod tests {
             .resource_mut::<View3d>()
             .set_selection(vec![a, b], Some(b));
         app.update();
+        let ce = sgl_material_of(&app, eb);
+        assert_eq!(sgl_colour_of(&app, &ce), [255, 255, 0], "主选中 = CE 黄");
+        let highlight = sgl_material_of(&app, ea);
         assert_eq!(
-            sgl_colour_of(&app, &sgl_material_of(&app, eb)),
-            [255, 255, 0],
-            "主选中 = CE 黄"
-        );
-        assert_eq!(
-            sgl_colour_of(&app, &sgl_material_of(&app, ea)),
+            sgl_colour_of(&app, &highlight),
             [255, 255, 255],
             "其它选中 = highlight 白"
         );
+        // 选中态直出颜色（不打光不反射），且一律不透明——否则半透明元素选中后会落进 Blend，
+        // 不进 prepass 就没有边线与伪阴影。
+        for handle in [&ce, &highlight] {
+            let material = sgl_material_value(&app, handle);
+            assert_eq!(material.params.flags.z, 1, "选中态直出颜色");
+            assert_eq!(material.opacity(), 1.0, "选中态不透明");
+            assert_eq!(material.alpha_mode(), AlphaMode::Opaque, "选中态进 prepass");
+        }
 
         {
             let mut view = app.world_mut().resource_mut::<View3d>();
@@ -4356,6 +4571,83 @@ mod tests {
             base_colour_of(&app, &standard_material_of(&app, ea)),
             type_color("PIPE").to_srgba().to_u8_array()
         );
+    }
+
+    /// 悬停是连续动作（一次拖动掠过几十上百个构件）：换目标只重挑「旧目标 + 新目标」命中的实体，
+    /// 其余实体连碰都不碰。用「无关实体的材质被人为摘掉」区分两条路径——增量刷不补它，
+    /// 全场刷（`material_dirty`）才补，这样断言能证明走的真是增量而不是恰好句柄相同。
+    #[test]
+    fn hover_change_repaints_only_the_affected_entities() {
+        let a = RefU64::from(1);
+        let b = RefU64::from(2);
+        let c = RefU64::from(3);
+        let mut app = materials_app(test_view());
+        let ea = spawn_model_mesh(&mut app, a, RefU64::from(70), "PIPE");
+        let eb = spawn_model_mesh(&mut app, b, RefU64::from(71), "EQUI");
+        let ec = spawn_model_mesh(&mut app, c, RefU64::from(72), "CYLN");
+        app.update();
+        let base = sgl_material_of(&app, ea);
+        assert_eq!(base, sgl_material_of(&app, eb), "出厂配色共用常态材质");
+
+        // 无关实体被人为摘掉材质：只有全场刷会给它补回来。
+        app.world_mut()
+            .entity_mut(ea)
+            .remove::<MeshMaterial3d<SglLookMaterial>>();
+
+        app.world_mut().resource_mut::<View3d>().hovered = Some(b);
+        app.world_mut().resource_mut::<View3d>().hover_dirty = true;
+        app.update();
+        let hover = sgl_material_of(&app, eb);
+        assert_ne!(hover, base, "被指的换成 active orange");
+        assert_eq!(sgl_colour_of(&app, &hover), [255, 190, 0]);
+        assert!(
+            app.world()
+                .entity(ea)
+                .get::<MeshMaterial3d<SglLookMaterial>>()
+                .is_none(),
+            "悬停增量不碰无关实体"
+        );
+        assert_eq!(sgl_material_of(&app, ec), base, "无关实体句柄不动");
+        assert_eq!(
+            app.world().resource::<View3d>().hover_applied,
+            Some(b),
+            "记账跟着更新"
+        );
+
+        // 换目标：旧的回常态，新的上悬停色，第三个仍不碰。
+        {
+            let mut view = app.world_mut().resource_mut::<View3d>();
+            view.hovered = Some(c);
+            view.hover_dirty = true;
+        }
+        app.update();
+        assert_eq!(sgl_material_of(&app, eb), base, "旧目标回常态");
+        assert_eq!(
+            sgl_colour_of(&app, &sgl_material_of(&app, ec)),
+            [255, 190, 0],
+            "新目标上悬停色"
+        );
+        assert!(
+            app.world()
+                .entity(ea)
+                .get::<MeshMaterial3d<SglLookMaterial>>()
+                .is_none(),
+            "换目标也不碰无关实体"
+        );
+
+        // 全场刷（这里借 material_dirty）才把摘掉的材质补回来。
+        app.world_mut().resource_mut::<View3d>().material_dirty = true;
+        app.update();
+        assert_eq!(sgl_material_of(&app, ea), base, "全场刷补回被摘掉的材质");
+
+        // 离开视口：悬停色全撤。
+        {
+            let mut view = app.world_mut().resource_mut::<View3d>();
+            view.hovered = None;
+            view.hover_dirty = true;
+        }
+        app.update();
+        assert_eq!(sgl_material_of(&app, ec), base, "离开视口撤掉悬停色");
     }
 
     /// `set_selection`：不在集内的主选中按没有算；集与主选中都没变就不翻脏标，只换主选中也要刷。

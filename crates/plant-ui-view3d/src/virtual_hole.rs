@@ -926,13 +926,20 @@ pub(crate) fn apply_hole_materials(
         xray: xray.0.clone(),
     };
     for (entity, mesh, previewed, pbr, sgl_material) in &mut previewed {
+        let selected_hit = view.selected.contains(&mesh.refno) || view.selected.contains(&mesh.owner);
         let state = if hole_xray.contains(&previewed.target) {
-            MaterialState::XRay
+            // 孔洞 X-Ray 压在选中之上；但选中了还要看得出「点了谁」——同 `material_state` 的 X-Ray 叠选中口径。
+            if selected_hit {
+                MaterialState::XraySelected
+            } else {
+                MaterialState::XRay
+            }
         } else {
             material_state(
                 &view.selected,
                 view.primary,
                 &view.xray,
+                view.hovered,
                 mesh.refno,
                 mesh.owner,
             )

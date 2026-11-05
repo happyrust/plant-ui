@@ -58,6 +58,10 @@ pub struct WorkbenchVm {
     /// 「房间树」面板（plant3d-web「房间」页签移植）：在册房间平铺一层，展开一间房是服务端聚合的
     /// 房间 → 专业 → 最小交付单元类型 → 单元 → 构件。行由宿主按展开状态展平，绘制层逐帧只读。
     pub room_tree: RoomTreeVm,
+    /// 「Spooling」面板（卷管 / 管段）：`SPLDRG` / `SPOOL` / `PSPOOL` / `HSPOOL` / `FIELD` / `PPIECE`
+    /// 六类平铺。不挂在模型树下——spool 的 owner 链不经过 `SITE`，从 SITE 根出发的树
+    /// 永远看不到它。数据面见 `plant_ui_data::spooling`。
+    pub spooling: SpoolingVm,
     /// 尺寸标注层（计划 B2–B4）：视口此刻挂着哪条 BRAN 的尺寸标注、到了哪一步。
     /// 不跟选中走——右键「查看尺寸标注」才换，之后换选中它照样挂着。
     pub dimensions: DimensionsVm,
@@ -860,6 +864,115 @@ pub struct RoomTreeRowVm {
     pub count: Option<usize>,
 }
 
+/// 「Spooling」面板的数据状态。
+///
+/// 与模型树 / 房间树都不同：spool 的 owner 链是 `SPOOL -> PSLIST -> PIPE -> ZONE`，
+/// 不经过 `SITE`，所以它不在模型树里，只能自成一层。六类 noun 平铺，不分层。
+///
+/// 空态是**常态**而不是异常：AMS 的 `/ALL` MDB 声明里没有带 spool 的库
+/// （`PSPOOL` 在 dbnum 251095、`HSPOOL` 在 251137，两者都不在 `CURD` 名单里），
+/// 所以这里六类全 0。界面要如实说「这一层是通的，只是这个项目没有这类数据」。
+#[derive(Debug, Clone, Default)]
+pub enum SpoolingVm {
+    /// 还没拉过：面板第一次成为活动页签才发 `SpoolingAction::Load`。
+    #[default]
+    Idle,
+    /// 分组统计在途。
+    Loading,
+    /// 分组统计到手；`rows` 是当前选中分组的那一页。
+    Ready(SpoolingDataVm),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SpoolingDataVm {
+    /// 六个固定分组，缺的补 0（顺序即 `plant_ui_data::spooling::SPOOL_GROUPS`）。
+    pub groups: Vec<SpoolingGroupVm>,
+    /// 当前选中的分组 noun；`None` = 还没点过，按第一个非空分组显示。
+    pub active: Option<String>,
+    /// 当前分组在途。
+    pub rows_loading: bool,
+    /// 当前分组的行。
+    pub rows: Vec<SpoolingRowVm>,
+    /// 行被 `limit` 截断时带上来的总数，用于「仅显示前 N 条」那行提示。
+    pub rows_truncated_at: Option<usize>,
+    /// 取行失败的原因（分组统计成功、行查询失败是可能的）。
+    pub rows_error: Option<String>,
+    /// 点开的某一行的成员（结构边 + 引用属性两槛合起来的结果）。
+    pub members: Option<SpoolingMembersVm>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpoolingGroupVm {
+    pub noun: String,
+    pub label: String,
+    pub count: usize,
+}
+
+/// 一行 spool 的绘制快照。
+///
+/// 全是宿主填进来的值，Vm 自己不做任何推导：可见性只从 `TreeModel` 读，
+/// 点击方向只从 `next_click_visible` 读。
+#[derive(Debug, Clone, Default)]
+pub struct SpoolingRowVm {
+    pub refno: RefU64,
+    pub noun: String,
+    /// 显示名：有名用名，无名按 `noun + refno 低位` 补（见 `crate::spooling::row_label`）。
+    pub label: String,
+    /// 行尾元信息：`属主类型 · 库号 · 成员数`。
+    pub meta: String,
+    pub owner: Option<RefU64>,
+    pub dbnum: Option<u32>,
+    pub children_count: u32,
+    /// 这一行在三维里的可见性，语义与 [`TreeRowVm::visibility`] 逐字一致：
+    /// 真值是三维回执上来的实际渲染结果，绘制层只读。
+    ///
+    /// spool 自己通常没有 mesh 实体，它这一格是宿主把它名下那批几何 refno
+    /// 交给 `TreeModel::visibility_for` 聚合出来的结果：有显示有隐藏就是半可见。
+    /// 宿主还没算过它名下几何时保持 [`RowVisibility::Unloaded`]。
+    pub visibility: RowVisibility,
+    /// 点这一行眼睛时 `SetVisible` 该带的方向，语义与 [`TreeRowVm::next_visible`] 逐字一致。
+    ///
+    /// 不能由 `visibility` 现推：eye 跟的是实际渲染结果，而指令下出去到画面变过来
+    /// 之间隔着查询与网格装载。那段时间里图标停在原样，再点一下要的是**反转上一次
+    /// 指令**，不是反转图标。宿主从 `next_click_visible` 读出后填进来。
+    pub next_visible: bool,
+    /// 这一行名下几何 refno 的数量；几何还没查回来时为 0。
+    ///
+    /// 只用于界面说明「这只眼睛管多少个几何」，不参与显隐判定——判定只认
+    /// [`Self::visibility`]。
+    pub geo_count: usize,
+    pub selected: bool,
+    pub primary: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SpoolingMembersVm {
+    /// 这一份成员属于哪个 spool。
+    pub of: Option<RefU64>,
+    pub loading: bool,
+    pub rows: Vec<SpoolingMemberVm>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SpoolingMemberVm {
+    pub refno: RefU64,
+    pub noun: String,
+    pub label: String,
+    /// 这一条是怎么找出来的：结构边（`pe_owner`）还是引用属性（`SPLMEM` / `PSARFA` / …）。
+    pub via: &'static str,
+    /// 这一条在三维里的可见性，语义与 [`TreeRowVm::visibility`] 逐字一致。
+    ///
+    /// 成员是真实 pe 元素（BRAN / ELBO / FLAN…），宿主可以直接把它交给
+    /// `TreeModel::visibility_for`；没有独立几何的件（GASK / SILE…）永远是
+    /// [`RowVisibility::Unloaded`]。
+    pub visibility: RowVisibility,
+    /// 点这一条眼睛时 `SetVisible` 该带的方向，语义与 [`TreeRowVm::next_visible`] 逐字一致。
+    /// 宿主从 `next_click_visible` 读出后填进来，绘制层不反推。
+    pub next_visible: bool,
+}
+
 /// 一次房间视图的身份牌：HUD 徽章、「截断直段」芯片与退出入口的数据源。
 #[derive(Debug, Clone, PartialEq)]
 pub struct RoomViewVm {
@@ -1237,5 +1350,93 @@ mod tests {
         let mut s = Selection::single(r(1));
         s.range(&order, r(9));
         assert_eq!(s.to_vec(), vec![r(9)]);
+    }
+
+    /// 新建的 spool 行还没算过名下几何：可见性是未加载、方向是 `false`（占位，
+    /// 真值由宿主按 `next_click_visible` 填）、几何数为 0。这三项就是宿主填值前的起点。
+    #[test]
+    fn spooling_row_vm_defaults_to_unloaded() {
+        let row = SpoolingRowVm::default();
+        assert_eq!(row.visibility, RowVisibility::Unloaded);
+        assert!(!row.next_visible, "默认占位是 false，真值由宿主填");
+        assert_eq!(row.geo_count, 0);
+        assert_eq!(row.refno, RefU64(0));
+        assert!(row.label.is_empty());
+    }
+
+    /// 快照字段原样保留宿主填进来的值：Vm 里没有任何推导，也不许有翻转。
+    ///
+    /// 注意**不要**在这里断言 `next_visible == visibility.on_click()`：指令下出去
+    /// 到画面变过来之间隔着查询与网格装载，那段时间里 `visibility` 还停在旧态而
+    /// `next_visible` 已经反过来了。两者相等只在静止态成立，写进测试会把在途态
+    /// 判成错误。
+    #[test]
+    fn spooling_row_vm_carries_snapshot_fields_verbatim() {
+        let row = SpoolingRowVm {
+            refno: r(11),
+            noun: "PSPOOL".into(),
+            label: "/403_LOS-001-PS01".into(),
+            visibility: RowVisibility::Partial,
+            next_visible: true,
+            geo_count: 10,
+            ..SpoolingRowVm::default()
+        };
+        assert_eq!(row.visibility, RowVisibility::Partial);
+        assert!(row.next_visible);
+        assert_eq!(row.geo_count, 10);
+    }
+
+    /// 在途态也要能原样带住：刚点过「显示」，指令已下出去，回执还没回来，所以
+    /// `visibility` 仍停在 Shown 之后的值而 `next_visible` 已经翻转。这一对组合
+    /// `on_click()` 永远推不出来——它证明 Vm 只存宿主给的值，没有在本地翻转任何一位。
+    #[test]
+    fn spooling_row_vm_keeps_the_in_flight_direction_untouched() {
+        let in_flight = SpoolingRowVm {
+            visibility: RowVisibility::Shown,
+            next_visible: true,
+            geo_count: 10,
+            ..SpoolingRowVm::default()
+        };
+        assert_eq!(in_flight.visibility, RowVisibility::Shown);
+        assert!(in_flight.next_visible);
+        assert_ne!(
+            in_flight.next_visible,
+            in_flight.visibility.on_click(),
+            "在途方向与静止态反推值必须不同，否则说明 Vm 自己算过"
+        );
+    }
+
+    /// 成员行与 spool 行同源同义：默认未加载、方向占位为 false。
+    #[test]
+    fn spooling_member_vm_defaults_match_the_row() {
+        let member = SpoolingMemberVm::default();
+        assert_eq!(member.visibility, RowVisibility::Unloaded);
+        assert!(!member.next_visible);
+        assert!(member.via.is_empty());
+    }
+
+    /// 没有独立几何的成员（GASK / SILE…）停在未加载，有几何的成员照样能带上真实回执。
+    #[test]
+    fn spooling_member_vm_keeps_snapshot_values() {
+        let gask = SpoolingMemberVm {
+            refno: r(21),
+            noun: "GASK".into(),
+            label: "GASK 21".into(),
+            via: "断点引用",
+            visibility: RowVisibility::Unloaded,
+            next_visible: true,
+        };
+        assert_eq!(gask.visibility, RowVisibility::Unloaded);
+
+        let bran = SpoolingMemberVm {
+            refno: r(22),
+            noun: "BRAN".into(),
+            label: "BRAN 22".into(),
+            via: "结构成员",
+            visibility: RowVisibility::Shown,
+            next_visible: false,
+        };
+        assert_eq!(bran.visibility, RowVisibility::Shown);
+        assert!(!bran.next_visible);
     }
 }

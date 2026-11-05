@@ -1885,6 +1885,24 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
         Req::ElementRooms(refno) => Evt::ElementRooms(refno, Ok(Vec::new())),
         // 同上：没有在册面板，右键菜单就不摆「查看房间内模型」。
         Req::PanelRooms => Evt::PanelRooms(Ok(Vec::new())),
+        // 剧本里没有管段：六类分组照常量给全，计数全 0。界面据此说「这一层是通的、
+        // 只是没有这类数据」——比回一个空 Vec 好：空 Vec 会让面板连分组芯片都不画。
+        Req::SpoolingOverview => Evt::SpoolingOverview(Ok(
+            plant_ui_data::spooling::SPOOL_GROUPS
+                .iter()
+                .map(|(noun, label)| plant_ui_data::spooling::SpoolGroup {
+                    noun: (*noun).to_string(),
+                    label: (*label).to_string(),
+                    count: 0,
+                })
+                .collect(),
+        )),
+        Req::SpoolRows(noun) => Evt::SpoolRows(noun, Ok(Vec::new())),
+        Req::SpoolMembers(of) => Evt::SpoolMembers(of, Ok(Vec::new())),
+        // 剧本里没有 spool 一族的数据（上面两臂回空），这一臂照样要给出**非空**的
+        // 确定性几何集：回空 Vec 会让仿真模式下的眼睛永远停在 `Unloaded`，点了看不出
+        // 任何变化，整条显隐链路在演示模式下就测不出来。
+        Req::SpoolGeometry(refno) => Evt::SpoolGeometry(refno, Ok(sim_spool_geometry())),
         Req::PanelRoom(refno) => Evt::PanelRoom(refno, Ok(None)),
         Req::RoomPanels(refno) => Evt::RoomPanels(refno, Ok(Vec::new())),
         // 同理，任何房间在剧本里都查不到。
@@ -2450,6 +2468,21 @@ pub fn model_scope_fixture(target: RefU64) -> crate::model_update_api::ModelReco
     }
 }
 
+/// 剧本里一个 spool 名下的几何：**确定性、非空**，且刻意选房间树那根 BRAN 与它的三个
+/// 构件（`9001_1010` / `1011` / `1012` / `1013`）——它们在 [`model_scope_fixture`] 里
+/// 都有记录，所以仿真模式下点 spool 行的眼睛，三维里真的会跟着变。
+///
+/// 不回空 Vec：空集会让眼睛永远停在 `Unloaded`，点下去什么都不会发生，
+/// 整条「翻译 → 登记 → 显隐 → 回执 → 重算」的链路在演示模式下就测不出来。
+fn sim_spool_geometry() -> Vec<RefU64> {
+    vec![
+        RefU64::from_two_nums(9001, 1010),
+        RefU64::from_two_nums(9001, 1011),
+        RefU64::from_two_nums(9001, 1012),
+        RefU64::from_two_nums(9001, 1013),
+    ]
+}
+
 /// 范围定位在剧本里的答案：`target` 子树下已生成几何的并集盒。
 ///
 /// 口径与真服务一致——自身 ∪ 后代，按 `model_scope_fixture` 给的 `world_aabb` 求并。
@@ -2854,5 +2887,33 @@ mod tests {
                 .records
                 .is_empty()
         );
+    }
+
+    /// `PLANT_UI_SIM=1` 下 spool → 几何必须有剧本：回**非空**的确定性几何集，
+    /// 且 refno 原样带回。回空 Vec 会让仿真模式下的眼睛永远停在 `Unloaded`，
+    /// 点下去什么都不会发生，整条显隐链路就测不出来了（VAL-IPC-001 / VAL-IPC-002）。
+    #[test]
+    fn sim_spool_geometry_is_non_empty_and_echoes_the_refno() {
+        let mut engine = Engine::new(ServiceMode::Legacy);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spool = RefU64::from_two_nums(2013287639, 1000);
+
+        handle(&mut engine, crate::data::Req::SpoolGeometry(spool), &tx);
+
+        match rx.try_recv() {
+            Ok(Evt::SpoolGeometry(echoed, Ok(geos))) => {
+                assert_eq!(echoed, spool, "refno 必须原样带回，晚到的旧结果才认得出来");
+                assert!(!geos.is_empty(), "仿真剧本不能回空几何集：{geos:?}");
+                assert_eq!(geos, sim_spool_geometry(), "同一请求要给同一份确定性结果");
+                // 这些 refno 在剧本的模型记录里都有东西：眼睛点下去三维真的会动。
+                assert!(
+                    geos.iter()
+                        .all(|geo| !model_scope_fixture(*geo).records.is_empty()),
+                    "剧本几何必须在模型记录里有落点：{geos:?}"
+                );
+            }
+            Ok(_) => panic!("期望 SpoolGeometry 回包，实际是别的 Evt"),
+            Err(error) => panic!("没收到回包：{error}"),
+        }
     }
 }

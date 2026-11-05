@@ -192,6 +192,17 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
             )));
         }
     }
+    // 悬停预选（E3D 的 active，计划 2026-10-29 阶段四）：指针在视口里、不在浮层上、也不在拖拽中时，
+    // 按屏幕位移节流发一次 `HoverViewport`；离开时发 `None` 撤掉悬停色。
+    // 节流在绘制层做（每发一次宿主就要走一遍射线，整库五万网格按 60 Hz 发不起）：位移小于
+    // `HOVER_STEP_PX` 就不发，目标是同一个元素时宿主自己也不会翻脏标。
+    // 滚轮缩放要在这里先读：`camera` 会把 `smooth_scroll_delta` 清零，读到就晚了。
+    let zooming = ui.input(|i| i.smooth_scroll_delta.y) != 0.0
+        && response.hovered()
+        && ui.input(|i| i.pointer.hover_pos()).is_some_and(|pointer| {
+            !bar.contains(pointer) && !cube.contains(pointer) && !hud.contains(pointer)
+        });
+    hover_pick(ui, &response, rect, view, [bar, cube, hud], zooming, cmds);
     camera(ui, rect, view.size, [bar, cube, hud], &response, cmds);
     // 视口右键菜单：与模型树行菜单同一段构造器，内容一致（S13 稿）。作用对象
     // 是**当前选中**——视口的拾取是一次异步往返，右键当帧拿不到指针底下是谁，
@@ -516,6 +527,68 @@ fn pointer_texture_uv(viewport: Vec2, texture: Vec2, pointer: Vec2) -> [f32; 2] 
     let uv = cover_uv(viewport, texture);
     let texture_uv = uv.min + pointer / viewport * uv.size();
     [texture_uv.x, texture_uv.y]
+}
+
+/// 悬停预选的最小位移（屏幕点）。小于它就不发新的一发——射线一趟要遍历整库网格，
+/// 逐帧发是白烧。5 pt 在 100% 缩放下约等于「换了一根管子」，够灵敏也不抖。
+const HOVER_STEP_PX: f32 = 5.0;
+
+/// 纹理 UV 位移折算成屏幕点数。**两个轴要分别折**：UV 的 x / y 各铺满纹理的一整条边，
+/// 而视口的宽高比与纹理不同，用视口宽统一归一的话，扁视口里竖直方向的阈值会缩到一两像素
+/// （1600×500 的视口、竖直 5 pt 就折成 0.01 个 UV，而阈值是 5/1600 = 0.003），鼠标轻轻一抖
+/// 就换一发。这里的折算与 [`pointer_texture_uv`] 的映射严格互逆。
+fn hover_step_in_points(rect: Rect, texture: Vec2, delta: Vec2) -> f32 {
+    let crop = cover_uv(rect.size(), texture);
+    let dx = delta.x * rect.width() / crop.width().max(f32::EPSILON);
+    let dy = delta.y * rect.height() / crop.height().max(f32::EPSILON);
+    (dx * dx + dy * dy).sqrt()
+}
+
+/// 指针掠过视口的悬停预选（E3D 的 active）。四件事：
+/// 1. 指针不在视口里 / 落在浮层上 / 正在拖拽（旋转平移）/ 正在滚轮缩放 → 发 `None` 撤色；
+/// 2. 位移不足 [`HOVER_STEP_PX`] 就不发（节流）；
+/// 3. 同一位置只发一次（egui 每帧都会调 `show`，`hover_pos` 不变时不该重复发）；
+/// 4. 上一发的位置记在 egui 的临时数据里，按 `response.id` 分开——将来多视口时互不干扰。
+///
+/// `camera_busy` 是滚轮缩放：那时指针不动、相机在动，底下的元素一直在换。不撤的话悬停色会
+/// 停在缩放前指着的那个元素上，直到鼠标再动——那是错的反馈，比没有更糟。
+fn hover_pick(
+    ui: &Ui,
+    response: &egui::Response,
+    rect: Rect,
+    view: &View3dVm,
+    overlays: [Rect; 3],
+    camera_busy: bool,
+    cmds: &mut Vec<Cmd>,
+) {
+    let id = response.id.with("hover_pick");
+    let last: Option<[f32; 2]> = ui.data(|d| d.get_temp(id)).flatten();
+    // 拖拽中不悬停：旋转 / 平移时指针底下的东西一直在换，闪成一片。
+    // 判「有按键按着」而不是「指针被 egui 占用」——后者在正常悬停时就为真。
+    let dragging = ui.ctx().input(|i| i.pointer.any_down());
+    let pointer = ui
+        .ctx()
+        .pointer_hover_pos()
+        .filter(|pointer| rect.contains(*pointer))
+        .filter(|_| !dragging && !camera_busy)
+        .filter(|pointer| !overlays.iter().any(|overlay| overlay.contains(*pointer)));
+    let Some(pointer) = pointer else {
+        // 离开视口 / 落在浮层上 / 开始拖拽 / 正在缩放：撤一次就够。
+        if last.is_some() {
+            ui.data_mut(|d| d.insert_temp(id, None::<[f32; 2]>));
+            cmds.push(Cmd::HoverViewport(None));
+        }
+        return;
+    };
+    let uv = pointer_texture_uv(rect.size(), view.size, pointer - rect.min);
+    if last.is_some_and(|last| {
+        let delta = vec2(uv[0] - last[0], uv[1] - last[1]);
+        hover_step_in_points(rect, view.size, delta) < HOVER_STEP_PX
+    }) {
+        return;
+    }
+    ui.data_mut(|d| d.insert_temp(id, Some(uv)));
+    cmds.push(Cmd::HoverViewport(Some(uv)));
 }
 
 /// 竖直渐变。egui 没有渐变笔刷，四个顶点各自带色的三角网格就是标准做法。
@@ -919,6 +992,141 @@ mod tests {
             button(true),
             button(false),
         ]
+    }
+
+    /// 悬停预选：指针在视口里移动会发 `HoverViewport(Some(uv))`，离开视口发 `None`。
+    /// 悬停是「指着」而不是「点中了」，与 `PickViewport` 分开——两者混在一起会让一次悬停变成一次选中。
+    #[test]
+    fn hovering_the_viewport_emits_a_hover_and_leaving_clears_it() {
+        let hovers = |cmds: &[Cmd]| -> Vec<Option<[f32; 2]>> {
+            cmds.iter()
+                .filter_map(|cmd| match cmd {
+                    Cmd::HoverViewport(uv) => Some(*uv),
+                    _ => None,
+                })
+                .collect()
+        };
+        // 移到视口中央：至少一发 Some，且 UV 落在纹理里。
+        let inside = viewport_cmds(vec![vec![egui::Event::PointerMoved(pos2(600.0, 350.0))]]);
+        let sent = hovers(&inside);
+        let uv = sent.last().copied().flatten().expect("视口里应当发悬停");
+        assert!(
+            (0.0..=1.0).contains(&uv[0]) && (0.0..=1.0).contains(&uv[1]),
+            "悬停 UV 落到纹理外面去了：{uv:?}"
+        );
+        assert!(
+            !inside.iter().any(|cmd| matches!(cmd, Cmd::PickViewport(_))),
+            "悬停不该变成拾取：{inside:?}"
+        );
+
+        // 移出视口：撤一次（`None`），不会重复撤。
+        let mut frames = vec![vec![egui::Event::PointerMoved(pos2(600.0, 350.0))]];
+        frames.push(vec![egui::Event::PointerMoved(pos2(5000.0, 5000.0))]);
+        let outside = hovers(&viewport_cmds(frames));
+        assert!(
+            outside.contains(&None),
+            "指针离开视口要撤掉悬停色：{outside:?}"
+        );
+        assert_eq!(
+            outside.iter().filter(|uv| uv.is_none()).count(),
+            1,
+            "撤色只该发一次：{outside:?}"
+        );
+    }
+
+    /// 节流：同一位置连着报两帧只发一次；位移超过 `HOVER_STEP_PX` 才发第二发。
+    #[test]
+    fn hover_is_throttled_by_pointer_movement() {
+        let hovers = |cmds: &[Cmd]| -> usize {
+            cmds.iter()
+                .filter(|cmd| matches!(cmd, Cmd::HoverViewport(_)))
+                .count()
+        };
+        let same_spot = viewport_cmds(vec![
+            vec![egui::Event::PointerMoved(pos2(600.0, 350.0))],
+            vec![egui::Event::PointerMoved(pos2(600.0, 350.0))],
+        ]);
+        assert_eq!(hovers(&same_spot), 1, "同一位置不该重复发：{same_spot:?}");
+
+        // 1 pt 位移小于阈值，不发。
+        let tiny = viewport_cmds(vec![
+            vec![egui::Event::PointerMoved(pos2(600.0, 350.0))],
+            vec![egui::Event::PointerMoved(pos2(601.0, 350.0))],
+        ]);
+        assert_eq!(hovers(&tiny), 1, "1 pt 位移不该发：{tiny:?}");
+
+        // 40 pt 位移超过阈值，发第二发。
+        let moved = viewport_cmds(vec![
+            vec![egui::Event::PointerMoved(pos2(600.0, 350.0))],
+            vec![egui::Event::PointerMoved(pos2(640.0, 350.0))],
+        ]);
+        assert_eq!(hovers(&moved), 2, "40 pt 位移要发：{moved:?}");
+    }
+
+    /// 节流阈值按屏幕点数算，**两个轴各自折算**。用视口宽度统一归一的话，扁视口里竖直方向的
+    /// 阈值会被压到一两像素——鼠标竖着轻轻一抖就换一发射线，正对着「别白烧」的反面。
+    #[test]
+    fn hover_throttle_holds_on_the_vertical_axis_in_a_wide_viewport() {
+        let hovers = |cmds: &[Cmd]| -> usize {
+            cmds.iter()
+                .filter(|cmd| matches!(cmd, Cmd::HoverViewport(_)))
+                .count()
+        };
+        // 折算本身：1200×700 的视口、纹理同尺寸，竖直 3 pt 应折回 3 pt（不是 3×700/1200）。
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 700.0));
+        let delta = vec2(0.0, 3.0 / 700.0);
+        assert!(
+            (hover_step_in_points(rect, vec2(1200.0, 700.0), delta) - 3.0).abs() < 1e-3,
+            "竖直位移要按高度折回点数"
+        );
+        // 竖直 3 pt：低于阈值，不该发第二发。
+        let vertical_tiny = viewport_cmds(vec![
+            vec![egui::Event::PointerMoved(pos2(600.0, 350.0))],
+            vec![egui::Event::PointerMoved(pos2(600.0, 353.0))],
+        ]);
+        assert_eq!(
+            hovers(&vertical_tiny),
+            1,
+            "竖直 3 pt 不该发：{vertical_tiny:?}"
+        );
+        // 竖直 40 pt：超过阈值，要发。
+        let vertical = viewport_cmds(vec![
+            vec![egui::Event::PointerMoved(pos2(600.0, 300.0))],
+            vec![egui::Event::PointerMoved(pos2(600.0, 340.0))],
+        ]);
+        assert_eq!(hovers(&vertical), 2, "竖直 40 pt 要发：{vertical:?}");
+    }
+
+    /// 滚轮缩放时指针不动、相机在动，底下的元素一直在换：悬停色必须撤掉，否则会停在
+    /// 缩放前指着的那个元素上，直到鼠标再动一次——那是错的反馈。
+    #[test]
+    fn zooming_clears_the_hover_instead_of_leaving_it_on_a_stale_element() {
+        let hovers = |cmds: &[Cmd]| -> Vec<Option<[f32; 2]>> {
+            cmds.iter()
+                .filter_map(|cmd| match cmd {
+                    Cmd::HoverViewport(uv) => Some(*uv),
+                    _ => None,
+                })
+                .collect()
+        };
+        // 先移进视口指着某处，再在同一位置滚一格滚轮。
+        let frames = vec![
+            vec![egui::Event::PointerMoved(pos2(600.0, 350.0))],
+            vec![
+                egui::Event::PointerMoved(pos2(600.0, 350.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(0.0, 40.0),
+                    modifiers: Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                },
+            ],
+        ];
+        let sent = hovers(&viewport_cmds(frames));
+        assert!(sent.contains(&None), "滚轮缩放要撤掉悬停色：{sent:?}");
+        // 撤了之后不该在同一帧又发一发 Some 把它盖回去。
+        let last = sent.last().copied().flatten();
+        assert_eq!(last, None, "缩放这一帧末态应是无悬停：{sent:?}");
     }
 
     /// 在视口里点一下，得发得出拾取命令。

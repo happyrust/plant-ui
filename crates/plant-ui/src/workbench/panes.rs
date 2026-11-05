@@ -24,6 +24,9 @@ pub enum Pane {
     /// 房间树（plant3d-web「房间」页签移植）：与模型树同一侧、同一组页签。单立一个 dock 页签而不是
     /// 模型树里自画子页签：plant-ui 的面板本身就是页签，再套一层是两套页签样式（计划 D1）。
     RoomTree,
+    /// Spooling（卷管 / 管段）：`SPLDRG` / `SPOOL` / `PSPOOL` / `HSPOOL` / `FIELD` / `PPIECE`
+    /// 六类平铺。与模型树同侧同组，但**不是**模型树的子层：spool 的 owner 链不经过 `SITE`。
+    Spooling,
     View3d,
     CommandLine,
     Logs,
@@ -39,6 +42,7 @@ impl Pane {
         match self {
             Pane::ModelTree => (ph::TREE_STRUCTURE, "模型树"),
             Pane::RoomTree => (ph::TREE_VIEW, "房间树"),
+            Pane::Spooling => (ph::PACKAGE, "管段"),
             Pane::View3d => (ph::CUBE, "三维视图"),
             Pane::CommandLine => (ph::TERMINAL_WINDOW, "命令行"),
             Pane::Logs => (ph::LIST_DASHES, "日志"),
@@ -128,6 +132,7 @@ impl TabViewer for Viewer<'_> {
             Pane::RoomTree => {
                 super::room_tree::show(ui, self.t, self.d, self.vm, self.room_tree, self.cmds)
             }
+            Pane::Spooling => super::spooling::show(ui, self.t, self.d, self.vm, self.cmds),
             Pane::Properties => super::props::show(ui, self.t, self.d, self.vm, self.cmds),
             Pane::Room => super::room::show(ui, self.t, self.d, self.vm, self.cmds),
             Pane::VirtualHoles => {

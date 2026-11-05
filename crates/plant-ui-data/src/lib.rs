@@ -12,6 +12,10 @@ pub use aios_core::{RefU64, RefnoEnum};
 #[cfg(not(target_arch = "wasm32"))]
 pub mod name_index;
 pub mod room;
+/// Spooling（卷管 / 管段）查询。与模型树分开：spool 不挂在 SITE 下，
+/// 走 `SPLDRG -> SPOOL`（老 spooler）与 `PIPE -> PSLIST -> PSPOOL`（pipe fabrication）
+/// 两条链。见模块文档。
+pub mod spooling;
 
 /// 连接本地 SurrealDB（读取工作目录的 DbOption.toml，走 aios_core 全局句柄 SUL_DB）。
 pub async fn connect() -> Result<()> {
@@ -60,10 +64,92 @@ pub async fn sample_named_elements(limit: usize) -> Result<Vec<(String, String, 
     Ok(rows)
 }
 
-/// 模型树根层：当前 MDB 世界下的 SITE 节点（带 children_count）。
+/// 模型树根层：当前 MDB 世界下的 SITE 节点（带 children_count），再追加
+/// `extra_element_dbnums` 补充库的 SITE（gen-model ADR-095：只增不减）。
+///
+/// 补充库排在 MDB 的 SITE 之后，按 refno 去重（某个库后来进了 MDB 声明也不会出两行），
+/// `order` 整体重排。补充名单为空时与原先逐位相同。
 pub async fn site_nodes() -> Result<Vec<EleTreeNode>> {
     let mdb = aios_core::helper::to_e3d_name(&aios_core::get_db_option().mdb_name).into_owned();
-    aios_core::get_mdb_world_site_ele_nodes(mdb, DBType::DESI).await
+    let nodes = aios_core::get_mdb_world_site_ele_nodes(mdb, DBType::DESI).await?;
+    let extra = extra_element_dbnums();
+    if extra.is_empty() {
+        return Ok(nodes);
+    }
+    // 列与 rs-core 的 MDB SITE 查询一致，模型树拿到的是同一种节点。
+    let mut response = SUL_DB
+        .query(EXTRA_SITE_SQL)
+        .bind(("extra", extra))
+        .await?;
+    let extra_nodes: Vec<EleTreeNode> = response.take(0)?;
+    Ok(merge_site_nodes(nodes, extra_nodes))
+}
+
+const EXTRA_SITE_SQL: &str = "SELECT refno, noun, name, owner,      array::len(select value in from <-pe_owner) AS children_count      FROM pe WHERE noun='SITE' AND dbnum IN $extra AND !deleted";
+
+/// MDB 的 SITE 在前、补充库的在后，按 refno 去重，`order` 按最终位置重排。
+fn merge_site_nodes(mut nodes: Vec<EleTreeNode>, extra: Vec<EleTreeNode>) -> Vec<EleTreeNode> {
+    for node in extra {
+        if !nodes.iter().any(|known| known.refno == node.refno) {
+            nodes.push(node);
+        }
+    }
+    for (i, node) in nodes.iter_mut().enumerate() {
+        node.order = i as _;
+    }
+    nodes
+}
+
+/// `DbOption.toml` 的 `extra_element_dbnums`，去重保序；没写、读不动或在浏览器端都是空表。
+///
+/// 读的是与 `aios_core::get_db_option()` 回落时同一份文件（工作目录 `DbOption`，
+/// `DB_OPTION_FILE` 可改指）。走旧版项目配置（资产根下的 legacy 文件）时那份配置不带
+/// 这个键，补充名单只可能来自工作目录里的 `DbOption.toml`；那里也没写就是不追加。
+pub fn extra_element_dbnums() -> Vec<u32> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static EXTRA: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+        EXTRA
+            .get_or_init(|| {
+                let name = std::env::var("DB_OPTION_FILE")
+                    .ok()
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| "DbOption".to_owned());
+                let read = config::Config::builder()
+                    .add_source(config::File::with_name(&name).required(false))
+                    .build()
+                    .and_then(|config| config.try_deserialize::<ExtraElementDbnums>());
+                match read {
+                    Ok(fields) => normalise_dbnums(fields.extra_element_dbnums),
+                    Err(error) => {
+                        eprintln!("⚠ 读取 extra_element_dbnums 失败（{name}）：{error}，模型树不追加补充库");
+                        Vec::new()
+                    }
+                }
+            })
+            .clone()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        Vec::new()
+    }
+}
+
+/// 只取补充名单这一键；同一个文件里其余的键都归 `aios_core::DbOption`，这里一律忽略。
+#[derive(Debug, Default, serde::Deserialize)]
+struct ExtraElementDbnums {
+    #[serde(default)]
+    extra_element_dbnums: Option<Vec<u32>>,
+}
+
+fn normalise_dbnums(configured: Option<Vec<u32>>) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::new();
+    for dbnum in configured.unwrap_or_default() {
+        if !out.contains(&dbnum) {
+            out.push(dbnum);
+        }
+    }
+    out
 }
 
 /// 任意元素的直接子层（无名节点由查询侧按 noun 补默认名）。
@@ -669,6 +755,48 @@ fn fmt_attr(v: &aios_core::NamedAttrValue) -> String {
     }
 }
 
+#[cfg(test)]
+mod extra_site_tests {
+    use super::*;
+
+    fn site(refno: u64, name: &str) -> EleTreeNode {
+        EleTreeNode {
+            refno: RefnoEnum::from(RefU64(refno)),
+            noun: "SITE".into(),
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    /// 补充库排在 MDB 的 SITE 之后；已在 MDB 里的不重复；order 按最终位置重排。
+    #[test]
+    fn extra_sites_append_after_the_mdb_sites_without_duplicates() {
+        let merged = merge_site_nodes(
+            vec![site(1, "/A"), site(2, "/B")],
+            vec![site(2, "/B"), site(3, "/PIPE_4DK_FWD")],
+        );
+        let names: Vec<_> = merged.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["/A", "/B", "/PIPE_4DK_FWD"]);
+        assert!(merged.iter().enumerate().all(|(i, n)| n.order as usize == i));
+    }
+
+    /// 没写补充名单就不追加：与引入前逐位相同。
+    #[test]
+    fn an_empty_extra_list_changes_nothing() {
+        let merged = merge_site_nodes(vec![site(1, "/A")], Vec::new());
+        assert_eq!(merged.len(), 1);
+        assert!(normalise_dbnums(None).is_empty());
+        assert_eq!(normalise_dbnums(Some(vec![251095, 251137, 251095])), [251095, 251137]);
+    }
+
+    /// 查询只认未软删的 SITE，并按补充名单过滤。
+    #[test]
+    fn the_extra_site_query_filters_by_dbnum_and_soft_delete() {
+        assert!(EXTRA_SITE_SQL.contains("noun='SITE'"));
+        assert!(EXTRA_SITE_SQL.contains("dbnum IN $extra"));
+        assert!(EXTRA_SITE_SQL.contains("!deleted"));
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

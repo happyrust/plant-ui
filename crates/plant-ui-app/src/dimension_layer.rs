@@ -384,6 +384,7 @@ mod tests {
                     id: "t".into(),
                     text: "N".into(),
                     position: [4.0, 5.0, 6.0],
+                    text_height_mm: None,
                 },
                 MbdPrimitive::SlopeMark {
                     id: "s".into(),
@@ -395,6 +396,7 @@ mod tests {
                     id: "empty".into(),
                     text: String::new(),
                     position: [0.0; 3],
+                    text_height_mm: None,
                 },
                 MbdPrimitive::Label {
                     id: "bad".into(),
@@ -625,6 +627,7 @@ mod tests {
             id: "t".into(),
             text: "N".into(),
             position: [0.0; 3],
+            text_height_mm: None,
         };
         let label = MbdPrimitive::Label {
             id: "lb".into(),
