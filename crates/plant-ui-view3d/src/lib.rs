@@ -63,6 +63,9 @@ pub use room_clip::{RoomClipPhase, RoomClipStatus, RoomVolumeBatch, panel_bounds
 
 const INITIAL_SIZE: UVec2 = UVec2::new(1200, 700);
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(120);
+/// 拖动降画质的保持时长：最后一次手势之后这么久没有新手势，才恢复超采样与伪阴影。
+/// 滚轮一格一格地来，太短会在两格之间来回重建离屏图。
+const INTERACTION_QUALITY_HOLD: Duration = Duration::from_millis(200);
 /// 没有渲染设备可问（单元测试）时当作纹理边长上限：wgpu 的 downlevel 缺省。
 const DEFAULT_MAX_TEXTURE_DIM: u32 = 8192;
 /// 模型单位（PDMS 毫米）到世界单位：1 mm = 0.01 世界单位，也就是
@@ -216,6 +219,9 @@ impl Plugin for View3dPlugin {
                     load_models,
                     update_mesh_progress,
                     retry_meshes,
+                    // 拖动降画质的到期与倍数回写。宿主下发手势时已续期，排在 apply_resize 之前，
+                    // 同一帧就开始按新倍数重建离屏图。
+                    update_interaction_quality,
                     apply_resize,
                     apply_commands,
                     // 直段根的 Visibility 这一帧被谁改过都在这儿记一笔（逐段眼睛，ADR-0033 阶段四）。
@@ -371,6 +377,11 @@ pub struct View3d {
     /// 逐段账变过、还没交给宿主的 BRAN。
     tube_dirty: HashSet<RefU64>,
     pending_resize: Option<(UVec2, Instant)>,
+    /// 拖动降画质：最近一次相机手势续到的期限。`Some` = 正在交互，超采样倍数压到 1、伪阴影暂停（边线照画，
+    /// prepass 不摘，免得管线重编）。由 [`update_interaction_quality`] 到期清掉。
+    interacting_until: Option<Instant>,
+    /// `PLANT_UI_DRAG_DOWNGRADE=0` 时为 false：交互期间也保持全画质。
+    drag_downgrade: bool,
     /// 已经改给离屏相机、但还没交给 egui 的新目标。至少让相机完整画过一帧再切，
     /// 否则窗口相机会采到刚创建、内容尚空的 GPU 纹理。
     prepared_resize: Option<PreparedResize>,
@@ -479,7 +490,16 @@ impl View3d {
     }
 
     pub fn camera(&mut self, gesture: CameraGesture) {
+        // 松手不续期：保持期从最后一次真动作算起，到期由 `update_interaction_quality` 收。
+        if self.drag_downgrade && !matches!(gesture, CameraGesture::End) {
+            self.interacting_until = Some(Instant::now() + INTERACTION_QUALITY_HOLD);
+        }
         self.commands.push_back(ViewCommand::Camera(gesture));
+    }
+
+    /// 正处在拖动降画质期间（手势进行中，或最后一次手势之后还没过保持期）。
+    fn interacting(&self) -> bool {
+        self.interacting_until.is_some()
     }
 
     pub fn model(&mut self, action: ModelAction) {
@@ -1200,6 +1220,10 @@ fn setup(
         tube_states: HashMap::new(),
         tube_dirty: HashSet::new(),
         pending_resize: None,
+        interacting_until: None,
+        drag_downgrade: render_gate::parse_default_on_flag(
+            std::env::var("PLANT_UI_DRAG_DOWNGRADE").ok().as_deref(),
+        ),
         prepared_resize: None,
         retired_resize: VecDeque::new(),
         picked: None,
@@ -1565,7 +1589,8 @@ fn sync_camera_look(
                 .and_then(blur_sharpness_for_depth_range)
                 .unwrap_or(post.ao2.w);
             // AO / 模糊按 1/倍数 分辨率跑：超采样时正好是屏幕分辨率（E3D 的 halfRes 关）。
-            SglLookPost::new(look.hlr, look.ao, sharpness, scale)
+            // 拖动期间暂停伪阴影（HBAO + 两遍模糊是后处理的大头）；边线照画，prepass 不摘，免得管线重编。
+            SglLookPost::new(look.hlr, look.ao && !view.interacting(), sharpness, scale)
                 .with_background(e3d_look::presets::e3d_background(look.gradient))
                 .with_debug(*debug_view)
         } else {
@@ -1583,6 +1608,36 @@ fn render_scale_for(look: ViewportLook, post_effects_supported: bool) -> u32 {
     match (look.mode, look.aa) {
         (LookMode::E3d, AntiAlias::Ssaa2x2) if post_effects_supported => 2,
         _ => 1,
+    }
+}
+
+/// 交互期间（拖动降画质）倍数压到 1，其余照外观走 [`render_scale_for`]。
+fn effective_render_scale(
+    look: ViewportLook,
+    post_effects_supported: bool,
+    interacting: bool,
+) -> u32 {
+    if interacting {
+        1
+    } else {
+        render_scale_for(look, post_effects_supported)
+    }
+}
+
+/// 拖动降画质的收尾：按住不放（`orbit.motion` 还在）一直续期，否则过了保持期就清掉；再把倍数按此刻状态写回。
+/// 恢复全画质时倍数变了，闸门按 `image_scale != render_scale` 算忙，会醒来补一帧完整画质再停。
+fn update_interaction_quality(mut view: ResMut<View3d>, orbit: Res<OrbitCamera>) {
+    if let Some(until) = view.interacting_until {
+        let now = Instant::now();
+        if orbit.motion.is_some() {
+            view.interacting_until = Some(now + INTERACTION_QUALITY_HOLD);
+        } else if now >= until {
+            view.interacting_until = None;
+        }
+    }
+    let wanted = effective_render_scale(view.look, view.post_effects_supported, view.interacting());
+    if view.render_scale != wanted {
+        view.render_scale = wanted;
     }
 }
 
@@ -2358,7 +2413,11 @@ fn apply_commands(
                     // 材质按外观全场重挑（`apply_materials`）；`LookMaterials` 见外观变了自己清表。
                     view.material_dirty = true;
                     // 超采样倍数变了由 `apply_resize` 重建离屏图；prepass / Msaa / FXAA 由 `sync_camera_look` 挂摘。
-                    view.render_scale = render_scale_for(look, view.post_effects_supported);
+                    view.render_scale = effective_render_scale(
+                        look,
+                        view.post_effects_supported,
+                        view.interacting(),
+                    );
                 }
             }
             ViewCommand::Snap { forward, up, fit } => {
@@ -2927,6 +2986,8 @@ pub(crate) fn blank_view() -> View3d {
         tube_states: HashMap::new(),
         tube_dirty: HashSet::new(),
         pending_resize: None,
+        interacting_until: None,
+        drag_downgrade: true,
         prepared_resize: None,
         retired_resize: VecDeque::new(),
         picked: None,
@@ -3516,6 +3577,174 @@ mod tests {
             !entity.get::<SglLookPost>().unwrap().active(),
             "PBR 不提取，节点不跑"
         );
+    }
+
+    /// 拖动降画质的测试台：倍数回写 + 相机外观件，出厂 E3D 外观（2×2 超采样、伪阴影开），起手全画质。
+    fn interaction_app(look: ViewportLook) -> (App, Entity) {
+        let mut app = App::new();
+        app.init_resource::<SglLookDebugView>()
+            .insert_resource(OrbitCamera::default());
+        let mut view = test_view();
+        view.look = look;
+        view.render_scale = render_scale_for(look, true);
+        view.image_scale = view.render_scale;
+        app.insert_resource(view).add_systems(
+            Update,
+            (update_interaction_quality, sync_camera_look).chain(),
+        );
+        let camera = app
+            .world_mut()
+            .spawn((
+                ViewCamera,
+                Transform::from_xyz(0.0, 0.0, 10.0).looking_at(Vec3::ZERO, Vec3::Y),
+                GlobalTransform::default(),
+                Projection::default(),
+                Msaa::Off,
+                SglLookPost::off(),
+            ))
+            .id();
+        app.update();
+        (app, camera)
+    }
+
+    fn post_of(app: &App, camera: Entity) -> SglLookPost {
+        *app.world().entity(camera).get::<SglLookPost>().unwrap()
+    }
+
+    fn gesture(app: &mut App, gesture: CameraGesture) {
+        app.world_mut().resource_mut::<View3d>().camera(gesture);
+    }
+
+    /// 让保持期立刻到期，不在测试里真等 200ms。
+    fn expire_interaction(app: &mut App) {
+        let mut view = app.world_mut().resource_mut::<View3d>();
+        if view.interacting_until.is_some() {
+            view.interacting_until = Some(Instant::now() - Duration::from_millis(1));
+        }
+    }
+
+    const BEGIN: CameraGesture = CameraGesture::Begin {
+        motion: CameraMotion::Orbit,
+        anchor: [0.5, 0.5],
+    };
+
+    /// 手势一开始就降：倍数 1、伪阴影关，边线与 prepass 照旧（不触发管线重编）。
+    #[test]
+    fn a_gesture_drops_supersampling_and_ao_but_keeps_the_edges() {
+        let (mut app, camera) = interaction_app(ViewportLook::default());
+        assert_eq!(app.world().resource::<View3d>().render_scale, 2);
+        assert!(post_of(&app, camera).ao_on());
+
+        gesture(&mut app, BEGIN);
+        app.update();
+        assert_eq!(app.world().resource::<View3d>().render_scale, 1);
+        let post = post_of(&app, camera);
+        assert!(!post.ao_on(), "拖动中伪阴影该暂停");
+        assert!(post.hlr_on(), "边线保留");
+        assert!(app.world().entity(camera).contains::<NormalPrepass>());
+    }
+
+    /// 按住拖着不放：每帧的 Drag 都续期；就算两次 Drag 之间超过保持期，只要还按着（`orbit.motion`）也不恢复。
+    #[test]
+    fn a_held_drag_stays_downgraded() {
+        let (mut app, camera) = interaction_app(ViewportLook::default());
+        gesture(&mut app, BEGIN);
+        app.world_mut().resource_mut::<OrbitCamera>().motion = Some(CameraMotion::Orbit);
+        for _ in 0..5 {
+            gesture(&mut app, CameraGesture::Drag([3.0, 1.0]));
+            app.update();
+            assert_eq!(app.world().resource::<View3d>().render_scale, 1);
+            assert!(!post_of(&app, camera).ao_on());
+        }
+        expire_interaction(&mut app);
+        app.update();
+        assert_eq!(
+            app.world().resource::<View3d>().render_scale,
+            1,
+            "还按着就续期，不因为手停了一下就恢复"
+        );
+    }
+
+    /// 松手后保持期内仍降级；过了保持期恢复 2× 与伪阴影，状态清掉。
+    #[test]
+    fn releasing_restores_full_quality_after_the_hold() {
+        let (mut app, camera) = interaction_app(ViewportLook::default());
+        gesture(&mut app, BEGIN);
+        app.update();
+        gesture(&mut app, CameraGesture::End);
+        app.update();
+        assert_eq!(
+            app.world().resource::<View3d>().render_scale,
+            1,
+            "保持期内不恢复"
+        );
+        assert!(!post_of(&app, camera).ao_on());
+
+        expire_interaction(&mut app);
+        app.update();
+        let view = app.world().resource::<View3d>();
+        assert_eq!(view.render_scale, 2);
+        assert!(view.interacting_until.is_none());
+        assert!(post_of(&app, camera).ao_on(), "恢复后伪阴影回来");
+    }
+
+    /// 滚轮也算交互；外观本来就是 1× 的（PBR、FXAA）不受影响，恢复后也还是 1。
+    #[test]
+    fn looks_without_supersampling_are_unaffected() {
+        let mut fxaa = ViewportLook::default();
+        fxaa.aa = AntiAlias::Fxaa;
+        let mut pbr = ViewportLook::default();
+        pbr.mode = LookMode::Pbr;
+        for look in [fxaa, pbr] {
+            let (mut app, _) = interaction_app(look);
+            gesture(
+                &mut app,
+                CameraGesture::Zoom {
+                    amount: 10.0,
+                    anchor: [0.5, 0.5],
+                },
+            );
+            app.update();
+            assert_eq!(app.world().resource::<View3d>().render_scale, 1);
+            expire_interaction(&mut app);
+            app.update();
+            assert_eq!(app.world().resource::<View3d>().render_scale, 1);
+        }
+        let factory = ViewportLook::default();
+        assert_eq!(effective_render_scale(factory, true, true), 1);
+        assert_eq!(effective_render_scale(factory, true, false), 2);
+        assert_eq!(effective_render_scale(factory, false, false), 1);
+    }
+
+    /// `PLANT_UI_DRAG_DOWNGRADE=0`：交互期间也保持全画质。
+    #[test]
+    fn a_disabled_drag_downgrade_never_drops_quality() {
+        let (mut app, camera) = interaction_app(ViewportLook::default());
+        app.world_mut().resource_mut::<View3d>().drag_downgrade = false;
+        gesture(&mut app, BEGIN);
+        app.update();
+        gesture(&mut app, CameraGesture::Drag([3.0, 1.0]));
+        app.update();
+        let view = app.world().resource::<View3d>();
+        assert_eq!(view.render_scale, 2);
+        assert!(view.interacting_until.is_none());
+        assert!(post_of(&app, camera).ao_on());
+    }
+
+    /// 交互中改外观：倍数仍压在 1，到期后才按新外观走。
+    #[test]
+    fn a_look_change_while_interacting_waits_for_the_hold() {
+        let (mut app, _) = interaction_app(ViewportLook::default());
+        gesture(&mut app, BEGIN);
+        app.update();
+        let mut look = ViewportLook::default();
+        look.gradient = !look.gradient;
+        let interacting = app.world().resource::<View3d>().interacting();
+        assert_eq!(effective_render_scale(look, true, interacting), 1);
+        app.world_mut().resource_mut::<View3d>().look = look;
+        expire_interaction(&mut app);
+        app.update();
+        assert_eq!(app.world().resource::<View3d>().render_scale, 2);
     }
 
     /// 离屏图的物理尺寸是逻辑尺寸 × 倍数，但不超过设备的纹理边长上限：超采样下跨三块屏的窗只是那一轴打折，不炸。

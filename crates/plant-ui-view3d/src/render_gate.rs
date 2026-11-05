@@ -40,13 +40,13 @@ impl Default for ViewportRenderGate {
     fn default() -> Self {
         Self {
             settle_frames_left: SETTLE_FRAMES,
-            enabled: parse_idle_render_flag(std::env::var("PLANT_UI_IDLE_RENDER").ok().as_deref()),
+            enabled: parse_default_on_flag(std::env::var("PLANT_UI_IDLE_RENDER").ok().as_deref()),
         }
     }
 }
 
-/// 缺省开，只有明确的否定值才关；与 `PLANT_UI_INDIRECT_DRAW` 同一套口径。
-pub(crate) fn parse_idle_render_flag(value: Option<&str>) -> bool {
+/// 缺省开，只有明确的否定值才关；与 `PLANT_UI_INDIRECT_DRAW` 同一套口径（`PLANT_UI_DRAG_DOWNGRADE` 也用它）。
+pub(crate) fn parse_default_on_flag(value: Option<&str>) -> bool {
     !value.is_some_and(|value| {
         matches!(
             value.trim().to_ascii_lowercase().as_str(),
@@ -263,12 +263,12 @@ mod tests {
     #[test]
     fn idle_render_is_on_unless_explicitly_switched_off() {
         for off in ["0", "false", "OFF", " no "] {
-            assert!(!parse_idle_render_flag(Some(off)), "{off}");
+            assert!(!parse_default_on_flag(Some(off)), "{off}");
         }
         for on in ["", "1", "true", "unexpected"] {
-            assert!(parse_idle_render_flag(Some(on)), "{on}");
+            assert!(parse_default_on_flag(Some(on)), "{on}");
         }
-        assert!(parse_idle_render_flag(None));
+        assert!(parse_default_on_flag(None));
     }
 
     #[test]
@@ -398,6 +398,37 @@ mod tests {
             app.update();
             assert!(is_active(&app, camera));
         }
+    }
+
+    /// 拖动降画质的恢复：保持期到了倍数回 2，与正展示的 1× 图不等，闸门醒来；新图换上之后重新停画。
+    #[test]
+    fn restoring_full_quality_after_a_drag_wakes_and_then_settles() {
+        let (mut app, camera) = gate_app();
+        app.add_systems(Update, crate::update_interaction_quality);
+        {
+            let mut view = app.world_mut().resource_mut::<View3d>();
+            view.render_scale = 2;
+            view.image_scale = 2;
+        }
+        assert!(settle(&mut app, camera));
+
+        app.world_mut()
+            .resource_mut::<View3d>()
+            .camera(plant_ui::CameraGesture::Drag([1.0, 0.0]));
+        app.update();
+        assert_eq!(app.world().resource::<View3d>().render_scale, 1);
+        assert!(is_active(&app, camera), "降画质要重建离屏图，闸门得醒着");
+        // apply_resize 换上 1× 的图之后（这里直接写结果），没有别的变化就照常停画。
+        app.world_mut().resource_mut::<View3d>().image_scale = 1;
+        assert!(settle(&mut app, camera), "交互态本身不该让视口一直画");
+
+        app.world_mut().resource_mut::<View3d>().interacting_until =
+            Some(web_time::Instant::now() - std::time::Duration::from_millis(1));
+        app.update();
+        assert_eq!(app.world().resource::<View3d>().render_scale, 2);
+        assert!(is_active(&app, camera), "恢复全画质要醒来补一帧");
+        app.world_mut().resource_mut::<View3d>().image_scale = 2;
+        assert!(settle(&mut app, camera), "换上 2× 的图之后重新停画");
     }
 
     #[test]
