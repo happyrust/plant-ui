@@ -10,7 +10,6 @@
 //! 并只框它取景：相机离它 150 m 上下、远端面 200 m 开外，是 2026-10-25 整库全视在浏览器里撞上「筒体条纹 / 穹顶同心环」
 //! 的最小复现（ND 深度存 f16 时百米外的量化步长超过边线阈值），不要模型库也能在两端复查。
 
-use std::collections::HashMap;
 use std::f32::consts::FRAC_PI_2;
 
 use aios_core::RefU64;
@@ -21,8 +20,7 @@ use web_time::{Duration, Instant};
 use super::colour_table::{E3D_AIDS_COLOUR, rgb_bytes};
 use crate::{
     ModelMesh, ModelPickTarget, ModelRoot, OrbitCamera, SceneRoot, View3d, ViewCamera, diag,
-    extend_bounds, fallback_line_material, frame_bounds, scene_bounds_from_mm, scene_transform,
-    type_color,
+    fallback_line_material, frame_bounds, scene_bounds_from_mm, scene_transform, type_color,
 };
 
 /// 帧时间汇总的窗口。
@@ -268,7 +266,7 @@ impl DemoShape {
 fn spawn_part(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
-    bounds: &mut HashMap<RefU64, (Vec3, Vec3)>,
+    view: &mut View3d,
     scene: Entity,
     refno: RefU64,
     part: &DemoPart,
@@ -277,7 +275,7 @@ fn spawn_part(
     let centre = Vec3::from_array(part.centre);
     let world_bounds = scene_bounds_from_mm((centre - half).to_array(), (centre + half).to_array());
     if let Some((min, max)) = world_bounds {
-        extend_bounds(bounds, refno, min, max);
+        view.extend_model_bounds(refno, min, max);
     }
     let mut colour = type_color(part.generic).to_srgba().to_u8_array();
     colour[3] = part.alpha;
@@ -334,26 +332,12 @@ pub(crate) fn spawn_look_demo(
         .id();
     let plant = union_bounds(PARTS.iter().enumerate().filter_map(|(index, part)| {
         let refno = RefU64(FIRST_REFNO + index as u64);
-        spawn_part(
-            &mut commands,
-            &mut meshes,
-            &mut view.bounds,
-            scene,
-            refno,
-            part,
-        )
+        spawn_part(&mut commands, &mut meshes, &mut view, scene, refno, part)
     }));
     let far = demo.far.then(|| {
         union_bounds(FAR_PARTS.iter().enumerate().filter_map(|(index, part)| {
             let refno = RefU64(FIRST_FAR_REFNO + index as u64);
-            spawn_part(
-                &mut commands,
-                &mut meshes,
-                &mut view.bounds,
-                scene,
-                refno,
-                part,
-            )
+            spawn_part(&mut commands, &mut meshes, &mut view, scene, refno, part)
         }))
     });
     // aids 蓝球：辅助几何走无光照 StandardMaterial（同地面网格 / 三轴），不挂 `ModelMesh`，

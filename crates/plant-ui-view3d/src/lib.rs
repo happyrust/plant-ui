@@ -407,7 +407,13 @@ pub struct View3d {
     /// 当前完整的 X-Ray 目标集；同时匹配模型 refno 与 owner。
     xray: HashSet<RefU64>,
     material_dirty: bool,
+    /// 每个模型（与它的 owner）的包围盒。只经 [`Self::extend_model_bounds`] / [`Self::remove_bounds`] /
+    /// [`Self::clear_bounds`] 改，免得漏翻 `bounds_dirty`。
     bounds: HashMap<RefU64, (Vec3, Vec3)>,
+    /// `bounds` 全体的并集缓存。E3D 外观每帧都要用它算模糊锐度，整库五万个盒子不能每帧现算。
+    scene_aabb: Option<(Vec3, Vec3)>,
+    /// `scene_aabb` 过期了（删过盒子，并集没法增量缩），下次读时重算。
+    bounds_dirty: bool,
     /// 隔离前的可见性快照（refno -> 是否可见）。`Some` = 正处于隔离中。
     /// 只记第一次：连续隔离退出时回到隔离前的世界，而不是上一间房。
     isolate_restore: Option<HashMap<RefU64, bool>>,
@@ -500,6 +506,40 @@ impl View3d {
     /// 正处在拖动降画质期间（手势进行中，或最后一次手势之后还没过保持期）。
     fn interacting(&self) -> bool {
         self.interacting_until.is_some()
+    }
+
+    /// 把一个盒子并进 `refno` 的包围盒。并集缓存是新鲜的就顺手扩上，不必重算。
+    fn extend_model_bounds(&mut self, refno: RefU64, min: Vec3, max: Vec3) {
+        extend_bounds(&mut self.bounds, refno, min, max);
+        if !self.bounds_dirty {
+            self.scene_aabb = Some(match self.scene_aabb {
+                Some((lo, hi)) => (lo.min(min), hi.max(max)),
+                None => (min, max),
+            });
+        }
+    }
+
+    fn remove_bounds(&mut self, removed: &HashSet<RefU64>) {
+        let before = self.bounds.len();
+        self.bounds.retain(|refno, _| !removed.contains(refno));
+        if self.bounds.len() != before {
+            self.bounds_dirty = true;
+        }
+    }
+
+    fn clear_bounds(&mut self) {
+        self.bounds.clear();
+        self.scene_aabb = None;
+        self.bounds_dirty = false;
+    }
+
+    /// 所有已装模型包围盒的并集；没有模型为 `None`。
+    fn scene_aabb(&mut self) -> Option<(Vec3, Vec3)> {
+        if self.bounds_dirty {
+            self.scene_aabb = union_of_bounds(&self.bounds);
+            self.bounds_dirty = false;
+        }
+        self.scene_aabb
     }
 
     pub fn model(&mut self, action: ModelAction) {
@@ -1236,6 +1276,8 @@ fn setup(
         xray: HashSet::new(),
         material_dirty: false,
         bounds: HashMap::new(),
+        scene_aabb: None,
+        bounds_dirty: false,
         isolate_restore: None,
         dimension_labels: Vec::new(),
         dimension_label_uvs: Vec::new(),
@@ -1539,7 +1581,7 @@ fn publish_camera(
 /// MSAA 回 4×、后处理关（不提取，节点不跑）。跑在变换传播之后，深度范围用的是本帧真正渲染的相机位姿。
 fn sync_camera_look(
     mut commands: Commands,
-    view: Res<View3d>,
+    mut view: ResMut<View3d>,
     debug_view: Res<SglLookDebugView>,
     mut cameras: Query<
         (
@@ -1564,6 +1606,12 @@ fn sync_camera_look(
     let fxaa = e3d && look.aa == AntiAlias::Fxaa;
     // 合成按相机此刻真正画着的那张图的倍数做块平均，不按目标值：切倍数那一两帧两者不等。
     let scale = view.rendering_scale();
+    // 只在缓存过期时才可变借用：`ResMut` 一写就标脏，平时只读不碰。
+    let scene_aabb = if view.bounds_dirty {
+        view.scene_aabb()
+    } else {
+        view.scene_aabb
+    };
     for (entity, transform, projection, mut msaa, mut post, has_prepass, has_fxaa) in &mut cameras {
         if prepass != has_prepass {
             if prepass {
@@ -1585,7 +1633,8 @@ fn sync_camera_look(
         }
         let wanted = if e3d {
             // E3D 3.1 每帧按场景深度范围算模糊锐度；算不出（空场景）沿用上一帧。
-            let sharpness = scene_depth_range(&view.bounds, transform, projection)
+            let sharpness = scene_aabb
+                .and_then(|(min, max)| scene_depth_range(min, max, transform, projection))
                 .and_then(blur_sharpness_for_depth_range)
                 .unwrap_or(post.ao2.w);
             // AO / 模糊按 1/倍数 分辨率跑：超采样时正好是屏幕分辨率（E3D 的 halfRes 关）。
@@ -1641,18 +1690,21 @@ fn update_interaction_quality(mut view: ResMut<View3d>, orbit: Res<OrbitCamera>)
     }
 }
 
-/// 所有已装模型的包围盒并集在相机眼空间的线性深度范围（世界单位）；没有模型为 `None`。
+/// 包围盒的并集；空表为 `None`。
+fn union_of_bounds(bounds: &HashMap<RefU64, (Vec3, Vec3)>) -> Option<(Vec3, Vec3)> {
+    bounds
+        .values()
+        .copied()
+        .reduce(|(min_a, max_a), (min_b, max_b)| (min_a.min(min_b), max_a.max(max_b)))
+}
+
+/// 场景并集盒（[`View3d::scene_aabb`]）在相机眼空间的线性深度范围（世界单位）。
 fn scene_depth_range(
-    bounds: &HashMap<RefU64, (Vec3, Vec3)>,
+    min: Vec3,
+    max: Vec3,
     camera: &GlobalTransform,
     projection: &Projection,
 ) -> Option<f32> {
-    let mut min = Vec3::splat(f32::INFINITY);
-    let mut max = Vec3::splat(f32::NEG_INFINITY);
-    for (lo, hi) in bounds.values() {
-        min = min.min(*lo);
-        max = max.max(*hi);
-    }
     if !min.is_finite() || !max.is_finite() {
         return None;
     }
@@ -1857,7 +1909,7 @@ fn forget_model_state(view: &mut View3d, removed: &HashSet<RefU64>) {
     view.render_dirty.retain(|refno| !removed.contains(refno));
     view.tube_states.retain(|refno, _| !removed.contains(refno));
     view.tube_dirty.retain(|refno| !removed.contains(refno));
-    view.bounds.retain(|refno, _| !removed.contains(refno));
+    view.remove_bounds(removed);
     view.loading_meshes
         .retain(|mesh| !removed.contains(&mesh.refno));
     view.failed_meshes
@@ -1919,7 +1971,7 @@ fn load_models(
     let frame = should_frame_batch(roots.is_empty());
     let models = batch.into_models();
     if replace {
-        view.bounds.clear();
+        view.clear_bounds();
         view.loading_meshes.clear();
         // 整场换掉，上一场的失败连同它指向的实体一起作废。
         view.failed_meshes.clear();
@@ -1939,22 +1991,16 @@ fn load_models(
         ) else {
             continue;
         };
-        extend_bounds(&mut view.bounds, model.refno.refno(), min, max);
-        extend_bounds(&mut view.bounds, model.owner.refno(), min, max);
+        view.extend_model_bounds(model.refno.refno(), min, max);
+        view.extend_model_bounds(model.owner.refno(), min, max);
     }
-    if frame {
-        let mut all_min = Vec3::splat(f32::INFINITY);
-        let mut all_max = Vec3::splat(f32::NEG_INFINITY);
-        for &(min, max) in view.bounds.values() {
-            all_min = all_min.min(min);
-            all_max = all_max.max(max);
-        }
-        if all_min.is_finite()
-            && all_max.is_finite()
-            && let Ok((mut camera, mut projection)) = camera.single_mut()
-        {
-            frame_bounds(all_min, all_max, &mut orbit, &mut camera, &mut projection);
-        }
+    if frame
+        && let Some((all_min, all_max)) = view.scene_aabb()
+        && all_min.is_finite()
+        && all_max.is_finite()
+        && let Ok((mut camera, mut projection)) = camera.single_mut()
+    {
+        frame_bounds(all_min, all_max, &mut orbit, &mut camera, &mut projection);
     }
     if replace {
         for entity in &roots {
@@ -3000,6 +3046,8 @@ pub(crate) fn blank_view() -> View3d {
         xray: HashSet::new(),
         material_dirty: false,
         bounds: HashMap::new(),
+        scene_aabb: None,
+        bounds_dirty: false,
         isolate_restore: None,
         dimension_labels: Vec::new(),
         dimension_label_uvs: Vec::new(),
@@ -3938,6 +3986,94 @@ mod tests {
                 .dot((orbit.focus - camera.translation).normalize())
                 > 0.999
         );
+    }
+
+    /// 并集缓存与直接遍历 `bounds` 求的并一致：增量扩、删（含 owner 盒）、清空、清空后再装。
+    #[test]
+    fn the_cached_scene_aabb_matches_a_fresh_union() {
+        let mut view = test_view();
+        let check = |view: &mut View3d, what: &str| {
+            let fresh = union_of_bounds(&view.bounds);
+            assert_eq!(view.scene_aabb(), fresh, "{what}");
+        };
+        check(&mut view, "空场景");
+        assert_eq!(view.scene_aabb(), None);
+
+        let (a, b, owner) = (RefU64::from(1), RefU64::from(2), RefU64::from(9));
+        view.extend_model_bounds(a, Vec3::new(-1.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 1.0));
+        view.extend_model_bounds(owner, Vec3::new(-1.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 1.0));
+        view.extend_model_bounds(b, Vec3::new(5.0, -3.0, 2.0), Vec3::new(8.0, 4.0, 3.0));
+        view.extend_model_bounds(owner, Vec3::new(5.0, -3.0, 2.0), Vec3::new(8.0, 4.0, 3.0));
+        assert!(!view.bounds_dirty, "只扩不删时缓存跟着扩，不用重算");
+        check(&mut view, "增量扩");
+
+        view.remove_bounds(&HashSet::from([b]));
+        assert!(view.bounds_dirty);
+        check(&mut view, "删了 b，owner 盒还在");
+        view.remove_bounds(&HashSet::from([owner]));
+        check(&mut view, "owner 也删了，并集缩回 a");
+        assert_eq!(
+            view.scene_aabb(),
+            Some((Vec3::new(-1.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 1.0)))
+        );
+        view.remove_bounds(&HashSet::from([RefU64::from(77)]));
+        assert!(!view.bounds_dirty, "删一个不在账上的不该让缓存过期");
+
+        view.clear_bounds();
+        check(&mut view, "清空");
+        view.extend_model_bounds(b, Vec3::splat(2.0), Vec3::splat(3.0));
+        check(&mut view, "清空后再装");
+
+        // 脏着的时候再扩：不能只扩旧缓存（旧缓存里还有删掉的盒子），读时要整体重算。
+        view.extend_model_bounds(a, Vec3::splat(-10.0), Vec3::splat(-9.0));
+        view.remove_bounds(&HashSet::from([a]));
+        view.extend_model_bounds(owner, Vec3::splat(0.0), Vec3::splat(1.0));
+        check(&mut view, "脏着又扩");
+    }
+
+    /// 改成吃并集盒之后，深度范围与旧实现（逐盒求并再算角点）一致。
+    #[test]
+    fn scene_depth_range_of_the_union_matches_the_per_box_version() {
+        let mut bounds = HashMap::new();
+        let boxes = [
+            (Vec3::new(-2.0, -1.0, -3.0), Vec3::new(1.0, 2.0, 0.5)),
+            (Vec3::new(4.0, 0.0, -8.0), Vec3::new(6.0, 3.0, -5.0)),
+            (Vec3::new(-1.0, -4.0, 1.0), Vec3::new(0.0, -2.0, 2.0)),
+        ];
+        for (index, aabb) in boxes.into_iter().enumerate() {
+            bounds.insert(RefU64::from(index as u64 + 1), aabb);
+        }
+        let camera = GlobalTransform::from(
+            Transform::from_xyz(3.0, 4.0, 12.0).looking_at(Vec3::ZERO, Vec3::Y),
+        );
+        let projection = Projection::default();
+        // 旧实现原样留在测试里当参照。
+        let old = |bounds: &HashMap<RefU64, (Vec3, Vec3)>| {
+            let mut min = Vec3::splat(f32::INFINITY);
+            let mut max = Vec3::splat(f32::NEG_INFINITY);
+            for (lo, hi) in bounds.values() {
+                min = min.min(*lo);
+                max = max.max(*hi);
+            }
+            if !min.is_finite() || !max.is_finite() {
+                return None;
+            }
+            let near = match &projection {
+                Projection::Perspective(perspective) => perspective.near,
+                Projection::Orthographic(orthographic) => orthographic.near,
+                _ => 0.0,
+            };
+            eye_depth_range(min, max, &camera.compute_matrix().inverse(), near)
+        };
+        let new = |bounds: &HashMap<RefU64, (Vec3, Vec3)>| {
+            union_of_bounds(bounds)
+                .and_then(|(min, max)| scene_depth_range(min, max, &camera, &projection))
+        };
+        assert!(old(&bounds).is_some());
+        assert_eq!(new(&bounds), old(&bounds));
+        let empty = HashMap::new();
+        assert_eq!(new(&empty), None);
+        assert_eq!(old(&empty), None);
     }
 
     #[test]
