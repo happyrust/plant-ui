@@ -2458,6 +2458,8 @@ mod tests {
             model_source: None,
             model_source_reason: None,
             legacy_endpoint: false,
+            group_scope: false,
+            unresolved_count: 0,
         }
     }
 

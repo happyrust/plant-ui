@@ -2044,6 +2044,14 @@ fn cleanup_unload_plan(
 /// 「没有可用模型」——它不是失败，可人会盯着一片空白等一个不会来的模型。
 fn generate_summary(label: &str, reply: &model_update_api::GenerateReply) -> String {
     let mut line = match reply.status {
+        // 分组（分组计划 G2）一个生成根都解不出：要么没有成员，要么成员的主位置全解析不出。
+        // 不退化成下面那句「范围内无可渲染几何（0 个生成根）」——那句让人以为是成员自己没几何。
+        _ if reply.group_scope && reply.generation_root_count == 0 => {
+            match reply.unresolved_count {
+                0 => format!("{label}：分组为空或成员不可解析"),
+                lost => format!("{label}：分组为空或成员不可解析（{lost} 个成员解析不出）"),
+            }
+        }
         model_update_api::GenerateStatus::NoRenderableGeometry => format!(
             "{label}：生成完成，范围内无可渲染几何（{} 个生成根）",
             reply.generation_root_count
@@ -2094,6 +2102,36 @@ fn regenerate_label(head: String, targets: usize) -> String {
         format!("{head} 等 {targets} 项")
     } else {
         head
+    }
+}
+
+/// 右键「重新生成 / 清理」多选时挑掉分组目标（GPWL / GPSET，分组计划 D6）。菜单那道门只看
+/// 被右键的那一行，多选里别的行若是分组，发出去只会吃服务端的 422 `group_scope`。留下的保持
+/// 原序；树上查不到名词的照发——分组只能从树上选出来。返回留下的目标与挑掉的个数。
+fn without_group_targets<'a>(
+    targets: Vec<RefU64>,
+    noun_of: impl Fn(RefU64) -> Option<&'a str>,
+) -> (Vec<RefU64>, usize) {
+    let before = targets.len();
+    let kept: Vec<RefU64> = targets
+        .into_iter()
+        .filter(|refno| !workbench::tree::is_group_node(noun_of(*refno)))
+        .collect();
+    let skipped = before - kept.len();
+    (kept, skipped)
+}
+
+/// 挑掉分组之后进日志的那一句：说跳过了几个；全是分组就说一个都没发。
+fn group_skip_note(kind: model_mutation::Kind, skipped: usize, left: usize) -> String {
+    let title = kind.title();
+    if left == 0 {
+        format!(
+            "{title}：选中的 {skipped} 项都是分组（GPWL / GPSET），一个都没发；分组自己没有模型，成员在它的主位置上右键"
+        )
+    } else {
+        format!(
+            "{title}：跳过 {skipped} 个分组（GPWL / GPSET），其余 {left} 项照发；分组自己没有模型，成员在它的主位置上右键"
+        )
     }
 }
 
@@ -5457,7 +5495,18 @@ impl App {
     /// 不清点、不解根、不删产物——确认框不带数字，人要判断的只有「这个范围要不要重算 / 清掉」。
     /// 右键换一行就重开一次，上一趟没确认的那份目标随之作废；跑起来的那一趟不会走到这里
     /// （`regen_busy` 挡着右键菜单的这两项）。
+    ///
+    /// 多选里的分组（GPWL / GPSET）先挑掉并在日志里说一声（分组计划 D6），见
+    /// [`without_group_targets`]；全是分组就不开框。
     fn begin_mutation(&mut self, kind: model_mutation::Kind, targets: Vec<RefU64>) {
+        let tree = &self.tree;
+        let (targets, skipped) = without_group_targets(targets, |refno| tree.noun(refno));
+        if skipped > 0 {
+            self.logs.info(
+                &mut self.vm.logs,
+                group_skip_note(kind, skipped, targets.len()),
+            );
+        }
         let Some(first) = targets.first().copied() else {
             return;
         };
@@ -8673,13 +8722,13 @@ mod tests {
         cleanup_unload_plan,
         dbnum_unload_set, command_reply_is_current, complete_refresh_generation,
         empty_props_verdict, expand_room_model_targets,
-        finished_after, generate_outcome, generate_summary, in_mdb_path, is_panel_noun,
-        mark_model_scope_unavailable, model_drains_idle, model_progress_terminal,
+        finished_after, generate_outcome, generate_summary, group_skip_note, in_mdb_path,
+        is_panel_noun, mark_model_scope_unavailable, model_drains_idle, model_progress_terminal,
         model_source_changed_line, model_visibility_plan, needs_children_query, read_face_switch,
         refresh_anchor, regenerate_label, reload_snapshot, resolve_panel_room_reply,
         restore_model_reload, scope_not_generated, settle_pending_directions,
         settle_refresh_generation, settled_pending_roots, sync_ime_window, take_hidden_for_replay,
-        task_matches_project, task_queue, tree_label, viewport_fits_window,
+        task_matches_project, task_queue, tree_label, viewport_fits_window, without_group_targets,
     };
     // 房间视图 · 直段截断（2026-09-29 计划 M4）的纯函数与编排账。
     use super::{
@@ -8688,6 +8737,7 @@ mod tests {
     };
     use crate::model_update_api;
     use chrono::{TimeZone, Utc};
+    use plant_ui::model_mutation;
     use plant_ui::model_update::PendingModelUnit;
     use std::collections::{HashMap, HashSet};
 
@@ -9127,6 +9177,100 @@ mod tests {
         );
     }
 
+    /// 右键多选里混着分组（GPWL / GPSET）：开框之前挑掉、日志说跳过几个，全是分组就一个都不发
+    /// （分组计划 D6——服务端对分组的重生成 / 清理回 422 `group_scope`）。树上查不到名词的照发。
+    #[test]
+    fn a_multi_select_drops_its_group_targets_and_says_how_many() {
+        let nouns: HashMap<RefU64, &str> = [
+            (RefU64(1), "EQUI"),
+            (RefU64(2), "GPSET"),
+            (RefU64(3), "PIPE"),
+            (RefU64(4), "gpwl"),
+        ]
+        .into_iter()
+        .collect();
+        let noun_of = |refno: RefU64| nouns.get(&refno).copied();
+        let targets = vec![RefU64(1), RefU64(2), RefU64(3), RefU64(4), RefU64(5)];
+        let (kept, skipped) = without_group_targets(targets, noun_of);
+        assert_eq!(kept, vec![RefU64(1), RefU64(3), RefU64(5)]);
+        assert_eq!(skipped, 2);
+        let (kept, skipped) = without_group_targets(vec![RefU64(2), RefU64(4)], noun_of);
+        assert!(kept.is_empty());
+        assert_eq!(skipped, 2);
+
+        let note = group_skip_note(model_mutation::Kind::Regenerate, 2, 3);
+        assert!(
+            note.starts_with("重新生成模型：")
+                && note.contains("跳过 2 个分组")
+                && note.contains("其余 3 项"),
+            "{note}"
+        );
+        let note = group_skip_note(model_mutation::Kind::Cleanup, 2, 0);
+        assert!(
+            note.starts_with("清理模型：") && note.contains("一个都没发"),
+            "{note}"
+        );
+
+        // 开框那一步先挑分组，再拿留下的第一个目标起标题：全是分组时不开框。
+        let source = include_str!("main.rs");
+        let begin = source
+            .split_once(
+                "fn begin_mutation(&mut self, kind: model_mutation::Kind, targets: Vec<RefU64>) {",
+            )
+            .expect("开框那一步")
+            .1
+            .split_once("fn begin_dbnum_model_cleanup(")
+            .expect("整库清理开框")
+            .0;
+        let filter = begin
+            .find("without_group_targets(targets,")
+            .expect("开框前挑分组");
+        let first = begin.find("targets.first()").expect("留下的第一个目标");
+        assert!(filter < first, "{begin}");
+    }
+
+    /// 分组（分组计划 G2）一个生成根都解不出：日志说「分组为空或成员不可解析」，不退化成通用的
+    /// 「范围内无可渲染几何（0 个生成根）」。普通节点的 0 根与有成员的分组照旧。
+    #[test]
+    fn an_empty_group_says_so_instead_of_no_renderable_geometry() {
+        let empty = model_update_api::GenerateReply {
+            model_available: false,
+            generation_root_count: 0,
+            cached_root_count: 0,
+            generated_root_count: 0,
+            group_scope: true,
+            unresolved_count: 2,
+            ..generate_reply(model_update_api::GenerateStatus::NoRenderableGeometry)
+        };
+        let line = generate_summary("GPSET /GS-1", &empty);
+        assert!(
+            line.contains("分组为空或成员不可解析") && line.contains("2 个成员解析不出"),
+            "{line}"
+        );
+        assert!(!line.contains("无可渲染几何"), "{line}");
+        let bare = model_update_api::GenerateReply {
+            unresolved_count: 0,
+            ..empty.clone()
+        };
+        assert_eq!(
+            generate_summary("GPSET /GS-1", &bare),
+            "GPSET /GS-1：分组为空或成员不可解析"
+        );
+        let plain = model_update_api::GenerateReply {
+            group_scope: false,
+            unresolved_count: 0,
+            ..empty
+        };
+        let line = generate_summary("ZONE /ZONE-A", &plain);
+        assert!(line.contains("范围内无可渲染几何（0 个生成根）"), "{line}");
+        let members = model_update_api::GenerateReply {
+            group_scope: true,
+            ..generate_reply(model_update_api::GenerateStatus::Generated)
+        };
+        let line = generate_summary("GPSET /GS-1", &members);
+        assert!(line.contains("3 个生成根") && !line.contains("分组为空"), "{line}");
+    }
+
     fn generate_reply(status: model_update_api::GenerateStatus) -> model_update_api::GenerateReply {
         model_update_api::GenerateReply {
             status,
@@ -9140,6 +9284,8 @@ mod tests {
             model_source: None,
             model_source_reason: None,
             legacy_endpoint: false,
+            group_scope: false,
+            unresolved_count: 0,
         }
     }
 

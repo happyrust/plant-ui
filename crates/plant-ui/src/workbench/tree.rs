@@ -410,8 +410,9 @@ pub(super) fn model_cmd(action: ModelAction) -> Cmd {
 
 /// 分组节点（GPWL / GPSET）：自己没有几何，成员的主位置在别处。「重新生成 / 清理」对它
 /// 不成立——服务端对分组的强制重生成与清理回 422 `group_scope`（分组计划 D6），菜单里
-/// 干脆不摆这两项；成员要重算就在它的主位置上右键。
-fn is_group_node(noun: Option<&str>) -> bool {
+/// 干脆不摆这两项；成员要重算就在它的主位置上右键。菜单只看被右键的那一行，多选里的
+/// 其余行由宿主开框前用同一个判定挑掉。
+pub fn is_group_node(noun: Option<&str>) -> bool {
     let noun = noun.unwrap_or_default();
     noun.eq_ignore_ascii_case("GPWL") || noun.eq_ignore_ascii_case("GPSET")
 }

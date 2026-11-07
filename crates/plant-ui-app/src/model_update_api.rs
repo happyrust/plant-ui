@@ -1006,6 +1006,11 @@ pub struct GenerateReply {
     /// 这一发是退回旧路径 `/api/v1/model/ensure` 才成的（服务端还没有 `/model/generate`，
     /// ADR-0030 后果 7）。日志据此点名一次「模型服务是旧版」。
     pub legacy_endpoint: bool,
+    /// 这一发打在分组（GPWL / GPSET）上：分组回执带 `scope_kind = "group"`（分组计划 G2）。
+    /// 普通节点与老服务端没有这一格 → `false`。
+    pub group_scope: bool,
+    /// 分组里解析不出主位置的成员数（分组回执的 `unresolved_count`）。非分组恒为 0。
+    pub unresolved_count: usize,
 }
 
 /// 服务端 `OnDemandModelResult.failed_roots[]` 的单根记录（gen-model `ScopeRootFailure`）。
@@ -1061,6 +1066,30 @@ struct GenerateBody {
     model_source: Option<String>,
     #[serde(default)]
     model_source_reason: Option<String>,
+    #[serde(default)]
+    scope_kind: Option<String>,
+    #[serde(default)]
+    unresolved_count: usize,
+}
+
+impl GenerateBody {
+    fn into_reply(self, legacy_endpoint: bool) -> GenerateReply {
+        GenerateReply {
+            status: generate_status(&self.status),
+            generation_root: self.generation_root,
+            model_available: self.model_available,
+            generation_root_count: self.generation_root_count,
+            cached_root_count: self.cached_root_count,
+            generated_root_count: self.generated_root_count,
+            failed_root_count: self.failed_root_count,
+            failed_roots: self.failed_roots,
+            model_source: self.model_source.as_deref().and_then(ModelSource::parse),
+            model_source_reason: self.model_source_reason,
+            legacy_endpoint,
+            group_scope: self.scope_kind.as_deref() == Some("group"),
+            unresolved_count: self.unresolved_count,
+        }
+    }
 }
 
 /// 生成接口的新名（gen-model ADR-086 D4）。老服务端只有旧名，404 时退回它（ADR-0030 后果 7）。
@@ -1106,19 +1135,7 @@ pub async fn generate_model(
             }
             Err(error) => return Err(error),
         };
-    Ok(GenerateReply {
-        status: generate_status(&reply.status),
-        generation_root: reply.generation_root,
-        model_available: reply.model_available,
-        generation_root_count: reply.generation_root_count,
-        cached_root_count: reply.cached_root_count,
-        generated_root_count: reply.generated_root_count,
-        failed_root_count: reply.failed_root_count,
-        failed_roots: reply.failed_roots,
-        model_source: reply.model_source.as_deref().and_then(ModelSource::parse),
-        model_source_reason: reply.model_source_reason,
-        legacy_endpoint,
-    })
+    Ok(reply.into_reply(legacy_endpoint))
 }
 
 #[derive(Deserialize)]
@@ -1717,6 +1734,53 @@ mod tests {
         );
         // 服务端换名字不许静默当成成功的那一档：它要能在日志里被点名。
         assert_eq!(generate_status("brand_new_state"), GenerateStatus::Unknown);
+    }
+
+    /// 分组的生成回执（分组计划 G2）带 `scope_kind = "group"` 与 `unresolved_count`：记成分组
+    /// 范围、原样收下解析不出的成员数，界面据此说「分组为空或成员不可解析」。普通节点与
+    /// 老服务端没有这两格——反序列化不许因此失败，缺席就是非分组、0。
+    #[test]
+    fn a_group_generate_reply_is_marked_with_its_unresolved_members() {
+        let group: GenerateBody = serde_json::from_str(
+            r#"{
+                "requested_refno": "24381/200001",
+                "generation_root": "24381/200001",
+                "generation_root_noun": "GPSET",
+                "status": "no_renderable_geometry",
+                "model_available": false,
+                "generation_root_count": 0,
+                "generation_roots": [],
+                "cached_root_count": 0,
+                "generated_root_count": 0,
+                "failed_root_count": 0,
+                "failed_roots": [],
+                "dbnum": null,
+                "model_source": null,
+                "model_source_reason": null,
+                "durable": false,
+                "scope_kind": "group",
+                "scope_refnos": [],
+                "unresolved_count": 2,
+                "routes": [],
+                "publication_status": "empty"
+            }"#,
+        )
+        .unwrap();
+        let reply = group.into_reply(false);
+        assert_eq!(reply.status, GenerateStatus::NoRenderableGeometry);
+        assert!(reply.group_scope);
+        assert_eq!(reply.unresolved_count, 2);
+        assert_eq!(reply.generation_root_count, 0);
+        assert!(reply.model_source.is_none());
+
+        let plain: GenerateBody = serde_json::from_str(
+            r#"{"status": "generated", "generation_root": "24381/100677", "generation_root_count": 3}"#,
+        )
+        .unwrap();
+        let reply = plain.into_reply(true);
+        assert!(!reply.group_scope);
+        assert_eq!(reply.unresolved_count, 0);
+        assert!(reply.legacy_endpoint);
     }
 
     /// 解析视图的回执带 `view: "resolved"`；老服务端不认 `resolved`，回执里没有这一格
