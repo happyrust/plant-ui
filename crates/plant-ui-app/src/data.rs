@@ -2290,6 +2290,21 @@ mod tests {
         }
     }
 
+    /// 分组（GPWL / GPSET）走同一条显示路径（分组计划 D4-a）：records 直接传点下去的分组，
+    /// 成员由服务端按 GPITEM 展开。眼睛这一臂不认类型、不先取解析成员再逐个查——那是
+    /// D4-b，要改 ADR-0030 D1。
+    #[test]
+    fn a_group_target_rides_the_same_ancestor_query() {
+        let lane = scopes_lane();
+        for forbidden in ["GPSET", "GPWL", "children_resolved(", "expanded_from_group"] {
+            assert!(!lane.contains(forbidden), "眼睛这一臂在客户端展开分组：{forbidden}");
+        }
+        assert!(
+            lane.contains("scope_roots: &[target],"),
+            "分组也以点下去的目标为祖先查：{lane}"
+        );
+    }
+
     /// 取回工作重装只重查、不先生成（ADR-0030 D3，实施约束 4）：服务供数以快照里的范围目标
     /// 为祖先问 records（一个 ZONE 一次往返），老快照没有范围记录就退到按模型 refno 问；
     /// 库供数照旧只查 `roots`。

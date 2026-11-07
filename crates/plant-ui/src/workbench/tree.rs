@@ -94,6 +94,13 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                                     tone: Status::Warn,
                                 });
                             }
+                            if row.group_view_unsupported {
+                                tags.push(RowTag {
+                                    icon: Some(ph::INFO),
+                                    text: "后端未支持分组解析",
+                                    tone: Status::Info,
+                                });
+                            }
                             let out = ui
                                 .scope_builder(UiBuilder::new().id(id), |ui| {
                                     widgets::tree_row_ui(
@@ -401,6 +408,14 @@ pub(super) fn model_cmd(action: ModelAction) -> Cmd {
     }
 }
 
+/// 分组节点（GPWL / GPSET）：自己没有几何，成员的主位置在别处。「重新生成 / 清理」对它
+/// 不成立——服务端对分组的强制重生成与清理回 422 `group_scope`（分组计划 D6），菜单里
+/// 干脆不摆这两项；成员要重算就在它的主位置上右键。
+fn is_group_node(noun: Option<&str>) -> bool {
+    let noun = noun.unwrap_or_default();
+    noun.eq_ignore_ascii_case("GPWL") || noun.eq_ignore_ascii_case("GPSET")
+}
+
 /// 元素菜单的公共部分：模型动作 + 房间归属 + 尺寸标注 + 复制 REFNO。模型树的行
 /// 菜单与三维视口的右键菜单是同一件事的两个入口，内容必须一致，所以收在一处。
 ///
@@ -520,7 +535,9 @@ pub(super) fn element_menu(
     // 「清理模型」紧挨「重新生成模型」正下方（2026-10-10 清理模型计划 D1）：只删产物、不重算，
     // 给「算错了要清掉再看」「只想清掉不想立刻重算」这类特殊情况用。两项共用一个忙碌位：
     // 都改模型库，服务端对重叠的根本来就回 409，没必要让人先点出一个 409 来。
-    if live {
+    //
+    // 分组节点（GPWL / GPSET）不摆这两项（分组计划 D6），见 [`is_group_node`]。
+    if live && !is_group_node(noun) {
         ui.separator();
         let busy_hint = "已经有一趟重新生成 / 清理在跑了";
         let label = format!("{}  重新生成模型{suffix}", ph::ARROWS_CLOCKWISE);
@@ -788,7 +805,7 @@ fn note(ui: &mut Ui, t: &Tokens, d: Density, state: PaneState, icon: &str, text:
 #[cfg(test)]
 mod tests {
     use super::{
-        RoomItem, dimension_menu_action, is_room_node, room_menu_action, row_id,
+        RoomItem, dimension_menu_action, is_group_node, is_room_node, room_menu_action, row_id,
         tree_item_accessible_label,
     };
     use crate::Cmd;
@@ -954,6 +971,33 @@ mod tests {
         assert!(!group.contains("Cmd::Model("), "改模型库的动作不走 ModelAction：{group}");
     }
 
+    /// 分组节点（GPWL / GPSET）不摆「重新生成 / 清理」（分组计划 D6）：服务端对分组的强制
+    /// 重生成与清理回 422 `group_scope`。钉源码：两项都在带分组判定的同一道门里。
+    #[test]
+    fn group_nodes_get_no_regenerate_or_cleanup_item() {
+        assert!(is_group_node(Some("GPWL")) && is_group_node(Some("gpset")));
+        assert!(!is_group_node(Some("GPITEM")) && !is_group_node(Some("EQUI")));
+        assert!(!is_group_node(None), "不知道类型时照旧出这两项");
+        let source = include_str!("tree.rs");
+        let body = source.split_once("#[cfg(test)]").expect("正文").0;
+        let menu = body
+            .split_once("pub(super) fn element_menu(")
+            .expect("element_menu")
+            .1
+            .split_once("fn dimension_menu_item(")
+            .expect("下一个函数")
+            .0;
+        let gate = menu.find("if live && !is_group_node(noun) {").expect("分组门");
+        let regenerate = menu.find("重新生成模型{suffix}").expect("重新生成项");
+        let cleanup = menu.find("清理模型{suffix}").expect("清理项");
+        assert!(gate < regenerate && regenerate < cleanup, "{menu}");
+        assert_eq!(
+            menu.matches("is_group_node(noun)").count(),
+            1,
+            "分组判定只在这一道门上"
+        );
+    }
+
     #[test]
     fn accessible_tree_identity_survives_rename_without_name_matching() {
         let refno = RefU64(0x1234);
@@ -984,6 +1028,7 @@ mod tests {
             parent: Some(RefU64(0x1000)),
             group: None,
             unresolved: 0,
+            group_view_unsupported: false,
         };
         let member = TreeRowVm {
             parent: Some(RefU64(0x2000)),

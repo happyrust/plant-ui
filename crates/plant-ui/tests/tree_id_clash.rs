@@ -51,6 +51,7 @@ fn row(refno: u64, depth: u16, name: &str, noun: &str, expandable: Option<bool>)
         parent: None,
         group: None,
         unresolved: 0,
+        group_view_unsupported: false,
     }
 }
 

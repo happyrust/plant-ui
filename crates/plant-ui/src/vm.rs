@@ -647,6 +647,9 @@ pub struct TreeRowVm {
     pub group: Option<TreeGroupLink>,
     /// 这一行（分组父节点）底下有几个成员解析不到；其余行为 0。
     pub unresolved: usize,
+    /// 这一行是 GPSET，展开时服务端却回了存储视图（老服务端不认 `resolved`）：底下还是
+    /// GPITEM。行上挂「后端未支持分组解析」——是提示，不算错误。其余行为 `false`。
+    pub group_view_unsupported: bool,
 }
 
 /// 分组成员行与所在分组的关系（服务端 `/tree/children?resolved=1` 的 `via` / `secondary`）。

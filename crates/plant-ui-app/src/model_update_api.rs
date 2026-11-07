@@ -338,6 +338,10 @@ struct ResolvedTreeReply {
     /// 解析不到的槽（引用目标已删、不在本 MDB…），只在有坏槽时出现。树上只要条数。
     #[serde(default)]
     unresolved: Vec<serde::de::IgnoredAny>,
+    /// 这一层按哪种视图回的：认 `resolved` 的服务端回 `"resolved"`；不认的老服务端不带
+    /// 这一格（或回 `"stored"`），GPSET 下就还是 GPITEM。
+    #[serde(default)]
+    view: Option<String>,
 }
 
 /// 树上的一层子节点。`links` 与 `nodes` 一一对应：分组成员行带 [`TreeGroupLink`]，
@@ -348,6 +352,9 @@ pub struct TreeLevel {
     pub links: Vec<Option<TreeGroupLink>>,
     /// 这一层有几个分组成员解析不到。
     pub unresolved: usize,
+    /// 服务端没按解析视图回（回执里没有 `view`，或是 `stored`）：GPSET 下还是 GPITEM，
+    /// 宿主据此给 GPSET 行挂「后端未支持分组解析」（分组计划 §2.6）。库供数与剧本恒为 `false`。
+    pub stored_view: bool,
 }
 
 impl From<Vec<aios_core::pdms_types::EleTreeNode>> for TreeLevel {
@@ -358,6 +365,7 @@ impl From<Vec<aios_core::pdms_types::EleTreeNode>> for TreeLevel {
             nodes,
             links,
             unresolved: 0,
+            stored_view: false,
         }
     }
 }
@@ -468,7 +476,7 @@ pub async fn tree_children(
 
 /// 解析视图的一层子节点：分组父节点（GPWL / GPSET）的行换成解析出的成员，其余父节点
 /// 与 [`tree_children`] 同一份。不认 `resolved` 的老服务端照旧回存储视图（GPSET 下是
-/// GPITEM），这里不区分——两种都画得出来。
+/// GPITEM）：两种都画得出来，只把 [`TreeLevel::stored_view`] 记上，让 GPSET 行说一声。
 pub async fn tree_children_resolved(
     base: &str,
     refno: aios_core::RefU64,
@@ -495,6 +503,7 @@ pub async fn tree_children_resolved(
         nodes,
         links,
         unresolved: reply.unresolved.len(),
+        stored_view: reply.view.as_deref() != Some("resolved"),
     })
 }
 
@@ -1708,6 +1717,57 @@ mod tests {
         );
         // 服务端换名字不许静默当成成功的那一档：它要能在日志里被点名。
         assert_eq!(generate_status("brand_new_state"), GenerateStatus::Unknown);
+    }
+
+    /// 解析视图的回执带 `view: "resolved"`；老服务端不认 `resolved`，回执里没有这一格
+    /// （分组计划 §2.6）——反序列化不许因此失败，缺席就是 `None`。
+    #[test]
+    fn resolved_tree_reply_reads_the_view_and_tolerates_its_absence() {
+        let new: ResolvedTreeReply = serde_json::from_value(serde_json::json!({
+            "source": "direct", "view": "resolved", "nodes": [],
+        }))
+        .unwrap();
+        assert_eq!(new.view.as_deref(), Some("resolved"));
+        let old: ResolvedTreeReply =
+            serde_json::from_value(serde_json::json!({"source": "direct", "nodes": []})).unwrap();
+        assert_eq!(old.view, None);
+    }
+
+    /// 分组的记录由服务端按成员展开（分组计划 D4-a）：跨库时 `source` 是 `mixed`、`dbnum`
+    /// 为空，外加 `expanded_from_group` / `scope_refnos` / `unresolved_count` / `routes`。
+    /// 这一页照样解得出、落进「没给 dbnum」那一桶、不参与混源判定——客户端不必认分组。
+    #[test]
+    fn a_group_records_page_is_read_like_any_other_page() {
+        let page: ModelRecordsPage = serde_json::from_value(serde_json::json!({
+            "source": "mixed",
+            "dbnum": null,
+            "model_source": null,
+            "items": [],
+            "total": 0,
+            "truncated": false,
+            "next_cursor": null,
+            "generation_root": "9304/1",
+            "expanded_from_group": true,
+            "scope_refnos": ["7997/5", "8001/3"],
+            "unresolved_count": 1,
+            "routes": [
+                {"dbnum": 7997, "source": "model-database"},
+                {"dbnum": 8001, "source": "model-memory"}
+            ],
+        }))
+        .unwrap();
+        assert_eq!(page.scope(), model_record_union::RecordScope::legacy());
+        let mut union = model_record_union::ModelRecordUnion::default();
+        union
+            .extend_scope(
+                model_record_union::RecordScope {
+                    dbnum: Some(7997),
+                    source: ModelSource::from_records_label("model-database"),
+                },
+                Vec::new(),
+            )
+            .unwrap();
+        union.extend_scope(page.scope(), page.items).unwrap();
     }
 
     /// ADR-0030 实施约束 6：源码里不再有 ensure——`ensure_model` / `EnsureReply` / `EnsureStatus` 一个不留，

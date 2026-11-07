@@ -900,6 +900,9 @@ struct TreeModel {
     group_links: HashMap<(RefU64, RefU64), TreeGroupLink>,
     /// 分组父节点下解析不到的成员数（服务端解析视图的 `unresolved`）。
     unresolved: HashMap<RefU64, usize>,
+    /// 展开时服务端回了存储视图的父节点（老服务端不认 `resolved`）。只有 GPSET 行据此挂
+    /// 「后端未支持分组解析」：别的父节点两种视图本来就是同一份。
+    stored_views: HashSet<RefU64>,
     expanded: HashSet<RefU64>,
     /// 子层查询在途的节点。
     loading: HashSet<RefU64>,
@@ -1118,6 +1121,8 @@ impl TreeModel {
                     parent,
                     group,
                     unresolved: model.unresolved.get(&refno).copied().unwrap_or(0),
+                    group_view_unsupported: n.noun.eq_ignore_ascii_case("GPSET")
+                        && model.stored_views.contains(&refno),
                 });
                 // 分组让树不再是树：GPSET 的成员里可以有 GPWL / GPSET 自己。已在这条
                 // 路径上的节点再出现时只画这一行、不往下展，数据成环也转得出来。
@@ -1189,6 +1194,11 @@ impl TreeModel {
             self.unresolved.insert(parent, level.unresolved);
         } else {
             self.unresolved.remove(&parent);
+        }
+        if level.stored_view {
+            self.stored_views.insert(parent);
+        } else {
+            self.stored_views.remove(&parent);
         }
         self.children.insert(parent, level.nodes);
     }
@@ -1311,6 +1321,7 @@ impl TreeModel {
         self.group_links
             .retain(|(parent, member), _| alive.contains(parent) && alive.contains(member));
         self.unresolved.retain(|refno, _| alive.contains(refno));
+        self.stored_views.retain(|refno| alive.contains(refno));
         self.expanded.retain(|refno| alive.contains(refno));
         self.loading.retain(|refno| alive.contains(refno));
         self.visibility.retain(|refno, _| alive.contains(refno));
@@ -10017,6 +10028,34 @@ mod tests {
                 ("ATTA", RefU64(4))
             ]
         );
+    }
+
+    /// 老服务端不认 `resolved=1`、回了存储视图（分组计划 §2.6）：只有 GPSET 行挂「后端未支持
+    /// 分组解析」——GPWL 等别的父节点两种视图本来就是同一份；再展开拿到解析视图就撤掉。
+    #[test]
+    fn a_gpset_answered_with_the_stored_view_is_flagged_on_its_row() {
+        let (gpwl, gpset) = (RefU64(11), RefU64(12));
+        let level = |nodes: Vec<EleTreeNode>, stored_view: bool| model_update_api::TreeLevel {
+            stored_view,
+            ..model_update_api::TreeLevel::from(nodes)
+        };
+        let mut tree = TreeModel {
+            group_roots: vec![node(gpwl, "GPWL", 1)],
+            ..Default::default()
+        };
+        tree.expanded.extend([gpwl, gpset]);
+        tree.install_children(gpwl, level(vec![node(gpset, "GPSET", 1)], true));
+        tree.install_children(gpset, level(vec![node(RefU64(13), "GPITEM", 0)], true));
+        let flagged = |tree: &TreeModel| -> Vec<String> {
+            tree.flatten(&HashMap::new())
+                .into_iter()
+                .filter(|row| row.group_view_unsupported)
+                .map(|row| row.noun)
+                .collect()
+        };
+        assert_eq!(flagged(&tree), ["GPSET"]);
+        tree.install_children(gpset, level(vec![node(RefU64(14), "EQUI", 0)], false));
+        assert!(flagged(&tree).is_empty(), "解析视图回来后提示撤掉");
     }
 
     /// eye 那条链路的最小复现：点击 -> 查询 -> View3d 回执。
