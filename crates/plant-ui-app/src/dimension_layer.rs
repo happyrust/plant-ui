@@ -327,6 +327,12 @@ mod tests {
     ) -> MbdPrimitive {
         MbdPrimitive::LinearDim {
             id: "d1".into(),
+            object_refno: None,
+            isoline_idx: None,
+            function: None,
+            node_refnos: None,
+            chain_id: None,
+            chain_seq: None,
             start,
             end,
             text: "1000".into(),
@@ -335,6 +341,8 @@ mod tests {
             arrow_lines,
             label_anchor: [500.0, 0.0, 0.0],
             reference: None,
+            text_height_mm: None,
+            text_up: None,
         }
     }
 
@@ -377,31 +385,74 @@ mod tests {
             vec![
                 MbdPrimitive::Label {
                     id: "lb".into(),
+                    object_refno: None,
+                    isoline_idx: None,
+                    function: None,
+                    node_refnos: None,
+                    chain_id: None,
+                    chain_seq: None,
                     text: "/PIPE-1".into(),
                     position: [1.0, 2.0, 3.0],
+                    text_height_mm: None,
+                    text_dir: None,
+                    text_up: None,
                 },
                 MbdPrimitive::AidText {
                     id: "t".into(),
+                    object_refno: None,
+                    isoline_idx: None,
+                    function: None,
+                    node_refnos: None,
+                    chain_id: None,
+                    chain_seq: None,
                     text: "N".into(),
                     position: [4.0, 5.0, 6.0],
                     text_height_mm: None,
+                    text_dir: None,
+                    text_up: None,
                 },
                 MbdPrimitive::SlopeMark {
                     id: "s".into(),
+                    object_refno: None,
+                    isoline_idx: None,
+                    function: None,
+                    node_refnos: None,
+                    chain_id: None,
+                    chain_seq: None,
                     text: "1:100".into(),
                     start: [0.0, 0.0, 0.0],
                     end: [200.0, 0.0, 100.0],
+                    text_height_mm: None,
+                    text_dir: None,
+                    text_up: None,
                 },
                 MbdPrimitive::AidText {
                     id: "empty".into(),
+                    object_refno: None,
+                    isoline_idx: None,
+                    function: None,
+                    node_refnos: None,
+                    chain_id: None,
+                    chain_seq: None,
                     text: String::new(),
                     position: [0.0; 3],
                     text_height_mm: None,
+                    text_dir: None,
+                    text_up: None,
                 },
                 MbdPrimitive::Label {
                     id: "bad".into(),
+                    object_refno: None,
+                    isoline_idx: None,
+                    function: None,
+                    node_refnos: None,
+                    chain_id: None,
+                    chain_seq: None,
                     text: "x".into(),
                     position: [f32::NAN, 0.0, 0.0],
+                    text_height_mm: None,
+                    text_dir: None,
+                    text_up: None,
                 },
                 linear([0.0; 3], [10.0, 0.0, 0.0], vec![], vec![]),
             ],
@@ -429,6 +480,12 @@ mod tests {
         // 尺寸线的锚点坏了：线也不画，整个图元丢。
         let bad_anchor = MbdPrimitive::LinearDim {
             id: "d".into(),
+            object_refno: None,
+            isoline_idx: None,
+            function: None,
+            node_refnos: None,
+            chain_id: None,
+            chain_seq: None,
             start: [0.0; 3],
             end: [10.0, 0.0, 0.0],
             text: "10".into(),
@@ -437,6 +494,8 @@ mod tests {
             arrow_lines: vec![],
             label_anchor: [0.0, f32::INFINITY, 0.0],
             reference: None,
+            text_height_mm: None,
+            text_up: None,
         };
         let mapped = batch_of(&data(vec![bad_anchor], None));
         assert_eq!(mapped.skipped, 1);
@@ -454,6 +513,12 @@ mod tests {
         );
         let good = MbdPrimitive::LeaderLine {
             id: "l".into(),
+            object_refno: None,
+            isoline_idx: None,
+            function: None,
+            node_refnos: None,
+            chain_id: None,
+            chain_seq: None,
             start: [0.0; 3],
             end: [0.0, 0.0, 300.0],
         };
@@ -468,6 +533,12 @@ mod tests {
     fn dashed_aid_lines_are_cut_into_real_length_dashes() {
         let aid = |style: Option<&str>, length: f32| MbdPrimitive::AidLine {
             id: "a".into(),
+            object_refno: None,
+            isoline_idx: None,
+            function: None,
+            node_refnos: None,
+            chain_id: None,
+            chain_seq: None,
             start: [0.0; 3],
             end: [length, 0.0, 0.0],
             style: style.map(str::to_owned),
@@ -519,6 +590,12 @@ mod tests {
     fn arcs_are_sampled_on_the_adr_0011_frame() {
         let arc = MbdPrimitive::AidArc {
             id: "arc".into(),
+            object_refno: None,
+            isoline_idx: None,
+            function: None,
+            node_refnos: None,
+            chain_id: None,
+            chain_seq: None,
             center: [100.0, 200.0, 300.0],
             x_axis: [1.0, 0.0, 0.0],
             normal: [0.0, 0.0, 1.0],
@@ -542,6 +619,12 @@ mod tests {
 
         let circle = MbdPrimitive::AidCircle {
             id: "c".into(),
+            object_refno: None,
+            isoline_idx: None,
+            function: None,
+            node_refnos: None,
+            chain_id: None,
+            chain_seq: None,
             center: [0.0; 3],
             normal: [0.0, 1.0, 0.0],
             radius: 10.0,
@@ -556,6 +639,12 @@ mod tests {
 
         let angle = MbdPrimitive::AngleDim {
             id: "ang".into(),
+            object_refno: None,
+            isoline_idx: None,
+            function: None,
+            node_refnos: None,
+            chain_id: None,
+            chain_seq: None,
             text: "45°".into(),
             center: [0.0; 3],
             // 故意给一个不正交、不归一的 x 轴：Gram-Schmidt 要把它扶正。
@@ -567,6 +656,9 @@ mod tests {
             leg_lines: vec![seg([0.0; 3], [150.0, 0.0, 0.0])],
             label_anchor: [0.0; 3],
             sub_kind: None,
+            text_height_mm: None,
+            text_dir: None,
+            text_up: None,
         };
         let lines = batch_of(&data(vec![angle], None)).batch.lines;
         assert_eq!(lines.len(), 9 + 1);
@@ -579,6 +671,12 @@ mod tests {
     fn degenerate_arcs_are_dropped_and_counted() {
         let arc = |radius: f32, normal: Vec3V2, sweep: f32| MbdPrimitive::AidArc {
             id: "arc".into(),
+            object_refno: None,
+            isoline_idx: None,
+            function: None,
+            node_refnos: None,
+            chain_id: None,
+            chain_seq: None,
             center: [0.0; 3],
             x_axis: [1.0, 0.0, 0.0],
             normal,
@@ -595,6 +693,12 @@ mod tests {
                 // x 轴与法向平行：Gram-Schmidt 后没有面内方向。
                 MbdPrimitive::AidArc {
                     id: "p".into(),
+                    object_refno: None,
+                    isoline_idx: None,
+                    function: None,
+                    node_refnos: None,
+                    chain_id: None,
+                    chain_seq: None,
                     center: [0.0; 3],
                     x_axis: [0.0, 0.0, 3.0],
                     normal: [0.0, 0.0, 1.0],
@@ -616,23 +720,52 @@ mod tests {
     fn marks_are_small_crosses_and_text_draws_no_lines() {
         let mark = MbdPrimitive::WeldMark {
             id: "w".into(),
+            object_refno: None,
+            isoline_idx: None,
+            function: None,
+            node_refnos: None,
+            chain_id: None,
+            chain_seq: None,
             position: [10.0, 20.0, 30.0],
             weld_type: None,
         };
         let point = MbdPrimitive::AidPoint {
             id: "p".into(),
+            object_refno: None,
+            isoline_idx: None,
+            function: None,
+            node_refnos: None,
+            chain_id: None,
+            chain_seq: None,
             position: [0.0; 3],
         };
         let text = MbdPrimitive::AidText {
             id: "t".into(),
+            object_refno: None,
+            isoline_idx: None,
+            function: None,
+            node_refnos: None,
+            chain_id: None,
+            chain_seq: None,
             text: "N".into(),
             position: [0.0; 3],
             text_height_mm: None,
+            text_dir: None,
+            text_up: None,
         };
         let label = MbdPrimitive::Label {
             id: "lb".into(),
+            object_refno: None,
+            isoline_idx: None,
+            function: None,
+            node_refnos: None,
+            chain_id: None,
+            chain_seq: None,
             text: "/PIPE-1".into(),
             position: [0.0; 3],
+            text_height_mm: None,
+            text_dir: None,
+            text_up: None,
         };
         let mapped = batch_of(&data(vec![mark, point, text, label], Some(50.0)));
         assert_eq!(mapped.skipped, 0);
@@ -650,6 +783,12 @@ mod tests {
         let fallback = batch_of(&data(
             vec![MbdPrimitive::AidPoint {
                 id: "p".into(),
+                object_refno: None,
+                isoline_idx: None,
+                function: None,
+                node_refnos: None,
+                chain_id: None,
+                chain_seq: None,
                 position: [0.0; 3],
             }],
             None,
