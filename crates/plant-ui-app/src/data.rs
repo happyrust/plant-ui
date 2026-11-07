@@ -24,6 +24,7 @@ use plant_ui::model_update::{Enqueued, Preview, ProgressEvent};
 use plant_ui::task_queue::Poll as QueuePoll;
 use plant_ui_data::{EleTreeNode, RefU64};
 
+use crate::model_update_api::TreeLevel;
 use crate::read_face::{ModelInstancesReq, ReadFace, ReadFaceKind, ServiceIdentity};
 use crate::search_index::{Scope, SearchIndex, SearchIndexState, SubstringHits};
 
@@ -445,9 +446,11 @@ pub enum Req {
 /// 一次取回工作重新查回来的那部分树。
 pub struct GetWork {
     pub sites: Vec<EleTreeNode>,
+    /// 分组入口（GPWL）。读不到只是这一段保持原样，原因随附，不让整次取回作废。
+    pub group_roots: Result<Vec<EleTreeNode>, String>,
     pub reload_models: bool,
-    /// 重查成功的分支及其新的直接子层。
-    pub branches: Vec<(RefU64, Vec<EleTreeNode>)>,
+    /// 重查成功的分支及其新的直接子层（解析视图）。
+    pub branches: Vec<(RefU64, TreeLevel)>,
     /// 服务端明确确认不存在的分支；与暂时查询失败分开处理。
     pub missing: Vec<RefU64>,
     /// 重查失败的分支及原因。一个分支查不动不该让整次取回作废，
@@ -466,6 +469,8 @@ pub struct ReadyInfo {
     /// 开始读取根层的时刻。首次队列快照只补这之后完成的批次，避免启动期间漏刷新。
     pub observed_at: chrono::DateTime<chrono::Utc>,
     pub sites: Vec<EleTreeNode>,
+    /// 分组入口（GPWL）。读不到只是树上少了分组那一段，不让连接作废；原因随附进日志。
+    pub group_roots: Result<Vec<EleTreeNode>, String>,
     /// 根层每个 SITE 属于哪个库（`(库号, SITE 名)`）。模型更新面板的 SITE 列用它认库；
     /// 库供数给不出库号，那一面恒空。
     pub site_dbs: Vec<(u32, String)>,
@@ -478,7 +483,7 @@ pub enum Evt {
         result: anyhow::Result<crate::read_face::SubtreeBounds>,
     },
     Ready(anyhow::Result<ReadyInfo>),
-    Children(RefU64, anyhow::Result<Vec<EleTreeNode>>),
+    Children(RefU64, anyhow::Result<TreeLevel>),
     Props(RefU64, anyhow::Result<Vec<plant_ui_data::Attr>>),
     /// 元素的房间归属，已按归属强度排序。带上请求时的 refno，晚到的旧结果要认得出来才好丢。
     ElementRooms(
@@ -774,11 +779,15 @@ async fn get_work(
     plant_ui_data::invalidate_all().await;
     face.invalidate().await;
     let sites = face.sites().await?;
+    let group_roots = face
+        .group_roots()
+        .await
+        .map_err(|error| crate::logs::error_chain(&error));
     let mut loaded = Vec::with_capacity(branches.len());
     let mut failed = Vec::new();
     let mut missing = Vec::new();
     for refno in branches {
-        match face.children(*refno).await {
+        match face.children_resolved(*refno).await {
             Ok(kids) => loaded.push((*refno, kids)),
             Err(error) if crate::model_update_api::failure_of(&error).code == "not_found" => {
                 missing.push(*refno);
@@ -788,6 +797,7 @@ async fn get_work(
     }
     Ok(GetWork {
         sites,
+        group_roots,
         reload_models,
         branches: loaded,
         missing,
@@ -798,8 +808,12 @@ async fn get_work(
 /// 启动序列只依赖当前供数模式的读面（工程标识 + SITE 根层并发取）；镜像离线不阻断
 /// 树、属性与三维。
 async fn ready(face: &ReadFace) -> anyhow::Result<ReadyInfo> {
-    let (identity, sites, site_dbs) =
-        futures::try_join!(face.identity(), face.sites(), face.site_dbs())?;
+    // 分组入口与之并发，但不进 try_join：读不到只是树上少一段，不能把启动判死。
+    let (core, group_roots) = futures::join!(
+        async { futures::try_join!(face.identity(), face.sites(), face.site_dbs()) },
+        face.group_roots(),
+    );
+    let (identity, sites, site_dbs) = core?;
     let observed_at = chrono::Utc::now();
     Ok(ReadyInfo {
         project: identity.project,
@@ -809,6 +823,7 @@ async fn ready(face: &ReadFace) -> anyhow::Result<ReadyInfo> {
         cache_versions: identity.cache_versions,
         observed_at,
         sites,
+        group_roots: group_roots.map_err(|error| crate::logs::error_chain(&error)),
         site_dbs,
     })
 }
@@ -898,7 +913,7 @@ async fn handle_read(
             });
         }
         Req::Children(refno) => {
-            let r = face.children(refno).await;
+            let r = face.children_resolved(refno).await;
             let _ = evt_tx.send(Evt::Children(refno, r));
         }
         Req::Props(refno) => {
@@ -2041,6 +2056,8 @@ mod tests {
             "model_update_api::tree_roots(",
             "model_update_api::tree_children(",
             "model_update_api::tree_ancestors(",
+            "model_update_api::tree_children_resolved(",
+            "model_update_api::tree_group_roots(",
             "model_update_api::search_names(",
             "model_update_api::element_attributes(",
             "model_update_api::model_records(",
@@ -2065,7 +2082,8 @@ mod tests {
         for expected in [
             "face.identity()",
             "face.sites()",
-            "face.children(",
+            "face.group_roots()",
+            "face.children_resolved(",
             "face.ancestors(",
             "face.props(",
             "face.resolve_name(",

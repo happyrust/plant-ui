@@ -14,6 +14,7 @@ use plant_ui::task_queue::{
     DbnumReport, Health, ModelSource, PendingUnits, Poll, QueueSnapshot, ResidentProgress,
     TaskChanges, TaskList,
 };
+use plant_ui::vm::TreeGroupLink;
 use plant_ui_data::{Attr, AttrKind};
 
 /// 服务端的统一错误包封 `{ code, message, detail }`（`web_service/mod.rs` 的 `ApiError`）。
@@ -317,6 +318,50 @@ struct TreeAncestorsReply {
     refnos: Vec<aios_core::RefnoEnum>,
 }
 
+/// `/tree/children?resolved=1` 的一行：节点本身，外加分组成员才带的 `via`（收录它的
+/// GPITEM）与 `secondary`（主位置在别处）。主链上的子节点这两格都不出现
+/// （gen-model `handlers.rs::tree_children_resolved`）。
+#[derive(Debug, Deserialize)]
+struct ResolvedTreeRow {
+    #[serde(flatten)]
+    node: aios_core::pdms_types::EleTreeNode,
+    #[serde(default)]
+    via: Option<aios_core::RefnoEnum>,
+    #[serde(default)]
+    secondary: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolvedTreeReply {
+    source: String,
+    nodes: Vec<ResolvedTreeRow>,
+    /// 解析不到的槽（引用目标已删、不在本 MDB…），只在有坏槽时出现。树上只要条数。
+    #[serde(default)]
+    unresolved: Vec<serde::de::IgnoredAny>,
+}
+
+/// 树上的一层子节点。`links` 与 `nodes` 一一对应：分组成员行带 [`TreeGroupLink`]，
+/// 主链上的行为 `None`。
+#[derive(Debug)]
+pub struct TreeLevel {
+    pub nodes: Vec<aios_core::pdms_types::EleTreeNode>,
+    pub links: Vec<Option<TreeGroupLink>>,
+    /// 这一层有几个分组成员解析不到。
+    pub unresolved: usize,
+}
+
+impl From<Vec<aios_core::pdms_types::EleTreeNode>> for TreeLevel {
+    /// 存储视图（库供数、剧本）：没有分组成员关系。
+    fn from(nodes: Vec<aios_core::pdms_types::EleTreeNode>) -> Self {
+        let links = vec![None; nodes.len()];
+        Self {
+            nodes,
+            links,
+            unresolved: 0,
+        }
+    }
+}
+
 /// `/tree/roots` 的另一种读法：节点连同服务端外包的库号，见 [`tree_root_dbs`]。
 #[derive(Debug, Deserialize)]
 struct TreeRootDbReply {
@@ -417,6 +462,56 @@ pub async fn tree_children(
     );
     let mut reply: TreeNodesReply = get(base, &path).await?;
     require_direct(&reply.source)?;
+    fill_legacy_default_names(&mut reply.nodes);
+    Ok(reply.nodes)
+}
+
+/// 解析视图的一层子节点：分组父节点（GPWL / GPSET）的行换成解析出的成员，其余父节点
+/// 与 [`tree_children`] 同一份。不认 `resolved` 的老服务端照旧回存储视图（GPSET 下是
+/// GPITEM），这里不区分——两种都画得出来。
+pub async fn tree_children_resolved(
+    base: &str,
+    refno: aios_core::RefU64,
+) -> anyhow::Result<TreeLevel> {
+    let path = format!(
+        "/api/v1/tree/children?refno={}&resolved=1",
+        urlencode(&refno.to_slash_string())
+    );
+    let reply: ResolvedTreeReply = get(base, &path).await?;
+    require_direct(&reply.source)?;
+    let (mut nodes, links): (Vec<_>, Vec<_>) = reply
+        .nodes
+        .into_iter()
+        .map(|row| {
+            let link = (row.secondary || row.via.is_some()).then(|| TreeGroupLink {
+                via: row.via.map(|via| via.refno()),
+                secondary: row.secondary,
+            });
+            (row.node, link)
+        })
+        .unzip();
+    fill_legacy_default_names(&mut nodes);
+    Ok(TreeLevel {
+        nodes,
+        links,
+        unresolved: reply.unresolved.len(),
+    })
+}
+
+/// 分组入口：WORLD 下的 GPWL（`/tree/roots?nouns=GPWL`）。不认 `GPWL` 的服务端回
+/// `bad_request`，更老的不认 `nouns`、照旧回 SITE——两种都按「没有分组」处理。
+pub async fn tree_group_roots(
+    base: &str,
+) -> anyhow::Result<Vec<aios_core::pdms_types::EleTreeNode>> {
+    let mut reply: TreeNodesReply = match get(base, "/api/v1/tree/roots?nouns=GPWL").await {
+        Ok(reply) => reply,
+        Err(error) if failure_of(&error).code == "bad_request" => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    require_direct(&reply.source)?;
+    reply
+        .nodes
+        .retain(|node| node.noun.eq_ignore_ascii_case("GPWL"));
     fill_legacy_default_names(&mut reply.nodes);
     Ok(reply.nodes)
 }

@@ -10,7 +10,7 @@ use egui_phosphor::regular as ph;
 
 use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Status, Tokens, space};
-use crate::style::widgets::{self, Eye, PaneNote, PaneState, RowIcon, TreeRow};
+use crate::style::widgets::{self, Eye, PaneNote, PaneState, RowIcon, RowTag, TreeRow};
 use crate::vm::{DimensionsVm, RoomVm, RowVisibility, Selection, TreeRowVm, TreeVm, WorkbenchVm};
 use crate::{Cmd, ModelAction};
 
@@ -73,7 +73,27 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                             // `unique_id = id.with(父 Ui 的自动计数)` 又把行序混了回来。
                             // 展开 / 折叠会让下方每一行都换号，egui 的
                             // `warn_if_rect_changes_id` 逐行描红框（调试构建默认开）。
-                            let id = Id::new(("wb-tree-row", row.refno));
+                            //
+                            // 分组让同一个元素能在树上出现几次（主位置一行、每个收录它的 GPSET
+                            // 下各一行），所以 refno 之外还要带上挂在谁底下、经哪个 GPITEM。
+                            let id = row_id(row);
+                            let unresolved = (row.unresolved > 0)
+                                .then(|| format!("{} 个成员不可解析", row.unresolved));
+                            let mut tags = Vec::new();
+                            if row.group.is_some_and(|link| link.secondary) {
+                                tags.push(RowTag {
+                                    icon: Some(ph::LINK_SIMPLE),
+                                    text: "引用",
+                                    tone: Status::Info,
+                                });
+                            }
+                            if let Some(text) = &unresolved {
+                                tags.push(RowTag {
+                                    icon: Some(ph::WARNING),
+                                    text: text.as_str(),
+                                    tone: Status::Warn,
+                                });
+                            }
                             let out = ui
                                 .scope_builder(UiBuilder::new().id(id), |ui| {
                                     widgets::tree_row_ui(
@@ -91,7 +111,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                                             // 没有实时渲染器时整列不出现，同右键菜单里那几项。
                                             eye: live.then(|| eye_of(row.visibility)),
                                             tone: Status::Neutral,
-                                            tags: &[],
+                                            tags: &tags,
                                         },
                                     )
                                 })
@@ -99,7 +119,22 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                             // 无名元素默认只显示短名（`ZONE 4`）；整条 E3D 全名
                             // （`ZONE 4 of SITE 2`）挂在悬停上，不另占一列。有名字的两者相同，
                             // 不挂——`on_hover_text` 会让每一行都多一次布局。
-                            if row.full_name != row.name {
+                            // 引用行的悬停交代它从哪来：经哪个 GPITEM 收录、主位置在别处。
+                            let reference = row.group.filter(|link| link.secondary).map(|link| {
+                                let via = link
+                                    .via
+                                    .map(|via| format!("经 GPITEM {} ", via.to_e3d_id()))
+                                    .unwrap_or_default();
+                                format!("分组引用：{via}收录，主位置在别处（右键「定位到原位置」）")
+                            });
+                            if let Some(reference) = reference {
+                                let text = if row.full_name != row.name {
+                                    format!("{}\n{reference}", row.full_name)
+                                } else {
+                                    reference
+                                };
+                                out.response.clone().on_hover_text(text);
+                            } else if row.full_name != row.name {
                                 out.response.clone().on_hover_text(&row.full_name);
                             }
                             // 自动化只认真正的树行：AccessKit 角色负责排除命令历史、
@@ -184,6 +219,16 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
     }
 }
 
+/// 树行的 egui id：refno 之外带上父行与经由的 GPITEM，不能混进行序（见 `show` 里的说明）。
+fn row_id(row: &TreeRowVm) -> Id {
+    Id::new((
+        "wb-tree-row",
+        row.parent,
+        row.refno,
+        row.group.and_then(|link| link.via),
+    ))
+}
+
 fn tree_item_accessible_label(refno: aios_core::RefU64, name: &str) -> String {
     // E3D 形式自带等号，前缀里就不再补一个，否则读屏念出来是「refno 等于 等于」。
     format!("refno {}; name={name}", refno.to_e3d_id())
@@ -263,6 +308,17 @@ fn row_menu(
         };
         if ui.button(format!("{icon}  {label}")).clicked() {
             cmds.push(Cmd::ToggleExpand(row.refno));
+            ui.close();
+        }
+        grouped = true;
+    }
+    // 引用行的主位置在别处：回去走与命令行定位同一条路（选中、展开祖先、滚进视野）。
+    if row.group.is_some_and(|link| link.secondary) {
+        if ui
+            .button(format!("{}  定位到原位置", ph::CROSSHAIR))
+            .clicked()
+        {
+            cmds.push(Cmd::LocateElement(row.refno));
             ui.close();
         }
         grouped = true;
@@ -732,10 +788,11 @@ fn note(ui: &mut Ui, t: &Tokens, d: Density, state: PaneState, icon: &str, text:
 #[cfg(test)]
 mod tests {
     use super::{
-        RoomItem, dimension_menu_action, is_room_node, room_menu_action, tree_item_accessible_label,
+        RoomItem, dimension_menu_action, is_room_node, room_menu_action, row_id,
+        tree_item_accessible_label,
     };
     use crate::Cmd;
-    use crate::vm::{DimensionsDataVm, DimensionsVm};
+    use crate::vm::{DimensionsDataVm, DimensionsVm, RowVisibility, TreeGroupLink, TreeRowVm};
     use aios_core::RefU64;
 
     /// 房间节点要两条都满足：类型是 `FRMW`，且登记在册。
@@ -907,5 +964,36 @@ mod tests {
         assert!(!after.contains("0_4660"));
         assert!(!after.contains("OLD-EQUI"));
         assert!(after.contains("name=NEW-EQUI"));
+    }
+
+    /// 分组成员既在主位置又在 GPSET 下：同一个 refno 两行，行 id 不能撞——撞了 egui 会把
+    /// 两行的交互混成一个，右键菜单也跟着串。同一行在帧与帧之间的 id 则必须不变。
+    #[test]
+    fn a_member_listed_under_a_group_keeps_its_own_row_id() {
+        let primary = TreeRowVm {
+            refno: RefU64(0x1234),
+            depth: 2,
+            name: "/E-01".to_owned(),
+            full_name: "/E-01".to_owned(),
+            noun: "EQUI".to_owned(),
+            expandable: None,
+            loading: false,
+            visibility: RowVisibility::Unloaded,
+            next_visible: true,
+            dimension_branch: None,
+            parent: Some(RefU64(0x1000)),
+            group: None,
+            unresolved: 0,
+        };
+        let member = TreeRowVm {
+            parent: Some(RefU64(0x2000)),
+            group: Some(TreeGroupLink {
+                via: Some(RefU64(0x2001)),
+                secondary: true,
+            }),
+            ..primary.clone()
+        };
+        assert_ne!(row_id(&primary), row_id(&member));
+        assert_eq!(row_id(&primary), row_id(&primary.clone()));
     }
 }

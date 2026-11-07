@@ -48,6 +48,9 @@ fn row(refno: u64, depth: u16, name: &str, noun: &str, expandable: Option<bool>)
         visibility: RowVisibility::Unloaded,
         next_visible: true,
         dimension_branch: None,
+        parent: None,
+        group: None,
+        unresolved: 0,
     }
 }
 

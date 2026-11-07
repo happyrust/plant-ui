@@ -640,6 +640,22 @@ pub struct TreeRowVm {
     /// （ELBO / ATTA / TUBI…）就是所在 BRAN；PIPE / ZONE / EQUI 这些为 `None`，右键菜单里
     /// 不出「查看尺寸标注」。宿主展平时顺着父链算好，绘制层不必回头找父行。
     pub dimension_branch: Option<RefU64>,
+    /// 这一行挂在哪一行底下（根层为 `None`）。分组成员既在主位置又在 GPSET 下，同一个
+    /// refno 在树上可以有几行，行的身份要带上它。
+    pub parent: Option<RefU64>,
+    /// GPSET 解析视图里成员行与分组的关系；主链上的行为 `None`。
+    pub group: Option<TreeGroupLink>,
+    /// 这一行（分组父节点）底下有几个成员解析不到；其余行为 0。
+    pub unresolved: usize,
+}
+
+/// 分组成员行与所在分组的关系（服务端 `/tree/children?resolved=1` 的 `via` / `secondary`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreeGroupLink {
+    /// 收录这个成员的 GPITEM。
+    pub via: Option<RefU64>,
+    /// 成员的主位置在别处，这一行只是引用：定位、显隐都跟主位置走。
+    pub secondary: bool,
 }
 
 /// 属性视图数据状态（跟随 `WorkbenchVm::selected`）。

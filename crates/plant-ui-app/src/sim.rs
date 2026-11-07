@@ -521,6 +521,7 @@ impl Engine {
             cache_versions: Vec::new(),
             observed_at: Utc::now(),
             sites: self.tree.sites.clone(),
+            group_roots: Ok(Vec::new()),
             // 剧本里的 SITE 不挂库号（`SimTree` 只长树），模型更新面板的 SITE 列
             // 在演示模式下不画。
             site_dbs: Vec::new(),
@@ -625,10 +626,11 @@ impl Engine {
     pub fn get_work(&self, branches: &[RefU64], reload_models: bool) -> GetWork {
         GetWork {
             sites: self.tree.sites.clone(),
+            group_roots: Ok(Vec::new()),
             reload_models,
             branches: branches
                 .iter()
-                .map(|refno| (*refno, self.children(*refno)))
+                .map(|refno| (*refno, self.children(*refno).into()))
                 .collect(),
             failed: Vec::new(),
             missing: Vec::new(),
@@ -1868,7 +1870,7 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
     let evt = match req {
         // 剧本引擎不分供数模式：换面与重连一样，回一份同样的假身份。
         Req::Reconnect | Req::SwitchReadFace(_) => Evt::Ready(Ok(engine.ready_info())),
-        Req::Children(refno) => Evt::Children(refno, Ok(engine.children(refno))),
+        Req::Children(refno) => Evt::Children(refno, Ok(engine.children(refno).into())),
         Req::Props(refno) => Evt::Props(refno, Ok(engine.props(refno))),
         // 范围定位：与真服务同口径地算子树包围盒。剧本里确实有几何的目标
         // （那根 BRAN 及其 SITE / ZONE / PIPE 祖先）照样能飞过去；子树里一条

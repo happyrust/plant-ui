@@ -107,6 +107,9 @@ pub fn noun_icon(noun: &str) -> &'static str {
         "HSPOOL" => ph::FAN,
         "FIELD" => ph::TRUCK,
         "PPIECE" => ph::SCISSORS,
+        // 分组：GPWL 是分组目录，GPSET 是一组引用成员。
+        "GPWL" => ph::FOLDERS,
+        "GPSET" => ph::SQUARES_FOUR,
         _ => ph::CUBE,
     }
 }

@@ -103,6 +103,17 @@ impl ServiceReadFace {
         model_update_api::tree_children(&self.base(), refno).await
     }
 
+    pub async fn children_resolved(
+        &self,
+        refno: RefU64,
+    ) -> anyhow::Result<model_update_api::TreeLevel> {
+        model_update_api::tree_children_resolved(&self.base(), refno).await
+    }
+
+    pub async fn group_roots(&self) -> anyhow::Result<Vec<EleTreeNode>> {
+        model_update_api::tree_group_roots(&self.base()).await
+    }
+
     pub async fn ancestors(&self, refno: RefU64) -> anyhow::Result<Vec<RefU64>> {
         model_update_api::tree_ancestors(&self.base(), refno).await
     }

@@ -18,7 +18,7 @@ use std::sync::mpsc;
 use plant_ui_data::{Attr, EleTreeNode, NameHit, RefU64};
 
 use crate::data::Evt;
-use crate::model_update_api::ModelRecords;
+use crate::model_update_api::{ModelRecords, TreeLevel};
 use crate::search_index::{Scope, SearchIndex, SubstringHits};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -162,6 +162,23 @@ impl ReadFace {
         match self {
             Self::Service(face) => face.children(refno).await,
             Self::Store(face) => face.children(refno).await,
+        }
+    }
+
+    /// 模型树展开用的子层：分组父节点（GPWL / GPSET）的行换成解析出的成员。库供数没有
+    /// 解析视图，回存储视图。[`Self::children`] 是两面对拍的那一份，不跟着换。
+    pub async fn children_resolved(&self, refno: RefU64) -> anyhow::Result<TreeLevel> {
+        match self {
+            Self::Service(face) => face.children_resolved(refno).await,
+            Self::Store(_) => self.children(refno).await.map(TreeLevel::from),
+        }
+    }
+
+    /// 分组入口（WORLD 下的 GPWL）。库供数没有这一面，回空表。
+    pub async fn group_roots(&self) -> anyhow::Result<Vec<EleTreeNode>> {
+        match self {
+            Self::Service(face) => face.group_roots().await,
+            Self::Store(_) => Ok(Vec::new()),
         }
     }
 

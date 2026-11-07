@@ -77,7 +77,7 @@ use plant_ui::vm::{
     RoomTreeConfirmVm, RoomTreeDataVm, RoomTreeVm, RoomViewVm, RoomVm, RoomsDataVm,
     RowVisibility, SearchHitVm, SearchRunVm, SearchVm, Selection, SpoolingDataVm,
     SpoolingGroupVm, SpoolingMemberVm, SpoolingMembersVm, SpoolingRowVm, SpoolingVm, SubIndexVm,
-    TreeRowVm, TreeVm, TruncationVm, View3dVm, WorkbenchVm,
+    TreeGroupLink, TreeRowVm, TreeVm, TruncationVm, View3dVm, WorkbenchVm,
 };
 use plant_ui::virtual_hole::{VirtualHoleOp, VirtualHoleReceipt, VirtualHoleStatus};
 use plant_ui::workbench::{self, Pane, WorkbenchState};
@@ -887,10 +887,19 @@ enum Locate {
 struct TreeModel {
     /// SITE 根层（MDB 世界的下一层）。
     roots: Vec<EleTreeNode>,
+    /// 分组入口（WORLD 下的 GPWL），树上排在 SITE 根层之后。库供数与老服务端没有，恒空。
+    group_roots: Vec<EleTreeNode>,
     /// 已加载的子层，按父 refno 缓存。
     children: HashMap<RefU64, Vec<EleTreeNode>>,
     /// 子 -> 父。命令行定位要顺着它把挡在目标前面的祖先一路展开。
+    ///
+    /// 只记主位置：分组成员在 GPSET 下那一行是引用，不改这里。
     parent: HashMap<RefU64, RefU64>,
+    /// 分组成员行与分组的关系，按 `(父行, 成员)` 记：同一个元素可以挂在几个 GPSET 下，
+    /// 也还在自己的主位置上。主链上的行不进表。
+    group_links: HashMap<(RefU64, RefU64), TreeGroupLink>,
+    /// 分组父节点下解析不到的成员数（服务端解析视图的 `unresolved`）。
+    unresolved: HashMap<RefU64, usize>,
     expanded: HashSet<RefU64>,
     /// 子层查询在途的节点。
     loading: HashSet<RefU64>,
@@ -1067,20 +1076,28 @@ impl TreeModel {
     fn flatten(&self, scopes: &HashMap<RefU64, Vec<RefU64>>) -> Vec<TreeRowVm> {
         /// `branch` 是走到这一层时头上最近的 BRAN（右键「查看尺寸标注」的靶子，计划 B2）：
         /// 顺着 DFS 往下带，比每行回头爬一遍父链便宜，也不用绘制层自己找父行。
+        #[allow(clippy::too_many_arguments)]
         fn walk(
             model: &TreeModel,
             scopes: &HashMap<RefU64, Vec<RefU64>>,
+            parent: Option<RefU64>,
             nodes: &[EleTreeNode],
             depth: u16,
             branch: Option<RefU64>,
+            on_path: &mut HashSet<RefU64>,
             rows: &mut Vec<TreeRowVm>,
         ) {
             for n in nodes {
                 let refno = n.refno.refno();
                 let expandable = (n.children_count > 0).then(|| model.expanded.contains(&refno));
                 let visibility = model.visibility_for(refno, scopes);
+                let group =
+                    parent.and_then(|parent| model.group_links.get(&(parent, refno)).copied());
                 let dimension_branch = if is_bran_noun(&n.noun) {
                     Some(refno)
+                } else if group.is_some_and(|link| link.secondary) {
+                    // 引用行头上是 GPSET 不是 BRAN：照主位置的父链找。
+                    model.dimension_branch(refno)
                 } else {
                     branch
                 };
@@ -1098,28 +1115,94 @@ impl TreeModel {
                         visibility,
                     ),
                     dimension_branch,
+                    parent,
+                    group,
+                    unresolved: model.unresolved.get(&refno).copied().unwrap_or(0),
                 });
+                // 分组让树不再是树：GPSET 的成员里可以有 GPWL / GPSET 自己。已在这条
+                // 路径上的节点再出现时只画这一行、不往下展，数据成环也转得出来。
                 if expandable == Some(true)
                     && let Some(kids) = model.children.get(&refno)
+                    && on_path.insert(refno)
                 {
-                    walk(model, scopes, kids, depth + 1, dimension_branch, rows);
+                    walk(
+                        model,
+                        scopes,
+                        Some(refno),
+                        kids,
+                        depth + 1,
+                        dimension_branch,
+                        on_path,
+                        rows,
+                    );
+                    on_path.remove(&refno);
                 }
             }
         }
         let mut rows = Vec::new();
-        walk(self, scopes, &self.roots, 0, None, &mut rows);
+        let mut on_path = HashSet::new();
+        walk(
+            self,
+            scopes,
+            None,
+            &self.roots,
+            0,
+            None,
+            &mut on_path,
+            &mut rows,
+        );
+        walk(
+            self,
+            scopes,
+            None,
+            &self.group_roots,
+            0,
+            None,
+            &mut on_path,
+            &mut rows,
+        );
         rows
     }
 
+    /// 树的两段根层：SITE 在前，分组入口（GPWL）在后。
+    fn root_nodes(&self) -> impl Iterator<Item = &EleTreeNode> {
+        self.roots.iter().chain(&self.group_roots)
+    }
+
+    /// 落一层子节点（展开回执与取回工作共用）。
+    ///
+    /// 分组成员行（`secondary`）的主位置在别处，这里不改它的 `parent`：定位、eye 继承、
+    /// 库号都沿主链走，GPSET 下那一行只是引用。
+    fn install_children(&mut self, parent: RefU64, level: model_update_api::TreeLevel) {
+        self.group_links.retain(|(owner, _), _| *owner != parent);
+        for (kid, link) in level.nodes.iter().zip(level.links.iter().copied()) {
+            let refno = kid.refno.refno();
+            if let Some(link) = link {
+                self.group_links.insert((parent, refno), link);
+            }
+            if !link.is_some_and(|link| link.secondary) {
+                self.parent.insert(refno, parent);
+            }
+            self.note_dbnum(kid);
+        }
+        if level.unresolved > 0 {
+            self.unresolved.insert(parent, level.unresolved);
+        } else {
+            self.unresolved.remove(&parent);
+        }
+        self.children.insert(parent, level.nodes);
+    }
+
     fn element_count(&self) -> usize {
-        self.roots.len() + self.children.values().map(Vec::len).sum::<usize>()
+        self.roots.len()
+            + self.group_roots.len()
+            + self.children.values().map(Vec::len).sum::<usize>()
     }
 
     /// 命令行里指认某个节点用的短名，形如 `EQUI /VESSEL-01`（name 自带前导斜杠）。
     /// 缓存里找不到就退回 refno——它至少还能在树上定位。
     fn label(&self, refno: RefU64) -> String {
-        self.roots
-            .iter()
+        self.root_nodes()
             .chain(self.children.values().flatten())
             .find(|n| n.refno.refno() == refno)
             .map(|n| format!("{} {}", n.noun, n.name))
@@ -1130,8 +1213,7 @@ impl TreeModel {
     /// 节点并发发出；旧实现每次选中都无条件查询，严格 schema 下会把普通元素
     /// 的正常选择误报成「PANEL 房间查询失败」。
     fn noun(&self, refno: RefU64) -> Option<&str> {
-        self.roots
-            .iter()
+        self.root_nodes()
             .chain(self.children.values().flatten())
             .find(|node| node.refno.refno() == refno)
             .map(|node| node.noun.as_str())
@@ -1146,7 +1228,7 @@ impl TreeModel {
     }
 
     fn is_root(&self, refno: RefU64) -> bool {
-        self.roots.iter().any(|n| n.refno.refno() == refno)
+        self.root_nodes().any(|n| n.refno.refno() == refno)
     }
 
     /// 这个元素在模型树上有一行吗。树只由当前 MDB 的设计库长出来，所以「在树上」
@@ -1192,6 +1274,8 @@ impl TreeModel {
         }
         self.roots
             .retain(|node| !missing.contains(&node.refno.refno()));
+        self.group_roots
+            .retain(|node| !missing.contains(&node.refno.refno()));
         for children in self.children.values_mut() {
             children.retain(|node| !missing.contains(&node.refno.refno()));
         }
@@ -1205,15 +1289,14 @@ impl TreeModel {
     /// 也会一直虚高。
     fn prune_unreachable(&mut self) -> Vec<RefU64> {
         let mut known: HashSet<RefU64> = self
-            .roots
-            .iter()
+            .root_nodes()
             .chain(self.children.values().flatten())
             .map(|node| node.refno.refno())
             .collect();
         known.extend(self.children.keys().copied());
         known.extend(self.parent.keys().copied());
         let mut alive: HashSet<RefU64> = HashSet::new();
-        let mut stack: Vec<RefU64> = self.roots.iter().map(|n| n.refno.refno()).collect();
+        let mut stack: Vec<RefU64> = self.root_nodes().map(|n| n.refno.refno()).collect();
         while let Some(refno) = stack.pop() {
             // 数据异常造出环时这里靠 `alive` 收敛，不会转不出去。
             if !alive.insert(refno) {
@@ -1225,6 +1308,9 @@ impl TreeModel {
         }
         self.children.retain(|refno, _| alive.contains(refno));
         self.parent.retain(|refno, _| alive.contains(refno));
+        self.group_links
+            .retain(|(parent, member), _| alive.contains(parent) && alive.contains(member));
+        self.unresolved.retain(|refno, _| alive.contains(refno));
         self.expanded.retain(|refno| alive.contains(refno));
         self.loading.retain(|refno| alive.contains(refno));
         self.visibility.retain(|refno, _| alive.contains(refno));
@@ -1268,8 +1354,7 @@ impl TreeModel {
     /// 这个元素的 PDMS 类型（`FRMW` / `BRAN` / `SITE`…）。与 `dimension_branch` 一样
     /// 只看已加载的树：元素不在缓存里就回 `None`，那时候本端确实还不知道它是什么。
     fn noun_of(&self, refno: RefU64) -> Option<&str> {
-        self.roots
-            .iter()
+        self.root_nodes()
             .chain(self.children.values().flatten())
             .find(|node| node.refno.refno() == refno)
             .map(|node| node.noun.as_str())
@@ -1281,8 +1366,7 @@ impl TreeModel {
     /// （视口拾取到的元素随定位把祖先一路加载回来，那之后就认得了）。
     fn dimension_branch(&self, refno: RefU64) -> Option<RefU64> {
         let noun_of = |refno: RefU64| {
-            self.roots
-                .iter()
+            self.root_nodes()
                 .chain(self.children.values().flatten())
                 .find(|node| node.refno.refno() == refno)
                 .map(|node| node.noun.as_str())
@@ -2751,6 +2835,7 @@ impl App {
                         self.tree.note_dbnum(site);
                     }
                     self.tree.roots = info.sites;
+                    self.install_group_roots(info.group_roots);
                     // 在册房间表：右键菜单靠它认出「这一行是房间」。230 行级，连上就取一次；
                     // 取不到只是少一项菜单，不进日志——房间树那条路自己会报查询失败。
                     self.vm.room_refnos.clear();
@@ -2790,16 +2875,20 @@ impl App {
                         Some(Retry::Connect),
                     );
                 }
-                data::Evt::Children(refno, Ok(kids)) => {
+                data::Evt::Children(refno, Ok(level)) => {
                     self.tree.loading.remove(&refno);
                     let el = self.tree.element(refno);
-                    let msg = format!("展开：{} 个子元素", kids.len());
+                    let msg = if level.unresolved > 0 {
+                        format!(
+                            "展开：{} 个子元素，另有 {} 个分组成员解析不到",
+                            level.nodes.len(),
+                            level.unresolved
+                        )
+                    } else {
+                        format!("展开：{} 个子元素", level.nodes.len())
+                    };
                     self.logs.info_of(&mut self.vm.logs, el, msg);
-                    for kid in &kids {
-                        self.tree.parent.insert(kid.refno.refno(), refno);
-                        self.tree.note_dbnum(kid);
-                    }
-                    self.tree.children.insert(refno, kids);
+                    self.tree.install_children(refno, level);
                     dirty = true;
                 }
                 data::Evt::Children(refno, Err(e)) => {
@@ -4109,12 +4198,9 @@ impl App {
                                 self.tree.note_dbnum(site);
                             }
                             self.tree.roots = fresh.sites;
-                            for (refno, kids) in fresh.branches {
-                                for kid in &kids {
-                                    self.tree.parent.insert(kid.refno.refno(), refno);
-                                    self.tree.note_dbnum(kid);
-                                }
-                                self.tree.children.insert(refno, kids);
+                            self.install_group_roots(fresh.group_roots);
+                            for (refno, level) in fresh.branches {
+                                self.tree.install_children(refno, level);
                             }
                             // 摘掉失败的分支之前先把话说完：`element` 要在树还
                             // 认得这个 refno 的时候取名字。
@@ -7215,6 +7301,23 @@ impl App {
                     self.finish_model_progress("模型加载完成");
                 }
             }
+        }
+    }
+
+    /// 分组入口落树（连接与取回工作共用）。读不到时保留已有的那一段——首次连上时它本来
+    /// 就空——原因进日志：少了分组只是树上少一段，不该让连接或取回作废。
+    fn install_group_roots(&mut self, group_roots: Result<Vec<EleTreeNode>, String>) {
+        match group_roots {
+            Ok(group_roots) => {
+                for group in &group_roots {
+                    self.tree.note_dbnum(group);
+                }
+                self.tree.group_roots = group_roots;
+            }
+            Err(reason) => self.logs.warn(
+                &mut self.vm.logs,
+                format!("分组入口读取失败，模型树暂不显示分组：{reason}"),
+            ),
         }
     }
 
