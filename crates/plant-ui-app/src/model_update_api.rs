@@ -332,7 +332,7 @@ struct ResolvedTreeRow {
 }
 
 #[derive(Debug, Deserialize)]
-struct ResolvedTreeReply {
+pub(crate) struct ResolvedTreeReply {
     source: String,
     nodes: Vec<ResolvedTreeRow>,
     /// 解析不到的槽（引用目标已删、不在本 MDB…），只在有坏槽时出现。树上只要条数。
@@ -486,25 +486,32 @@ pub async fn tree_children_resolved(
         urlencode(&refno.to_slash_string())
     );
     let reply: ResolvedTreeReply = get(base, &path).await?;
-    require_direct(&reply.source)?;
-    let (mut nodes, links): (Vec<_>, Vec<_>) = reply
-        .nodes
-        .into_iter()
-        .map(|row| {
-            let link = (row.secondary || row.via.is_some()).then(|| TreeGroupLink {
-                via: row.via.map(|via| via.refno()),
-                secondary: row.secondary,
-            });
-            (row.node, link)
+    reply.into_level()
+}
+
+impl ResolvedTreeReply {
+    /// 回执落成树上的一层。与取数分开：分组契约的用例直接喂 gen-model 形状的回执。
+    pub(crate) fn into_level(self) -> anyhow::Result<TreeLevel> {
+        require_direct(&self.source)?;
+        let (mut nodes, links): (Vec<_>, Vec<_>) = self
+            .nodes
+            .into_iter()
+            .map(|row| {
+                let link = (row.secondary || row.via.is_some()).then(|| TreeGroupLink {
+                    via: row.via.map(|via| via.refno()),
+                    secondary: row.secondary,
+                });
+                (row.node, link)
+            })
+            .unzip();
+        fill_legacy_default_names(&mut nodes);
+        Ok(TreeLevel {
+            nodes,
+            links,
+            unresolved: self.unresolved.len(),
+            stored_view: self.view.as_deref() != Some("resolved"),
         })
-        .unzip();
-    fill_legacy_default_names(&mut nodes);
-    Ok(TreeLevel {
-        nodes,
-        links,
-        unresolved: reply.unresolved.len(),
-        stored_view: reply.view.as_deref() != Some("resolved"),
-    })
+    }
 }
 
 /// 分组入口：WORLD 下的 GPWL（`/tree/roots?nouns=GPWL`）。不认 `GPWL` 的服务端回
@@ -1832,6 +1839,169 @@ mod tests {
             )
             .unwrap();
         union.extend_scope(page.scope(), page.items).unwrap();
+    }
+
+    /// gen-model 分组契约快照里的字段名，照抄自 `gen-model/tests/fixtures/group-contract/` 下的
+    /// `tree-children-resolved-gpset.json`、`tree-ancestors-secondary-parents.json`、
+    /// `model-generate-gpset.json`、`model-records-gpset.json`（不跨仓读文件）。gen-model 改了回执字段
+    /// 会连基准一起重写，这几张清单跟着改。
+    mod gen_model_group_contract {
+        pub const CHILDREN_RESOLVED: &[&str] = &["source", "parent", "view", "nodes", "unresolved"];
+        pub const CHILDREN_RESOLVED_ROW: &[&str] = &[
+            "refno",
+            "noun",
+            "name",
+            "owner",
+            "order",
+            "children_count",
+            "op",
+            "mod_cnt",
+            "children_updated",
+            "status_code",
+            "dbnum",
+            "via",
+            "secondary",
+            "rule",
+        ];
+        pub const ANCESTORS: &[&str] = &["source", "refnos", "secondary_parents"];
+        pub const GENERATE: &[&str] = &[
+            "requested_refno",
+            "generation_root",
+            "generation_root_noun",
+            "status",
+            "model_available",
+            "model_instance_count",
+            "generated_instance_count",
+            "generation_root_count",
+            "generation_roots",
+            "cached_root_count",
+            "generated_root_count",
+            "failed_root_count",
+            "failed_roots",
+            "dbnum",
+            "model_source",
+            "model_source_reason",
+            "durable",
+            "scope_kind",
+            "scope_refnos",
+            "unresolved_count",
+            "routes",
+            "publication_status",
+        ];
+        pub const RECORDS: &[&str] = &[
+            "source",
+            "dbnum",
+            "model_source",
+            "model_source_reason",
+            "durable",
+            "complete",
+            "incomplete_roots",
+            "durable_fallback_roots",
+            "snapshot_epoch",
+            "session_vector",
+            "items",
+            "total",
+            "truncated",
+            "next_cursor",
+            "generation_root",
+            "expanded_from_group",
+            "scope_refnos",
+            "unresolved_count",
+            "routes",
+        ];
+    }
+
+    /// DTO 去回执里找的键：serde 反序列化结构体时交给 Deserializer 的字段表（derive 生成的
+    /// `FIELDS`）。带 `#[serde(flatten)]` 的结构体走 map、不报字段表。
+    fn dto_fields<T: serde::de::DeserializeOwned>() -> Vec<&'static str> {
+        use serde::de::{Error as _, Visitor, value::Error};
+
+        struct Probe(Vec<&'static str>);
+        impl<'de> serde::Deserializer<'de> for &mut Probe {
+            type Error = Error;
+            fn deserialize_any<V: Visitor<'de>>(self, _: V) -> Result<V::Value, Error> {
+                Err(Error::custom("不是结构体"))
+            }
+            fn deserialize_struct<V: Visitor<'de>>(
+                self,
+                _: &'static str,
+                fields: &'static [&'static str],
+                _: V,
+            ) -> Result<V::Value, Error> {
+                self.0.extend_from_slice(fields);
+                Err(Error::custom("只要字段表"))
+            }
+            serde::forward_to_deserialize_any! {
+                bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string bytes byte_buf
+                option unit unit_struct newtype_struct seq tuple tuple_struct map enum
+                identifier ignored_any
+            }
+        }
+        let mut probe = Probe(Vec::new());
+        let _ = T::deserialize(&mut probe);
+        let name = std::any::type_name::<T>();
+        assert!(!probe.0.is_empty(), "{name} 没报字段表");
+        probe.0
+    }
+
+    /// 分组契约：plant-ui 的分组 DTO 去回执里找的键都得在 gen-model 的基准里——不在，就是后端改了名
+    /// 或删了、这边静默落成默认值。前端不读的字段不管。`absent` 是读了、gen-model 这一版却不发的键，
+    /// 它们一旦出现在基准里就该从 `absent` 拿掉。
+    #[test]
+    fn group_dtos_read_only_fields_the_gen_model_snapshots_carry() {
+        use self::gen_model_group_contract as gen_model;
+
+        fn assert_reads(what: &str, reads: &[&str], sent: &[&str], absent: &[&str]) {
+            for key in absent {
+                assert!(!sent.contains(key), "{what}：gen-model 已经发 `{key}` 了");
+            }
+            let stray: Vec<&str> = reads
+                .iter()
+                .copied()
+                .filter(|key| !sent.contains(key) && !absent.contains(key))
+                .collect();
+            assert!(
+                stray.is_empty(),
+                "{what}：plant-ui 读的 {stray:?} 不在 gen-model 的基准里"
+            );
+        }
+
+        assert_reads(
+            "/tree/children?resolved=1",
+            &dto_fields::<ResolvedTreeReply>(),
+            gen_model::CHILDREN_RESOLVED,
+            &[],
+        );
+        // 行 = flatten 进来的 EleTreeNode + 分组成员才带的 via / secondary。ResolvedTreeRow 走 map、
+        // 拿不到字段表，这两格由 main.rs 的坏槽链路用例按 gen-model 的形状读实。`short_name`：
+        // gen-model 这一版的树节点不发（old-aios-core 的 EleTreeNode 没有这一格），无名元素的短名由
+        // `fill_legacy_default_names` 补。
+        let mut row = dto_fields::<aios_core::pdms_types::EleTreeNode>();
+        row.extend(["via", "secondary"]);
+        assert_reads(
+            "/tree/children?resolved=1 的行",
+            &row,
+            gen_model::CHILDREN_RESOLVED_ROW,
+            &["short_name"],
+        );
+        assert_reads(
+            "/tree/ancestors",
+            &dto_fields::<TreeAncestorsReply>(),
+            gen_model::ANCESTORS,
+            &[],
+        );
+        assert_reads(
+            "/model/generate",
+            &dto_fields::<GenerateBody>(),
+            gen_model::GENERATE,
+            &[],
+        );
+        assert_reads(
+            "/model/records",
+            &dto_fields::<ModelRecordsPage>(),
+            gen_model::RECORDS,
+            &[],
+        );
     }
 
     /// ADR-0030 实施约束 6：源码里不再有 ensure——`ensure_model` / `EnsureReply` / `EnsureStatus` 一个不留，

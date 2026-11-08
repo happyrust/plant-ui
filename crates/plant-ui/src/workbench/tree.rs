@@ -77,8 +77,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                             // 分组让同一个元素能在树上出现几次（主位置一行、每个收录它的 GPSET
                             // 下各一行），所以 refno 之外还要带上挂在谁底下、经哪个 GPITEM。
                             let id = row_id(row);
-                            let unresolved = (row.unresolved > 0)
-                                .then(|| format!("{} 个成员不可解析", row.unresolved));
+                            let unresolved = unresolved_hint(row);
                             let mut tags = Vec::new();
                             if row.group.is_some_and(|link| link.secondary) {
                                 tags.push(RowTag {
@@ -415,6 +414,11 @@ pub(super) fn model_cmd(action: ModelAction) -> Cmd {
 pub fn is_group_node(noun: Option<&str>) -> bool {
     let noun = noun.unwrap_or_default();
     noun.eq_ignore_ascii_case("GPWL") || noun.eq_ignore_ascii_case("GPSET")
+}
+
+/// 分组父行上的坏槽提示：服务端解析视图里解析不到的成员条数（`unresolved`），没有就不出声。
+pub fn unresolved_hint(row: &TreeRowVm) -> Option<String> {
+    (row.unresolved > 0).then(|| format!("{} 个成员不可解析", row.unresolved))
 }
 
 /// 元素菜单的公共部分：模型动作 + 房间归属 + 尺寸标注 + 复制 REFNO。模型树的行

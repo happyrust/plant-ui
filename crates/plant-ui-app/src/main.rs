@@ -10204,6 +10204,74 @@ mod tests {
         assert!(flagged(&tree).is_empty(), "解析视图回来后提示撤掉");
     }
 
+    /// 坏槽的端到端：GPREF 指向不存在的元素（`target_missing`）从 gen-model 的回执一路走到 GPSET
+    /// 那一行的提示。回执照抄 gen-model 的分组契约快照
+    /// `gen-model/tests/fixtures/group-contract/tree-children-resolved-gpset.json`：三个解析出的成员、
+    /// 三个坏槽（`gpref_missing` / `db_not_in_mdb` / `target_missing`），树上只数条数。
+    #[test]
+    fn a_gpref_to_a_missing_element_reaches_the_gpset_row_hint() {
+        let reply = serde_json::json!({
+            "source": "direct",
+            "parent": "2/11",
+            "view": "resolved",
+            "nodes": [
+                {"refno": "1_4", "noun": "BRAN", "name": "/PIPE-100/B1", "owner": "1_3", "order": 0,
+                 "children_count": 1, "op": 0, "mod_cnt": null, "children_updated": null,
+                 "status_code": null, "dbnum": 7001, "via": "2_12", "secondary": true, "rule": false},
+                {"refno": "3_5", "noun": "EQUI", "name": "/P-201", "owner": "3_2", "order": 1,
+                 "children_count": 0, "op": 0, "mod_cnt": null, "children_updated": null,
+                 "status_code": null, "dbnum": 7003, "via": "2_13", "secondary": true, "rule": false},
+                {"refno": "1_6", "noun": "VALV", "name": "/PIPE-100/B1/V1", "owner": "1_4", "order": 2,
+                 "children_count": 0, "op": 0, "mod_cnt": null, "children_updated": null,
+                 "status_code": null, "dbnum": 7001, "via": "2_14", "secondary": true, "rule": false}
+            ],
+            "unresolved": [
+                {"via": "2_15", "target": null, "reason": "gpref_missing"},
+                {"via": "2_16", "target": "9_1", "reason": "db_not_in_mdb"},
+                {"via": "2_17", "target": "1_99", "reason": "target_missing"}
+            ]
+        });
+        let level = serde_json::from_value::<model_update_api::ResolvedTreeReply>(reply)
+            .unwrap()
+            .into_level()
+            .unwrap();
+        assert_eq!(level.unresolved, 3);
+
+        let refno = |db: u64, no: u64| RefU64((db << 32) | no);
+        let (gpwl, gpset) = (refno(2, 10), refno(2, 11));
+        let mut tree = TreeModel {
+            group_roots: vec![node(gpwl, "GPWL", 1)],
+            ..Default::default()
+        };
+        tree.expanded.extend([gpwl, gpset]);
+        tree.install_children(
+            gpwl,
+            model_update_api::TreeLevel::from(vec![node(gpset, "GPSET", 6)]),
+        );
+        tree.install_children(gpset, level);
+        let rows = tree.flatten(&HashMap::new());
+        let seen: Vec<_> = rows
+            .iter()
+            .map(|row| (row.noun.as_str(), row.group.and_then(|link| link.via)))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("GPWL", None),
+                ("GPSET", None),
+                ("BRAN", Some(refno(2, 12))),
+                ("EQUI", Some(refno(2, 13))),
+                ("VALV", Some(refno(2, 14))),
+            ]
+        );
+        let hints: Vec<_> = rows
+            .iter()
+            .map(plant_ui::workbench::tree::unresolved_hint)
+            .collect();
+        let on_gpset = Some("3 个成员不可解析".to_owned());
+        assert_eq!(hints, [None, on_gpset, None, None, None]);
+    }
+
     /// eye 那条链路的最小复现：点击 -> 查询 -> View3d 回执。
     ///
     /// 中间那几步用的就是 `handle_cmds` / `Evt::ModelScope` / `sync_render_states`
