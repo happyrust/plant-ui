@@ -78,28 +78,7 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                             // 下各一行），所以 refno 之外还要带上挂在谁底下、经哪个 GPITEM。
                             let id = row_id(row);
                             let unresolved = unresolved_hint(row);
-                            let mut tags = Vec::new();
-                            if row.group.is_some_and(|link| link.secondary) {
-                                tags.push(RowTag {
-                                    icon: Some(ph::LINK_SIMPLE),
-                                    text: "引用",
-                                    tone: Status::Info,
-                                });
-                            }
-                            if let Some(text) = &unresolved {
-                                tags.push(RowTag {
-                                    icon: Some(ph::WARNING),
-                                    text: text.as_str(),
-                                    tone: Status::Warn,
-                                });
-                            }
-                            if row.group_view_unsupported {
-                                tags.push(RowTag {
-                                    icon: Some(ph::INFO),
-                                    text: "后端未支持分组解析",
-                                    tone: Status::Info,
-                                });
-                            }
+                            let tags = row_tags(row, unresolved.as_deref().unwrap_or_default());
                             let out = ui
                                 .scope_builder(UiBuilder::new().id(id), |ui| {
                                     widgets::tree_row_ui(
@@ -125,13 +104,24 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                             // 无名元素默认只显示短名（`ZONE 4`）；整条 E3D 全名
                             // （`ZONE 4 of SITE 2`）挂在悬停上，不另占一列。有名字的两者相同，
                             // 不挂——`on_hover_text` 会让每一行都多一次布局。
-                            // 引用行的悬停交代它从哪来：经哪个 GPITEM 收录、主位置在别处。
-                            let reference = row.group.filter(|link| link.secondary).map(|link| {
-                                let via = link
-                                    .via
-                                    .map(|via| format!("经 GPITEM {} ", via.to_e3d_id()))
-                                    .unwrap_or_default();
-                                format!("分组引用：{via}收录，主位置在别处（右键「定位到原位置」）")
+                            // 成员行的悬停交代它从哪来：规则命中，还是经哪个 GPITEM 收录。
+                            let reference = row.group.and_then(|link| {
+                                if link.rule {
+                                    Some(
+                                        "分组规则命中：主位置在别处（右键「定位到原位置」）"
+                                            .to_owned(),
+                                    )
+                                } else if link.secondary {
+                                    let via = link
+                                        .via
+                                        .map(|via| format!("经 GPITEM {} ", via.to_e3d_id()))
+                                        .unwrap_or_default();
+                                    Some(format!(
+                                        "分组引用：{via}收录，主位置在别处（右键「定位到原位置」）"
+                                    ))
+                                } else {
+                                    None
+                                }
                             });
                             if let Some(reference) = reference {
                                 let text = if row.full_name != row.name {
@@ -419,6 +409,47 @@ pub fn is_group_node(noun: Option<&str>) -> bool {
 /// 分组父行上的坏槽提示：服务端解析视图里解析不到的成员条数（`unresolved`），没有就不出声。
 pub fn unresolved_hint(row: &TreeRowVm) -> Option<String> {
     (row.unresolved > 0).then(|| format!("{} 个成员不可解析", row.unresolved))
+}
+
+/// 一行的角标。
+///
+/// `unresolved` 的文本由调用方持有（[`unresolved_hint`] 返回 `String`），这里只借它的
+/// `&str`：在函数内部临时造一个 `String` 再返回 `RowTag`，返回值会借到已经析构的局部量。
+///
+/// 规则成员（`rule`）与 GPITEM 引用成员（`secondary`）是两件事：前者由分组规则命中、
+/// 没有经由的 GPITEM；后者是 GPITEM 显式收录。两者都挂角标，但文案与图标不同。
+pub fn row_tags<'a>(row: &TreeRowVm, unresolved: &'a str) -> Vec<RowTag<'a>> {
+    let mut tags = Vec::new();
+    if let Some(link) = row.group {
+        if link.rule {
+            tags.push(RowTag {
+                icon: Some(ph::FUNNEL),
+                text: "规则",
+                tone: Status::Info,
+            });
+        } else if link.secondary {
+            tags.push(RowTag {
+                icon: Some(ph::LINK_SIMPLE),
+                text: "引用",
+                tone: Status::Info,
+            });
+        }
+    }
+    if !unresolved.is_empty() {
+        tags.push(RowTag {
+            icon: Some(ph::WARNING),
+            text: unresolved,
+            tone: Status::Warn,
+        });
+    }
+    if row.group_view_unsupported {
+        tags.push(RowTag {
+            icon: Some(ph::INFO),
+            text: "后端未支持分组解析",
+            tone: Status::Info,
+        });
+    }
+    tags
 }
 
 /// 元素菜单的公共部分：模型动作 + 房间归属 + 尺寸标注 + 复制 REFNO。模型树的行
@@ -811,7 +842,7 @@ fn note(ui: &mut Ui, t: &Tokens, d: Density, state: PaneState, icon: &str, text:
 mod tests {
     use super::{
         RoomItem, dimension_menu_action, is_group_node, is_room_node, room_menu_action, row_id,
-        tree_item_accessible_label,
+        row_tags, tree_item_accessible_label, unresolved_hint,
     };
     use crate::Cmd;
     use crate::vm::{DimensionsDataVm, DimensionsVm, RowVisibility, TreeGroupLink, TreeRowVm};
@@ -1040,10 +1071,117 @@ mod tests {
             group: Some(TreeGroupLink {
                 via: Some(RefU64(0x2001)),
                 secondary: true,
+                rule: false,
             }),
             ..primary.clone()
         };
         assert_ne!(row_id(&primary), row_id(&member));
         assert_eq!(row_id(&primary), row_id(&primary.clone()));
+    }
+
+    /// 规则成员行（`rule: true`，`via` 为 `None`）挂「规则」角标，不挂「引用」角标：
+    /// 它由分组规则 SCOSEL 命中，不是 GPITEM 显式收录。两者在回执里只差 `rule` 一格。
+    #[test]
+    fn a_rule_member_row_is_tagged_as_a_rule_not_as_a_reference() {
+        let row = TreeRowVm {
+            refno: RefU64(0x3001),
+            depth: 2,
+            name: "/ZONE-PIPING-AREA01".to_owned(),
+            full_name: "/ZONE-PIPING-AREA01".to_owned(),
+            noun: "ZONE".to_owned(),
+            expandable: Some(false),
+            loading: false,
+            visibility: RowVisibility::Unloaded,
+            next_visible: true,
+            dimension_branch: None,
+            parent: Some(RefU64(0x3000)),
+            group: Some(TreeGroupLink {
+                via: None,
+                secondary: true,
+                rule: true,
+            }),
+            unresolved: 0,
+            group_view_unsupported: false,
+        };
+        let tags = row_tags(&row, "");
+        let texts: Vec<&str> = tags.iter().map(|tag| tag.text).collect();
+        assert!(
+            texts.contains(&"规则"),
+            "规则成员要挂「规则」角标：{texts:?}"
+        );
+        assert!(
+            !texts.contains(&"引用"),
+            "规则成员不是 GPITEM 引用，不该挂「引用」：{texts:?}"
+        );
+        assert_eq!(
+            texts.len(),
+            1,
+            "没有坏槽、不是老服务端，只该有一个角标：{texts:?}"
+        );
+    }
+
+    /// GPITEM 解析成员行（`secondary: true`、`rule: false`）仍是「引用」角标——本次改动
+    /// 不能把既有行为翻成「规则」。
+    #[test]
+    fn a_gpref_member_row_keeps_the_reference_tag() {
+        let row = TreeRowVm {
+            refno: RefU64(0x4001),
+            depth: 2,
+            name: "/E-01".to_owned(),
+            full_name: "/E-01".to_owned(),
+            noun: "EQUI".to_owned(),
+            expandable: None,
+            loading: false,
+            visibility: RowVisibility::Unloaded,
+            next_visible: true,
+            dimension_branch: None,
+            parent: Some(RefU64(0x4000)),
+            group: Some(TreeGroupLink {
+                via: Some(RefU64(0x4002)),
+                secondary: true,
+                rule: false,
+            }),
+            unresolved: 0,
+            group_view_unsupported: false,
+        };
+        let tags = row_tags(&row, "");
+        let texts: Vec<&str> = tags.iter().map(|tag| tag.text).collect();
+        assert!(
+            texts.contains(&"引用"),
+            "GPITEM 成员仍挂「引用」：{texts:?}"
+        );
+        assert!(
+            !texts.contains(&"规则"),
+            "`rule: false` 不能被误判成规则成员：{texts:?}"
+        );
+    }
+
+    /// 主链行（`group: None`）两个角标都不挂；坏槽与老服务端提示照旧。
+    #[test]
+    fn a_plain_row_has_no_membership_tag_but_keeps_its_hints() {
+        let row = TreeRowVm {
+            refno: RefU64(0x5001),
+            depth: 1,
+            name: "/SITE-1".to_owned(),
+            full_name: "/SITE-1".to_owned(),
+            noun: "SITE".to_owned(),
+            expandable: Some(true),
+            loading: false,
+            visibility: RowVisibility::Unloaded,
+            next_visible: true,
+            dimension_branch: None,
+            parent: None,
+            group: None,
+            unresolved: 2,
+            group_view_unsupported: true,
+        };
+        let hint = unresolved_hint(&row).expect("两个坏槽要出声");
+        let tags = row_tags(&row, &hint);
+        let texts: Vec<&str> = tags.iter().map(|tag| tag.text).collect();
+        assert_eq!(
+            texts,
+            [hint.as_str(), "后端未支持分组解析"],
+            "主链行只有坏槽与老服务端提示：{texts:?}"
+        );
     }
 }

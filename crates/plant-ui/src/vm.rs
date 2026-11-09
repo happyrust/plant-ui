@@ -652,13 +652,15 @@ pub struct TreeRowVm {
     pub group_view_unsupported: bool,
 }
 
-/// 分组成员行与所在分组的关系（服务端 `/tree/children?resolved=1` 的 `via` / `secondary`）。
+/// 分组成员行与所在分组的关系（服务端 `/tree/children?resolved=1` 的 `via` / `secondary` / `rule`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TreeGroupLink {
-    /// 收录这个成员的 GPITEM。
+    /// 收录这个成员的 GPITEM。规则成员没有（`None`）。
     pub via: Option<RefU64>,
     /// 成员的主位置在别处，这一行只是引用：定位、显隐都跟主位置走。
     pub secondary: bool,
+    /// 由分组规则（SCOSEL）命中，不是 GPITEM 显式收录。与 `secondary` 同时为真。
+    pub rule: bool,
 }
 
 /// 属性视图数据状态（跟随 `WorkbenchVm::selected`）。

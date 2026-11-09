@@ -319,8 +319,8 @@ struct TreeAncestorsReply {
 }
 
 /// `/tree/children?resolved=1` 的一行：节点本身，外加分组成员才带的 `via`（收录它的
-/// GPITEM）与 `secondary`（主位置在别处）。主链上的子节点这两格都不出现
-/// （gen-model `handlers.rs::tree_children_resolved`）。
+/// GPITEM）、`secondary`（主位置在别处）与 `rule`（由分组规则 SCOSEL 命中）。
+/// 主链上的子节点这三格都不出现（gen-model `handlers.rs::resolved_children_body`）。
 #[derive(Debug, Deserialize)]
 struct ResolvedTreeRow {
     #[serde(flatten)]
@@ -329,6 +329,11 @@ struct ResolvedTreeRow {
     via: Option<aios_core::RefnoEnum>,
     #[serde(default)]
     secondary: bool,
+    /// 分组规则（SCOSEL）命中的成员：主位置在别处，且没有经由的 GPITEM（`via` 为 `null`）。
+    /// gen-model `handlers.rs::resolved_children_body` 对规则成员发 `rule: true`，
+    /// 对 GPITEM 解析成员发 `rule: false`。默认 `false`：老服务端不带这一格。
+    #[serde(default)]
+    rule: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -497,10 +502,14 @@ impl ResolvedTreeReply {
             .nodes
             .into_iter()
             .map(|row| {
-                let link = (row.secondary || row.via.is_some()).then(|| TreeGroupLink {
-                    via: row.via.map(|via| via.refno()),
-                    secondary: row.secondary,
-                });
+                // `|| row.rule` 单看是冗余的（规则成员的 `secondary` 也是 `true`），但把
+                // 规则命中单独列出来：将来 `secondary` 的语义若变化，规则成员仍是一条成员行。
+                let link =
+                    (row.secondary || row.via.is_some() || row.rule).then(|| TreeGroupLink {
+                        via: row.via.map(|via| via.refno()),
+                        secondary: row.secondary,
+                        rule: row.rule,
+                    });
                 (row.node, link)
             })
             .unzip();
@@ -1804,6 +1813,89 @@ mod tests {
         assert_eq!(old.view, None);
     }
 
+    /// `/tree/children?resolved=1` 的规则成员行：`via: null`、`secondary: true`、`rule: true`。
+    /// 与 GPITEM 解析成员（`via` 有值、`rule: false`）必须能区分——这是分组规则 G3 的契约形状
+    /// （gen-model `handlers.rs::resolved_children_body`）。回执形状取自 gen-model 契约快照
+    /// `tests/fixtures/group-contract/tree-children-resolved-gpset-rules.json` 的规则成员行。
+    ///
+    /// `mod_cnt` 与 `status_code` 必须显式给 `null`：`EleTreeNode` 这两格没有 `#[serde(default)]`，
+    /// 缺失会报 `missing field`。
+    #[test]
+    fn a_rule_member_row_carries_rule_without_via() {
+        let reply: ResolvedTreeReply = serde_json::from_value(serde_json::json!({
+            "source": "direct",
+            "parent": "2/11",
+            "view": "resolved",
+            "nodes": [{
+                "refno": "1_3", "noun": "ZONE", "name": "/ZONE-PIPING-AREA01",
+                "owner": "1_2", "order": 0, "children_count": 0,
+                "op": 0,
+                "mod_cnt": null,
+                "children_updated": null,
+                "status_code": null,
+                "dbnum": 7001,
+                "via": null, "secondary": true, "rule": true
+            }]
+        }))
+        .unwrap();
+        let level = reply.into_level().unwrap();
+        let link = level.links[0].expect("规则成员也是一条二级成员");
+        assert!(link.rule, "rule 必须从回执传到 TreeGroupLink");
+        assert!(link.secondary, "规则成员同时是二级成员");
+        assert_eq!(link.via, None, "规则成员没有经由的 GPITEM");
+        assert!(!level.stored_view);
+    }
+
+    /// GPITEM 解析成员行：`via` 有值、`secondary: true`、`rule: false`。不能因为本次改动被
+    /// 误判成规则成员。
+    #[test]
+    fn a_gpref_member_row_stays_a_plain_secondary_link() {
+        let reply: ResolvedTreeReply = serde_json::from_value(serde_json::json!({
+            "source": "direct",
+            "parent": "2/11",
+            "view": "resolved",
+            "nodes": [{
+                "refno": "1_4", "noun": "BRAN", "name": "/PIPE-100/B1",
+                "owner": "1_3", "order": 0, "children_count": 1,
+                "op": 0,
+                "mod_cnt": null,
+                "children_updated": null,
+                "status_code": null,
+                "dbnum": 7001,
+                "via": "1_9", "secondary": true, "rule": false
+            }]
+        }))
+        .unwrap();
+        let level = reply.into_level().unwrap();
+        let link = level.links[0].expect("GPITEM 成员是一条二级成员");
+        assert!(!link.rule, "`rule: false` 不能被当成规则成员");
+        assert!(link.secondary);
+        assert_eq!(link.via, Some(aios_core::RefU64((1 << 32) | 9)));
+    }
+
+    /// 老服务端（分组解析之前的那一档）行里没有 `rule`：缺席就是 `false`，不报错。
+    #[test]
+    fn a_row_without_rule_defaults_to_a_plain_member() {
+        let reply: ResolvedTreeReply = serde_json::from_value(serde_json::json!({
+            "source": "direct",
+            "parent": "2/11",
+            "view": "resolved",
+            "nodes": [{
+                "refno": "1_4", "noun": "BRAN", "name": "/PIPE-100/B1",
+                "owner": "1_3", "order": 0, "children_count": 1,
+                "op": 0,
+                "mod_cnt": null,
+                "children_updated": null,
+                "status_code": null,
+                "dbnum": 7001,
+                "via": "1_9", "secondary": true
+            }]
+        }))
+        .unwrap();
+        let link = reply.into_level().unwrap().links[0].expect("成员行");
+        assert!(!link.rule);
+    }
+
     /// 分组的记录由服务端按成员展开（分组计划 D4-a）：跨库时 `source` 是 `mixed`、`dbnum`
     /// 为空，外加 `expanded_from_group` / `scope_refnos` / `unresolved_count` / `routes`。
     /// 这一页照样解得出、落进「没给 dbnum」那一桶、不参与混源判定——客户端不必认分组。
@@ -1972,12 +2064,16 @@ mod tests {
             gen_model::CHILDREN_RESOLVED,
             &[],
         );
-        // 行 = flatten 进来的 EleTreeNode + 分组成员才带的 via / secondary。ResolvedTreeRow 走 map、
-        // 拿不到字段表，这两格由 main.rs 的坏槽链路用例按 gen-model 的形状读实。`short_name`：
+        // 行 = flatten 进来的 EleTreeNode + 分组成员才带的 via / secondary / rule。ResolvedTreeRow 走 map、
+        // 拿不到字段表，这几格由 main.rs 的坏槽链路用例按 gen-model 的形状读实。`short_name`：
         // gen-model 这一版的树节点不发（old-aios-core 的 EleTreeNode 没有这一格），无名元素的短名由
         // `fill_legacy_default_names` 补。
+        //
+        // `rule` 必须列在这里：它在 `CHILDREN_RESOLVED_ROW` 里（gen-model 已经发了），但
+        // `assert_reads` 的两条检查都不覆盖「发了、没人读」这一格——漏读它不报错，将来后端删掉
+        // 这个键也不会红。列进来之后，`rule` 若从基准里消失，第 ② 条会报「读了不存在的键」。
         let mut row = dto_fields::<aios_core::pdms_types::EleTreeNode>();
-        row.extend(["via", "secondary"]);
+        row.extend(["via", "secondary", "rule"]);
         assert_reads(
             "/tree/children?resolved=1 的行",
             &row,
