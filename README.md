@@ -81,6 +81,27 @@ clippy 里有 deny 级 lint，报了就得改，不能压。
 
 不要用 `cargo test --workspace`，也不要单跑 `-p plant-ui-data`：那一组集成测试硬要求 `PLANT_TEST_WORKSPACE` 指向带 `DbOption.toml` 的运行目录，缺了就 panic。它们多数还标了 `#[ignore]`，要跑得显式加 `--ignored` 并备好本地 SurrealDB。
 
+## 分组规则成员（SCOSEL）
+
+GPSET 规则组的成员不是 GPITEM 槽，而是一段 `SCOSEL` 规则；后端求值后按解析视图回成员行。本仓把这些行与 GPITEM 显式收录的成员行区分开：
+
+- `TreeGroupLink` 新增 `pub rule: bool`：`true` = 由分组规则（`SCOSEL`）命中，`false` = GPITEM 显式收录（或主链子节点）。两处构造点同步填。
+- 树行标签由 `crates/plant-ui/src/workbench/tree.rs` 的 `row_tags(row, unresolved)` 统一产出：规则成员挂「规则」（`ph::FUNNEL` 图标，`Status::Info`），GPITEM 成员仍挂「引用」（`ph::LINK_SIMPLE`）。`unresolved` 的文本拥有权留在调用处，`row_tags` 只借 `&str`。
+- 悬停文案区分两者：规则成员是「分组规则命中：主位置在别处（右键「定位到原位置」）」；GPITEM 成员是「分组引用：经 GPITEM `<refno>` 收录，主位置在别处（右键「定位到原位置」）」。
+- 右键「定位到原位置」对规则成员同样可用：它照旧走主链选中、展开祖先、滚进视野。
+- `row_id` 未改动，同一个元素在主位置与分组下仍是同一条身份。
+
+后端契约（`GET /api/v1/tree/children?refno=<GPSET>&resolved=1`）：规则成员是 `via: null` + `secondary: true` + `rule: true`；GPITEM 成员是 `via: <GPITEM refno>` + `secondary: true` + `rule: false`；主链子节点三个键都不出现。`ResolvedTreeRow` 的 `rule` 带 `#[serde(default)]`，老服务端不带这一格就是 `false`，行为退回改动前。后端开关 `AIOS_GROUP_SCOSEL` 默认关，关着时回执逐字不变。
+
+测试：
+
+```powershell
+cargo test -p rs-plant
+cargo test -p plant-ui
+```
+
+包名是 `rs-plant`（不是目录名 `plant-ui-app`）。
+
 ## 验收探针
 
 `inspect` 走 `egui_inspection` 的线协议直连运行中的应用，读控件树、注入输入、截图。应用那一侧要用同一个 `EGUI_INSPECTION` 启动。
