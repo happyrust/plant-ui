@@ -10,9 +10,9 @@ use std::sync::mpsc;
 use plant_ui::task_queue::DbnumReport;
 use plant_ui_data::{Attr, EleTreeNode, RefU64};
 
-use super::{Identity, ModelInstancesReq, SearchOutcome, SubtreeBounds};
+use super::{Identity, ModelInstancesReq, Progress, SearchOutcome, SubtreeBounds};
 use crate::data::{Evt, SEARCH_LIMIT};
-use crate::model_update_api::{self, ModelRecords};
+use crate::model_update_api::{self, ModelRecords, ModelRecordsRequest};
 use crate::search_index::{Scope, SearchIndexState, SubstringHits};
 
 pub struct ServiceReadFace;
@@ -157,18 +157,25 @@ impl ServiceReadFace {
     }
 
     /// 以 `scope_roots` 里的每一个为祖先问 `/model/records`（服务端按祖先回答子树里已生成
-    /// 的全部实例，gen-model ADR-086；没生成过是 200 空）。整批一次回，没有逐根进度可报。
+    /// 的全部实例，gen-model ADR-086；没生成过是 200 空）。列在 `split_sites` 的顶层 SITE 先
+    /// `tree/children` 拆成 ZONE、按成员有界并发取（成员多时打包，计划 T1 / T2），进度按成员报；
+    /// 其余目标整批一次回、不报进度。
     pub async fn model_instances(
         &self,
         req: &ModelInstancesReq<'_>,
+        progress: Progress<'_>,
     ) -> anyhow::Result<ModelRecords> {
         let identity = req.identity;
         model_update_api::model_records(
             identity.base,
-            req.scope_roots,
-            identity.project,
-            identity.mdb,
-            identity.namespace,
+            &ModelRecordsRequest {
+                scope_roots: req.scope_roots,
+                split_sites: req.split_sites,
+                project: identity.project,
+                mdb: identity.mdb,
+                namespace: identity.namespace,
+            },
+            progress,
         )
         .await
     }

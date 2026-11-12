@@ -90,10 +90,15 @@ pub struct ServiceIdentity<'a> {
 /// - `scope_roots`：**服务供数要问的祖先**，`/model/records` 对每一个按祖先回答（gen-model
 ///   ADR-086）——eye 显示 = 点下去的目标本身；重装 = 快照里点过眼睛的范围目标（一个 ZONE
 ///   一次往返），老快照没有范围记录时退到 `roots`。
+/// - `split_sites`：`scope_roots` 里的**顶层 SITE**（调用方从树根层认出来的）。服务供数对它们先
+///   `tree/children` 拿 ZONE，再按成员有界并发取（成员多时打包，计划 T1 / T2）；`tree/children`
+///   失败或没有成员退回整根取法。不在这里的目标一个祖先一发，请求形状与从前逐字节相同。
+///   库供数不看它。
 #[derive(Debug, Clone, Copy)]
 pub struct ModelInstancesReq<'a> {
     pub roots: &'a [RefU64],
     pub scope_roots: &'a [RefU64],
+    pub split_sites: &'a [RefU64],
     pub identity: ServiceIdentity<'a>,
 }
 
@@ -107,7 +112,8 @@ pub struct SearchOutcome {
     pub index_failure: Option<String>,
 }
 
-/// 三维实例读取的进度回调 `(done, total)`。服务供数一次整批回，不报进度；库供数按根报。
+/// 三维实例读取的进度回调 `(done, total)`。库供数按根报；服务供数只在把顶层 SITE 拆成成员取时
+/// 按「收完几个成员 / 共几个」报（先报 `(0, n)`），整根取法一次整批回、不报。
 pub type Progress<'a> = &'a mut (dyn FnMut(usize, usize) + Send);
 
 pub enum ReadFace {
@@ -241,7 +247,7 @@ impl ReadFace {
         progress: Progress<'_>,
     ) -> anyhow::Result<ModelRecords> {
         match self {
-            Self::Service(face) => face.model_instances(req).await,
+            Self::Service(face) => face.model_instances(req, progress).await,
             Self::Store(face) => face.model_instances(req.roots, progress).await,
         }
     }
@@ -288,15 +294,17 @@ mod tests {
     }
 
     /// 两面要的根写在同一份请求里、由各自取，调用方不必知道哪一面在场：
-    /// 服务供数拿 `scope_roots`，库供数拿 `roots`。这里钉的是两份各自独立、
-    /// 不会被谁悄悄合成一份。
+    /// 服务供数拿 `scope_roots`（顶层 SITE 另列在 `split_sites`），库供数拿 `roots`。这里钉的是
+    /// 三份各自独立、不会被谁悄悄合成一份。
     #[test]
     fn a_model_request_carries_both_root_sets() {
         let roots = [RefU64::from(20)];
         let scope_roots = [RefU64::from(7), RefU64::from(20), RefU64::from(42)];
+        let split_sites = [RefU64::from(7)];
         let req = ModelInstancesReq {
             roots: &roots,
             scope_roots: &scope_roots,
+            split_sites: &split_sites,
             identity: ServiceIdentity {
                 base: "http://127.0.0.1:8022",
                 project: "SAM",
@@ -306,6 +314,7 @@ mod tests {
         };
         assert_eq!(req.roots, &roots);
         assert_eq!(req.scope_roots, &scope_roots);
+        assert_eq!(req.split_sites, &split_sites);
         assert_eq!(req.identity.base, "http://127.0.0.1:8022");
     }
 

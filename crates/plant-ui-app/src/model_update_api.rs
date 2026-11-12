@@ -8,6 +8,12 @@ use std::time::Duration;
 
 #[path = "model_record_union.rs"]
 mod model_record_union;
+/// 服务供数取记录的形状（拆顶层 SITE、有界并发、批量形；计划 T1 / T2）。传输抽成可注入的
+/// [`records_fetch::RecordsTransport`]，逻辑层单测用假应答跑。
+#[path = "model_records_fetch.rs"]
+mod records_fetch;
+
+pub(crate) use records_fetch::{FetchOptions, ModelRecordsRequest};
 
 use plant_ui::model_update::{Enqueued, Failure, Preview};
 use plant_ui::task_queue::{
@@ -1302,6 +1308,10 @@ struct ModelRecordsPage {
     #[serde(default)]
     items: Vec<plant_ui::ModelRecord>,
     next_cursor: Option<usize>,
+    /// 还有下一页。与 `next_cursor` 同进退：`truncated = true` 却没有 `next_cursor` 是服务端的矛盾
+    /// 回执，这根按「分页未完成」报错，不许当成读完（plant3d-web `modelRecords.test.ts` 同一条）。
+    #[serde(default)]
+    truncated: bool,
     /// `model-memory` / `model-database`——这一页是从哪儿读的（老字段）。
     #[serde(default)]
     source: String,
@@ -1326,8 +1336,8 @@ pub struct ModelRecords {
     pub records: Vec<plant_ui::ModelRecord>,
     /// dbnum 升序；老服务端没给 dbnum 的那一桶键为 `None`。
     pub sources: Vec<(Option<u32>, ModelSource)>,
-    /// 这次装载发了几发 `model/records`（每页一发）。装载计时（计划 T0）与测速记录读它；
-    /// 库供数与剧本恒 0。
+    /// 这次装载发了几发 `model/records`（单根分页每页一发、批量形每发一发；不含 `tree/children`
+    /// 与 `/health`）。装载计时（计划 T0）与测速记录读它；库供数与剧本恒 0。
     pub requests: usize,
     /// 这些 `model/records` 回执的响应体字节数之和。
     pub bytes: usize,
@@ -1375,71 +1385,19 @@ impl ModelRecords {
 /// process projection.  There is intentionally no SurrealDB fallback here, and a
 /// single dbnum is never assembled from two sources: mixing the two epochs would
 /// make a single viewport load internally inconsistent.
+///
+/// 取法（计划 T1 / T2，照 plant3d-web）：`scope_roots` 里列在 `split_sites` 的顶层 SITE 先
+/// `tree/children` 拿成员（ZONE），成员以 6 路有界并发各发单根 `model/records`，成员多于 64 个且
+/// 后端声明了批量形时几个一发；其余目标照旧一个祖先一发、按页翻完。`tree/children` 失败或 SITE
+/// 没有成员时退回整根取法。回执按 dbnum 分桶、一桶一源（ADR-0025）。`progress` 只在拆成员时按
+/// 「收完几个成员 / 共几个」回报。
 pub async fn model_records(
     base: &str,
-    roots: &[aios_core::RefU64],
-    project: &str,
-    mdb: &str,
-    namespace: &str,
+    req: &ModelRecordsRequest<'_>,
+    progress: &mut (dyn FnMut(usize, usize) + Send),
 ) -> anyhow::Result<ModelRecords> {
-    let mut out = model_record_union::ModelRecordUnion::default();
-    let mut requests = 0;
-    let mut bytes = 0;
-    for root in roots {
-        let mut scope_records = Vec::new();
-        let mut scope = None;
-        let mut cursor = None;
-        loop {
-            let body = serde_json::json!({
-                "project": project,
-                "mdb": mdb,
-                "namespace": namespace,
-                "generation_root": root.to_slash_string(),
-                "limit": 5000,
-                "cursor": cursor,
-            });
-            // 先量字节再解析：装载计时（计划 T0）要记这一趟发了几发、收了多少。
-            let text = post_text(
-                base,
-                "/api/v1/model/records",
-                body.to_string(),
-                Duration::from_secs(30),
-            )
-            .await?;
-            requests += 1;
-            bytes += text.len();
-            let page: ModelRecordsPage =
-                serde_json::from_str(&text).context("解析模型更新服务响应失败")?;
-            // 同一根分页中途翻面（第一页内存、第二页 rocksdb）：两页算的未必是同一版，
-            // 与跨根混源同一条纪律，整根报错让调用点重来。
-            let this = page.scope();
-            match scope {
-                None => scope = Some(this),
-                Some(first) if first != this && this.source.is_some() && first.source.is_some() => {
-                    anyhow::bail!(
-                        "生成根 {} 的记录分页中途换了取数源（{} → {}），这一趟不可用，请重查",
-                        root.to_slash_string(),
-                        first.source.map(|s| s.as_str()).unwrap_or("?"),
-                        this.source.map(|s| s.as_str()).unwrap_or("?"),
-                    )
-                }
-                Some(_) => {}
-            }
-            scope_records.extend(page.items);
-            let Some(next) = page.next_cursor else { break };
-            cursor = Some(next);
-        }
-        out.extend_scope(
-            scope.unwrap_or_else(model_record_union::RecordScope::legacy),
-            scope_records,
-        )?;
-    }
-    Ok(ModelRecords {
-        sources: out.sources(),
-        records: out.finish(),
-        requests,
-        bytes,
-    })
+    let transport = records_fetch::HttpRecordsTransport::new(base);
+    records_fetch::collect(&transport, req, &FetchOptions::from_env(), progress).await
 }
 
 fn generate_status(raw: &str) -> GenerateStatus {
@@ -1488,7 +1446,7 @@ async fn post<T: DeserializeOwned>(
 }
 
 /// [`post`] 的前半：发出去、收回响应体原文（非 2xx 已包成 [`ApiError`]），不解析。取记录那一路要先量
-/// 字节数再解析，所以分成两半；别处仍用 [`post`]。
+/// 字节数再解析（`records_fetch`），所以分成两半；别处仍用 [`post`]。
 async fn post_text(base: &str, path: &str, body: String, timeout: Duration) -> anyhow::Result<String> {
     let mut req = ehttp::Request::post(format!("{base}{path}"), body.into_bytes());
     // ehttp 的 `post()` 默认带 `Content-Type: text/plain`，而 `Headers::insert`
@@ -1539,7 +1497,7 @@ fn request<T: DeserializeOwned>(response: ehttp::Response) -> anyhow::Result<T> 
 }
 
 /// 响应体原文：非 2xx 解成 [`ApiError`]（与 [`request`] 同一套包封），2xx 原样交出、不解析。
-/// 只给取记录那一路用——它要先量字节数再解析。
+/// 只给取记录那一路用——它要先量字节数、再按单根 / 批量两种形状各自解析。
 fn request_text(response: ehttp::Response) -> anyhow::Result<String> {
     let status = response.status;
     if !response.ok {

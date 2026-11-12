@@ -1265,6 +1265,20 @@ impl TreeModel {
         }
     }
 
+    /// `targets` 里哪些是**顶层 SITE**（SITE 根层上的行）。显示 / 重装时服务供数对它们先拆成 ZONE
+    /// 再按成员取（计划 T1 / T2）；只认根层，ZONE 以下与分组入口都不算——拆只能拆到生成根之上。
+    fn top_sites_among(&self, targets: &[RefU64]) -> Vec<RefU64> {
+        targets
+            .iter()
+            .copied()
+            .filter(|target| {
+                self.roots.iter().any(|root| {
+                    root.refno.refno() == *target && root.noun.eq_ignore_ascii_case("SITE")
+                })
+            })
+            .collect()
+    }
+
     /// 这个 refno 属于哪个库。节点自己的 `dbnum` 是直接答案；还没物化出来的行
     /// 沿 `parent` 链往上走，任一跳落表就算数。都说不出回 `None`。
     fn dbnum_of(&self, refno: RefU64) -> Option<u32> {
@@ -4335,6 +4349,8 @@ impl App {
                                     .req
                                     .send(data::Req::Models {
                                         roots,
+                                        // 顶层 SITE 拆成 ZONE 取（计划 T1）。
+                                        split_sites: self.tree.top_sites_among(&snapshot.targets),
                                         // 服务供数以清场前点过眼睛的那些目标为祖先重查
                                         // （ADR-0030 D3）：一个 ZONE 一次往返，不逐个模型问；
                                         // 只查不生。
@@ -7391,6 +7407,8 @@ impl App {
                     .req
                     .send(data::Req::ModelScopes {
                         epoch: self.model_scope_epoch,
+                        // 顶层 SITE 拆成 ZONE 取（计划 T1）：宿主手里有根层，服务面不必再问。
+                        split_sites: self.tree.top_sites_among(&targets),
                         targets: targets.clone(),
                         base: model_update_api::base_url(),
                         project: self.vm.project.clone(),
@@ -9533,6 +9551,27 @@ mod tests {
         tree.note_dbnum(&zero);
         assert_eq!(tree.dbnum_of(RefU64(4)), None, "dbnum = 0 不落表");
         assert_eq!(tree.dbnum_of(RefU64(99)), None, "查不到就说不出");
+    }
+
+    /// 拆成 ZONE 取（计划 T1）只对**顶层 SITE**：根层上的 SITE 行算，ZONE、根层下的 SITE、分组入口
+    /// 都不算；顺序随 `targets`。眼睛与取回工作的两条请求都经它点名。
+    #[test]
+    fn top_sites_among_picks_only_root_layer_sites() {
+        let site_a = RefU64(1);
+        let site_b = RefU64(2);
+        let zone = RefU64(3);
+        let nested_site = RefU64(4);
+        let group = RefU64(5);
+        let mut tree = TreeModel::default();
+        tree.roots = vec![node(site_a, "SITE", 2), node(site_b, "SITE", 0)];
+        tree.group_roots = vec![node(group, "GPWL", 1)];
+        tree.children
+            .insert(site_a, vec![node(zone, "ZONE", 1), node(nested_site, "SITE", 0)]);
+        assert_eq!(
+            tree.top_sites_among(&[zone, site_b, nested_site, group, site_a]),
+            vec![site_b, site_a]
+        );
+        assert!(tree.top_sites_among(&[zone, RefU64(99)]).is_empty());
     }
 
     /// 取回工作与换面都要先排干数据线程的在途请求：发之前先放弃「重新生成」那一趟的补齐等待，

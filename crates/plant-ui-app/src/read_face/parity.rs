@@ -1372,9 +1372,11 @@ pub async fn run(options: &Options) -> anyhow::Result<Report> {
     let mut store_keys = Vec::new();
     for root in &roots {
         let one = [root.refno];
+        // 对拍不拆 SITE：两面都按整根问，比的是同一条祖先查询。
         let req = ModelInstancesReq {
             roots: &one,
             scope_roots: &one,
+            split_sites: &[],
             identity,
         };
         let mut quiet_service = |_: usize, _: usize| {};
