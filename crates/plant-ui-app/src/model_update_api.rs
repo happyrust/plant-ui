@@ -1326,6 +1326,11 @@ pub struct ModelRecords {
     pub records: Vec<plant_ui::ModelRecord>,
     /// dbnum 升序；老服务端没给 dbnum 的那一桶键为 `None`。
     pub sources: Vec<(Option<u32>, ModelSource)>,
+    /// 这次装载发了几发 `model/records`（每页一发）。装载计时（计划 T0）与测速记录读它；
+    /// 库供数与剧本恒 0。
+    pub requests: usize,
+    /// 这些 `model/records` 回执的响应体字节数之和。
+    pub bytes: usize,
 }
 
 impl ModelRecords {
@@ -1378,6 +1383,8 @@ pub async fn model_records(
     namespace: &str,
 ) -> anyhow::Result<ModelRecords> {
     let mut out = model_record_union::ModelRecordUnion::default();
+    let mut requests = 0;
+    let mut bytes = 0;
     for root in roots {
         let mut scope_records = Vec::new();
         let mut scope = None;
@@ -1391,13 +1398,18 @@ pub async fn model_records(
                 "limit": 5000,
                 "cursor": cursor,
             });
-            let page: ModelRecordsPage = post(
+            // 先量字节再解析：装载计时（计划 T0）要记这一趟发了几发、收了多少。
+            let text = post_text(
                 base,
                 "/api/v1/model/records",
                 body.to_string(),
                 Duration::from_secs(30),
             )
             .await?;
+            requests += 1;
+            bytes += text.len();
+            let page: ModelRecordsPage =
+                serde_json::from_str(&text).context("解析模型更新服务响应失败")?;
             // 同一根分页中途翻面（第一页内存、第二页 rocksdb）：两页算的未必是同一版，
             // 与跨根混源同一条纪律，整根报错让调用点重来。
             let this = page.scope();
@@ -1425,6 +1437,8 @@ pub async fn model_records(
     Ok(ModelRecords {
         sources: out.sources(),
         records: out.finish(),
+        requests,
+        bytes,
     })
 }
 
@@ -1469,6 +1483,13 @@ async fn post<T: DeserializeOwned>(
     body: String,
     timeout: Duration,
 ) -> anyhow::Result<T> {
+    let text = post_text(base, path, body, timeout).await?;
+    serde_json::from_str(&text).context("解析模型更新服务响应失败")
+}
+
+/// [`post`] 的前半：发出去、收回响应体原文（非 2xx 已包成 [`ApiError`]），不解析。取记录那一路要先量
+/// 字节数再解析，所以分成两半；别处仍用 [`post`]。
+async fn post_text(base: &str, path: &str, body: String, timeout: Duration) -> anyhow::Result<String> {
     let mut req = ehttp::Request::post(format!("{base}{path}"), body.into_bytes());
     // ehttp 的 `post()` 默认带 `Content-Type: text/plain`，而 `Headers::insert`
     // 是**追加**不是替换（同名键允许重复）——insert 会造出两个 Content-Type，
@@ -1482,7 +1503,7 @@ async fn post<T: DeserializeOwned>(
         .await
         .map_err(transport)
         .context("请求模型更新服务失败")?;
-    request(response)
+    request_text(response)
 }
 
 /// 无 body 的 DELETE。`ehttp` 没有现成的构造器，拿 `get()` 的壳换方法名——其余
@@ -1515,6 +1536,18 @@ fn request<T: DeserializeOwned>(response: ehttp::Response) -> anyhow::Result<T> 
         return Err(anyhow::Error::new(ApiError(error_packet(status, body))));
     }
     serde_json::from_str(&body).context("解析模型更新服务响应失败")
+}
+
+/// 响应体原文：非 2xx 解成 [`ApiError`]（与 [`request`] 同一套包封），2xx 原样交出、不解析。
+/// 只给取记录那一路用——它要先量字节数再解析。
+fn request_text(response: ehttp::Response) -> anyhow::Result<String> {
+    let status = response.status;
+    if !response.ok {
+        let body = response.text().context("模型更新服务响应不是 UTF-8")?;
+        return Err(anyhow::Error::new(ApiError(error_packet(status, body))));
+    }
+    // 直接接管响应缓冲，不复制：一页 5000 条记录有几 MB。
+    String::from_utf8(response.bytes).context("模型更新服务响应不是 UTF-8")
 }
 
 /// 解错误包封。`code` 缺失时按状态码兜底——422 是前置条件不满足、409 是任务冲突、

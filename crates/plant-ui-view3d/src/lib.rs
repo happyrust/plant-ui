@@ -819,6 +819,11 @@ pub struct MeshLoadProgress {
     pub done: usize,
     pub total: usize,
     pub errors: Vec<String>,
+    /// 这一批实体生成的时刻——[`load_models`] 把记录变成实体、网格开始取的那一拍。装载计时
+    /// （计划 T0）的「首批实体生成」读它；整批有了结果之前每一拍都原样带着，宿主不必自己记。
+    pub spawned_at: Option<Instant>,
+    /// 网格全部落定（`done == total`）的那一拍；只有终态有。装载计时的「网格全部落定」读它。
+    pub settled_at: Option<Instant>,
 }
 
 impl MeshLoadProgress {
@@ -2140,10 +2145,14 @@ fn load_models(
 }
 
 fn begin_mesh_progress(total: usize) -> MeshLoadProgress {
+    let now = Instant::now();
     MeshLoadProgress {
         done: 0,
         total,
         errors: Vec::new(),
+        spawned_at: Some(now),
+        // 零网格的批当场就是终态。
+        settled_at: (total == 0).then_some(now),
     }
 }
 
@@ -2189,10 +2198,17 @@ fn update_mesh_progress(mut view: ResMut<View3d>, assets: Res<AssetServer>) {
     }
     view.render_dirty.extend(settled_now);
     let total = view.loading_meshes.len();
+    // 生成时刻随上一拍带下来；终态那一拍补上落定时刻（计划 T0 的两个回报点）。
+    let spawned_at = view
+        .mesh_progress
+        .as_ref()
+        .and_then(|progress| progress.spawned_at);
     view.mesh_progress = Some(MeshLoadProgress {
         done,
         total,
         errors,
+        spawned_at,
+        settled_at: (done == total).then(Instant::now),
     });
     if done == total {
         // 整批有了结果：失败的那些挑出来留着。换过网格目录之后要重来的就是它们，
@@ -4429,6 +4445,8 @@ mod tests {
             done: 2,
             total: 2,
             errors: vec!["meshes/missing.mesh: not found".into()],
+            spawned_at: None,
+            settled_at: Some(Instant::now()),
         });
 
         assert_eq!(view.take_mesh_progress().unwrap().errors.len(), 1);
@@ -4440,6 +4458,13 @@ mod tests {
         let progress = begin_mesh_progress(0);
         assert!(progress.finished());
         assert!(progress.errors.is_empty());
+        // 零网格的批：生成即落定，两个时刻都在（装载计时读它们）。
+        assert!(progress.spawned_at.is_some());
+        assert_eq!(progress.settled_at, progress.spawned_at);
+        // 还在等网格的批只有生成时刻。
+        let pending = begin_mesh_progress(3);
+        assert!(pending.spawned_at.is_some());
+        assert!(pending.settled_at.is_none());
     }
 
     #[test]

@@ -2467,6 +2467,8 @@ pub fn model_scope_fixture(target: RefU64) -> crate::model_update_api::ModelReco
             })
             .collect(),
         sources: Vec::new(),
+        requests: 0,
+        bytes: 0,
     }
 }
 

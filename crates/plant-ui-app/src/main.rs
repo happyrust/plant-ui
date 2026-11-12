@@ -12,6 +12,7 @@ mod dimension_layer;
 mod focus_bounds;
 #[cfg(not(target_arch = "wasm32"))]
 mod gallery;
+mod load_timing;
 mod logs;
 mod mbd_api;
 mod model_update_api;
@@ -666,6 +667,8 @@ fn show_app(
     if let Some(refno) = view3d.take_picked() {
         app.handle_cmds(ctx, vec![Cmd::LocateElement(refno)]);
     }
+    // 装载计时（T0）：帧间隔在取网格进度之前量，落定那一帧也算进「期间」。
+    app.tick_load_timing();
     if let Some(progress) = view3d.take_mesh_progress() {
         app.sync_mesh_progress(progress);
     }
@@ -1693,6 +1696,9 @@ struct App {
     model_owner: HashMap<RefU64, RefU64>,
     model_show_waiting: HashSet<RefU64>,
     latest_mesh_progress: Option<plant_ui_view3d::MeshLoadProgress>,
+    /// 装载链路的阶段计时（计划 T0）：`PLANT_UI_LOAD_TIMING=1` 时点眼睛开账、网格落定收账写一行；
+    /// 关着恒 `None`，没有别的开销。
+    load_timing: Option<load_timing::LoadTiming>,
     model_scope_failures: usize,
     model_progress_until: Option<Instant>,
     /// 范围定位的「正在查询」提示压着的到期时刻：(epoch, target, 到期)。
@@ -2812,6 +2818,7 @@ impl App {
             model_owner: HashMap::new(),
             model_show_waiting: HashSet::new(),
             latest_mesh_progress: None,
+            load_timing: None,
             model_scope_failures: 0,
             model_progress_until: None,
             focus_scope_pending: None,
@@ -3516,6 +3523,10 @@ impl App {
                     total,
                 } if epoch == self.model_scope_epoch => {
                     if self.model_scope_pending.contains(&target) {
+                        // 装载计时（T0）：拆成员时第一个成员收完 = 记录首页到。
+                        if done >= 1 && let Some(timing) = self.load_timing.as_mut() {
+                            timing.note_records_progress(Instant::now());
+                        }
                         self.model_progress_until = None;
                         self.vm.model_load = Some(if total == 0 {
                             ModelLoadVm::Resolving("解析模型范围…".into())
@@ -3530,6 +3541,21 @@ impl App {
                 }
                 data::Evt::ModelScope(epoch, target, result) if epoch == self.model_scope_epoch => {
                     self.model_scope_pending.remove(&target);
+                    // 装载计时（T0）：一个目标的记录回包到了；全部目标都回了 = 记录末页到。
+                    if let Some(timing) = self.load_timing.as_mut() {
+                        let (requests, bytes, records) = result
+                            .as_ref()
+                            .map_or((0, 0, 0), |loaded| {
+                                (loaded.requests, loaded.bytes, loaded.records.len())
+                            });
+                        timing.note_scope(
+                            Instant::now(),
+                            requests,
+                            bytes,
+                            records,
+                            self.model_scope_pending.len(),
+                        );
+                    }
                     // 老服务端（ADR-086 之前）对没生成过的范围回 409 `not_generated`：与新服务端的
                     // 200 空是同一件事，按查空处理、不记 ERROR（ADR-0030 后果 6）。
                     let result = match result {
@@ -4629,6 +4655,26 @@ impl App {
         } else {
             self.fail_model_progress(format!("模型加载失败（{failures} 项）"));
         }
+        self.finish_load_timing();
+    }
+
+    /// 装载计时（T0）收账：这次显示到了终态（网格全部落定、或查空 / 失败就地收口），把五个时刻与
+    /// 期间最长一帧写成一行——日志面板一行，stderr 一行（量测时从终端抄）。关着时 `load_timing`
+    /// 恒 `None`，这里什么都不做。
+    fn finish_load_timing(&mut self) {
+        let Some(timing) = self.load_timing.take() else {
+            return;
+        };
+        let line = timing.summary();
+        eprintln!("[plant-ui 装载计时] {line}");
+        self.logs.info(&mut self.vm.logs, line);
+    }
+
+    /// 装载计时（T0）每帧一拍：量帧间隔，记加载期间最长的那一帧。没在计时就是一次 `Option` 判空。
+    fn tick_load_timing(&mut self) {
+        if let Some(timing) = self.load_timing.as_mut() {
+            timing.tick_frame(Instant::now());
+        }
     }
 
     fn tick_model_progress(&mut self) {
@@ -4668,6 +4714,10 @@ impl App {
     }
 
     fn sync_mesh_progress(&mut self, progress: plant_ui_view3d::MeshLoadProgress) {
+        // 装载计时（T0）：view3d 经回执带来的两个时刻——首批实体生成、网格全部落定。
+        if let Some(timing) = self.load_timing.as_mut() {
+            timing.note_mesh_progress(progress.spawned_at, progress.settled_at);
+        }
         self.latest_mesh_progress = (!progress.finished()).then(|| progress.clone());
         if progress.finished() {
             let before = self.vm.refresh_generation;
@@ -7336,7 +7386,7 @@ impl App {
                 self.model_progress_until = None;
                 self.vm.model_load = Some(ModelLoadVm::Resolving("解析模型范围…".into()));
                 let targets = query;
-                if self
+                let sent = self
                     .bridge
                     .req
                     .send(data::Req::ModelScopes {
@@ -7347,8 +7397,15 @@ impl App {
                         mdb: self.mdb.clone(),
                         namespace: self.namespace.clone(),
                     })
-                    .is_err()
-                {
+                    .is_ok();
+                // 装载计时（T0）：显示方向的一次点击开一本账；途中再点就另开一本（量的是最近那一下）。
+                if sent && visible && load_timing::enabled() {
+                    self.load_timing = Some(load_timing::LoadTiming::start(
+                        Instant::now(),
+                        targets.len(),
+                    ));
+                }
+                if !sent {
                     for target in targets {
                         self.model_scope_pending.remove(&target);
                         self.tree.pending_direction.remove(&target);
