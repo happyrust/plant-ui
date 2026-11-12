@@ -5,6 +5,23 @@
 
 版本口径按 `Cargo.toml` 的 `workspace.package.version`。下面「未发布」是已经写进这棵树、还没改版本号的界面变化。
 
+## 0.1.15 · 模型显示提速（期 1）
+
+> 版本号由发版的人落到 `Cargo.toml`；这一节是 `feat/model-load-parity` 分支上期 0 / 期 1 的界面变化
+> （计划 `docs/plans/model-load-speed-parity.md`，ADR-0034）。写下时单测还没经编译锁跑过，实测欠着后端。
+
+### 模型显示
+
+- **点顶层 SITE 的眼睛快多了。** 服务供数下，SITE 不再当成一个祖先、5000 条一页串行翻（8 万件的 SITE 光记录就要约 21 秒），而是先取它的 ZONE 清单，6 个 ZONE 同时在途各自取记录；ZONE 多于 64 个且后端声明了批量形（`/health.capabilities.model_records_batch_max_roots`）时几个 ZONE 打成一发（头几发 1、1、2、4、8 个，之后 16 个），请求数从几百发降到几十发。取法、并发数、每发个数与 plant3d-web 相同。ZONE、PIPE 等非 SITE 节点的取法不变；取回工作重装里的 SITE 同样按 ZONE 取。
+- **加载进度条在拆成 ZONE 取时显示「查询已有模型 k / n」**（收完几个 ZONE / 共几个）；整根取法照旧只有「解析模型范围…」。
+- **同库不混源的纪律不变。** 一个 ZONE 回内存投影、别的回 rocksdb，整次仍按 ADR-0025 报错重查；任一 ZONE 取失败整次失败（与从前单根失败同口径）。
+- 环境变量 `PLANT_UI_RECORDS_BATCH`：`0` / `1` 关掉打包（退回逐 ZONE 取），`N` 改每发个数（不超过后端声明、不超过 64）；对应 plant3d-web 页面地址上的 `gm_records_batch`。
+
+### 量具
+
+- 环境变量 `PLANT_UI_LOAD_TIMING=1` 起客户端，点眼睛后网格全部落定时日志面板多一行「装载计时」：记录首页 / 末页到、首批实体生成、网格全部落定四个相对点击的毫秒数，记录请求数与字节数，期间最长一帧；同一行也打到 stderr。关着没有开销。
+- `scripts/model-load-replay.mjs`：不经客户端直接问后端，三种取法（整根翻页 / 按 ZONE 6 路 / 批量形）各跑 N 次报中位数、请求数、字节数，只发只读请求；后端地址由参数或环境变量给。
+
 ## 未发布
 
 ### 房间树

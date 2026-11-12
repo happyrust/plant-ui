@@ -383,3 +383,14 @@ T9（随时，网页端）──► T10（等后端提交）
 ## 十三、已落地
 
 （施工时按任务填：日期、提交号、量到的数。）
+
+| 日期 | 任务 | 提交 | 单测 | 实测 | 备注 |
+|---|---|---|---|---|---|
+| 2026-11-12 | 文档 | `c71b9c797` | — | — | ADR-0034 改「已接受」、本文第七节改「评审已确认」、CONTEXT 四词条 |
+| 2026-11-12 | T0 | `6e855442f` | `load_timing` 4 条、view3d `MeshLoadProgress` 1 条改（**未编译验证**） | **欠量**：后端 8022 没在跑 | 埋点开关 `PLANT_UI_LOAD_TIMING=1`；回放脚本 `scripts/model-load-replay.mjs`；evidence 表头在 `docs/evidence/2026-11-12-model-load-baseline.md`。与计划对不上：① 第二个落点用 `eprintln!`（stderr）而不是 `tracing::info!`——`tracing` 不在 rs-plant 依赖里、bevy 没开 `bevy_log`，加依赖会改 `Cargo.lock`；② 计时账放新文件 `load_timing.rs`，`main.rs` 只挂五处；③ `ModelRecords` 多 `requests` / `bytes` 两格给计时与测速读 |
+| 2026-11-12 | T1 + T2 | `e6640d81c` | `model_records_fetch` 21 条、`task_queue` 1 条、`main` 1 条、`read_face` 1 条改、`data` 2 条改（**未编译验证**） | **欠量**：同上 | 两任务合成一笔：都住在新文件 `crates/plant-ui-app/src/model_records_fetch.rs`，拆开要维护两份取法。与计划对不上：① 「顶层 SITE」由宿主从 `TreeModel.roots` 认出，经 `Req` / `ModelLoad` / `ModelInstancesReq` 的新字段 `split_sites` 带到服务面（零额外请求），不是在服务面用 `tree_children` 回执判；② `/health.capabilities` 由服务面在成员 > 64（或 `PLANT_UI_RECORDS_BATCH` 明说个数）时懒取一次；③ 发请求抽成 `RecordsTransport` trait 才能用假应答测；④ 批量形回执用独立的 `ModelRecordsBatchPage` 解（`ModelRecordsPage` 的字段清单钉着 gen-model 分组契约快照，不为批量形多一格）；⑤ 这一层仍是整次成败（任一成员失败整次报错，与改前单根失败同口径），逐成员交付留给 T3 |
+
+**施工环境里对不上的两处（2026-11-12 晚）：**
+
+- 包名是 `rs-plant`，不是 `plant-ui-app`：单测命令是 `cargo test -p rs-plant --bin rs-plant`（第三节、T0–T2「验证」里写的 `-p plant-ui-app --lib` 跑不起来；`.github/workflows/release.yml` 里的 `cargo build -p plant-ui-app --release --locked` 同样对不上，这一轮不动它）。
+- 「热产物」不热：`D:\Rust\.cargo\targets\plant-ui-8e44c653\debug` 只剩 `build/` 与 `incremental/`，`deps/` 没了，这一轮的编译是冷编；树里的 `cargo` 是本机换成 huacnlee 分支的前端，`rustc` 与产物目录记录都是钉的 `nightly-2026-07-21`，所以沿用编译锁脚本调用的 `cargo`。编译锁两次开编（jobs 4 / jobs 2）都在 20 秒内因全机可提交余量跌破 12 GB 被杀（别的会话在锁外编译），按规矩停下，T0–T2 标「未编译验证」。
