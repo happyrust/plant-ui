@@ -6669,13 +6669,18 @@ version = "0.1.14"
 dependencies = [
  "aios_core",
  "anyhow",
+ "async-lock 3.4.2",
  "bevy",
  "bevy_egui35",
+ "futures",
  "getrandom 0.3.4",
+ "js-sys",
  "plant-csg",
  "plant-room",
  "plant-ui",
  "ring",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
  "web-time",
 ]

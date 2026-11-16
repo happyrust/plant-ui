@@ -381,17 +381,18 @@ fn run(canvas: &str, asset_root: String) {
     let _ = canvas;
 
     let mut app = BevyApp::new();
-    // 网格走自己的资产源，根目录可以在设置里改。**必须先于 `AssetPlugin` 注册**：
-    // 源是在那个插件建起来的那一刻定型的，晚一步 Bevy 只会打一行 error 然后无视。
-    // 浏览器端没有本地目录，网格与字体贴图一样由站点供给，那一侧不注册这个源
-    // （见 `mesh_source::asset_path` 的两个分支）。
-    #[cfg(not(target_arch = "wasm32"))]
+    // 网格走自己的资产源。**必须先于 `AssetPlugin` 注册**：源是在那个插件建起来的那一刻
+    // 定型的，晚一步 Bevy 只会打一行 error 然后无视。
+    // 桌面端这个源读本地目录，根目录可以在设置里改；浏览器端它向站点的资产根取，管住同时
+    // 发出去多少请求、取不到的重来（见 `mesh_source`）。
     {
         use bevy::asset::AssetApp;
-        app.register_asset_source(
-            plant_ui_view3d::mesh_source::SOURCE_NAME,
-            plant_ui_view3d::mesh_source::source_builder(),
-        );
+        #[cfg(not(target_arch = "wasm32"))]
+        let source = plant_ui_view3d::mesh_source::source_builder();
+        #[cfg(target_arch = "wasm32")]
+        let source =
+            plant_ui_view3d::mesh_source::source_builder(&asset_root, mesh_fetch_requested());
+        app.register_asset_source(plant_ui_view3d::mesh_source::SOURCE_NAME, source);
     }
     app.add_plugins(
         DefaultPlugins
@@ -484,6 +485,19 @@ fn look_debug_requested() -> Option<plant_ui_view3d::e3d_look::post::SglLookDebu
 fn look_debug_requested() -> Option<plant_ui_view3d::e3d_look::post::SglLookDebugView> {
     query_value(&location_search(), "look_debug")
         .and_then(|value| plant_ui_view3d::e3d_look::post::SglLookDebugView::parse(&value))
+}
+
+/// `?mesh_fetch=<路数>`（浏览器）：网格文件同时在途的请求数上限，不写就用出厂值。
+/// 排查取网格慢或被浏览器拒掉时，换个数刷新页面就能比，不必重新出包。
+#[cfg(target_arch = "wasm32")]
+fn mesh_fetch_requested() -> Option<usize> {
+    mesh_fetch_from(query_value(&location_search(), "mesh_fetch").as_deref())
+}
+
+/// `mesh_fetch` 的值：正整数才算数，别的当没写（上限由 view3d 那边夹住）。
+#[cfg(any(test, target_arch = "wasm32"))]
+fn mesh_fetch_from(value: Option<&str>) -> Option<usize> {
+    value?.trim().parse().ok().filter(|&routes| routes > 0)
 }
 
 /// 页面地址的查询串（带 `?`）；拿不到就是空串。
@@ -9081,6 +9095,21 @@ mod tests {
                 .and_then(|value| SglLookDebugView::parse(&value)),
             Some(SglLookDebugView::DepthError)
         );
+    }
+
+    /// 地址栏的 `mesh_fetch=<路数>`：正整数才算数，别的值当没写（用出厂值）。
+    #[test]
+    fn the_mesh_fetch_override_comes_from_the_query_string() {
+        let routes = |search: &str| {
+            super::mesh_fetch_from(super::query_value(search, "mesh_fetch").as_deref())
+        };
+        assert_eq!(routes("?mesh_fetch=24"), Some(24));
+        assert_eq!(routes("?look=pbr&mesh_fetch=6"), Some(6));
+        assert_eq!(super::mesh_fetch_from(Some(" 12 ")), Some(12));
+        assert_eq!(routes("?look=pbr"), None, "没写");
+        assert_eq!(routes("?mesh_fetch=0"), None, "零路等于不取，不认");
+        assert_eq!(routes("?mesh_fetch=-3"), None);
+        assert_eq!(routes("?mesh_fetch=many"), None);
     }
 
     /// 房间树挂着的动作在回包落地后的去向：树还在途 → 等；树没回来 → 作废；树刚到而这条动作还没替自己补过叶子 →

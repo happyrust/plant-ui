@@ -46,6 +46,8 @@ use plant_ui::{
 
 pub mod e3d_look;
 mod look_materials;
+#[cfg(any(target_arch = "wasm32", test))]
+mod mesh_fetch;
 pub mod mesh_source;
 mod render_gate;
 mod room_clip;
