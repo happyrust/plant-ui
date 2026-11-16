@@ -243,9 +243,9 @@ pub enum Req {
         mdb: String,
         namespace: String,
     },
-    /// 库级模型预检查：`GET /dbnums/{dbnum}/model/roots` 的就绪根快照（`ready_total > 0`
-    /// 即「这个库有按当前源生成且仍最新的模型」）。与 `ModelScopes` 同帧同发——结果显示
-    /// 路径用它抢在 records 回空之前认账；它是枚举级重查询，按库单飞，宿主去重。
+    /// 库级模型预检查：`GET /dbnums/{dbnum}/model/roots` 的就绪根快照（有根就绪即「这个库有
+    /// 按当前源生成且仍最新的模型」，判据见 `DbnumModelRoots::has_model`）。与 `ModelScopes`
+    /// 同帧同发——结果显示路径用它抢在 records 回空之前认账；它是枚举级重查询，按库单飞，宿主去重。
     DbnumModelProbe {
         epoch: u64,
         dbnum: u32,
@@ -545,7 +545,7 @@ pub enum Evt {
         RefU64,
         anyhow::Result<crate::model_update_api::ModelRecords>,
     ),
-    /// 库级模型预检查的回包（`Req::DbnumModelProbe`）。`Ok` 且 `ready_total == 0` =
+    /// 库级模型预检查的回包（`Req::DbnumModelProbe`）。`Ok` 且 `has_model()` 为假 =
     /// 这个库没有按当前源生成的模型——宿主据此默认重新生成；`Err` 按「不知道」放行。
     DbnumModelProbe {
         epoch: u64,

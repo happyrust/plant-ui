@@ -247,14 +247,30 @@ fn dbnum_model_path(
 
 /// `GET /api/v1/dbnums/{dbnum}/model/roots` 的库级就绪快照（gen-model `dbnum_model_roots`）。
 ///
-/// `ready` 的判据本身就要求回执按冻结时的当前源 `sesno` 生成（含必要的发布 ACK），所以
-/// `ready_total > 0` = 库里有现成且仍是最新的模型（「已生成」）；`= 0` = 没生成过或全部
-/// 落后。显示路径拿它做库级预检查：`0` 时不等 records 回空就直接默认重新生成。
+/// `ready` 的判据本身就要求回执按冻结时的当前源 `sesno` 生成（含必要的发布 ACK），所以「有根
+/// 就绪」= 库里有现成且仍是最新的模型（「已生成」）。服务端为它记了两本账，这里各读一格，合起来
+/// 才是结论（[`Self::has_model`]）。显示路径拿它做库级预检查：两本账都说没有时，不等 records 回空
+/// 就直接默认重新生成。
 #[derive(Debug, Default, Clone, Copy, Deserialize)]
 pub struct DbnumModelRoots {
-    /// 已就绪（按当前源生成）的根数。
+    /// 已就绪（按当前源生成）的根数——**服务进程自己的投影**（回包里的
+    /// `ready_source = process_projection`）：服务一重启就从零记起，库里的模型一根没少它也是 0。
     #[serde(default)]
     pub ready_total: usize,
+    /// 落盘的账（库级凭证 ∨ 进程账本）认可的就绪根数，服务重启不清零。没有这一格的老服务端读成
+    /// `None`，不当成 0——「没说」与「说了没有」不是一回事。
+    #[serde(default)]
+    pub durable_ready_total: Option<usize>,
+}
+
+impl DbnumModelRoots {
+    /// 这个库有没有按当前源生成的模型：两本账任一本说有就是有。
+    ///
+    /// 只看 `ready_total` 的话，服务重启之后每个库都会被说成「没有模型」，显示路径就会把库里
+    /// 现成的模型再生成一遍。
+    pub fn has_model(&self) -> bool {
+        self.ready_total > 0 || self.durable_ready_total.is_some_and(|ready| ready > 0)
+    }
 }
 
 /// 库级模型探针：问「这个库现在有没有按当前源生成的模型」。一次根枚举快照，大库秒级——
@@ -1733,6 +1749,38 @@ mod tests {
             "",
             "没勾这一格时不留标点"
         );
+    }
+
+    /// 库级预检查要两本账合起来看：服务重启之后进程那本从零记起（`ready_total = 0`），模型其实都在，
+    /// 落盘那本（`durable_ready_total`）说得清。只读前一格就会把现成的模型当成没生成过。
+    #[test]
+    fn a_restarted_service_still_reports_the_models_it_has_on_disk() {
+        let roots = |body: &str| serde_json::from_str::<DbnumModelRoots>(body).unwrap();
+        // 接口文档 §4.5.1C 的例子：刚重启过的服务，进程投影是空的，落盘的账说 2720 根都在。
+        let restarted = roots(
+            r#"{"source":"direct","task_id":null,"dbnum":7997,"source_sesno":264,"total":2720,
+                "ready_total":0,"ready_source":"process_projection","durable_ready_total":2720,
+                "only_ready":false,"roots":[]}"#,
+        );
+        assert_eq!(
+            (restarted.ready_total, restarted.durable_ready_total),
+            (0, Some(2720))
+        );
+        assert!(restarted.has_model(), "重启不等于没有模型");
+
+        assert!(
+            !roots(r#"{"total":12,"ready_total":0,"durable_ready_total":0}"#).has_model(),
+            "两本账都说没有，才是真没有"
+        );
+        assert!(roots(r#"{"ready_total":3,"durable_ready_total":0}"#).has_model());
+
+        // 没有落盘那一格的回包（老服务端不给；带 `task_id` 的任务快照给的是 null）：只能按进程那本认。
+        let old = roots(r#"{"total":12,"ready_total":0}"#);
+        assert_eq!(old.durable_ready_total, None, "没说不能读成 0");
+        assert!(!old.has_model());
+        let task = roots(r#"{"ready_total":5,"durable_ready_total":null}"#);
+        assert_eq!(task.durable_ready_total, None);
+        assert!(task.has_model());
     }
 
     /// generate 的四档状态对界面是四件不同的事，压成布尔就分不出「重做过了」与

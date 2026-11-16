@@ -1680,8 +1680,9 @@ struct App {
     model_scope_pending: HashSet<RefU64>,
     model_scope_epoch: u64,
     /// 「这个库有没有按当前源生成的模型」的会话级结论：`GET /dbnums/{n}/model/roots`
-    /// 探针的 `ready_total > 0`，或该库的目标真查出过 records（正写）。`false`
-    /// 不压已确认的 `true`——探针晚回的空结论不许推翻证据。
+    /// 探针说有（`DbnumModelRoots::has_model`：进程投影与落盘的账任一本有数），或该库的目标
+    /// 真查出过 records、刚生成成功（正写）。`false` 不压已确认的 `true`——探针晚回的空结论
+    /// 不许推翻证据，也不许据此再催一次生成（[`dbnum_has_model`]）。
     dbnum_model_known: HashMap<u32, bool>,
     /// 在途的库级探针（每库单飞，回包时摘掉）。
     dbnum_model_probing: HashSet<u32>,
@@ -2495,6 +2496,15 @@ fn model_visibility_plan(
         }
     }
     plan
+}
+
+/// 库级探针的回包并进「这个库有没有模型」的会话级结论（`App::dbnum_model_known`），返回并入
+/// 之后的结论——要不要默认重新生成，看的是这个返回值，不是探针单方面的说法。
+///
+/// 已经记成「有」的不被探针的「没有」推翻：那个「有」来自真查出来的 records 或一次成功的生成，
+/// 是证据；探针读的是服务端的账，晚到的空结论可能只是账没跟上。
+fn dbnum_has_model(known: Option<bool>, probe_has_model: bool) -> bool {
+    known == Some(true) || probe_has_model
 }
 
 /// 房间边只挂叶子构件；隐含直管则以 BRAN/HANG refno 渲染。把已经加载的、
@@ -3978,24 +3988,20 @@ impl App {
                 }
                 data::Evt::SubtreeBounds { .. } => {}
                 data::Evt::ModelScopeProgress { .. } | data::Evt::ModelScope(..) => {}
-                // 库级模型预检查的回包：换代前的不认。`ready_total == 0` = 这个库没有按
-                // 当前源生成的模型——还在等 records 回包的同库目标直接默认重新生成，不必
-                // 先吃一拍查空；`ready_total > 0` / `Err` 都只记账，records 那一路照常裁决。
+                // 库级模型预检查的回包：换代前的不认。探针说这个库没有按当前源生成的模型（服务端
+                // 两本账都是零，见 `DbnumModelRoots::has_model`）——还在等 records 回包的同库目标
+                // 直接默认重新生成，不必先吃一拍查空；说有 / `Err` 都只记账，records 那一路照常裁决。
                 data::Evt::DbnumModelProbe { epoch, .. } if epoch != self.model_scope_epoch => {}
                 data::Evt::DbnumModelProbe { dbnum, result, .. } => {
                     self.dbnum_model_probing.remove(&dbnum);
                     if let Ok(roots) = result {
-                        let has_model = roots.ready_total > 0;
-                        match self.dbnum_model_known.entry(dbnum) {
-                            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                                if has_model {
-                                    entry.insert(true);
-                                }
-                            }
-                            std::collections::hash_map::Entry::Vacant(entry) => {
-                                entry.insert(has_model);
-                            }
-                        }
+                        // 先并进会话级结论再裁决：这个库真查出过 records 的话，探针晚到的「没有」
+                        // 既不改账、也不催生成。
+                        let has_model = dbnum_has_model(
+                            self.dbnum_model_known.get(&dbnum).copied(),
+                            roots.has_model(),
+                        );
+                        self.dbnum_model_known.insert(dbnum, has_model);
                         if !has_model {
                             // 只替「显示」方向的待决目标发起：隐藏方向的查空不生成。
                             let pending: Vec<RefU64> = self
@@ -5753,7 +5759,7 @@ impl App {
     }
 
     /// 「没有模型就默认重新生成」的自动入口：显示路径发现范围内没有已生成模型
-    /// （库级探针 `ready_total == 0`，或按祖先查 records 一条没有）时替用户发起——
+    /// （库级探针说这个库没有模型，或按祖先查 records 一条没有）时替用户发起——
     /// 与右键同一条 `GenerateModels` 通道，只是跳过确认框：这两种发现说的本来就是
     /// 「现在没有可看的」，问一次没有意义。进度屏照常进 `Running`，回执仍由
     /// [`Self::settle_models_generated`] 收，成功即按原方向显示。
@@ -9800,7 +9806,7 @@ mod tests {
 
     /// 「显示前预检查 dbnum 有没有模型，没有就默认重新生成；节点查空同样重新生成」
     /// （需求口径）。钉住五处接线：显示方向才发探针与默认生成（隐藏只查不生）；库级
-    /// 结论 `ready_total == 0` 直接进生成不绕 records；查空先试生成、发不出去才收
+    /// 结论「没有模型」直接进生成不绕 records；查空先试生成、发不出去才收
     /// 「未加载」；每 refno 每会话只自动一发；自动趟尊重生成期间翻成隐藏的方向。
     #[test]
     fn display_regenerates_when_dbnum_has_no_model() {
@@ -9870,7 +9876,7 @@ mod tests {
             "生成在途的目标不标未加载、不打提示：{empty}"
         );
 
-        // 探针回包：换代的不认；`ready_total == 0` 才催生成，且只替显示方向的待决目标。
+        // 探针回包：换代的不认；并进库级结论之后仍是「没有模型」才催生成，且只替显示方向的待决目标。
         assert!(
             source
                 .contains("Evt::DbnumModelProbe { epoch, .. } if epoch != self.model_scope_epoch"),
@@ -9883,7 +9889,16 @@ mod tests {
             .split_once("data::Evt::ResolvedName")
             .expect("下一臂")
             .0;
-        assert!(probe.contains("roots.ready_total > 0"), "就绪判据：{probe}");
+        // 就绪判据要两本账合看（服务重启后进程那本是空的），再并进会话级结论——这一臂自己去读
+        // `ready_total` 的话，重启过的服务会让显示路径把每个库现成的模型再生成一遍。
+        assert!(
+            probe.contains("dbnum_has_model(") && probe.contains("roots.has_model()"),
+            "就绪判据：{probe}"
+        );
+        assert!(
+            !probe.contains("ready_total"),
+            "探针那一臂不许绕过 has_model 自己去读 ready_total：{probe}"
+        );
         assert!(
             probe.contains("pending_direction.get(target).copied()"),
             "探针只替显示方向的待决目标发起：{probe}"
@@ -10219,6 +10234,22 @@ mod tests {
                 "{head}：{body}"
             );
         }
+    }
+
+    /// 探针回包并进库级结论：已经有证据说「有」的库（真查出过 records、或刚生成成功），探针晚到的
+    /// 「没有」推不翻它，也就不会把现成的模型再生成一遍；没有别的证据时听探针的。
+    #[test]
+    fn a_late_probe_cannot_overturn_models_already_seen() {
+        use super::dbnum_has_model;
+        assert!(
+            dbnum_has_model(Some(true), false),
+            "见过模型的库不因探针说没有而重新生成"
+        );
+        assert!(dbnum_has_model(Some(true), true));
+        assert!(dbnum_has_model(None, true));
+        assert!(dbnum_has_model(Some(false), true), "探针说有了就改口");
+        assert!(!dbnum_has_model(None, false), "没有别的证据时听探针的");
+        assert!(!dbnum_has_model(Some(false), false));
     }
 
     /// `timeout` 回执（服务端 120 s 预算到点、后台继续）不发显示，其余失败也不发（ADR-0030 实施约束 3）。
