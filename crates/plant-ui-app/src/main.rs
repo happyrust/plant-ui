@@ -686,6 +686,10 @@ fn show_app(
     if let Some(progress) = view3d.take_mesh_progress() {
         app.sync_mesh_progress(progress);
     }
+    // 排在进度后面：「其中几个再点一次显示会重取」那一行要跟在「加载失败」那一行下面。
+    for event in view3d.take_mesh_retry_events() {
+        app.sync_mesh_retry(event);
+    }
     let render_states = view3d.take_render_states();
     if !render_states.is_empty() {
         app.sync_render_states(render_states);
@@ -773,7 +777,6 @@ fn show_app(
         view3d.virtual_hole_op(op);
     }
     let window_px = windows.single().ok().map(|window| window.physical_size());
-    let mut retried = 0;
     for command in app.view3d_commands.drain(..) {
         match command {
             Cmd::PickViewport(uv) => view3d.pick(uv),
@@ -791,15 +794,13 @@ fn show_app(
             Cmd::SetViewportLook(look) => view3d.set_look(look),
             Cmd::SnapView { forward, up, fit } => view3d.snap(forward, up, fit),
             Cmd::RestoreCamera(pose) => view3d.restore_camera(pose),
-            Cmd::RetryFailedMeshes => retried = view3d.retry_failed_meshes(),
+            // 重发了几个、结果如何，都等视口下一拍的回执再写日志（`sync_mesh_retry`）。
+            Cmd::RetryFailedMeshes => {
+                view3d.retry_failed_meshes();
+            }
+            Cmd::RetryRecoverableMeshes => view3d.retry_recoverable_meshes(),
             _ => unreachable!("只缓存三维命令"),
         }
-    }
-    if retried > 0 {
-        app.logs.info(
-            &mut app.vm.logs,
-            format!("正在重试 {retried} 个加载失败的网格"),
-        );
     }
     Ok(())
 }
@@ -4907,6 +4908,42 @@ impl App {
         }
     }
 
+    /// 重试那条线上的一件事（`View3d::take_mesh_retry_events`）写进日志：哪些再点一次「显示」
+    /// 会重取、重取发出去了、取回几个还差几个。
+    /// eye 不在这里动——取回来的网格经渲染回执（`sync_render_states`）自己会到。
+    fn sync_mesh_retry(&mut self, event: plant_ui_view3d::MeshRetryEvent) {
+        use plant_ui_view3d::MeshRetryEvent;
+        match event {
+            MeshRetryEvent::Retryable { files } => self.logs.info(
+                &mut self.vm.logs,
+                format!(
+                    "没取到的网格文件里有 {files} 个是连接中断或服务报错，再点一次「显示」会重取"
+                ),
+            ),
+            MeshRetryEvent::Started { files } => self.logs.info(
+                &mut self.vm.logs,
+                format!("正在重取 {files} 个加载失败的网格文件"),
+            ),
+            MeshRetryEvent::Finished { recovered, errors } => {
+                if recovered > 0 {
+                    self.logs.info(
+                        &mut self.vm.logs,
+                        format!("重取回来 {recovered} 个网格文件"),
+                    );
+                }
+                if !errors.is_empty() {
+                    let error = anyhow::anyhow!(errors.join("\n"));
+                    self.logs.error(
+                        &mut self.vm.logs,
+                        format!("重取之后仍有 {} 个网格文件没取到", errors.len()),
+                        &error,
+                        None,
+                    );
+                }
+            }
+        }
+    }
+
     fn log_refresh_generation(&mut self) {
         self.logs.info(
             &mut self.vm.logs,
@@ -5500,7 +5537,8 @@ impl App {
                 | Cmd::SetViewportLook(_)
                 | Cmd::SnapView { fit: false, .. }
                 | Cmd::RestoreCamera(_)
-                | Cmd::RetryFailedMeshes) => self.view3d_commands.push(command),
+                | Cmd::RetryFailedMeshes
+                | Cmd::RetryRecoverableMeshes) => self.view3d_commands.push(command),
                 Cmd::Navigate(step) => {
                     self.navigate(step);
                     dirty = true;
@@ -7523,6 +7561,10 @@ impl App {
     /// `Cmd::Model(SetVisible)` 与 [`Self::show_room_model`] 共用它——房间模型
     /// 与树上点眼睛是同一件事，加载与进度反馈那一整套没有第二份的道理。
     fn set_model_visible(&mut self, refnos: Vec<RefU64>, visible: bool) {
+        // 再点一次「显示」，顺带把早先没取到、再试可能就成的网格重取一遍（连接断过、服务报过错的
+        // 那些）；隐藏方向不发。没有这样的网格时视口什么也不做，日志里也不添东西。
+        self.view3d_commands
+            .extend(visible.then_some(Cmd::RetryRecoverableMeshes));
         // 只记方向，不动 eye：图标要等三维真的画成这样再变。
         for refno in &refnos {
             let previous = self.tree.visibility_for(*refno, &self.model_scopes);
@@ -9110,6 +9152,50 @@ mod tests {
         assert_eq!(routes("?mesh_fetch=0"), None, "零路等于不取，不认");
         assert_eq!(routes("?mesh_fetch=-3"), None);
         assert_eq!(routes("?mesh_fetch=many"), None);
+    }
+
+    /// 再点一次「显示」要顺带重取早先没取到的网格（连接断过、服务报过错的那些），不必刷新页面。
+    /// 重取哪些、结果怎么记由视口那边的测试管；这里钉住宿主的四处接线：显示方向才下发（隐藏不发）；
+    /// 命令进三维队列；视口照办；视口的回执排在进度之后逐件写进日志。
+    #[test]
+    fn showing_a_model_again_refetches_the_meshes_that_may_come_back() {
+        let source = include_str!("main.rs");
+        let (production, _) = source.split_once("\nmod tests {").expect("测试模块分界");
+        let visible_fn = production
+            .split_once("fn set_model_visible(")
+            .expect("显示/隐藏入口")
+            .1
+            .split_once("fn install_group_roots(")
+            .expect("下一个方法")
+            .0;
+        assert!(
+            visible_fn.contains(".extend(visible.then_some(Cmd::RetryRecoverableMeshes))"),
+            "重取只跟显示方向走：{visible_fn}"
+        );
+        assert!(
+            production
+                .contains("| Cmd::RetryRecoverableMeshes) => self.view3d_commands.push(command)"),
+            "重取命令要进三维队列"
+        );
+        let frame = production
+            .split_once("fn show_app(")
+            .expect("每帧入口")
+            .1
+            .split_once("enum DimensionLayerUpdate {")
+            .expect("每帧入口结尾")
+            .0;
+        assert!(
+            frame.contains("Cmd::RetryRecoverableMeshes => view3d.retry_recoverable_meshes()"),
+            "视口要照办：{frame}"
+        );
+        let progress = frame.find("view3d.take_mesh_progress()").expect("取进度");
+        let events = frame
+            .find("for event in view3d.take_mesh_retry_events() {")
+            .expect("取重试回执");
+        assert!(
+            progress < events && frame.contains("app.sync_mesh_retry(event);"),
+            "回执排在进度之后写日志：「再点一次显示会重取」要跟在「加载失败」下面：{frame}"
+        );
     }
 
     /// 房间树挂着的动作在回包落地后的去向：树还在途 → 等；树没回来 → 作废；树刚到而这条动作还没替自己补过叶子 →
