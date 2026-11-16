@@ -47,6 +47,10 @@ pub struct RuntimeConfig {
     /// 原生端的外观走 `settings.ron`。
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     pub look: plant_ui::ViewportLookOverrides,
+    /// Bevy 资产根（`config.json` 的 `assets_url`）。资产与宿主页面不同源时才有，比如 rs-server
+    /// 托管页面、网格在模型服务的 `/assets` 下；`None` 时 wasm 的 `start()` 用相对页面的 `assets`。
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub assets_url: Option<String>,
 }
 
 /// 这一组连同 [`browser_runtime_config`] 只有 wasm 的 `start()` 入口用得到——配置由
@@ -68,6 +72,8 @@ struct BrowserConfig {
     data_api_url: String,
     #[serde(default)]
     look: plant_ui::ViewportLookOverrides,
+    #[serde(default)]
+    assets_url: Option<String>,
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -133,6 +139,13 @@ pub fn browser_runtime_config(json: &str) -> Result<RuntimeConfig> {
             }
             let model_api_url = normalize_http_url("model_api_url", &config.model_api_url)?;
             let data_api_url = normalize_http_url("data_api_url", &config.data_api_url)?;
+            let assets_url = config
+                .assets_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| normalize_http_url("assets_url", value))
+                .transpose()?;
             let db_host = config.db.host.trim().trim_end_matches('/');
             let mut db = aios_core::options::DbOption::default();
             db.v_ip = if config.db.secure
@@ -155,6 +168,7 @@ pub fn browser_runtime_config(json: &str) -> Result<RuntimeConfig> {
                 data_api_url,
                 auto_gen_mesh: false,
                 look: config.look,
+                assets_url,
             })
         }
     }
@@ -218,6 +232,7 @@ pub fn legacy_runtime_config(
         data_api_url,
         auto_gen_mesh: legacy.auto_gen_mesh,
         look: plant_ui::ViewportLookOverrides::default(),
+        assets_url: None,
     })
 }
 
@@ -524,6 +539,57 @@ mod tests {
         assert_eq!(current.look.aa, Some(plant_ui::AntiAlias::Fxaa));
         assert_eq!(current.look.hlr, Some(false));
         assert_eq!(current.look.mode, None);
+    }
+
+    /// 资产与宿主页面不同源时（rs-server 托管），config.json 用 `assets_url` 把 Bevy 资产根指过去；
+    /// 不给、给 null 或空串都回落到相对的 `assets`，给了就得是 http(s) 绝对地址。
+    #[test]
+    fn browser_startup_carries_the_optional_assets_url() {
+        let current = |assets_url: serde_json::Value| {
+            serde_json::json!({
+                "db": {
+                    "host": "127.0.0.1",
+                    "port": 8009,
+                    "namespace": "1516",
+                    "database": "AvevaMarineSample",
+                    "mdb": "/ALL",
+                    "username": "",
+                    "password": ""
+                },
+                "model_api_url": "http://127.0.0.1:8022",
+                "data_api_url": "http://127.0.0.1:9098",
+                "assets_url": assets_url,
+            })
+        };
+        let pointed =
+            browser_runtime_config(&current("http://127.0.0.1:8022/assets/".into()).to_string())
+                .unwrap();
+        assert_eq!(
+            pointed.assets_url.as_deref(),
+            Some("http://127.0.0.1:8022/assets")
+        );
+
+        let mut without = current(serde_json::Value::Null);
+        without.as_object_mut().unwrap().remove("assets_url");
+        for absent in [
+            without,
+            current(serde_json::Value::Null),
+            current("".into()),
+            current("  ".into()),
+        ] {
+            let config = browser_runtime_config(&absent.to_string()).unwrap();
+            assert_eq!(config.assets_url, None, "{absent}");
+        }
+
+        let relative = browser_runtime_config(&current("assets".into()).to_string());
+        assert!(relative.is_err(), "相对路径应当拒收");
+
+        let legacy = serde_json::json!({
+            "legacy_project_ron": legacy_ron("wss://db.example.test:443", "DESI"),
+            "model_api_url": "https://plant.example.test/",
+        });
+        let legacy = browser_runtime_config(&legacy.to_string()).unwrap();
+        assert_eq!(legacy.assets_url, None);
     }
 
     /// 旧 RON 启动形态的后端访问地址唯一来源是 e3d.project.ron 的 api_host：

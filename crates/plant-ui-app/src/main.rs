@@ -142,7 +142,10 @@ pub fn start(canvas: String, config_json: String) -> Result<(), wasm_bindgen::Js
         .then(plant_ui::ViewportLookOverrides::from_query(&query))
         .apply(plant_ui::ViewportLook::default());
     settings_store::set_browser_look(look);
-    run(&canvas, "assets".into());
+    run(
+        &canvas,
+        config.assets_url.unwrap_or_else(|| "assets".into()),
+    );
     Ok(())
 }
 
