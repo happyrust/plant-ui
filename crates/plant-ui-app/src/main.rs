@@ -1705,6 +1705,14 @@ struct App {
     /// 显示路径「库无模型 / 查空 → 默认重新生成」的去重账：每 refno 每会话只自动
     /// 一发，右键显式「重新生成模型」另走 `begin_mutation` 不受此限。
     auto_generate_attempted: HashSet<RefU64>,
+    /// 排着队等「默认重新生成」的显示目标。模型变更一次只跑一趟（`mutation_run` 只有一格）：
+    /// 那一格被占着（另一趟在跑 / 确认框开着）的时候，后来点的眼睛不丢，按点的先后一批一批
+    /// 等在这里，那一格空出来就接着发（`drain_auto_generate_queue`）。排队中的目标再点一次
+    /// 眼睛（方向不再是「显示」）就不发了。
+    auto_generate_queue: std::collections::VecDeque<QueuedGenerate>,
+    /// 队列接着发下一批时，上一趟留下的失败框先让位收在这里（进度框只有一格），队列排空后
+    /// 摆回去——排队不许把失败原因冲掉。
+    auto_generate_shadowed_failure: Option<model_mutation::Vm>,
     focus_bounds_request: focus_bounds::Request<RefU64>,
     /// `clear` bumps this generation so replies from the cleared session are ignored.
     command_epoch: u64,
@@ -1914,6 +1922,16 @@ struct MutationRun {
     /// 「等房间参照模型」档的开关（`Req::RebuildRooms` 在用）：重建已发出、服务端
     /// 收不回——置位只是让数据线程停止轮询（「后台继续」），重建照跑到底。
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// 排队等「默认重新生成」的一批显示目标（`App::auto_generate_queue`）。一次受阻的
+/// `begin_auto_generate` 调用是一批——一次多选点眼睛、一条库级探针回执各是一批，轮到时
+/// 仍旧整批发出去，标签与回执的口径和不排队时一样。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueuedGenerate {
+    targets: Vec<RefU64>,
+    /// 受阻那一刻的缘由（「范围内没有已生成的模型」等），轮到时写进日志。
+    reason: String,
 }
 
 /// 一发 generate 的回执归到哪一档（ADR-0030 D2 第 3 步）。
@@ -2628,6 +2646,122 @@ fn mark_model_scope_unavailable(
     *failures += 1;
 }
 
+/// 把受阻的一批记进队列，返回这一次新排上的目标。已经排着的（在哪一批里都算）不重复排：
+/// 同一个目标点一次显示会先后来两次——点下去那一次、查空回执那一次。没有新目标就不进队。
+fn enqueue_auto_generate(
+    queue: &mut std::collections::VecDeque<QueuedGenerate>,
+    targets: Vec<RefU64>,
+    reason: String,
+) -> Vec<RefU64> {
+    let mut fresh: Vec<RefU64> = Vec::new();
+    for target in targets {
+        if !fresh.contains(&target) && !generate_is_queued(queue, target) {
+            fresh.push(target);
+        }
+    }
+    if !fresh.is_empty() {
+        queue.push_back(QueuedGenerate {
+            targets: fresh.clone(),
+            reason,
+        });
+    }
+    fresh
+}
+
+fn generate_is_queued(queue: &std::collections::VecDeque<QueuedGenerate>, target: RefU64) -> bool {
+    queue.iter().any(|batch| batch.targets.contains(&target))
+}
+
+/// 把一个目标从队列里摘掉：它的查询有了结果——真有记录就直接显示、查询失败已另行报错，都不必
+/// 再生成。摘空了的批一并拿掉。返回队列里原先有没有它。
+fn forget_queued_generate(
+    queue: &mut std::collections::VecDeque<QueuedGenerate>,
+    target: RefU64,
+) -> bool {
+    let before = queued_generate_targets(queue);
+    for batch in queue.iter_mut() {
+        batch.targets.retain(|queued| *queued != target);
+    }
+    queue.retain(|batch| !batch.targets.is_empty());
+    queued_generate_targets(queue) != before
+}
+
+fn queued_generate_targets(queue: &std::collections::VecDeque<QueuedGenerate>) -> usize {
+    queue.iter().map(|batch| batch.targets.len()).sum()
+}
+
+/// 队列里此刻仍然要显示的目标数（进度框底下那句排队提示报的数）。排队期间又点了一次眼睛的
+/// 不算——轮到时它们会被跳过（`next_queued_generate`）。
+fn queued_show_targets(
+    queue: &std::collections::VecDeque<QueuedGenerate>,
+    pending_direction: &HashMap<RefU64, bool>,
+) -> usize {
+    queue
+        .iter()
+        .flat_map(|batch| batch.targets.iter())
+        .filter(|target| pending_direction.get(*target).copied() == Some(true))
+        .count()
+}
+
+/// 取下一批该发的：从队头起，只留轮到这一刻仍然要显示的目标（方向还是「显示」）；整批都不要了
+/// 就接着看下一批。返回（要发的那一批，途中被跳过的目标）。一次只取一批：后面的批留在队里，
+/// 轮到之前还能取消。
+fn next_queued_generate(
+    queue: &mut std::collections::VecDeque<QueuedGenerate>,
+    pending_direction: &HashMap<RefU64, bool>,
+) -> (Option<QueuedGenerate>, Vec<RefU64>) {
+    let mut skipped = Vec::new();
+    while let Some(batch) = queue.pop_front() {
+        let (targets, dropped): (Vec<RefU64>, Vec<RefU64>) = batch
+            .targets
+            .into_iter()
+            .partition(|target| pending_direction.get(target).copied() == Some(true));
+        skipped.extend(dropped);
+        if !targets.is_empty() {
+            return (
+                Some(QueuedGenerate {
+                    targets,
+                    reason: batch.reason,
+                }),
+                skipped,
+            );
+        }
+    }
+    (None, skipped)
+}
+
+/// 先后两趟的失败框并成一框：进度框只有一格，队列接着发的时候前一趟的失败不能被冲掉。两边都是
+/// 失败态才并——标题与头一句跟先失败的那一趟，后一趟带着自己的范围和动词接在后面；只有先前那一框
+/// 就原样留着；其余情形以后来的为准。
+fn merge_failed_mutations(
+    earlier: Option<model_mutation::Vm>,
+    later: Option<model_mutation::Vm>,
+) -> Option<model_mutation::Vm> {
+    match (earlier, later) {
+        (
+            Some(model_mutation::Vm::Failed {
+                kind,
+                label,
+                reason,
+            }),
+            Some(model_mutation::Vm::Failed {
+                kind: later_kind,
+                label: later_label,
+                reason: later_reason,
+            }),
+        ) => Some(model_mutation::Vm::Failed {
+            kind,
+            label,
+            reason: format!(
+                "{reason}；{later_label} {}：{later_reason}",
+                later_kind.failed_verb()
+            ),
+        }),
+        (earlier, None) => earlier,
+        (_, later) => later,
+    }
+}
+
 fn model_progress_terminal(pending_meshes: usize, failures: usize) -> Option<bool> {
     (pending_meshes == 0).then_some(failures == 0)
 }
@@ -2829,6 +2963,8 @@ impl App {
             dbnum_model_known: HashMap::new(),
             dbnum_model_probing: HashSet::new(),
             auto_generate_attempted: HashSet::new(),
+            auto_generate_queue: std::collections::VecDeque::new(),
+            auto_generate_shadowed_failure: None,
             focus_bounds_request: Default::default(),
             command_epoch: 0,
             loaded_models: HashSet::new(),
@@ -3601,7 +3737,10 @@ impl App {
                                 .mutation_run
                                 .as_ref()
                                 .is_some_and(|run| run.targets.contains(&target));
-                            if auto || in_flight {
+                            // 排着队等那一格空出来的也一样安静收口：轮到时再生成、回执落定再显示。
+                            // 排队期间改点了隐藏的同样安静——轮到时它会被跳过，没有东西失败。
+                            let queued = generate_is_queued(&self.auto_generate_queue, target);
+                            if auto || in_flight || queued {
                                 if auto {
                                     let element = self.tree.element(target);
                                     self.logs.info_of(
@@ -3655,6 +3794,9 @@ impl App {
                             let memory_note = loaded.memory_note().unwrap_or_default();
                             let models = loaded.records;
                             self.tree.visibility_unavailable.remove(&target);
+                            // 真有记录就不必再生成：排着队等默认重新生成的这一个摘掉（留着的话轮到时
+                            // 会把刚显示出来的范围再生成、再重载一遍）。
+                            forget_queued_generate(&mut self.auto_generate_queue, target);
                             // 真查出记录 = 这个库有模型：库级结论正写，探针晚到的空结论压不掉它。
                             if let Some(dbnum) = self.tree.dbnum_of(target) {
                                 self.dbnum_model_known.insert(dbnum, true);
@@ -3808,6 +3950,9 @@ impl App {
                                 &mut self.model_scope_failures,
                                 target,
                             );
+                            // 查询失败照旧报错收口、不替它生成：排着队的这一个也摘掉，免得轮到时对
+                            // 一个刚报过错的目标悄悄再发一趟。
+                            forget_queued_generate(&mut self.auto_generate_queue, target);
                             let element = self.tree.element(target);
                             self.logs.error_of(
                                 &mut self.vm.logs,
@@ -5680,8 +5825,13 @@ impl App {
     /// [`Self::settle_models_generated`] 收，成功即按原方向显示。
     ///
     /// 返回真正发出去的那批目标。约束：每 refno 每会话只自动一发
-    /// （`auto_generate_attempted`，发不出去不记账，下次点击还能再试）；已有一趟
-    /// 变更在跑或服务不可写时一个都不发，调用方按原来的查空收口。
+    /// （`auto_generate_attempted`，发不出去不记账，下次点击还能再试）；服务不可写时
+    /// 一个都不发，调用方按原来的查空收口。
+    ///
+    /// 已有一趟变更占着那一格（在跑 / 确认框开着）时，这一批不发也不丢：记进
+    /// `auto_generate_queue`，那一格空出来由 [`Self::drain_auto_generate_queue`] 按点的先后
+    /// 接着发。这时返回同样是空，调用方照旧把目标交给查询那一路——查空那一臂认得排着队的，
+    /// 不标「未加载」。
     fn begin_auto_generate(&mut self, targets: Vec<RefU64>, reason: String) -> Vec<RefU64> {
         let targets: Vec<RefU64> = targets
             .into_iter()
@@ -5690,7 +5840,38 @@ impl App {
         if targets.is_empty() {
             return Vec::new();
         }
-        if self.mutation_run.is_some() || self.vm.regen_busy || !self.model_service_executable() {
+        // 前面已经有人排着时也排到后面去，不插队。
+        let occupied = self.mutation_run.is_some() || self.vm.regen_busy;
+        if occupied || !self.auto_generate_queue.is_empty() {
+            self.queue_auto_generate(targets, &reason);
+            return Vec::new();
+        }
+        self.start_auto_generate(targets, &reason)
+    }
+
+    /// 受阻的那一批记进队列。这里不问服务可不可写——那一问会打 WARN，留到真正要发的时候
+    /// （[`Self::start_auto_generate`]）。树行在排队期间没有任何变化，所以在日志里说一句；
+    /// 已经排着的目标再来一次（查空回执那一次）不重复排、也不重复说。
+    fn queue_auto_generate(&mut self, targets: Vec<RefU64>, reason: &str) {
+        let fresh =
+            enqueue_auto_generate(&mut self.auto_generate_queue, targets, reason.to_owned());
+        let Some(head) = fresh.first().copied() else {
+            return;
+        };
+        let label = regenerate_label(self.tree.label(head), fresh.len());
+        let waiting = queued_generate_targets(&self.auto_generate_queue);
+        self.logs.info(
+            &mut self.vm.logs,
+            format!(
+                "{label}：{reason}；前面还有模型变更没落定，先排队，轮到时默认重新生成（队列里共 {waiting} 个目标；排队中的再点一次眼睛即可取消）"
+            ),
+        );
+    }
+
+    /// 真正发出一趟自动生成：服务可写才发，发了才记「试过」。返回发出去的那批目标，发不出去为空。
+    /// 调用方保证此刻没有别的变更占着那一格，且 `targets` 非空。
+    fn start_auto_generate(&mut self, targets: Vec<RefU64>, reason: &str) -> Vec<RefU64> {
+        if !self.model_service_executable() {
             return Vec::new();
         }
         for target in &targets {
@@ -5743,6 +5924,97 @@ impl App {
             label,
         });
         targets
+    }
+
+    /// 那一格空出来就接着发队列里的下一批。每帧两次（`ui`：收完回执之后、处理完这一帧的命令之后），
+    /// 队列空着时只是两次判空。一次只发一批：后面的批在轮到之前仍然可以取消（再点一次眼睛）。
+    /// 返回这一次有没有动过状态（发出了一批、跳过了目标、或把让位的失败框摆了回去）。
+    fn drain_auto_generate_queue(&mut self) -> bool {
+        if self.auto_generate_queue.is_empty() && self.auto_generate_shadowed_failure.is_none() {
+            return false;
+        }
+        if self.mutation_run.is_some() || self.vm.regen_busy {
+            return false;
+        }
+        let mut changed = false;
+        loop {
+            let (batch, skipped) =
+                next_queued_generate(&mut self.auto_generate_queue, &self.tree.pending_direction);
+            for target in skipped {
+                changed = true;
+                let element = self.tree.element(target);
+                self.logs.info_of(
+                    &mut self.vm.logs,
+                    element,
+                    "排队期间这次显示已取消，不再默认重新生成（没有发出生成请求）",
+                );
+            }
+            let Some(batch) = batch else {
+                break;
+            };
+            changed = true;
+            // 进度框只有一格：上一趟留下的失败框先让位，队列排空后摆回去。
+            if matches!(self.mutation, Some(model_mutation::Vm::Failed { .. })) {
+                self.auto_generate_shadowed_failure = merge_failed_mutations(
+                    self.auto_generate_shadowed_failure.take(),
+                    self.mutation.take(),
+                );
+            }
+            let reason = format!("排队轮到，{}", batch.reason);
+            if !self
+                .start_auto_generate(batch.targets.clone(), &reason)
+                .is_empty()
+            {
+                return true;
+            }
+            self.close_unsent_queued_generate(&batch.targets);
+        }
+        if let Some(failed) = self.auto_generate_shadowed_failure.take() {
+            changed = true;
+            self.mutation = merge_failed_mutations(Some(failed), self.mutation.take());
+        }
+        changed
+    }
+
+    /// 轮到了却发不出去的那一批（服务不可写 / 数据线程已关，原因已由发起那一步报过）：和不排队时
+    /// 发不出去一样收「未加载」。查询已经安静收过口的在这里补上；查询还在途的不动，回执到了由
+    /// 查空那一臂照常收。
+    fn close_unsent_queued_generate(&mut self, targets: &[RefU64]) {
+        let mut closed = false;
+        for target in targets {
+            if self.model_scope_pending.contains(target) {
+                continue;
+            }
+            mark_model_scope_unavailable(
+                &mut self.tree.pending_direction,
+                &mut self.tree.visibility_unavailable,
+                &mut self.model_scope_failures,
+                *target,
+            );
+            let element = self.tree.element(*target);
+            self.logs
+                .info_of(&mut self.vm.logs, element, EMPTY_SCOPE_HINT);
+            closed = true;
+        }
+        if closed {
+            self.finish_model_progress("模型加载完成");
+            self.rebuild_tree();
+        }
+    }
+
+    /// 场景整体作废（重载清场 / 重连 / 换读面）时队列跟着作废：排着的目标说的是旧场景，点过的方向
+    /// 也在同一步清掉了。让位的失败框不动，下一次排空时照常摆回去。
+    fn discard_auto_generate_queue(&mut self, why: &str) {
+        let waiting = queued_generate_targets(&self.auto_generate_queue);
+        self.auto_generate_queue.clear();
+        if waiting > 0 {
+            self.logs.info(
+                &mut self.vm.logs,
+                format!(
+                    "{why}：排队等默认重新生成的 {waiting} 个目标已作废（没有发出生成请求）；之后如仍未显示，请重新点显示"
+                ),
+            );
+        }
     }
 
     /// 确认框的回执。接受就对右键那几行**各一发**——重新生成是 `generate(force = true)`，整批
@@ -7581,6 +7853,8 @@ impl App {
         self.focus_bounds_request.cancel();
         self.model_scope_epoch = self.model_scope_epoch.wrapping_add(1);
         self.dbnum_model_probing.clear();
+        // 排着队等默认重新生成的目标说的也是清场前那个世界，点过的方向下面一并清掉：队列作废。
+        self.discard_auto_generate_queue("三维场景重载");
         // 尺寸标注量的是清场前那份几何，重装回来的 BRAN 可能已经不是那个样子（计划 B3：
         // 换场景清层）。要看就再右键一次。
         self.clear_pipe_dimensions();
@@ -7823,6 +8097,7 @@ impl App {
         self.dbnum_model_known.clear();
         self.dbnum_model_probing.clear();
         self.auto_generate_attempted.clear();
+        self.discard_auto_generate_queue("连接已重置");
         // 上一段连接的库号：换接入点后同一个号未必还是同一个库。
         self.search_hit_dbs.clear();
         self.tree.visibility_unavailable.clear();
@@ -8813,6 +9088,11 @@ mod tests {
         IsolateMatching, RoomViewCtx, TruncationVm, room_view_fallback_focus, room_view_isolate,
         room_volume_is_current, truncation_summary, truncation_vm,
     };
+    // 「默认重新生成」的排队（2026-11-16：连续点多个没有模型的目标，后来的不丢）的纯函数。
+    use super::{
+        QueuedGenerate, enqueue_auto_generate, forget_queued_generate, generate_is_queued,
+        merge_failed_mutations, next_queued_generate, queued_generate_targets, queued_show_targets,
+    };
     use crate::model_update_api;
     use chrono::{TimeZone, Utc};
     use plant_ui::model_mutation;
@@ -9751,6 +10031,290 @@ mod tests {
             settle.contains("pending_direction.get(target).copied() != Some(false)"),
             "{settle}"
         );
+    }
+
+    /// 连续点多个没有模型的目标（2026-11-16）：模型变更一次只跑一趟，那一格被占着时后来的不丢——
+    /// 按点的先后一批一批排着。同一个目标不重复排（点下去一次、查空回执又来一次），一次多选
+    /// 仍是一批。
+    #[test]
+    fn blocked_auto_generates_queue_in_click_order_without_duplicates() {
+        let mut queue = std::collections::VecDeque::new();
+        let first = enqueue_auto_generate(&mut queue, vec![ZONE], "甲".into());
+        assert_eq!(first, vec![ZONE]);
+        // 同一个目标的第二次不重复排，也不新开一批。
+        assert!(enqueue_auto_generate(&mut queue, vec![ZONE], "乙".into()).is_empty());
+        assert_eq!(queue.len(), 1);
+        // 一次多选是一批：已经排着的、自身重复的挑掉，其余保持原序。
+        let second = enqueue_auto_generate(&mut queue, vec![STRU, ZONE, PANE_A, STRU], "丙".into());
+        assert_eq!(second, vec![STRU, PANE_A]);
+        assert_eq!(
+            queue,
+            std::collections::VecDeque::from(vec![
+                QueuedGenerate {
+                    targets: vec![ZONE],
+                    reason: "甲".into(),
+                },
+                QueuedGenerate {
+                    targets: vec![STRU, PANE_A],
+                    reason: "丙".into(),
+                },
+            ])
+        );
+        assert_eq!(queued_generate_targets(&queue), 3);
+        assert!(generate_is_queued(&queue, PANE_A));
+        assert!(!generate_is_queued(&queue, PANE_B));
+    }
+
+    /// 轮到时只发仍然要显示的：排队期间又点了一次眼睛（方向不再是「显示」）的跳过并报出来，
+    /// 整批都不要了就接着看下一批；一次只取一批，后面的留在队里——轮到之前还能取消。
+    #[test]
+    fn the_queue_hands_out_one_batch_at_a_time_and_skips_cancelled_targets() {
+        let mut queue = std::collections::VecDeque::new();
+        enqueue_auto_generate(&mut queue, vec![ZONE], "甲".into());
+        enqueue_auto_generate(&mut queue, vec![STRU, PANE_A], "乙".into());
+        enqueue_auto_generate(&mut queue, vec![PANE_B], "丙".into());
+        // ZONE 改点了隐藏；PANE_A 的方向已经撤掉：都不再是「显示」。
+        let pending = HashMap::from([(ZONE, false), (STRU, true), (PANE_B, true)]);
+        assert_eq!(
+            queued_show_targets(&queue, &pending),
+            2,
+            "框底报的数只算仍要显示的"
+        );
+
+        let (batch, skipped) = next_queued_generate(&mut queue, &pending);
+        assert_eq!(
+            batch,
+            Some(QueuedGenerate {
+                targets: vec![STRU],
+                reason: "乙".into(),
+            }),
+            "头一批整批取消了，接着看第二批；批里只留仍要显示的"
+        );
+        assert_eq!(skipped, vec![ZONE, PANE_A]);
+        assert_eq!(queued_generate_targets(&queue), 1, "后面的批留在队里");
+
+        let (batch, skipped) = next_queued_generate(&mut queue, &pending);
+        assert_eq!(batch.map(|batch| batch.targets), Some(vec![PANE_B]));
+        assert!(skipped.is_empty());
+
+        let (batch, skipped) = next_queued_generate(&mut queue, &pending);
+        assert_eq!(batch, None);
+        assert!(skipped.is_empty());
+    }
+
+    /// 查询有了结果的目标从队列里摘掉（真有记录就直接显示、查询失败已另行报错），摘空的批不留空壳。
+    #[test]
+    fn a_settled_query_takes_its_target_out_of_the_queue() {
+        let mut queue = std::collections::VecDeque::new();
+        enqueue_auto_generate(&mut queue, vec![ZONE], "甲".into());
+        enqueue_auto_generate(&mut queue, vec![STRU, PANE_A], "乙".into());
+        assert!(forget_queued_generate(&mut queue, ZONE));
+        assert!(
+            !forget_queued_generate(&mut queue, ZONE),
+            "不在队里的摘不到"
+        );
+        assert_eq!(queue.len(), 1, "摘空的批不留空壳");
+        assert!(forget_queued_generate(&mut queue, PANE_A));
+        assert_eq!(
+            queue.front().map(|batch| batch.targets.clone()),
+            Some(vec![STRU])
+        );
+    }
+
+    /// 进度框只有一格：队列接着发的时候，先前那一趟的失败不许被冲掉——两框并成一框，标题与头一句
+    /// 跟先失败的那一趟，后一趟带着自己的范围和动词接在后面。
+    #[test]
+    fn failures_from_consecutive_runs_merge_into_one_dialog() {
+        let failed = |kind: model_mutation::Kind, label: &str, reason: &str| {
+            Some(model_mutation::Vm::Failed {
+                kind,
+                label: label.to_owned(),
+                reason: reason.to_owned(),
+            })
+        };
+        let merged = merge_failed_mutations(
+            failed(model_mutation::Kind::Cleanup, "/ZONE-A", "甲"),
+            failed(model_mutation::Kind::Regenerate, "/ZONE-B", "乙"),
+        );
+        let Some(model_mutation::Vm::Failed {
+            kind,
+            label,
+            reason,
+        }) = merged
+        else {
+            panic!("两框并成一框");
+        };
+        assert_eq!(kind, model_mutation::Kind::Cleanup);
+        assert_eq!(label, "/ZONE-A");
+        assert_eq!(reason, "甲；/ZONE-B 生成失败：乙");
+
+        // 只有先前那一框：原样留着。只有后来的：以后来的为准。
+        let kept =
+            merge_failed_mutations(failed(model_mutation::Kind::Regenerate, "/A", "甲"), None);
+        assert_eq!(kept.as_ref().map(model_mutation::Vm::label), Some("/A"));
+        let later =
+            merge_failed_mutations(None, failed(model_mutation::Kind::Regenerate, "/B", "乙"));
+        assert_eq!(later.as_ref().map(model_mutation::Vm::label), Some("/B"));
+        assert!(merge_failed_mutations(None, None).is_none());
+        // 在途的框不许被旧失败盖住。
+        let running = merge_failed_mutations(
+            failed(model_mutation::Kind::Regenerate, "/A", "甲"),
+            Some(model_mutation::Vm::Running {
+                kind: model_mutation::Kind::Regenerate,
+                label: "/B".into(),
+            }),
+        );
+        assert!(matches!(running, Some(model_mutation::Vm::Running { .. })));
+    }
+
+    /// 排队的接线（源码级）：受阻的不丢而是排队；查空那一臂认得排着队的；查询有结果的摘出队列；
+    /// 每帧收完回执、处理完命令各接着发一次；清场与重连时队列作废。
+    #[test]
+    fn the_auto_generate_queue_is_wired_end_to_end() {
+        let source = include_str!("main.rs");
+        let between = |from: &str, to: &str| {
+            source
+                .split_once(from)
+                .unwrap_or_else(|| panic!("找不到 {from}"))
+                .1
+                .split_once(to)
+                .unwrap_or_else(|| panic!("找不到 {to}"))
+                .0
+        };
+
+        // 自动入口：那一格被占着、或前面已经有人排着 → 排队（不插队），不再直接丢。
+        // 排队时不问服务可不可写：那一问会打 WARN，留到真正要发的时候。
+        let begin = between("fn begin_auto_generate(", "fn queue_auto_generate(");
+        assert!(
+            begin.contains("self.mutation_run.is_some() || self.vm.regen_busy"),
+            "{begin}"
+        );
+        assert!(
+            begin.contains("!self.auto_generate_queue.is_empty()"),
+            "前面有人排着就排到后面：{begin}"
+        );
+        let queue_call = begin.find("self.queue_auto_generate(targets, &reason);");
+        let start_call = begin.find("self.start_auto_generate(targets, &reason)");
+        assert!(
+            queue_call.is_some() && start_call.is_some() && queue_call < start_call,
+            "{begin}"
+        );
+        assert!(!begin.contains("model_service_executable"), "{begin}");
+        let queue = between("fn queue_auto_generate(", "fn start_auto_generate(");
+        assert!(
+            queue.contains("enqueue_auto_generate(&mut self.auto_generate_queue"),
+            "{queue}"
+        );
+        assert!(!queue.contains("model_service_executable"), "{queue}");
+
+        // 发出那一步：先过服务那道门，再记账——发不出去不记账，下次点击还能再试。
+        let start = between("fn start_auto_generate(", "fn drain_auto_generate_queue(");
+        let gate = start.find("self.model_service_executable()");
+        let mark = start.find("auto_generate_attempted.insert(*target)");
+        assert!(gate.is_some() && mark.is_some() && gate < mark, "{start}");
+
+        // 排空那一步：那一格没空出来不发；上一趟的失败框先收好再发；一次只发一批；
+        // 队列排空后把让位的失败框摆回去。
+        let drain = between(
+            "fn drain_auto_generate_queue(&mut self) -> bool {",
+            "fn close_unsent_queued_generate(",
+        );
+        assert!(
+            drain.contains("if self.mutation_run.is_some() || self.vm.regen_busy {"),
+            "{drain}"
+        );
+        assert!(
+            drain.contains(
+                "next_queued_generate(&mut self.auto_generate_queue, &self.tree.pending_direction)"
+            ),
+            "轮到时按此刻的方向过滤：{drain}"
+        );
+        let shadow = drain.find("self.auto_generate_shadowed_failure = merge_failed_mutations(");
+        let fire = drain.find(".start_auto_generate(batch.targets.clone(), &reason)");
+        let one_batch = drain.find("return true;");
+        let restore = drain
+            .find("self.mutation = merge_failed_mutations(Some(failed), self.mutation.take());");
+        assert!(
+            shadow.is_some()
+                && fire.is_some()
+                && one_batch.is_some()
+                && restore.is_some()
+                && shadow < fire
+                && fire < one_batch
+                && one_batch < restore,
+            "{drain}"
+        );
+
+        // 查空那一臂：排着队的安静收口，不标「未加载」、不计失败。
+        let empty = between(
+            "Ok(loaded) if loaded.records.is_empty() => {",
+            "Ok(loaded) => {",
+        );
+        assert!(
+            empty.contains("let queued = generate_is_queued(&self.auto_generate_queue, target);"),
+            "{empty}"
+        );
+        assert!(
+            empty.contains("if auto || in_flight || queued {"),
+            "{empty}"
+        );
+        // 真有记录、查询失败两臂各把目标摘出队列一次；查空那一臂不摘（它要等轮到）。
+        let forget = "forget_queued_generate(&mut self.auto_generate_queue, target);";
+        assert!(!empty.contains(forget), "{empty}");
+        let replies = between(
+            "Ok(loaded) if loaded.records.is_empty() => {",
+            "data::Evt::SubtreeBounds {",
+        );
+        assert_eq!(replies.matches(forget).count(), 2, "{replies}");
+
+        // 每帧：收完回执就接着发（在画进度框之前）；处理完这一帧的命令再看一次并催下一帧。
+        // 框底报的排队数只算此刻仍要显示的。
+        let frame = source
+            .rsplit_once("fn ui(&mut self, ui: &mut egui::Ui) {")
+            .expect("每帧入口")
+            .1;
+        let pump = frame.find("self.pump_events(ui.ctx());");
+        let first = frame.find("self.drain_auto_generate_queue();");
+        let count = frame
+            .find("queued_show_targets(&self.auto_generate_queue, &self.tree.pending_direction);");
+        let draw = frame.find("cmds.extend(model_mutation::show(");
+        let handle = frame.find("self.handle_cmds(ui.ctx(), cmds);");
+        let second = frame.find("if self.drain_auto_generate_queue() {");
+        assert!(
+            pump.is_some()
+                && first.is_some()
+                && count.is_some()
+                && draw.is_some()
+                && handle.is_some()
+                && second.is_some()
+                && pump < first
+                && first < count
+                && count < draw
+                && draw < handle
+                && handle < second,
+            "{frame}"
+        );
+        let after_commands = &frame[second.expect("处理完命令再看一次")..];
+        assert!(
+            after_commands
+                .split_once('}')
+                .expect("催下一帧")
+                .0
+                .contains("ui.ctx().request_repaint();"),
+            "{after_commands}"
+        );
+
+        // 场景整体作废时队列跟着作废：重载清场、重连 / 换读面。
+        for head in [
+            "fn clear_scene_for_reload(&mut self) {",
+            "fn reset_for_reconnect(&mut self) {",
+        ] {
+            let body = between(head, "\n    fn ");
+            assert!(
+                body.contains("self.discard_auto_generate_queue("),
+                "{head}：{body}"
+            );
+        }
     }
 
     /// `timeout` 回执（服务端 120 s 预算到点、后台继续）不发显示，其余失败也不发（ADR-0030 实施约束 3）。
@@ -12175,6 +12739,8 @@ impl App {
 impl App {
     fn ui(&mut self, ui: &mut egui::Ui) {
         self.pump_events(ui.ctx());
+        // 上一趟模型变更刚落定的话，排着队的下一批在画这一帧之前就接上，进度框不闪。
+        self.drain_auto_generate_queue();
         self.tick_model_progress();
         self.tick_focus_scope();
         if self.model_progress_until.is_some() || self.focus_scope_pending.is_some() {
@@ -12239,6 +12805,9 @@ impl App {
             &self.model_update,
             &mut self.model_update_state,
         ));
+        // 排着队等默认重新生成、此刻仍要显示的目标数：那一框占着的时候在框底说一句。
+        let queued_generates =
+            queued_show_targets(&self.auto_generate_queue, &self.tree.pending_direction);
         cmds.extend(model_mutation::show(
             ui.ctx(),
             &t,
@@ -12246,6 +12815,7 @@ impl App {
             // 框里「一并删除网格文件」那一格要就地改这个值，所以是 `&mut`：勾选状态随
             // 确认回执一起交出去（`Cmd::ModelMutationConfirm`）。
             self.mutation.as_mut(),
+            queued_generates,
         ));
         cmds.extend(room_browser::show(
             ui.ctx(),
@@ -12313,6 +12883,11 @@ impl App {
         self.settle_tree_reveal();
         self.settle_room_tree_reveal();
         self.handle_cmds(ui.ctx(), cmds);
+        // 这一帧的命令可能刚把那一格空出来（取消确认框 / 关掉失败框）：排着队的接着发，并催
+        // 下一帧把进度框画出来。
+        if self.drain_auto_generate_queue() {
+            ui.ctx().request_repaint();
+        }
         // 布尔作业是异步的：计算中有回执没回来时催下一帧，计数别停在旧数字上。
         if self.vm.virtual_holes.calculating > 0 {
             ui.ctx()

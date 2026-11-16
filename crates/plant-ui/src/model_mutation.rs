@@ -87,7 +87,8 @@ impl Kind {
         }
     }
 
-    fn failed_verb(self) -> &'static str {
+    /// 失败态那一句里的动词。宿主把先后两趟的失败并成一句时也查它。
+    pub fn failed_verb(self) -> &'static str {
         match self {
             Self::Regenerate => "生成失败",
             Self::Cleanup => "清理失败",
@@ -178,7 +179,15 @@ pub fn confirm_prompt(kind: Kind, label: &str) -> String {
     }
 }
 
-pub fn show(ctx: &egui::Context, t: &Tokens, d: Density, vm: Option<&mut Vm>) -> Vec<Cmd> {
+/// `queued` 是显示路径上排着队等「默认重新生成」的目标数：模型变更一次只跑一趟，这一框占着
+/// 的时候后来点的眼睛只能等。树行在排队期间没有任何变化，所以在这一框底下说一句（`queue_note`）。
+pub fn show(
+    ctx: &egui::Context,
+    t: &Tokens,
+    d: Density,
+    vm: Option<&mut Vm>,
+    queued: usize,
+) -> Vec<Cmd> {
     let Some(vm) = vm else {
         return Vec::new();
     };
@@ -197,6 +206,10 @@ pub fn show(ctx: &egui::Context, t: &Tokens, d: Density, vm: Option<&mut Vm>) ->
     }
     window.show(ctx, |ui| {
         body(ui, t, d, vm, &mut cmds);
+        if let Some(note) = queue_note(vm, queued) {
+            ui.add_space(d.px(6.0));
+            ui.label(RichText::new(note).small().color(t.text_muted));
+        }
     });
     // 关窗等于不做。窗口右上角那个叉与「取消」必须是同一件事，不然人以为
     // 自己躲开了这个决定。
@@ -389,6 +402,23 @@ pub fn tone(vm: &Vm) -> Status {
     match vm {
         Vm::Confirm { .. } | Vm::WaitingResident { .. } | Vm::Running { .. } => Status::Warn,
         Vm::Failed { .. } => Status::Error,
+    }
+}
+
+/// 这一框底下那句排队提示（`show` 的 `queued`）。没有排队的不说；失败态也不说——失败态
+/// 不挡路，排着的那一批同一帧就接着发了，轮不到它来报。
+fn queue_note(vm: &Vm, queued: usize) -> Option<String> {
+    if queued == 0 {
+        return None;
+    }
+    match vm {
+        Vm::Confirm { .. } => Some(format!(
+            "另有 {queued} 个目标在排队等默认生成：这一框确认或取消之后才会接着发。"
+        )),
+        Vm::WaitingResident { .. } | Vm::Running { .. } => Some(format!(
+            "另有 {queued} 个目标在排队，这一趟落定后依次默认生成；排队中的再点一次眼睛即可取消。"
+        )),
+        Vm::Failed { .. } => None,
     }
 }
 
@@ -590,5 +620,64 @@ mod tests {
         };
         assert_eq!(running.label(), "/ZONE-A");
         assert_eq!(running.kind(), Kind::Cleanup);
+    }
+
+    /// 排队提示：没有排队的不说；确认档说「确认或取消之后才接着发」，在途两档说「落定后依次」
+    /// 并交代取消的办法；失败态不说（它不挡路）。数字原样带出。提示画在整框底下，不进
+    /// `Running` 那一臂——那一臂「没有按钮、没有命令」的钉子不受它影响。
+    #[test]
+    fn the_queue_note_shows_only_while_this_dialog_holds_the_slot() {
+        let label = || "/ZONE-A".to_owned();
+        let running = Vm::Running {
+            kind: Kind::Regenerate,
+            label: label(),
+        };
+        assert_eq!(queue_note(&running, 0), None, "没有排队的不说");
+        let note = queue_note(&running, 2).expect("在途时有排队就说");
+        assert!(
+            note.contains("2 个目标") && note.contains("再点一次眼睛"),
+            "{note}"
+        );
+        let confirm = Vm::Confirm {
+            kind: Kind::Cleanup,
+            label: label(),
+            dbnum: None,
+            purge_meshes: true,
+        };
+        let note = queue_note(&confirm, 1).expect("确认框占着也说");
+        assert!(
+            note.contains("1 个目标") && note.contains("确认或取消"),
+            "{note}"
+        );
+        let waiting = Vm::WaitingResident {
+            kind: Kind::RoomRebuild,
+            label: label(),
+            phase: "edge-recompute".into(),
+            files: None,
+            meshes: None,
+            dbnums: None,
+        };
+        assert!(queue_note(&waiting, 3).is_some(), "等待档同样占着槽");
+        let failed = Vm::Failed {
+            kind: Kind::Regenerate,
+            label: label(),
+            reason: "x".into(),
+        };
+        assert_eq!(queue_note(&failed, 3), None, "失败态不挡路");
+
+        let source = include_str!("model_mutation.rs");
+        let code = source.split_once("mod tests {").expect("测试模块").0;
+        let show = code
+            .split_once("pub fn show(")
+            .expect("show")
+            .1
+            .split_once("fn body(")
+            .expect("body")
+            .0;
+        let draw = show
+            .find("body(ui, t, d, vm, &mut cmds);")
+            .expect("先画正文");
+        let note = show.find("queue_note(vm, queued)").expect("再画排队提示");
+        assert!(draw < note, "{show}");
     }
 }
