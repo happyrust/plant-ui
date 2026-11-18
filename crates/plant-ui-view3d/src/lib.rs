@@ -1897,8 +1897,8 @@ fn xray_material() -> StandardMaterial {
 }
 
 /// 一块网格此刻的显示状态。E3D 外观下六态六色（常态 / 悬停预选橙 / highlight 白 / CE 黄 / X-Ray 蓝 /
-/// X-Ray 叠选中黄），PBR 外观只有三枚材质，CE 与 Highlight 落到同一枚高亮、X-Ray 两态落到同一枚半透明蓝
-/// （都由 `LookMaterials` 裁决）。
+/// X-Ray 叠选中黄），PBR 外观四色：常态类型色、悬停预选橙（实体另带一点自发光）、CE 与 Highlight 同一个
+/// 选中色、X-Ray 两态同一枚半透明蓝（都由 `LookMaterials` 裁决）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum MaterialState {
     Base,
@@ -5125,6 +5125,76 @@ mod tests {
         }
         app.update();
         assert_eq!(sgl_material_of(&app, ec), base, "离开视口撤掉悬停色");
+    }
+
+    /// PBR 外观同样有悬停预选：被指的未选中件换成悬停橙（半透明件的透明度不变）、不描边，指针移开回到
+    /// 同一枚类型色材质；已选中件不被悬停色覆盖。
+    #[test]
+    fn pbr_look_tints_the_hovered_element_and_keeps_its_translucency() {
+        let pipe = RefU64::from(1);
+        let room = RefU64::from(2);
+        let mut app = materials_app(pbr_view());
+        let ep = spawn_model_mesh(&mut app, pipe, RefU64::from(70), "PIPE");
+        let er = spawn_model_mesh(&mut app, room, RefU64::from(71), "CE");
+        app.update();
+        let pipe_base = standard_material_of(&app, ep);
+        let room_base = standard_material_of(&app, er);
+        assert_eq!(base_colour_of(&app, &room_base)[3], 200);
+
+        {
+            let mut view = app.world_mut().resource_mut::<View3d>();
+            view.hovered = Some(room);
+            view.hover_dirty = true;
+        }
+        app.update();
+        assert_eq!(
+            base_colour_of(&app, &standard_material_of(&app, er)),
+            [255, 190, 0, 200],
+            "悬停橙，透明度还是元素自己的"
+        );
+        assert!(
+            app.world().entity(er).get::<RenderLayers>().is_none(),
+            "悬停只换颜色，不描边"
+        );
+        assert_eq!(
+            standard_material_of(&app, ep),
+            pipe_base,
+            "没被指的那一个句柄不动"
+        );
+
+        // 选中另一件、指针还停在原处：被指的照旧是悬停橙。
+        app.world_mut()
+            .resource_mut::<View3d>()
+            .set_selection(vec![pipe], Some(pipe));
+        app.update();
+        assert_eq!(
+            base_colour_of(&app, &standard_material_of(&app, er)),
+            [255, 190, 0, 200],
+            "选中别的件不撤悬停"
+        );
+
+        // 指针移到已选中的件上：它还是选中色、照旧描边，原来被指的回到同一枚类型色材质。
+        {
+            let mut view = app.world_mut().resource_mut::<View3d>();
+            view.hovered = Some(pipe);
+            view.hover_dirty = true;
+        }
+        app.update();
+        assert_eq!(
+            base_colour_of(&app, &standard_material_of(&app, ep)),
+            SELECT_COLOR.to_srgba().to_u8_array(),
+            "选中件不被悬停色覆盖"
+        );
+        assert_eq!(
+            app.world().entity(ep).get::<RenderLayers>(),
+            Some(&selection_outline::selected_layers()),
+            "选中件照旧描边"
+        );
+        assert_eq!(
+            standard_material_of(&app, er),
+            room_base,
+            "指针移走回到同一枚类型色材质，不新建"
+        );
     }
 
     /// `set_selection`：不在集内的主选中按没有算；集与主选中都没变就不翻脏标，只换主选中也要刷。

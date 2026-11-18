@@ -9,7 +9,8 @@
 //! 一个出处，两种外观才不会各漏一处。
 //!
 //! 选中配色（填色 + 描边色）也在这儿定：[`SelectionPalette`]。选中 / 悬停**只换颜色**——明暗照算、透明度还是元素
-//! 自己的，「选了谁」由选中描边（`selection_outline`）交代（ADR-0032 修订 2026-11-18）。
+//! 自己的，「选了谁」由选中描边（`selection_outline`）交代（ADR-0032 修订 2026-11-18）。只有 PBR 外观的悬停在
+//! 换色之外再加一点自发光（[`PBR_HOVER_GLOW`]）：那里的常态是类型色，换成悬停色不一定看得出来。
 
 use std::collections::HashMap;
 
@@ -30,6 +31,11 @@ use crate::{
 /// 又没到不透明（不透明会把房间体内部挡死，那正是 X-Ray 存在的理由）。
 const XRAY_SELECTED_ALPHA: u8 = 160;
 
+/// PBR 外观悬停实体的自发光，占悬停色（线性空间）的比例。只换颜色不够：设备的类型色与缺省悬停橙是同一个
+/// `#ffbe00`，换了画面不变；背光面本来就暗，乘出来的颜色也看不出换没换。自发光是加上去的，这两种情况都
+/// 亮得起来，又没亮到把明暗抹平。半透明件的自发光被着色器按透明度再压一遍，几乎不显——它们靠换色。
+const PBR_HOVER_GLOW: f32 = 0.3;
+
 /// plant3d-web 默认外观的选中色（`ViewerPanel.vue` 的 `WEB_SELECTION_COLOR` / `WEB_HOVER_COLOR` 与
 /// `outlineStyle.edgeColor`）：品红填色、橙色悬停、粉色描边。只在 [`SelectionPalette::Web`] 下用。
 const WEB_SELECTION_COLOUR: u32 = 0xff4fd8;
@@ -39,7 +45,8 @@ const WEB_OUTLINE_COLOUR: u32 = 0xff9ae8;
 /// 选中配色：填色与描边色在这一处定，两种外观各取一列（ADR-0032 修订 2026-11-18）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub(crate) enum SelectionPalette {
-    /// 本项目的口径（缺省）：E3D 外观主选中 CE 黄、其它选中白、悬停橙；PBR 外观橙红；描边两种外观都是橙红。
+    /// 本项目的口径（缺省）：E3D 外观主选中 CE 黄、其它选中白，PBR 外观选中橙红；
+    /// 悬停两种外观都是橙，描边都是橙红。
     #[default]
     Native,
     /// plant3d-web 的口径（`PLANT_UI_SELECTION_PALETTE=web`）：主选中与其它选中都是品红、悬停橙、描边粉。
@@ -79,8 +86,8 @@ impl SelectionPalette {
         }
     }
 
-    /// E3D 外观：悬停预选的填色。
-    fn e3d_hover(self) -> u32 {
+    /// 悬停预选的填色，两种外观同一个：缺省是 E3D 的 active 橙，plant3d-web 口径是它自己的悬停橙。
+    fn hover(self) -> u32 {
         match self {
             Self::Native => E3D_ACTIVE_COLOUR,
             Self::Web => WEB_HOVER_COLOUR,
@@ -217,8 +224,9 @@ impl LookMaterials {
             self.look = Some(look);
         }
         match look.mode {
-            // PBR 外观：常态按类型色（含半透明），CE 与其它选中都是选中色（缺省橙红 `SELECT_COLOR`）。
-            // X-Ray 命中且选中时仍是那枚共享的 X-Ray 材质——PBR 外观不改 X-Ray 的观感（只有 E3D 外观叠黄）。
+            // PBR 外观：常态按类型色（含半透明），CE 与其它选中都是选中色（缺省橙红 `SELECT_COLOR`），
+            // 悬停预选是悬停橙加一点自发光。X-Ray 命中且选中时仍是那枚共享的 X-Ray 材质——PBR 外观不改
+            // X-Ray 的观感（只有 E3D 外观叠黄）。
             LookMode::Pbr => {
                 let colour = match state {
                     MaterialState::Base => bytes_colour(mesh.colour),
@@ -228,9 +236,11 @@ impl LookMaterials {
                         .palette
                         .pbr_selected()
                         .with_alpha(mesh.colour[3] as f32 / 255.0),
-                    // 悬停预选在 PBR 外观下不另配色：沿用今天的行为（未选中件就是类型色），
-                    // 免得动改动前的画面。
-                    MaterialState::Hover => bytes_colour(mesh.colour),
+                    // 悬停预选的颜色同样不动透明度：鼠标掠过半透明的房间体时，里面的构件还得看得见。
+                    // 实体另加的那点自发光在 `standard` 里。
+                    MaterialState::Hover => {
+                        rgb_colour(self.palette.hover()).with_alpha(mesh.colour[3] as f32 / 255.0)
+                    }
                     MaterialState::XRay | MaterialState::XraySelected => XRAY_COLOR,
                 };
                 ModelMaterial::Pbr(self.standard(colour, mesh.line, state, assets))
@@ -250,7 +260,8 @@ impl LookMaterials {
         }
     }
 
-    /// `StandardMaterial` 那一半：PBR 外观的实体与两种外观下的无光照线。X-Ray 共用 `XRayMaterial`。
+    /// `StandardMaterial` 那一半：PBR 外观的实体与两种外观下的无光照线。X-Ray 共用 `XRayMaterial`；
+    /// PBR 外观的悬停实体带自发光（[`hover_material`]），线不带——无光照材质不吃自发光。
     fn standard(
         &mut self,
         colour: Color,
@@ -272,6 +283,8 @@ impl LookMaterials {
             .or_insert_with(|| {
                 assets.standard.add(if line {
                     fallback_line_material(colour)
+                } else if state == MaterialState::Hover {
+                    hover_material(colour)
                 } else {
                     model_material(colour)
                 })
@@ -344,7 +357,7 @@ fn e3d_colour(
         MaterialState::Ce => (palette.e3d_ce(), a),
         MaterialState::Highlight => (palette.e3d_highlight(), a),
         // 悬停预选：E3D 的 active orange。
-        MaterialState::Hover => (palette.e3d_hover(), a),
+        MaterialState::Hover => (palette.hover(), a),
         // X-Ray 命中且同时在选中集里：保留穿透（仍是 Blend），但颜色换成主选中色、alpha 抬到 160
         // ——否则房间视图里点中什么都只是那片淡蓝，「点了谁」看不出来。
         MaterialState::XraySelected => (palette.e3d_ce(), XRAY_SELECTED_ALPHA),
@@ -352,6 +365,14 @@ fn e3d_colour(
             ColourScheme::E3dFactory => (E3D_DEFAULT_ELEMENT_COLOUR, a),
             ColourScheme::ByType => (pack_rgb(r, g, b), a),
         },
+    }
+}
+
+/// PBR 外观悬停实体的材质：悬停色打底、照常打光，再加 [`PBR_HOVER_GLOW`] 的自发光。
+fn hover_material(colour: Color) -> StandardMaterial {
+    StandardMaterial {
+        emissive: colour.to_linear() * PBR_HOVER_GLOW,
+        ..model_material(colour)
     }
 }
 
@@ -410,13 +431,15 @@ mod tests {
             self.table.resolve(look, mesh, state, &mut assets)
         }
 
-        fn standard_colour(&self, material: &ModelMaterial) -> [u8; 4] {
+        fn standard_material(&self, material: &ModelMaterial) -> &StandardMaterial {
             let ModelMaterial::Pbr(handle) = material else {
                 panic!("期望 StandardMaterial，拿到 {material:?}");
             };
-            self.standard
-                .get(handle)
-                .unwrap()
+            self.standard.get(handle).unwrap()
+        }
+
+        fn standard_colour(&self, material: &ModelMaterial) -> [u8; 4] {
+            self.standard_material(material)
                 .base_color
                 .to_srgba()
                 .to_u8_array()
@@ -511,6 +534,53 @@ mod tests {
         );
     }
 
+    /// PBR 外观的悬停预选：悬停橙打底、照常打光、透明度跟元素自己，实体再加一点自发光；常态与选中不发光。
+    #[test]
+    fn pbr_look_hover_is_the_hover_colour_with_a_glow() {
+        let mut bench = Bench::new();
+        let pipe = mesh("PIPE", false);
+        let base = bench.resolve(pbr_look(), &pipe, MaterialState::Base);
+        let hover = bench.resolve(pbr_look(), &pipe, MaterialState::Hover);
+        assert_eq!(bench.standard_colour(&hover), [255, 190, 0, 255]);
+        assert_ne!(hover, base, "悬停不是类型色");
+        let material = bench.standard_material(&hover);
+        assert!(!material.unlit, "悬停件照常打光");
+        assert_eq!(
+            material.emissive,
+            Color::srgb_u8(255, 190, 0).to_linear() * PBR_HOVER_GLOW
+        );
+        for state in [
+            MaterialState::Base,
+            MaterialState::Ce,
+            MaterialState::Highlight,
+        ] {
+            let material = bench.resolve(pbr_look(), &pipe, state);
+            assert_eq!(
+                bench.standard_material(&material).emissive,
+                LinearRgba::BLACK,
+                "{state:?} 不发光"
+            );
+        }
+
+        // 类型色碰巧就是悬停橙的件（今天的设备）：颜色换了等于没换，认得出悬停靠的是那点自发光。
+        let orange = ModelMesh {
+            colour: [255, 190, 0, 255],
+            ..mesh("EQUI", false)
+        };
+        let base = bench.resolve(pbr_look(), &orange, MaterialState::Base);
+        let hover = bench.resolve(pbr_look(), &orange, MaterialState::Hover);
+        assert_eq!(bench.standard_colour(&hover), bench.standard_colour(&base));
+        assert_ne!(hover, base, "同色也不是同一枚材质");
+        let glow = bench.standard_material(&hover).emissive;
+        assert_ne!(glow, LinearRgba::BLACK);
+
+        // 半透明元素（类型色 alpha 200）：透明度不变，材质仍是 Blend。
+        let hover = bench.resolve(pbr_look(), &mesh("CE", false), MaterialState::Hover);
+        assert_eq!(bench.standard_colour(&hover), [255, 190, 0, 200]);
+        let material = bench.standard_material(&hover);
+        assert_eq!(material.alpha_mode, AlphaMode::Blend);
+    }
+
     /// 选中配色：缺省是本项目口径；`PLANT_UI_SELECTION_PALETTE=web` 换成 plant3d-web 的品红 / 橙 / 粉，
     /// 别的值都当没写。两种外观的填色与描边色一起换。
     #[test]
@@ -556,6 +626,8 @@ mod tests {
         }
         let hover = bench.resolve(look, &pipe, MaterialState::Hover);
         assert_eq!(bench.sgl_colour(&hover), ([0xff, 0xaa, 0x44], 1.0));
+        let hover = bench.resolve(pbr_look(), &pipe, MaterialState::Hover);
+        assert_eq!(bench.standard_colour(&hover), [0xff, 0xaa, 0x44, 0xff]);
         // X-Ray 叠选中跟着主选中色走。
         let xray_selected = bench.resolve(look, &pipe, MaterialState::XraySelected);
         assert_eq!(bench.sgl_colour(&xray_selected).0, [0xff, 0x4f, 0xd8]);
@@ -665,7 +737,9 @@ mod tests {
         assert_eq!(bench.standard_colour(&e3d), [189, 189, 189, 255]);
         let ce = bench.resolve(ViewportLook::default(), &line, MaterialState::Ce);
         assert_eq!(bench.standard_colour(&ce), [255, 255, 0, 255]);
-        for material in [&pbr, &e3d, &ce] {
+        let hover = bench.resolve(pbr_look(), &line, MaterialState::Hover);
+        assert_eq!(bench.standard_colour(&hover), [255, 190, 0, 255]);
+        for material in [&pbr, &e3d, &ce, &hover] {
             let ModelMaterial::Pbr(handle) = material else {
                 unreachable!()
             };
