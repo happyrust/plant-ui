@@ -735,6 +735,8 @@ fn show_app(
         });
     // 主选中一并下发：E3D 外观把它染 CE 黄，其余选中染 highlight 白。
     view3d.set_selection(app.vm.selection.to_vec(), app.vm.selection.primary());
+    // 屏幕缩放一并下发：选中描边的宽度按逻辑点定，高分屏上要乘它。
+    view3d.set_pixels_per_point(ctx.pixels_per_point());
     if let Some(models) = app.pending_models.take() {
         view3d.load(models);
     }

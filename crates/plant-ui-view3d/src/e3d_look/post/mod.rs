@@ -320,8 +320,9 @@ impl Plugin for SglLookPostPlugin {
     }
 }
 
+/// 选中描边的节点（`crate::selection_outline`）要排在这个节点之后，所以标签在 crate 内可见。
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
-struct SglLookLabel;
+pub(crate) struct SglLookLabel;
 
 /// 每个视图的中间纹理。`nd` / `hlr` 全分辨率；`ao` / `blur` / `ao_blurred` / `declutter` 按 `ao_scale` 缩小
 /// （超采样时 = 屏幕分辨率）。`nd`：rgb = 面法线 × 标记长度、a = 线性深度，格式见 [`nd_texture_format`]；其余单通道 0..1。

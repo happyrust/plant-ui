@@ -38,6 +38,14 @@ pub const EFFECT_SHADOWS: u32 = 2;
 /// 普通构件：边线 + 伪阴影都参与（E3D 默认）。
 pub const EFFECT_ALL: u32 = EFFECT_EDGES | EFFECT_SHADOWS;
 
+/// 着色方式（`flags.z`）：按 SGL 公式打光——常态。
+pub const SHADING_LIT: u32 = 0;
+/// 颜色不打光直出：房间 X-Ray 与像素探针。
+pub const SHADING_FLAT: u32 = 1;
+/// 染色：选中 / 悬停。明暗还是那套光照算出来的，但只拿来缩放颜色、不往白里加，色相不被反射与高光洗淡。
+/// 最暗压到几成看颜色的饱和度：有色相的压得深，白这样没色相的只略压，否则与常态灰分不开。
+pub const SHADING_TINT: u32 = 2;
+
 /// 着色器 uniform，每个字段都是 16 字节（WebGL2 对齐）。
 #[derive(Debug, Clone, Copy, PartialEq, ShaderType)]
 pub struct SglLookParams {
@@ -49,7 +57,8 @@ pub struct SglLookParams {
     pub shading: Vec4,
     /// 头灯在眼空间的方向（xyz）。
     pub lamp_dir_eye: Vec4,
-    /// x = 参与标记 0..3；y = 1 用环境贴图（0 用天地兜底）；z = 1 颜色不打光直出（像素探针用）；w 补齐。
+    /// x = 参与标记 0..3；y = 1 用环境贴图（0 用天地兜底）；z = 着色方式（[`SHADING_LIT`] /
+    /// [`SHADING_FLAT`] / [`SHADING_TINT`]）；w 补齐。
     pub flags: UVec4,
 }
 
@@ -126,7 +135,14 @@ impl SglLookMaterial {
 
     /// 颜色不打光直出（Ka = 1 的效果）：像素探针读 lightgrey 应为 189。
     pub fn flat(mut self) -> Self {
-        self.params.flags.z = 1;
+        self.params.flags.z = SHADING_FLAT;
+        self
+    }
+
+    /// 染色（选中 / 悬停）：亮面是颜色本身，暗面按同一套光照压暗，从不加白——构件还认得出形状，
+    /// 颜色也不会被环境反射洗成淡黄、近白（见 `sgl_look.wgsl` 的 `tint_shade`）。
+    pub fn tint(mut self) -> Self {
+        self.params.flags.z = SHADING_TINT;
         self
     }
 }
@@ -224,7 +240,9 @@ mod tests {
             EFFECT_EDGES,
         );
         assert_eq!(material.params.flags, UVec4::new(EFFECT_EDGES, 1, 0, 0));
-        assert_eq!(material.flat().params.flags.z, 1);
+        assert_eq!(material.params.flags.z, SHADING_LIT);
+        assert_eq!(material.clone().flat().params.flags.z, SHADING_FLAT);
+        assert_eq!(material.tint().params.flags.z, SHADING_TINT);
     }
 
     /// 着色器文本钉：公式的四项、sRGB 字节域输出、prepass 把线性深度写进 RGB、标记写进 alpha。改公式得连这条一起改。
@@ -237,6 +255,12 @@ mod tests {
             "@group(2) @binding(2) var env_sampler: sampler;",
             "pow(max(ndh, 1e-6), kse) * ndl_raw",
             "c * (ka + kd * ndl) + vec3(ks * spec) + kr * env",
+            // 染色：同一组系数算明暗，乘在颜色上，不加白
+            "rgb = c * tint_shade(c, kd, ks, kr, ndl, spec, env);",
+            // 暗面压到几成：有色相 0.68，没色相 0.88，按饱和度在两者间取
+            "const TINT_SHADE_FLOOR_VIVID: f32 = 0.68;",
+            "const TINT_SHADE_FLOOR_NEUTRAL: f32 = 0.88;",
+            "mix(TINT_SHADE_FLOOR_NEUTRAL, TINT_SHADE_FLOOR_VIVID, (hi - lo) / max(hi, 1e-4))",
             "srgb_to_linear(",
             "reflect(-v, n)",
             "f32(material.flags.x) / 3.0",

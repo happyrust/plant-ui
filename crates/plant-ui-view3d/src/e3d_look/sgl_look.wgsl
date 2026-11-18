@@ -45,7 +45,7 @@ struct SglLookParams {
     shading: vec4<f32>,
     // 头灯在眼空间的方向
     lamp_dir_eye: vec4<f32>,
-    // x = 参与标记 0..3；y = 1 用环境贴图；z = 1 颜色直出不打光
+    // x = 参与标记 0..3；y = 1 用环境贴图；z = 着色方式：0 按公式打光、1 颜色直出、2 染色（选中 / 悬停）
     flags: vec4<u32>,
 }
 
@@ -57,6 +57,28 @@ fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
     let lo = c / 12.92;
     let hi = pow((c + vec3(0.055)) / 1.055, vec3(2.4));
     return select(hi, lo, c <= vec3(0.04045));
+}
+
+// 染色压到最暗时留下的颜色比例，看颜色有多「彩」。有色相的（CE 黄、悬停橙）靠色相认，压到 VIVID 立体感才足；
+// 再低，CE 黄就发橄榄绿。没色相的（highlight 白）一压暗就是没选中件的 lightgrey——演示厂里量过，压到 0.68
+// 的选中管（177–202）比旁边没选中的管（173–238）还暗——所以只许压到 NEUTRAL。
+const TINT_SHADE_FLOOR_VIVID: f32 = 0.68;
+const TINT_SHADE_FLOOR_NEUTRAL: f32 = 0.88;
+
+fn tint_shade_floor(c: vec3<f32>) -> f32 {
+    let hi = max(c.r, max(c.g, c.b));
+    let lo = min(c.r, min(c.g, c.b));
+    return mix(TINT_SHADE_FLOOR_NEUTRAL, TINT_SHADE_FLOOR_VIVID, (hi - lo) / max(hi, 1e-4));
+}
+
+// 染色（选中 / 悬停）的明暗：公式里随朝向变的那几项（漫反射、高光、环境反射）归一到 [tint_shade_floor(c), 1]，
+// 上限取「正对头灯、反射到天顶」。它只用来缩放颜色，不往白里加：出厂预设 Kr 0.8，照原公式加上去 CE 黄会被洗成
+// 淡黄、highlight 白与常态灰只差几十个灰阶（2026-10-29 改成直出的原因）；直出又成了没有明暗的色块。
+fn tint_shade(c: vec3<f32>, kd: f32, ks: f32, kr: f32, ndl: f32, spec: f32, env: vec3<f32>) -> f32 {
+    let env_lum = dot(env, vec3(0.2126, 0.7152, 0.0722));
+    let lit = kd * ndl + ks * spec + kr * env_lum;
+    let span = max(kd + kr * material.shading.z, 1e-4);
+    return mix(tint_shade_floor(c), 1.0, clamp(lit / span, 0.0, 1.0));
 }
 
 #ifdef PREPASS_PIPELINE
@@ -116,8 +138,10 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> @locatio
     let c = material.colour.rgb;
     var rgb = c * (ka + kd * ndl) + vec3(ks * spec) + kr * env;
     if (material.flags.z == 1u) {
-        // 像素探针用：Ka = 1 直出，lightgrey 应读回 189
+        // 直出（房间 X-Ray、像素探针）：Ka = 1，lightgrey 应读回 189
         rgb = c;
+    } else if (material.flags.z == 2u) {
+        rgb = c * tint_shade(c, kd, ks, kr, ndl, spec, env);
     }
     return vec4(srgb_to_linear(clamp(rgb, vec3(0.0), vec3(1.0))), material.shading.y);
 }

@@ -18,10 +18,11 @@ use bevy::core_pipeline::prepass::NormalPrepass;
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy::render::render_resource::PipelineCache;
-use bevy::render::view::PreviousVisibleEntities;
+use bevy::render::view::{PreviousVisibleEntities, RenderLayers};
 
 use crate::e3d_look::material::SglLookMaterial;
 use crate::e3d_look::post::SglLookPost;
+use crate::selection_outline::SelectionOutline;
 use crate::{OrbitCamera, View3d, ViewCamera, ViewportRenderCamera};
 
 /// 最后一次变化之后再画几帧。管线编完、资产传上 GPU 的那一帧画面才完整；流水线渲染下 render world
@@ -84,6 +85,8 @@ type EntityChanged = Or<(
     Changed<MeshMaterial3d<StandardMaterial>>,
     Changed<MeshMaterial3d<SglLookMaterial>>,
     Changed<DirectionalLight>,
+    // 选中描边的遮罩层：PBR 外观下 X-Ray 与 X-Ray 叠选中是同一枚材质，选中 / 取消时只有这一层在变。
+    Changed<RenderLayers>,
 )>;
 
 /// 主相机上影响画面的组件。不查 `Changed<Camera>`：闸门自己写 `is_active`，查了就会把自己唤醒。
@@ -92,6 +95,8 @@ type CameraChanged = Or<(
     Changed<Projection>,
     Changed<Msaa>,
     Changed<SglLookPost>,
+    // 选中描边的有无、颜色、宽度（`update_selection_outline` 只在真变了的时候写）。
+    Changed<SelectionOutline>,
     Added<NormalPrepass>,
     Added<Fxaa>,
 )>;
@@ -104,6 +109,7 @@ pub(crate) struct SceneChanges<'w, 's> {
     removed_meshes: RemovedComponents<'w, 's, Mesh3d>,
     removed_pbr: RemovedComponents<'w, 's, MeshMaterial3d<StandardMaterial>>,
     removed_sgl: RemovedComponents<'w, 's, MeshMaterial3d<SglLookMaterial>>,
+    removed_layers: RemovedComponents<'w, 's, RenderLayers>,
     removed_prepass: RemovedComponents<'w, 's, NormalPrepass>,
     removed_fxaa: RemovedComponents<'w, 's, Fxaa>,
     mesh_events: EventReader<'w, 's, AssetEvent<Mesh>>,
@@ -120,6 +126,7 @@ impl SceneChanges<'_, '_> {
         changed |= drain_removed(&mut self.removed_meshes);
         changed |= drain_removed(&mut self.removed_pbr);
         changed |= drain_removed(&mut self.removed_sgl);
+        changed |= drain_removed(&mut self.removed_layers);
         changed |= drain_removed(&mut self.removed_prepass);
         changed |= drain_removed(&mut self.removed_fxaa);
         changed |= drain_assets(&mut self.mesh_events);
@@ -376,6 +383,40 @@ mod tests {
         app.world_mut().despawn(entity);
         app.update();
         assert!(is_active(&app, camera), "删网格没有唤醒相机");
+    }
+
+    /// 选中描边的三种变化都得唤醒相机：选中件挂上 / 摘掉遮罩层（PBR 外观下 X-Ray 件选中前后材质不换，
+    /// 只有这一层在变），以及相机上的描边设置变了。
+    #[test]
+    fn selection_outline_changes_wake_the_camera() {
+        let (mut app, camera) = gate_app();
+        let model = app
+            .world_mut()
+            .spawn((Transform::default(), Visibility::Visible))
+            .id();
+        assert!(settle(&mut app, camera));
+        app.world_mut()
+            .entity_mut(model)
+            .insert(crate::selection_outline::selected_layers());
+        app.update();
+        assert!(is_active(&app, camera), "挂上遮罩层没有唤醒相机");
+
+        assert!(settle(&mut app, camera));
+        app.world_mut().entity_mut(model).remove::<RenderLayers>();
+        app.update();
+        assert!(is_active(&app, camera), "摘掉遮罩层没有唤醒相机");
+
+        assert!(settle(&mut app, camera));
+        app.world_mut().entity_mut(camera).insert(SelectionOutline {
+            mask: Handle::default(),
+            coverage: Handle::default(),
+            colour: Color::WHITE,
+            width_px: 2.0,
+            active: true,
+        });
+        app.update();
+        assert!(is_active(&app, camera), "描边设置变了没有唤醒相机");
+        assert!(settle(&mut app, camera), "描边设置不再变就该停下");
     }
 
     #[test]
