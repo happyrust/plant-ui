@@ -1636,6 +1636,12 @@ struct App {
     xray_active_room: Option<RefU64>,
     /// 已查过的房间 -> 全部在册面板。重复点同一间房不再打一次详情查询。
     room_panel_cache: HashMap<RefU64, Vec<RefU64>>,
+    /// 在册 PANEL -> 所属房间（连上时取的那张登记表）。认「主选中是不是房间面板」靠它，不必等模型树
+    /// 展开到那一行。
+    panel_rooms: HashMap<RefU64, RefU64>,
+    /// 主选中已经去查过房间归属的那块 PANEL（[`App::ask_panel_room`]）。每个主选中只查一次：
+    /// 树每重建一次都会再看一眼，查失败或房间 X-Ray 被虚拟孔洞抢走之后不该又自己查回来。
+    panel_room_asked: Option<RefU64>,
     /// 模型还在路上、等它落地就取景的那间房（`Cmd::ShowRoomModel`）。
     ///
     /// 取景不能跟着指令一起下发：视口的包围盒来自模型查询回包里的 `world_aabb`，
@@ -2933,6 +2939,8 @@ impl App {
             mirror_error_said: None,
             xray_active_room: None,
             room_panel_cache: HashMap::new(),
+            panel_rooms: HashMap::new(),
+            panel_room_asked: None,
             pending_room_frame: None,
             room_pane_focus: None,
             nav: nav_history::NavHistory::default(),
@@ -3047,9 +3055,11 @@ impl App {
                     }
                     self.tree.roots = info.sites;
                     self.install_group_roots(info.group_roots);
-                    // 在册房间表：右键菜单靠它认出「这一行是房间」。230 行级，连上就取一次；
-                    // 取不到只是少一项菜单，不进日志——房间树那条路自己会报查询失败。
+                    // 在册房间表：右键菜单靠它认出「这一行是房间」，选中时靠它认出「这块是
+                    // 房间面板」好开房间 X-Ray。230 行级，连上就取一次；取不到只是少一项菜单、
+                    // 选中面板退回看模型树认，不进日志——房间树那条路自己会报查询失败。
                     self.vm.room_refnos.clear();
+                    self.panel_rooms.clear();
                     let _ = self.bridge.req.send(data::Req::PanelRooms);
                     // 换面之后的重装（ADR-0026 热切，计划 §5.3）：清场前的快照到这儿才
                     // 移进取回工作那一格，随后走取回工作那条现成路——`clear_scene_for_reload`
@@ -3441,12 +3451,15 @@ impl App {
                         }
                     };
                 }
-                // 在册房间表：右键菜单靠它认出「这一行是房间」。取一次就够，失败只是
-                // 少一项菜单，不打扰用户——房间树那条路自己会说查询失败。
+                // 在册房间表：右键菜单靠它认出「这一行是房间」，选中时靠它认出房间面板。
+                // 取一次就够，失败只是少一项菜单，不打扰用户——房间树那条路自己会说查询失败。
                 data::Evt::PanelRooms(result) => {
                     if let Ok(rows) = result {
                         // `all_panel_rooms` 给的是 `(面板, 房间)`；树上判房间用 `in` 那一头。
-                        self.vm.room_refnos = rows.into_iter().map(|(_, room)| room).collect();
+                        self.vm.room_refnos = rows.iter().map(|&(_, room)| room).collect();
+                        self.panel_rooms = rows.into_iter().collect();
+                        // 表比选中晚到：已经选着的那块面板此刻才认得出来。
+                        self.ask_panel_room();
                     }
                 }
                 // Spooling：六类分组统计回包。
@@ -7066,7 +7079,26 @@ impl App {
     fn refetch_rooms(&mut self, refno: RefU64) {
         self.vm.rooms.begin_query();
         let _ = self.bridge.req.send(data::Req::ElementRooms(refno));
-        if self.tree.noun(refno).is_some_and(is_panel_noun) {
+        self.panel_room_asked = None;
+        self.ask_panel_room();
+    }
+
+    /// 主选中是房间面板就去查它属于哪间房（回包落地开房间 X-Ray），每个主选中只查一次。
+    ///
+    /// 认面板先看在册登记表、再看模型树（`vm.selection_noun`，选中与树重建时同步）：从房间树、
+    /// 三维拾取或搜索选中时，模型树多半还没展开到那一行，只看树就认不出来。登记表晚到、
+    /// 树重建之后各再看一眼。
+    fn ask_panel_room(&mut self) {
+        let target = panel_room_query(
+            self.vm.selection.primary(),
+            self.panel_room_asked,
+            |refno| {
+                self.panel_rooms.contains_key(&refno)
+                    || self.vm.selection_noun.as_deref().is_some_and(is_panel_noun)
+            },
+        );
+        if let Some(refno) = target {
+            self.panel_room_asked = Some(refno);
             let _ = self.bridge.req.send(data::Req::PanelRoom(refno));
         }
     }
@@ -8179,6 +8211,8 @@ impl App {
         // 无选中时按「让它出来」兜底，与 `sync_selection_branch` 的 `.unwrap_or(true)` 同一口径。
         self.vm.selection_next_visible = true;
         self.vm.room_refnos.clear();
+        self.panel_rooms.clear();
+        self.panel_room_asked = None;
         // 房间树是旧接入点的：整份丢掉，面板回到 Idle，下次画出来再拉；在途的回包凭帧号作废。
         self.room_tree.clear();
         self.room_tree_epoch = self.room_tree_epoch.wrapping_add(1);
@@ -8302,6 +8336,8 @@ impl App {
         self.vm.element_count = self.tree.element_count();
         // 树变了，主选中头上的 BRAN 可能这才加载到（视口拾取 -> 定位 -> 祖先落地）。
         self.sync_selection_branch();
+        // 同理，主选中那一行这才展开出来、认得出是 PANEL 的话，房间 X-Ray 补查一次。
+        self.ask_panel_room();
         // 房间树的 eye 读的是同一份实际可见性账，跟着一起重新展平；「加载模型」的取景也在这里等范围回包。
         self.settle_room_tree_frame();
         self.rebuild_room_tree();
@@ -9079,7 +9115,8 @@ mod tests {
         empty_props_verdict, expand_room_model_targets,
         finished_after, generate_outcome, generate_summary, group_skip_note, in_mdb_path,
         is_panel_noun, mark_model_scope_unavailable, model_drains_idle, model_progress_terminal,
-        model_source_changed_line, model_visibility_plan, needs_children_query, read_face_switch,
+        model_source_changed_line, model_visibility_plan, needs_children_query, panel_room_query,
+        read_face_switch,
         refresh_anchor, regenerate_label, reload_snapshot, resolve_panel_room_reply,
         restore_model_reload, scope_not_generated, settle_pending_directions,
         settle_refresh_generation, settled_pending_roots, sync_ime_window, take_hidden_for_replay,
@@ -9349,6 +9386,25 @@ mod tests {
         assert!(is_panel_noun("pane"));
         assert!(!is_panel_noun("BRAN"));
         assert!(!is_panel_noun("EQUI"));
+    }
+
+    /// 认面板不等模型树（调用方把在册登记表也算进 `is_panel`），但同一个主选中只查一次：
+    /// 树重建、登记表晚到都会再问一遍，不能每次都打库。
+    #[test]
+    fn panel_room_query_asks_once_per_recognised_primary() {
+        let panel = RefU64(11);
+        let pipe = RefU64(12);
+        let is_panel = |refno: RefU64| refno == panel;
+
+        assert_eq!(panel_room_query(Some(panel), None, is_panel), Some(panel));
+        assert_eq!(panel_room_query(Some(panel), Some(panel), is_panel), None);
+        assert_eq!(
+            panel_room_query(Some(panel), Some(pipe), is_panel),
+            Some(panel),
+            "上一个主选中的「查过」不作数"
+        );
+        assert_eq!(panel_room_query(Some(pipe), None, is_panel), None);
+        assert_eq!(panel_room_query(None, None, is_panel), None);
     }
 
     #[test]
@@ -12587,6 +12643,16 @@ enum PanelRoomResolution {
 
 fn is_panel_noun(noun: &str) -> bool {
     noun.eq_ignore_ascii_case("PANE")
+}
+
+/// 要不要去查主选中的房间归属：认得出是 PANEL，且这个主选中还没查过。
+fn panel_room_query(
+    primary: Option<RefU64>,
+    asked: Option<RefU64>,
+    is_panel: impl FnOnce(RefU64) -> bool,
+) -> Option<RefU64> {
+    let refno = primary?;
+    (asked != Some(refno) && is_panel(refno)).then_some(refno)
 }
 
 fn resolve_panel_room_reply(
