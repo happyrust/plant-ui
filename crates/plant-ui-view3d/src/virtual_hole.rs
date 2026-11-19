@@ -1097,6 +1097,7 @@ mod tests {
                     owner: refno,
                     colour: [0; 4],
                     line: false,
+                    room_shell: false,
                 },
                 ModelPickTarget { refno },
                 ChildOf(parent),

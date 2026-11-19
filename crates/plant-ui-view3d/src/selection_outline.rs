@@ -696,6 +696,7 @@ mod tests {
             owner: aios_core::RefU64(1),
             colour: [255; 4],
             line: false,
+            room_shell: false,
         }
     }
 

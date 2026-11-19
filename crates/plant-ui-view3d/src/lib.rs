@@ -1132,6 +1132,8 @@ struct ModelMesh {
     /// 无光照线（无效 TUBI 的 `LineList` 兜底）还是实体网格。线在两种外观下都是无光照
     /// `StandardMaterial`，实体在 E3D 外观下换 `SglLookMaterial`。
     line: bool,
+    /// 房间壳（[`is_room_shell`]）：类型色不透明，选中 / 悬停时由 `LookMaterials` 压成半透明。
+    room_shell: bool,
 }
 
 /// 拾取只依赖模型身份，不依赖它使用 StandardMaterial 还是专用虚线材质。
@@ -1802,6 +1804,14 @@ fn type_color(generic: &str) -> Color {
     }
 }
 
+/// 房间壳：房间与它的面板（`ROOM` / `PANE`）。在册房间的面板就是 PANE，一块往往就是整间房的体积。
+fn is_room_shell(generic: &str) -> bool {
+    matches!(
+        PdmsGenericType::from_str(generic).unwrap_or(PdmsGenericType::UNKOWN),
+        PdmsGenericType::ROOM | PdmsGenericType::PANE
+    )
+}
+
 /// 一个类型的 PBR 材质。双面 + 关背面剔除保留原壳
 /// 「管壁两面都画」的行为——PDMS 网格法线不保证朝外，剔一面会漏。
 fn model_material(color: Color) -> StandardMaterial {
@@ -1909,8 +1919,8 @@ enum MaterialState {
     /// 主选中（E3D 的 CE）。
     Ce,
     XRay,
-    /// X-Ray 命中且同时在选中集里：穿透保留，颜色换成 CE 黄、alpha 抬到 160——
-    /// 否则房间视图里点中什么都只是那片淡蓝，「点了谁」看不出来。
+    /// X-Ray 命中且同时在选中集里：穿透保留，颜色换成 CE 黄、alpha 抬到 160（房间壳是 96，与它不开
+    /// X-Ray 时的选中同一档）——否则房间视图里点中什么都只是那片淡蓝，「点了谁」看不出来。
     XraySelected,
 }
 
@@ -2080,6 +2090,7 @@ fn load_models(
             let refno = model.refno.refno();
             let owner = model.owner.refno();
             let colour = type_color(&model.generic).to_srgba().to_u8_array();
+            let room_shell = is_room_shell(&model.generic);
             let visible = initial_model_visibility(&desired_visibility, refno, owner);
             let visibility = if visible {
                 Visibility::Visible
@@ -2129,6 +2140,7 @@ fn load_models(
                                 owner,
                                 colour,
                                 line: true,
+                                room_shell,
                             },
                             ModelPickTarget { refno },
                             NotShadowCaster,
@@ -2151,6 +2163,7 @@ fn load_models(
                                 owner,
                                 colour,
                                 line: false,
+                                room_shell,
                             },
                             ModelPickTarget { refno },
                         ));
@@ -4830,6 +4843,7 @@ mod tests {
                 owner,
                 colour: type_color(generic).to_srgba().to_u8_array(),
                 line: false,
+                room_shell: is_room_shell(generic),
             })
             .id()
     }

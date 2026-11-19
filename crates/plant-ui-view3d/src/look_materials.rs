@@ -11,6 +11,7 @@
 //! 选中配色（填色 + 描边色）也在这儿定：[`SelectionPalette`]。选中 / 悬停**只换颜色**——明暗照算、透明度还是元素
 //! 自己的，「选了谁」由选中描边（`selection_outline`）交代（ADR-0032 修订 2026-11-18）。只有 PBR 外观的悬停在
 //! 换色之外再加一点自发光（[`PBR_HOVER_GLOW`]）：那里的常态是类型色，换成悬停色不一定看得出来。
+//! 房间壳例外：它的类型色不透明，选中 / 悬停时压到 [`ROOM_SHELL_SELECTED_ALPHA`]（ADR-0032 修订 2026-11-19）。
 
 use std::collections::HashMap;
 
@@ -30,6 +31,12 @@ use crate::{
 /// `XraySelected` 的 alpha 字节：比房间 X-Ray 的 64 实得多（穿透还看得见，但一眼能认出点中了谁），
 /// 又没到不透明（不透明会把房间体内部挡死，那正是 X-Ray 存在的理由）。
 const XRAY_SELECTED_ALPHA: u8 = 160;
+
+/// 房间壳（`ROOM` / `PANE`）选中、悬停与 X-Ray 叠选中时的 alpha 字节上限。房间壳的类型色不透明，只换颜色的话
+/// 一选中（甚至鼠标划过）整间房就成了一块实心色，里面全挡死。真实库里一块 PANE 往往就是整间房，房间 X-Ray
+/// 开着时被选中的也正是它，所以 X-Ray 叠选中也落这一档而不是 [`XRAY_SELECTED_ALPHA`]：X-Ray 回包落地那一下不跳，
+/// 也不会反而变实。比房间 X-Ray 的 64 实一点；「点中了谁」由选中色与选中描边交代，不靠不透明度。
+const ROOM_SHELL_SELECTED_ALPHA: u8 = 96;
 
 /// PBR 外观悬停实体的自发光，占悬停色（线性空间）的比例。只换颜色不够：设备的类型色与缺省悬停橙是同一个
 /// `#ffbe00`，换了画面不变；背光面本来就暗，乘出来的颜色也看不出换没换。自发光是加上去的，这两种情况都
@@ -235,18 +242,17 @@ impl LookMaterials {
                     MaterialState::Ce | MaterialState::Highlight => self
                         .palette
                         .pbr_selected()
-                        .with_alpha(mesh.colour[3] as f32 / 255.0),
+                        .with_alpha(selected_alpha(mesh) as f32 / 255.0),
                     // 悬停预选的颜色同样不动透明度：鼠标掠过半透明的房间体时，里面的构件还得看得见。
                     // 实体另加的那点自发光在 `standard` 里。
-                    MaterialState::Hover => {
-                        rgb_colour(self.palette.hover()).with_alpha(mesh.colour[3] as f32 / 255.0)
-                    }
+                    MaterialState::Hover => rgb_colour(self.palette.hover())
+                        .with_alpha(selected_alpha(mesh) as f32 / 255.0),
                     MaterialState::XRay | MaterialState::XraySelected => XRAY_COLOR,
                 };
                 ModelMaterial::Pbr(self.standard(colour, mesh.line, state, assets))
             }
             LookMode::E3d => {
-                let (rgb, alpha) = e3d_colour(look, self.palette, mesh.colour, state);
+                let (rgb, alpha) = e3d_colour(look, self.palette, mesh, state);
                 if mesh.line {
                     // 无效 TUBI 的 LineList 兜底线在 E3D 外观下仍是无光照 StandardMaterial（它是
                     // handles / aids 一类的辅助画法，不是实体），只换成 E3D 的配色。
@@ -341,30 +347,44 @@ impl LookMaterials {
 /// 半透明跟着元素自己，**选中 / 悬停也一样**：半透明是显示属性，选中只换颜色（plant3d-web 的选中覆盖色
 /// 也只换 RGB）。2026-10-29 曾把选中态一律归一成不透明，为的是半透明件「选了像没选」；代价是房间体
 /// 一类的大半透明件一选中（甚至鼠标只是划过）就成了一整块不透明纯色，把里面全挡死。现在「选了谁」
-/// 由选中描边交代，这一条撤回。
+/// 由选中描边交代，这一条撤回。房间壳另压一档（[`selected_alpha`]）。
 fn e3d_colour(
     look: ViewportLook,
     palette: SelectionPalette,
-    colour: [u8; 4],
+    mesh: &ModelMesh,
     state: MaterialState,
 ) -> (u32, u8) {
-    let [r, g, b, a] = colour;
+    let [r, g, b, a] = mesh.colour;
+    let selected = selected_alpha(mesh);
     match state {
         MaterialState::XRay => {
             let [xr, xg, xb, xa] = XRAY_COLOR.to_srgba().to_u8_array();
             (pack_rgb(xr, xg, xb), xa)
         }
-        MaterialState::Ce => (palette.e3d_ce(), a),
-        MaterialState::Highlight => (palette.e3d_highlight(), a),
+        MaterialState::Ce => (palette.e3d_ce(), selected),
+        MaterialState::Highlight => (palette.e3d_highlight(), selected),
         // 悬停预选：E3D 的 active orange。
-        MaterialState::Hover => (palette.hover(), a),
-        // X-Ray 命中且同时在选中集里：保留穿透（仍是 Blend），但颜色换成主选中色、alpha 抬到 160
-        // ——否则房间视图里点中什么都只是那片淡蓝，「点了谁」看不出来。
+        MaterialState::Hover => (palette.hover(), selected),
+        // X-Ray 命中且同时在选中集里：保留穿透（仍是 Blend），但颜色换成主选中色、alpha 抬到
+        // `XRAY_SELECTED_ALPHA`——否则房间视图里点中什么都只是那片淡蓝，「点了谁」看不出来。房间壳与它不开
+        // X-Ray 时的选中同一档。
+        MaterialState::XraySelected if mesh.room_shell => (palette.e3d_ce(), selected),
         MaterialState::XraySelected => (palette.e3d_ce(), XRAY_SELECTED_ALPHA),
         MaterialState::Base => match look.colour_scheme {
             ColourScheme::E3dFactory => (E3D_DEFAULT_ELEMENT_COLOUR, a),
             ColourScheme::ByType => (pack_rgb(r, g, b), a),
         },
+    }
+}
+
+/// 选中 / 悬停态的 alpha 字节：元素自己的；房间壳压到 [`ROOM_SHELL_SELECTED_ALPHA`]，本来就更透的（演示厂的
+/// 房间体）不动。
+fn selected_alpha(mesh: &ModelMesh) -> u8 {
+    let own = mesh.colour[3];
+    if mesh.room_shell {
+        own.min(ROOM_SHELL_SELECTED_ALPHA)
+    } else {
+        own
     }
 }
 
@@ -395,7 +415,7 @@ mod tests {
 
     use super::*;
     use crate::e3d_look::material::{SHADING_FLAT, SHADING_TINT};
-    use crate::type_color;
+    use crate::{is_room_shell, type_color};
 
     struct Bench {
         standard: Assets<StandardMaterial>,
@@ -468,6 +488,7 @@ mod tests {
             owner: aios_core::RefU64(1),
             colour: type_color(generic).to_srgba().to_u8_array(),
             line,
+            room_shell: is_room_shell(generic),
         }
     }
 
@@ -721,6 +742,64 @@ mod tests {
         assert_eq!(bench.sgl_colour(&typed_pipe), ([250, 250, 30], 1.0));
         let typed_equi = bench.resolve(by_type, &equi, MaterialState::Base);
         assert_ne!(typed_pipe, typed_equi);
+    }
+
+    /// 房间壳（PANE / ROOM）的类型色不透明：常态照旧，选中 / 悬停（E3D 外观连 X-Ray 叠选中）压到
+    /// `ROOM_SHELL_SELECTED_ALPHA`、PBR 外观落进 Blend；本来就比这一档更透的房间体（演示厂的 alpha 64）
+    /// 选中后不变实。别的构件不受影响，见 `e3d_look_paints_lightgrey_ce_yellow_highlight_white`。
+    #[test]
+    fn room_shells_turn_see_through_when_selected_or_hovered() {
+        let mut bench = Bench::new();
+        let look = ViewportLook::default();
+        let shell_opacity = ROOM_SHELL_SELECTED_ALPHA as f32 / 255.0;
+        for generic in ["PANE", "ROOM"] {
+            let shell = mesh(generic, false);
+            assert!(shell.room_shell, "{generic}");
+            assert_eq!(shell.colour[3], 255, "{generic} 的类型色不透明");
+            let base = bench.resolve(look, &shell, MaterialState::Base);
+            assert_eq!(bench.sgl_colour(&base).1, 1.0, "{generic} 常态不透明");
+            for state in [
+                MaterialState::Ce,
+                MaterialState::Highlight,
+                MaterialState::Hover,
+                MaterialState::XraySelected,
+            ] {
+                let material = bench.resolve(look, &shell, state);
+                let (_, opacity) = bench.sgl_colour(&material);
+                assert!(
+                    (opacity - shell_opacity).abs() < 1e-6,
+                    "{generic} {state:?}"
+                );
+            }
+            let base = bench.resolve(pbr_look(), &shell, MaterialState::Base);
+            assert_eq!(bench.standard_material(&base).alpha_mode, AlphaMode::Opaque);
+            for state in [
+                MaterialState::Ce,
+                MaterialState::Highlight,
+                MaterialState::Hover,
+            ] {
+                let material = bench.resolve(pbr_look(), &shell, state);
+                assert_eq!(
+                    bench.standard_colour(&material)[3],
+                    ROOM_SHELL_SELECTED_ALPHA,
+                    "{generic} {state:?}"
+                );
+                assert_eq!(
+                    bench.standard_material(&material).alpha_mode,
+                    AlphaMode::Blend
+                );
+            }
+        }
+
+        assert!(!mesh("PIPE", false).room_shell && !mesh("CE", false).room_shell);
+
+        let thin = ModelMesh {
+            colour: [213, 191, 169, 64],
+            ..mesh("PANE", false)
+        };
+        let selected = bench.resolve(look, &thin, MaterialState::Ce);
+        let (_, opacity) = bench.sgl_colour(&selected);
+        assert!((opacity - 64.0 / 255.0).abs() < 1e-6, "更透的不变实");
     }
 
     /// 无效 TUBI 的兜底线两种外观下都是无光照 StandardMaterial，只换配色。

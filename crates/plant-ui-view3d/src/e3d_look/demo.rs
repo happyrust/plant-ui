@@ -20,7 +20,8 @@ use web_time::{Duration, Instant};
 use super::colour_table::{E3D_AIDS_COLOUR, rgb_bytes};
 use crate::{
     ModelMesh, ModelPickTarget, ModelRoot, OrbitCamera, SceneRoot, View3d, ViewCamera, diag,
-    fallback_line_material, frame_bounds, scene_bounds_from_mm, scene_transform, type_color,
+    fallback_line_material, frame_bounds, is_room_shell, scene_bounds_from_mm, scene_transform,
+    type_color,
 };
 
 /// 帧时间汇总的窗口。
@@ -299,6 +300,7 @@ fn spawn_part(
                     owner: refno,
                     colour,
                     line: false,
+                    room_shell: is_room_shell(part.generic),
                 },
                 ModelPickTarget { refno },
             ));
