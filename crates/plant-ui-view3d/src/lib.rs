@@ -35,7 +35,7 @@ use bevy::render::render_resource::{
     Extent3d, Shader, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
 };
 use bevy::render::renderer::{RenderAdapter, RenderDevice};
-use bevy::render::view::{NoIndirectDrawing, VisibilitySystems};
+use bevy::render::view::{NoIndirectDrawing, RenderLayers, VisibilitySystems};
 use bevy::render::{Render, RenderApp, RenderSystems, renderer::render_system};
 use bevy::transform::TransformSystems;
 use bevy_egui35::{EguiUserTextures, egui};
@@ -51,6 +51,7 @@ mod mesh_fetch;
 pub mod mesh_source;
 mod render_gate;
 mod room_clip;
+mod selection_outline;
 mod virtual_hole;
 
 use e3d_look::env_cube::SglEnvCube;
@@ -59,7 +60,7 @@ use e3d_look::post::{
     SglLookDebugView, SglLookPost, SglLookPostPlugin, blur_sharpness_for_depth_range,
     eye_depth_range,
 };
-use look_materials::{LookMaterials, MaterialAssets};
+use look_materials::{LookMaterials, MaterialAssets, SelectionPalette};
 
 pub use room_clip::{RoomClipPhase, RoomClipStatus, RoomVolumeBatch, panel_bounds_mm};
 
@@ -119,8 +120,8 @@ const AXIS_COLORS: [Color; 3] = [
 /// 这一档定死是从 rs-plant3-d 的观感里对出来的。
 const MODEL_METALLIC: f32 = 0.1;
 const MODEL_ROUGHNESS: f32 = 0.7;
-/// 选中高亮色：橙红描不上边框（无 outline 依赖），直接换 base_color 最稳。
-/// 与 rs-plant3-d outline 的 ORANGE_RED 同源。
+/// 选中色：PBR 外观下选中件的填色，也是两种外观下选中描边的颜色（缺省配色，见
+/// `look_materials::SelectionPalette`）。与 rs-plant3-d outline 的 ORANGE_RED 同源。
 const SELECT_COLOR: Color = Color::srgb(1.0, 0.27, 0.0);
 /// 房间面板 X-Ray：淡蓝、约 25% 不透明度。
 const XRAY_COLOR: Color = Color::srgba_u8(89, 169, 255, 64);
@@ -199,7 +200,8 @@ impl Plugin for View3dPlugin {
             .init_resource::<render_gate::ViewportRenderGate>()
             .init_resource::<render_gate::PipelinesPending>()
             .init_resource::<room_clip::RoomClip>()
-            .init_resource::<LookMaterials>()
+            // 选中配色启动时读一次环境变量（`PLANT_UI_SELECTION_PALETTE`），进程内不变。
+            .insert_resource(LookMaterials::with_palette(SelectionPalette::from_env()))
             // E3D 外观的实体材质：prepass 开着，阶段二的边线 / 伪阴影读它写的深度与标记；
             // 没有阴影（SGL 本来就没有）。
             .add_plugins(MaterialPlugin::<SglLookMaterial> {
@@ -209,6 +211,8 @@ impl Plugin for View3dPlugin {
             })
             // 边线 / 伪阴影后处理（阶段二）：只对挂了生效 `SglLookPost` 的视图跑。
             .add_plugins(SglLookPostPlugin)
+            // 选中描边：渲染图里接在 E3D 后处理之后，所以插件也排在它后面（连边时那个节点得已经在图上）。
+            .add_plugins(selection_outline::SelectionOutlinePlugin)
             .add_plugins(ExtractResourcePlugin::<ViewportResizeSync>::default())
             .init_asset_loader::<MeshLoader>()
             .add_systems(
@@ -240,6 +244,8 @@ impl Plugin for View3dPlugin {
                     virtual_hole::apply_hole_materials,
                     animate_snap,
                     update_grid,
+                    // 选中描边的遮罩跟着本帧的离屏图尺寸与投影走：排在 apply_resize 与改投影的几个系统之后。
+                    selection_outline::sync_selection_mask,
                 )
                     .chain(),
             )
@@ -260,6 +266,13 @@ impl Plugin for View3dPlugin {
                     render_gate::freeze_view_visibility_while_idle
                         .after(render_gate::gate_viewport_render)
                         .in_set(VisibilitySystems::CheckVisibility),
+                    // 选中描边：有没有选中件 / 颜色 / 宽度在闸门之前定（变了要醒来画一帧），遮罩相机的开关跟在
+                    // 闸门之后、可见性检查之前（刚打开的相机要赶上同一帧的检查）。
+                    selection_outline::update_selection_outline
+                        .before(render_gate::gate_viewport_render),
+                    selection_outline::gate_selection_mask
+                        .after(render_gate::gate_viewport_render)
+                        .before(VisibilitySystems::CheckVisibility),
                 ),
             );
         // `--look-demo` / `?look_demo=1`（E3D 外观移植计划的演示厂）：宿主插了 `LookDemo` 资源才摆场景。
@@ -449,6 +462,9 @@ pub struct View3d {
     /// （宿主 `look_background`）只在 PBR 外观、设备跑不了后处理、或管线还没编好的头几帧露出来。
     /// Bevy 侧没有背景相机：主相机清成透明（`Color::NONE`），底下露的就是绘制层那层。
     look: ViewportLook,
+    /// 屏幕缩放（egui 的 `pixels_per_point`），宿主每帧经 [`Self::set_pixels_per_point`] 报。选中描边的宽度
+    /// 按逻辑点定，乘它才是屏幕像素。
+    pixels_per_point: f32,
 }
 
 impl View3d {
@@ -587,6 +603,17 @@ impl View3d {
             self.selected = selected;
             self.primary = primary;
             self.selection_dirty = true;
+        }
+    }
+
+    /// 宿主每帧报一次屏幕缩放（egui 的 `pixels_per_point`）：选中描边的宽度按逻辑点定，高分屏上乘它
+    /// 才不至于细成一根发丝。非正数、非有限值不收。
+    pub fn set_pixels_per_point(&mut self, pixels_per_point: f32) {
+        if pixels_per_point.is_finite()
+            && pixels_per_point > 0.0
+            && self.pixels_per_point != pixels_per_point
+        {
+            self.pixels_per_point = pixels_per_point;
         }
     }
 
@@ -857,6 +884,11 @@ pub struct MeshLoadProgress {
     pub done: usize,
     pub total: usize,
     pub errors: Vec<String>,
+    /// 这一批实体生成的时刻——[`load_models`] 把记录变成实体、网格开始取的那一拍。装载计时
+    /// （计划 T0）的「首批实体生成」读它；整批有了结果之前每一拍都原样带着，宿主不必自己记。
+    pub spawned_at: Option<Instant>,
+    /// 网格全部落定（`done == total`）的那一拍；只有终态有。装载计时的「网格全部落定」读它。
+    pub settled_at: Option<Instant>,
 }
 
 impl MeshLoadProgress {
@@ -1217,6 +1249,8 @@ struct ModelMesh {
     /// 无光照线（无效 TUBI 的 `LineList` 兜底）还是实体网格。线在两种外观下都是无光照
     /// `StandardMaterial`，实体在 E3D 外观下换 `SglLookMaterial`。
     line: bool,
+    /// 房间壳（[`is_room_shell`]）：类型色不透明，选中 / 悬停时由 `LookMaterials` 压成半透明。
+    room_shell: bool,
 }
 
 /// 拾取只依赖模型身份，不依赖它使用 StandardMaterial 还是专用虚线材质。
@@ -1408,6 +1442,7 @@ fn setup(
         hole_labels: Vec::new(),
         hole_label_uvs: Vec::new(),
         look,
+        pixels_per_point: 1.0,
     });
     commands.insert_resource(OrbitCamera::default());
     // E3D 外观的环境立方体贴图：六张内嵌 PNG 解一次，所有 SglLookMaterial 共用。
@@ -1444,6 +1479,16 @@ fn setup(
     if !indirect.0 {
         view_camera.insert(NoIndirectDrawing);
     }
+    // 选中描边的遮罩相机挂成主相机的子实体；它的两张图只跟视口的屏幕分辨率走，与主相机的超采样倍数无关。
+    let view_camera = view_camera.id();
+    selection_outline::spawn_selection_mask(
+        &mut commands,
+        &mut images,
+        view_camera,
+        INITIAL_SIZE,
+        max_texture_dim,
+        indirect.0,
+    );
     // 启动时说一句跑在哪块卡 / 哪条后端上：后端相关的画面问题（如上）排查时第一句就要问这个。
     if let Some(adapter) = adapter.as_deref() {
         let info = adapter.get_info();
@@ -1878,6 +1923,14 @@ fn type_color(generic: &str) -> Color {
     }
 }
 
+/// 房间壳：房间与它的面板（`ROOM` / `PANE`）。在册房间的面板就是 PANE，一块往往就是整间房的体积。
+fn is_room_shell(generic: &str) -> bool {
+    matches!(
+        PdmsGenericType::from_str(generic).unwrap_or(PdmsGenericType::UNKOWN),
+        PdmsGenericType::ROOM | PdmsGenericType::PANE
+    )
+}
+
 /// 一个类型的 PBR 材质。双面 + 关背面剔除保留原壳
 /// 「管壁两面都画」的行为——PDMS 网格法线不保证朝外，剔一面会漏。
 fn model_material(color: Color) -> StandardMaterial {
@@ -1973,8 +2026,8 @@ fn xray_material() -> StandardMaterial {
 }
 
 /// 一块网格此刻的显示状态。E3D 外观下六态六色（常态 / 悬停预选橙 / highlight 白 / CE 黄 / X-Ray 蓝 /
-/// X-Ray 叠选中黄），PBR 外观只有三枚材质，CE 与 Highlight 落到同一枚高亮、X-Ray 两态落到同一枚半透明蓝
-/// （都由 `LookMaterials` 裁决）。
+/// X-Ray 叠选中黄），PBR 外观四色：常态类型色、悬停预选橙（实体另带一点自发光）、CE 与 Highlight 同一个
+/// 选中色、X-Ray 两态同一枚半透明蓝（都由 `LookMaterials` 裁决）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum MaterialState {
     Base,
@@ -1985,9 +2038,16 @@ enum MaterialState {
     /// 主选中（E3D 的 CE）。
     Ce,
     XRay,
-    /// X-Ray 命中且同时在选中集里：穿透保留，颜色换成 CE 黄、alpha 抬到 160——
-    /// 否则房间视图里点中什么都只是那片淡蓝，「点了谁」看不出来。
+    /// X-Ray 命中且同时在选中集里：穿透保留，颜色换成 CE 黄、alpha 抬到 160（房间壳是 96，与它不开
+    /// X-Ray 时的选中同一档）——否则房间视图里点中什么都只是那片淡蓝，「点了谁」看不出来。
     XraySelected,
+}
+
+impl MaterialState {
+    /// 这个状态描不描边：选中的都描（含 X-Ray 叠选中），悬停与常态不描——描边留给「选了谁」。
+    fn outlined(self) -> bool {
+        matches!(self, Self::Ce | Self::Highlight | Self::XraySelected)
+    }
 }
 
 /// 普通实体与无效 TUBI 共用的唯一状态裁决：X-Ray > CE > Highlight > Hover > Base，且 refno / owner
@@ -2149,6 +2209,7 @@ fn load_models(
             let refno = model.refno.refno();
             let owner = model.owner.refno();
             let colour = type_color(&model.generic).to_srgba().to_u8_array();
+            let room_shell = is_room_shell(&model.generic);
             let visible = initial_model_visibility(&desired_visibility, refno, owner);
             let visibility = if visible {
                 Visibility::Visible
@@ -2198,6 +2259,7 @@ fn load_models(
                                 owner,
                                 colour,
                                 line: true,
+                                room_shell,
                             },
                             ModelPickTarget { refno },
                             NotShadowCaster,
@@ -2220,6 +2282,7 @@ fn load_models(
                                 owner,
                                 colour,
                                 line: false,
+                                room_shell,
                             },
                             ModelPickTarget { refno },
                         ));
@@ -2259,10 +2322,14 @@ fn load_models(
 }
 
 fn begin_mesh_progress(total: usize) -> MeshLoadProgress {
+    let now = Instant::now();
     MeshLoadProgress {
         done: 0,
         total,
         errors: Vec::new(),
+        spawned_at: Some(now),
+        // 零网格的批当场就是终态。
+        settled_at: (total == 0).then_some(now),
     }
 }
 
@@ -2308,10 +2375,17 @@ fn update_mesh_progress(mut view: ResMut<View3d>, assets: Res<AssetServer>) {
     }
     view.render_dirty.extend(settled_now);
     let total = view.loading_meshes.len();
+    // 生成时刻随上一拍带下来；终态那一拍补上落定时刻（计划 T0 的两个回报点）。
+    let spawned_at = view
+        .mesh_progress
+        .as_ref()
+        .and_then(|progress| progress.spawned_at);
     view.mesh_progress = Some(MeshLoadProgress {
         done,
         total,
         errors,
+        spawned_at,
+        settled_at: (done == total).then(Instant::now),
     });
     if done == total {
         // 整批有了结果：失败的那些挑出来留着。换过网格目录之后要重来的就是它们，
@@ -2920,7 +2994,8 @@ fn orbit_camera(camera: &mut Transform, focus: Vec3, x: f32, y: f32) {
 
 /// 全场材质刷新：选择集 / X-Ray / 外观变了，或有新的 `ModelMesh` 出生（装模型、房间截断补的兄弟段），
 /// 就按 `material_state` 各态从 [`LookMaterials`] 取句柄挂上。模型网格出生时不带材质，材质只在
-/// 这里给——一个出处，两种外观才不会各漏一处。
+/// 这里给——一个出处，两种外观才不会各漏一处。选中描边要的遮罩层（`selection_outline`）也跟着状态在这里
+/// 挂 / 摘：选中的挂，其余摘。
 ///
 /// 悬停是例外：它一帧能换好几件，而「指着谁」只影响被指的那一两个实体，全场遍历没必要。所以悬停
 /// 目标变了只重挑「旧目标 + 新目标」命中的实体，其余实体的悬停态没变、句柄原样留着。要重挑谁由
@@ -2940,6 +3015,7 @@ fn apply_materials(
         &ModelMesh,
         Option<&mut MeshMaterial3d<StandardMaterial>>,
         Option<&mut MeshMaterial3d<SglLookMaterial>>,
+        Has<RenderLayers>,
     )>,
 ) {
     // 全场刷的条件：选择集 / 外观脏了，或有新网格要补材质。悬停只脏时不走全场。
@@ -2967,7 +3043,7 @@ fn apply_materials(
         env: env.0.clone(),
         xray: xray.0.clone(),
     };
-    for (entity, mesh, pbr, sgl_material) in &mut meshes {
+    for (entity, mesh, pbr, sgl_material, masked) in &mut meshes {
         if !full
             && !hover_targets
                 .iter()
@@ -2986,6 +3062,17 @@ fn apply_materials(
         look_materials
             .resolve(look, mesh, state, &mut assets)
             .attach(entity, pbr, sgl_material, &mut commands);
+        // 选中描边：选中件多挂一层给遮罩相机看，不再选中就摘掉。只在要变时动，免得白触发变更检测。
+        let outlined = state.outlined();
+        if outlined != masked {
+            if outlined {
+                commands
+                    .entity(entity)
+                    .insert(selection_outline::selected_layers());
+            } else {
+                commands.entity(entity).remove::<RenderLayers>();
+            }
+        }
     }
 }
 
@@ -3213,6 +3300,7 @@ pub(crate) fn blank_view() -> View3d {
         hole_labels: Vec::new(),
         hole_label_uvs: Vec::new(),
         look: ViewportLook::default(),
+        pixels_per_point: 1.0,
     }
 }
 
@@ -4583,6 +4671,8 @@ mod tests {
             done: 2,
             total: 2,
             errors: vec!["meshes/missing.mesh: not found".into()],
+            spawned_at: None,
+            settled_at: Some(Instant::now()),
         });
 
         assert_eq!(view.take_mesh_progress().unwrap().errors.len(), 1);
@@ -4594,6 +4684,13 @@ mod tests {
         let progress = begin_mesh_progress(0);
         assert!(progress.finished());
         assert!(progress.errors.is_empty());
+        // 零网格的批：生成即落定，两个时刻都在（装载计时读它们）。
+        assert!(progress.spawned_at.is_some());
+        assert_eq!(progress.settled_at, progress.spawned_at);
+        // 还在等网格的批只有生成时刻。
+        let pending = begin_mesh_progress(3);
+        assert!(pending.spawned_at.is_some());
+        assert!(pending.settled_at.is_none());
     }
 
     #[test]
@@ -5268,6 +5365,7 @@ mod tests {
                 owner,
                 colour: type_color(generic).to_srgba().to_u8_array(),
                 line: false,
+                room_shell: is_room_shell(generic),
             })
             .id()
     }
@@ -5325,8 +5423,8 @@ mod tests {
             .unwrap()
     }
 
-    /// PBR 外观 = 改动前：选中换成橙红高亮，取消回到同一枚类型色材质。网格出生不带材质，
-    /// 第一帧靠 `Added<ModelMesh>` 补上。
+    /// PBR 外观：选中换成橙红填色并挂上遮罩层（选中描边），取消回到同一枚类型色材质、摘掉遮罩层。
+    /// 网格出生不带材质，第一帧靠 `Added<ModelMesh>` 补上。
     #[test]
     fn selection_highlight_replaces_and_restores_the_type_material() {
         let refno = RefU64::from(42);
@@ -5348,6 +5446,10 @@ mod tests {
                 .is_none(),
             "PBR 外观下没有 SGL 组件"
         );
+        assert!(
+            app.world().entity(entity).get::<RenderLayers>().is_none(),
+            "常态不挂遮罩层"
+        );
 
         app.world_mut()
             .resource_mut::<View3d>()
@@ -5359,6 +5461,11 @@ mod tests {
             base_colour_of(&app, &highlight),
             SELECT_COLOR.to_srgba().to_u8_array()
         );
+        assert_eq!(
+            app.world().entity(entity).get::<RenderLayers>(),
+            Some(&selection_outline::selected_layers()),
+            "选中件多挂一层给遮罩相机看（选中描边）"
+        );
 
         app.world_mut()
             .resource_mut::<View3d>()
@@ -5368,6 +5475,10 @@ mod tests {
             standard_material_of(&app, entity),
             base,
             "取消选中回到同一枚常态材质，不新建"
+        );
+        assert!(
+            app.world().entity(entity).get::<RenderLayers>().is_none(),
+            "取消选中摘掉遮罩层"
         );
     }
 
@@ -5414,13 +5525,24 @@ mod tests {
             [255, 255, 255],
             "其它选中 = highlight 白"
         );
-        // 选中态直出颜色（不打光不反射），且一律不透明——否则半透明元素选中后会落进 Blend，
-        // 不进 prepass 就没有边线与伪阴影。
+        // 选中态是染色（明暗照算、不加白）；不透明的元素选中后仍不透明、仍进 prepass（边线与伪阴影照有）。
         for handle in [&ce, &highlight] {
             let material = sgl_material_value(&app, handle);
-            assert_eq!(material.params.flags.z, 1, "选中态直出颜色");
-            assert_eq!(material.opacity(), 1.0, "选中态不透明");
-            assert_eq!(material.alpha_mode(), AlphaMode::Opaque, "选中态进 prepass");
+            assert_eq!(
+                material.params.flags.z,
+                e3d_look::material::SHADING_TINT,
+                "选中态染色"
+            );
+            assert_eq!(material.opacity(), 1.0, "不透明元素选中后仍不透明");
+            assert_eq!(material.alpha_mode(), AlphaMode::Opaque, "仍进 prepass");
+        }
+        // 主选中与其它选中都描边：多挂一层给遮罩相机看。
+        for entity in [ea, eb] {
+            assert_eq!(
+                app.world().entity(entity).get::<RenderLayers>(),
+                Some(&selection_outline::selected_layers()),
+                "选中件该挂遮罩层"
+            );
         }
 
         {
@@ -5488,6 +5610,10 @@ mod tests {
         assert_ne!(hover, base, "被指的换成 active orange");
         assert_eq!(sgl_colour_of(&app, &hover), [255, 190, 0]);
         assert!(
+            app.world().entity(eb).get::<RenderLayers>().is_none(),
+            "悬停只换颜色，不描边"
+        );
+        assert!(
             app.world()
                 .entity(ea)
                 .get::<MeshMaterial3d<SglLookMaterial>>()
@@ -5537,6 +5663,76 @@ mod tests {
         assert_eq!(sgl_material_of(&app, ec), base, "离开视口撤掉悬停色");
     }
 
+    /// PBR 外观同样有悬停预选：被指的未选中件换成悬停橙（半透明件的透明度不变）、不描边，指针移开回到
+    /// 同一枚类型色材质；已选中件不被悬停色覆盖。
+    #[test]
+    fn pbr_look_tints_the_hovered_element_and_keeps_its_translucency() {
+        let pipe = RefU64::from(1);
+        let room = RefU64::from(2);
+        let mut app = materials_app(pbr_view());
+        let ep = spawn_model_mesh(&mut app, pipe, RefU64::from(70), "PIPE");
+        let er = spawn_model_mesh(&mut app, room, RefU64::from(71), "CE");
+        app.update();
+        let pipe_base = standard_material_of(&app, ep);
+        let room_base = standard_material_of(&app, er);
+        assert_eq!(base_colour_of(&app, &room_base)[3], 200);
+
+        {
+            let mut view = app.world_mut().resource_mut::<View3d>();
+            view.hovered = Some(room);
+            view.hover_dirty = true;
+        }
+        app.update();
+        assert_eq!(
+            base_colour_of(&app, &standard_material_of(&app, er)),
+            [255, 190, 0, 200],
+            "悬停橙，透明度还是元素自己的"
+        );
+        assert!(
+            app.world().entity(er).get::<RenderLayers>().is_none(),
+            "悬停只换颜色，不描边"
+        );
+        assert_eq!(
+            standard_material_of(&app, ep),
+            pipe_base,
+            "没被指的那一个句柄不动"
+        );
+
+        // 选中另一件、指针还停在原处：被指的照旧是悬停橙。
+        app.world_mut()
+            .resource_mut::<View3d>()
+            .set_selection(vec![pipe], Some(pipe));
+        app.update();
+        assert_eq!(
+            base_colour_of(&app, &standard_material_of(&app, er)),
+            [255, 190, 0, 200],
+            "选中别的件不撤悬停"
+        );
+
+        // 指针移到已选中的件上：它还是选中色、照旧描边，原来被指的回到同一枚类型色材质。
+        {
+            let mut view = app.world_mut().resource_mut::<View3d>();
+            view.hovered = Some(pipe);
+            view.hover_dirty = true;
+        }
+        app.update();
+        assert_eq!(
+            base_colour_of(&app, &standard_material_of(&app, ep)),
+            SELECT_COLOR.to_srgba().to_u8_array(),
+            "选中件不被悬停色覆盖"
+        );
+        assert_eq!(
+            app.world().entity(ep).get::<RenderLayers>(),
+            Some(&selection_outline::selected_layers()),
+            "选中件照旧描边"
+        );
+        assert_eq!(
+            standard_material_of(&app, er),
+            room_base,
+            "指针移走回到同一枚类型色材质，不新建"
+        );
+    }
+
     /// `set_selection`：不在集内的主选中按没有算；集与主选中都没变就不翻脏标，只换主选中也要刷。
     #[test]
     fn set_selection_keeps_the_primary_inside_the_set_and_only_dirties_on_change() {
@@ -5583,6 +5779,11 @@ mod tests {
 
         app.update();
         assert_eq!(standard_material_of(&app, entity), xray);
+        assert_eq!(
+            app.world().entity(entity).get::<RenderLayers>(),
+            Some(&selection_outline::selected_layers()),
+            "X-Ray 命中且选中：材质还是那枚半透明蓝，描边照有"
+        );
 
         {
             let mut view = app.world_mut().resource_mut::<View3d>();
@@ -5603,6 +5804,7 @@ mod tests {
         app.update();
         let base = standard_material_of(&app, entity);
         assert_ne!(base, highlight);
+        assert!(app.world().entity(entity).get::<RenderLayers>().is_none());
         assert_eq!(
             base_colour_of(&app, &base),
             type_color("PIPE").to_srgba().to_u8_array()

@@ -12,6 +12,7 @@ mod dimension_layer;
 mod focus_bounds;
 #[cfg(not(target_arch = "wasm32"))]
 mod gallery;
+mod load_timing;
 mod logs;
 mod mbd_api;
 mod model_update_api;
@@ -683,6 +684,8 @@ fn show_app(
     if let Some(refno) = view3d.take_picked() {
         app.handle_cmds(ctx, vec![Cmd::LocateElement(refno)]);
     }
+    // 装载计时（T0）：帧间隔在取网格进度之前量，落定那一帧也算进「期间」。
+    app.tick_load_timing();
     if let Some(progress) = view3d.take_mesh_progress() {
         app.sync_mesh_progress(progress);
     }
@@ -750,6 +753,8 @@ fn show_app(
         });
     // 主选中一并下发：E3D 外观把它染 CE 黄，其余选中染 highlight 白。
     view3d.set_selection(app.vm.selection.to_vec(), app.vm.selection.primary());
+    // 屏幕缩放一并下发：选中描边的宽度按逻辑点定，高分屏上要乘它。
+    view3d.set_pixels_per_point(ctx.pixels_per_point());
     if let Some(models) = app.pending_models.take() {
         view3d.load(models);
     }
@@ -1280,6 +1285,20 @@ impl TreeModel {
         }
     }
 
+    /// `targets` 里哪些是**顶层 SITE**（SITE 根层上的行）。显示 / 重装时服务供数对它们先拆成 ZONE
+    /// 再按成员取（计划 T1 / T2）；只认根层，ZONE 以下与分组入口都不算——拆只能拆到生成根之上。
+    fn top_sites_among(&self, targets: &[RefU64]) -> Vec<RefU64> {
+        targets
+            .iter()
+            .copied()
+            .filter(|target| {
+                self.roots.iter().any(|root| {
+                    root.refno.refno() == *target && root.noun.eq_ignore_ascii_case("SITE")
+                })
+            })
+            .collect()
+    }
+
     /// 这个 refno 属于哪个库。节点自己的 `dbnum` 是直接答案；还没物化出来的行
     /// 沿 `parent` 链往上走，任一跳落表就算数。都说不出回 `None`。
     fn dbnum_of(&self, refno: RefU64) -> Option<u32> {
@@ -1632,6 +1651,12 @@ struct App {
     xray_active_room: Option<RefU64>,
     /// 已查过的房间 -> 全部在册面板。重复点同一间房不再打一次详情查询。
     room_panel_cache: HashMap<RefU64, Vec<RefU64>>,
+    /// 在册 PANEL -> 所属房间（连上时取的那张登记表）。认「主选中是不是房间面板」靠它，不必等模型树
+    /// 展开到那一行。
+    panel_rooms: HashMap<RefU64, RefU64>,
+    /// 主选中已经去查过房间归属的那块 PANEL（[`App::ask_panel_room`]）。每个主选中只查一次：
+    /// 树每重建一次都会再看一眼，查失败或房间 X-Ray 被虚拟孔洞抢走之后不该又自己查回来。
+    panel_room_asked: Option<RefU64>,
     /// 模型还在路上、等它落地就取景的那间房（`Cmd::ShowRoomModel`）。
     ///
     /// 取景不能跟着指令一起下发：视口的包围盒来自模型查询回包里的 `world_aabb`，
@@ -1720,6 +1745,9 @@ struct App {
     model_owner: HashMap<RefU64, RefU64>,
     model_show_waiting: HashSet<RefU64>,
     latest_mesh_progress: Option<plant_ui_view3d::MeshLoadProgress>,
+    /// 装载链路的阶段计时（计划 T0）：`PLANT_UI_LOAD_TIMING=1` 时点眼睛开账、网格落定收账写一行；
+    /// 关着恒 `None`，没有别的开销。
+    load_timing: Option<load_timing::LoadTiming>,
     model_scope_failures: usize,
     model_progress_until: Option<Instant>,
     /// 范围定位的「正在查询」提示压着的到期时刻：(epoch, target, 到期)。
@@ -2936,6 +2964,8 @@ impl App {
             mirror_error_said: None,
             xray_active_room: None,
             room_panel_cache: HashMap::new(),
+            panel_rooms: HashMap::new(),
+            panel_room_asked: None,
             pending_room_frame: None,
             room_pane_focus: None,
             nav: nav_history::NavHistory::default(),
@@ -2976,6 +3006,7 @@ impl App {
             model_owner: HashMap::new(),
             model_show_waiting: HashSet::new(),
             latest_mesh_progress: None,
+            load_timing: None,
             model_scope_failures: 0,
             model_progress_until: None,
             focus_scope_pending: None,
@@ -3049,9 +3080,11 @@ impl App {
                     }
                     self.tree.roots = info.sites;
                     self.install_group_roots(info.group_roots);
-                    // 在册房间表：右键菜单靠它认出「这一行是房间」。230 行级，连上就取一次；
-                    // 取不到只是少一项菜单，不进日志——房间树那条路自己会报查询失败。
+                    // 在册房间表：右键菜单靠它认出「这一行是房间」，选中时靠它认出「这块是
+                    // 房间面板」好开房间 X-Ray。230 行级，连上就取一次；取不到只是少一项菜单、
+                    // 选中面板退回看模型树认，不进日志——房间树那条路自己会报查询失败。
                     self.vm.room_refnos.clear();
+                    self.panel_rooms.clear();
                     let _ = self.bridge.req.send(data::Req::PanelRooms);
                     // 换面之后的重装（ADR-0026 热切，计划 §5.3）：清场前的快照到这儿才
                     // 移进取回工作那一格，随后走取回工作那条现成路——`clear_scene_for_reload`
@@ -3443,12 +3476,15 @@ impl App {
                         }
                     };
                 }
-                // 在册房间表：右键菜单靠它认出「这一行是房间」。取一次就够，失败只是
-                // 少一项菜单，不打扰用户——房间树那条路自己会说查询失败。
+                // 在册房间表：右键菜单靠它认出「这一行是房间」，选中时靠它认出房间面板。
+                // 取一次就够，失败只是少一项菜单，不打扰用户——房间树那条路自己会说查询失败。
                 data::Evt::PanelRooms(result) => {
                     if let Ok(rows) = result {
                         // `all_panel_rooms` 给的是 `(面板, 房间)`；树上判房间用 `in` 那一头。
-                        self.vm.room_refnos = rows.into_iter().map(|(_, room)| room).collect();
+                        self.vm.room_refnos = rows.iter().map(|&(_, room)| room).collect();
+                        self.panel_rooms = rows.into_iter().collect();
+                        // 表比选中晚到：已经选着的那块面板此刻才认得出来。
+                        self.ask_panel_room();
                     }
                 }
                 // Spooling：六类分组统计回包。
@@ -3680,6 +3716,10 @@ impl App {
                     total,
                 } if epoch == self.model_scope_epoch => {
                     if self.model_scope_pending.contains(&target) {
+                        // 装载计时（T0）：拆成员时第一个成员收完 = 记录首页到。
+                        if done >= 1 && let Some(timing) = self.load_timing.as_mut() {
+                            timing.note_records_progress(Instant::now());
+                        }
                         self.model_progress_until = None;
                         self.vm.model_load = Some(if total == 0 {
                             ModelLoadVm::Resolving("解析模型范围…".into())
@@ -3694,6 +3734,21 @@ impl App {
                 }
                 data::Evt::ModelScope(epoch, target, result) if epoch == self.model_scope_epoch => {
                     self.model_scope_pending.remove(&target);
+                    // 装载计时（T0）：一个目标的记录回包到了；全部目标都回了 = 记录末页到。
+                    if let Some(timing) = self.load_timing.as_mut() {
+                        let (requests, bytes, records) = result
+                            .as_ref()
+                            .map_or((0, 0, 0), |loaded| {
+                                (loaded.requests, loaded.bytes, loaded.records.len())
+                            });
+                        timing.note_scope(
+                            Instant::now(),
+                            requests,
+                            bytes,
+                            records,
+                            self.model_scope_pending.len(),
+                        );
+                    }
                     // 老服务端（ADR-086 之前）对没生成过的范围回 409 `not_generated`：与新服务端的
                     // 200 空是同一件事，按查空处理、不记 ERROR（ADR-0030 后果 6）。
                     let result = match result {
@@ -4478,6 +4533,8 @@ impl App {
                                     .req
                                     .send(data::Req::Models {
                                         roots,
+                                        // 顶层 SITE 拆成 ZONE 取（计划 T1）。
+                                        split_sites: self.tree.top_sites_among(&snapshot.targets),
                                         // 服务供数以清场前点过眼睛的那些目标为祖先重查
                                         // （ADR-0030 D3）：一个 ZONE 一次往返，不逐个模型问；
                                         // 只查不生。
@@ -4798,6 +4855,26 @@ impl App {
         } else {
             self.fail_model_progress(format!("模型加载失败（{failures} 项）"));
         }
+        self.finish_load_timing();
+    }
+
+    /// 装载计时（T0）收账：这次显示到了终态（网格全部落定、或查空 / 失败就地收口），把五个时刻与
+    /// 期间最长一帧写成一行——日志面板一行，stderr 一行（量测时从终端抄）。关着时 `load_timing`
+    /// 恒 `None`，这里什么都不做。
+    fn finish_load_timing(&mut self) {
+        let Some(timing) = self.load_timing.take() else {
+            return;
+        };
+        let line = timing.summary();
+        eprintln!("[plant-ui 装载计时] {line}");
+        self.logs.info(&mut self.vm.logs, line);
+    }
+
+    /// 装载计时（T0）每帧一拍：量帧间隔，记加载期间最长的那一帧。没在计时就是一次 `Option` 判空。
+    fn tick_load_timing(&mut self) {
+        if let Some(timing) = self.load_timing.as_mut() {
+            timing.tick_frame(Instant::now());
+        }
     }
 
     fn tick_model_progress(&mut self) {
@@ -4837,6 +4914,10 @@ impl App {
     }
 
     fn sync_mesh_progress(&mut self, progress: plant_ui_view3d::MeshLoadProgress) {
+        // 装载计时（T0）：view3d 经回执带来的两个时刻——首批实体生成、网格全部落定。
+        if let Some(timing) = self.load_timing.as_mut() {
+            timing.note_mesh_progress(progress.spawned_at, progress.settled_at);
+        }
         self.latest_mesh_progress = (!progress.finished()).then(|| progress.clone());
         if progress.finished() {
             let before = self.vm.refresh_generation;
@@ -7056,7 +7137,26 @@ impl App {
     fn refetch_rooms(&mut self, refno: RefU64) {
         self.vm.rooms.begin_query();
         let _ = self.bridge.req.send(data::Req::ElementRooms(refno));
-        if self.tree.noun(refno).is_some_and(is_panel_noun) {
+        self.panel_room_asked = None;
+        self.ask_panel_room();
+    }
+
+    /// 主选中是房间面板就去查它属于哪间房（回包落地开房间 X-Ray），每个主选中只查一次。
+    ///
+    /// 认面板先看在册登记表、再看模型树（`vm.selection_noun`，选中与树重建时同步）：从房间树、
+    /// 三维拾取或搜索选中时，模型树多半还没展开到那一行，只看树就认不出来。登记表晚到、
+    /// 树重建之后各再看一眼。
+    fn ask_panel_room(&mut self) {
+        let target = panel_room_query(
+            self.vm.selection.primary(),
+            self.panel_room_asked,
+            |refno| {
+                self.panel_rooms.contains_key(&refno)
+                    || self.vm.selection_noun.as_deref().is_some_and(is_panel_noun)
+            },
+        );
+        if let Some(refno) = target {
+            self.panel_room_asked = Some(refno);
             let _ = self.bridge.req.send(data::Req::PanelRoom(refno));
         }
     }
@@ -7673,19 +7773,28 @@ impl App {
                 self.model_progress_until = None;
                 self.vm.model_load = Some(ModelLoadVm::Resolving("解析模型范围…".into()));
                 let targets = query;
-                if self
+                let sent = self
                     .bridge
                     .req
                     .send(data::Req::ModelScopes {
                         epoch: self.model_scope_epoch,
+                        // 顶层 SITE 拆成 ZONE 取（计划 T1）：宿主手里有根层，服务面不必再问。
+                        split_sites: self.tree.top_sites_among(&targets),
                         targets: targets.clone(),
                         base: model_update_api::base_url(),
                         project: self.vm.project.clone(),
                         mdb: self.mdb.clone(),
                         namespace: self.namespace.clone(),
                     })
-                    .is_err()
-                {
+                    .is_ok();
+                // 装载计时（T0）：显示方向的一次点击开一本账；途中再点就另开一本（量的是最近那一下）。
+                if sent && visible && load_timing::enabled() {
+                    self.load_timing = Some(load_timing::LoadTiming::start(
+                        Instant::now(),
+                        targets.len(),
+                    ));
+                }
+                if !sent {
                     for target in targets {
                         self.model_scope_pending.remove(&target);
                         self.tree.pending_direction.remove(&target);
@@ -8164,6 +8273,8 @@ impl App {
         // 无选中时按「让它出来」兜底，与 `sync_selection_branch` 的 `.unwrap_or(true)` 同一口径。
         self.vm.selection_next_visible = true;
         self.vm.room_refnos.clear();
+        self.panel_rooms.clear();
+        self.panel_room_asked = None;
         // 房间树是旧接入点的：整份丢掉，面板回到 Idle，下次画出来再拉；在途的回包凭帧号作废。
         self.room_tree.clear();
         self.room_tree_epoch = self.room_tree_epoch.wrapping_add(1);
@@ -8287,6 +8398,8 @@ impl App {
         self.vm.element_count = self.tree.element_count();
         // 树变了，主选中头上的 BRAN 可能这才加载到（视口拾取 -> 定位 -> 祖先落地）。
         self.sync_selection_branch();
+        // 同理，主选中那一行这才展开出来、认得出是 PANEL 的话，房间 X-Ray 补查一次。
+        self.ask_panel_room();
         // 房间树的 eye 读的是同一份实际可见性账，跟着一起重新展平；「加载模型」的取景也在这里等范围回包。
         self.settle_room_tree_frame();
         self.rebuild_room_tree();
@@ -9064,7 +9177,8 @@ mod tests {
         empty_props_verdict, expand_room_model_targets,
         finished_after, generate_outcome, generate_summary, group_skip_note, in_mdb_path,
         is_panel_noun, mark_model_scope_unavailable, model_drains_idle, model_progress_terminal,
-        model_source_changed_line, model_visibility_plan, needs_children_query, read_face_switch,
+        model_source_changed_line, model_visibility_plan, needs_children_query, panel_room_query,
+        read_face_switch,
         refresh_anchor, regenerate_label, reload_snapshot, resolve_panel_room_reply,
         restore_model_reload, scope_not_generated, settle_pending_directions,
         settle_refresh_generation, settled_pending_roots, sync_ime_window, take_hidden_for_replay,
@@ -9393,6 +9507,25 @@ mod tests {
         assert!(is_panel_noun("pane"));
         assert!(!is_panel_noun("BRAN"));
         assert!(!is_panel_noun("EQUI"));
+    }
+
+    /// 认面板不等模型树（调用方把在册登记表也算进 `is_panel`），但同一个主选中只查一次：
+    /// 树重建、登记表晚到都会再问一遍，不能每次都打库。
+    #[test]
+    fn panel_room_query_asks_once_per_recognised_primary() {
+        let panel = RefU64(11);
+        let pipe = RefU64(12);
+        let is_panel = |refno: RefU64| refno == panel;
+
+        assert_eq!(panel_room_query(Some(panel), None, is_panel), Some(panel));
+        assert_eq!(panel_room_query(Some(panel), Some(panel), is_panel), None);
+        assert_eq!(
+            panel_room_query(Some(panel), Some(pipe), is_panel),
+            Some(panel),
+            "上一个主选中的「查过」不作数"
+        );
+        assert_eq!(panel_room_query(Some(pipe), None, is_panel), None);
+        assert_eq!(panel_room_query(None, None, is_panel), None);
     }
 
     #[test]
@@ -9880,6 +10013,27 @@ mod tests {
         tree.note_dbnum(&zero);
         assert_eq!(tree.dbnum_of(RefU64(4)), None, "dbnum = 0 不落表");
         assert_eq!(tree.dbnum_of(RefU64(99)), None, "查不到就说不出");
+    }
+
+    /// 拆成 ZONE 取（计划 T1）只对**顶层 SITE**：根层上的 SITE 行算，ZONE、根层下的 SITE、分组入口
+    /// 都不算；顺序随 `targets`。眼睛与取回工作的两条请求都经它点名。
+    #[test]
+    fn top_sites_among_picks_only_root_layer_sites() {
+        let site_a = RefU64(1);
+        let site_b = RefU64(2);
+        let zone = RefU64(3);
+        let nested_site = RefU64(4);
+        let group = RefU64(5);
+        let mut tree = TreeModel::default();
+        tree.roots = vec![node(site_a, "SITE", 2), node(site_b, "SITE", 0)];
+        tree.group_roots = vec![node(group, "GPWL", 1)];
+        tree.children
+            .insert(site_a, vec![node(zone, "ZONE", 1), node(nested_site, "SITE", 0)]);
+        assert_eq!(
+            tree.top_sites_among(&[zone, site_b, nested_site, group, site_a]),
+            vec![site_b, site_a]
+        );
+        assert!(tree.top_sites_among(&[zone, RefU64(99)]).is_empty());
     }
 
     /// 取回工作与换面都要先排干数据线程的在途请求：发之前先放弃「重新生成」那一趟的补齐等待，
@@ -12635,6 +12789,16 @@ enum PanelRoomResolution {
 
 fn is_panel_noun(noun: &str) -> bool {
     noun.eq_ignore_ascii_case("PANE")
+}
+
+/// 要不要去查主选中的房间归属：认得出是 PANEL，且这个主选中还没查过。
+fn panel_room_query(
+    primary: Option<RefU64>,
+    asked: Option<RefU64>,
+    is_panel: impl FnOnce(RefU64) -> bool,
+) -> Option<RefU64> {
+    let refno = primary?;
+    (asked != Some(refno) && is_panel(refno)).then_some(refno)
 }
 
 fn resolve_panel_room_reply(

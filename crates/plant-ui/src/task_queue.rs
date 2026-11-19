@@ -318,6 +318,34 @@ pub struct Health {
     /// （`resident`）。老服务端没这一格 → `None` → 「等房间参照模型」只画 spinner。
     #[serde(default)]
     pub room_build: Option<RoomBuildHealth>,
+    /// gen-model `/health.capabilities`：只加不改的能力协商块（spec §4.1）。老服务端没有整块
+    /// → 每格 `None`，按「没声明」处理。
+    #[serde(default)]
+    pub capabilities: HealthCapabilities,
+}
+
+/// `/health.capabilities` 里本端读的格。别的格（整库能力、网格格式、打包取网格的上限…）这里不认，
+/// 要用时再加；没列出的键 serde 直接略过。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct HealthCapabilities {
+    /// 批量形 `model/records` 一发最多带几个根（spec §4.5.2）。没声明、`null`、不是整数
+    /// → `None` = 这个后端不打包。字面值宽松：一个声明格写坏了不该让整份 `/health` 解析失败。
+    #[serde(default, deserialize_with = "lenient_u64")]
+    pub model_records_batch_max_roots: Option<u64>,
+}
+
+/// 只认非负整数；别的（字符串、小数、`null`、对象）一律 `None`，不报错。
+fn lenient_u64<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Number(u64),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Raw::deserialize(deserializer)? {
+        Raw::Number(n) => Some(n),
+        Raw::Other(_) => None,
+    })
 }
 
 /// `/health.room_build`：房间面的一格。界面只读 `resident`（常驻参照模型）；
@@ -5048,6 +5076,36 @@ mod tests {
 
         let legacy: Health = serde_json::from_str(r#"{"project":"ProjAMS"}"#).unwrap();
         assert_eq!(legacy.data_read_mode, None);
+    }
+
+    /// `/health.capabilities`（spec §4.1）：批量形上限真解出来；老服务端没有整块、块里没这一格、
+    /// 格写成字符串 / 小数 / null 都是「没声明」，整份 `/health` 照常解析、老字段不受影响。
+    #[test]
+    fn health_capabilities_read_the_batch_limit_and_tolerate_absence() {
+        let declared: Health = serde_json::from_str(
+            r#"{"project":"ProjAMS","data_read_mode":"direct",
+                "capabilities":{"dbnum_model_ensure":true,"model_records_batch_max_roots":64,
+                                "mesh_formats":["mesh","glb"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(declared.capabilities.model_records_batch_max_roots, Some(64));
+        assert_eq!(declared.data_read_mode.as_deref(), Some("direct"));
+
+        let legacy: Health = serde_json::from_str(r#"{"project":"ProjAMS"}"#).unwrap();
+        assert_eq!(legacy.capabilities, HealthCapabilities::default());
+        assert_eq!(legacy.capabilities.model_records_batch_max_roots, None);
+
+        for odd in [r#""64""#, "64.5", "null", "-1", r#"{"max":64}"#] {
+            let health: Health = serde_json::from_str(&format!(
+                r#"{{"project":"ProjAMS","capabilities":{{"model_records_batch_max_roots":{odd}}}}}"#
+            ))
+            .unwrap_or_else(|error| panic!("{odd}：{error}"));
+            assert_eq!(
+                health.capabilities.model_records_batch_max_roots, None,
+                "{odd} 不是非负整数，按没声明"
+            );
+            assert_eq!(health.project, "ProjAMS");
+        }
     }
 
     /// 契约形状对不上是最贵的一类错：终态摘要的 `batch` 是**单数**，

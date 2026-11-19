@@ -948,6 +948,8 @@ impl Engine {
                     stale_catalogue_dbnums: vec![8191],
                     unreadable_catalogue_dbnums: 0,
                 }),
+                // 剧本里的服务端不声明能力块：和没有这一块的老服务端同一档（取记录不打包）。
+                capabilities: Default::default(),
             }),
             pending: self.pending.clone(),
             pending_known: true,
@@ -2467,6 +2469,8 @@ pub fn model_scope_fixture(target: RefU64) -> crate::model_update_api::ModelReco
             })
             .collect(),
         sources: Vec::new(),
+        requests: 0,
+        bytes: 0,
     }
 }
 

@@ -143,6 +143,8 @@ impl StoreReadFace {
             // 库供数没有直段身份（`tubi_relate` 行折成的 `GeomInstQuery` 里没这一格）：场景里只按 refno 认。
             records: records.into_iter().map(plant_ui::ModelRecord::from).collect(),
             sources: Vec::new(),
+            requests: 0,
+            bytes: 0,
         })
     }
 

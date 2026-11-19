@@ -222,9 +222,12 @@ pub enum Req {
     /// `roots` 是快照里的模型 refno（库供数按它一根一条 `anc CONTAINS` 查）；`scope_targets`
     /// 是清场前点过眼睛的树目标——服务供数以它们为祖先问 `/model/records`（一个 ZONE 一次往返，
     /// 不必逐叶子问）。`scope_targets` 为空 = 老快照没有范围记录，服务供数退到按 `roots` 逐个查。
+    /// `split_sites` 是 `scope_targets` 里的顶层 SITE（宿主从树根层认出来的）：服务供数对它们
+    /// 先拆成 ZONE 再按成员取（计划 T1 / T2）。
     Models {
         roots: Vec<RefU64>,
         scope_targets: Vec<RefU64>,
+        split_sites: Vec<RefU64>,
         /// 这次重装是不是在清偿「数据已应用、三维欠着」那笔账（`Evt::Models` 原样带回）。
         debt_reload: bool,
         base: String,
@@ -235,9 +238,12 @@ pub enum Req {
     /// eye 显示路径：以点下去的每个目标为祖先查已生成的模型（ADR-0030 D1）。查询这一臂
     /// 本身只查不生；查空 / 库无模型时**默认重新生成**的兜底在宿主（`Evt::ModelScope`
     /// 回包与 `Evt::DbnumModelProbe` 会合后由 [`Req::GenerateModels`] 发出）。
+    /// `split_sites` 是 `targets` 里的顶层 SITE（宿主从树根层认出来的）：服务供数对它们先拆成
+    /// ZONE 再按成员有界并发取（计划 T1 / T2）；其余目标一个祖先一发，形状不变。
     ModelScopes {
         epoch: u64,
         targets: Vec<RefU64>,
+        split_sites: Vec<RefU64>,
         base: String,
         project: String,
         mdb: String,
@@ -702,6 +708,7 @@ enum ModelLoad {
     Replace {
         roots: Vec<RefU64>,
         scope_targets: Vec<RefU64>,
+        split_sites: Vec<RefU64>,
         debt_reload: bool,
         base: String,
         project: String,
@@ -711,6 +718,7 @@ enum ModelLoad {
     Scopes {
         epoch: u64,
         targets: Vec<RefU64>,
+        split_sites: Vec<RefU64>,
         base: String,
         project: String,
         mdb: String,
@@ -727,6 +735,7 @@ fn route_model_load(req: Req, tx: &mpsc::Sender<ModelLoad>) -> Result<Option<Req
         Req::Models {
             roots,
             scope_targets,
+            split_sites,
             debt_reload,
             base,
             project,
@@ -736,6 +745,7 @@ fn route_model_load(req: Req, tx: &mpsc::Sender<ModelLoad>) -> Result<Option<Req
             .send(ModelLoad::Replace {
                 roots,
                 scope_targets,
+                split_sites,
                 debt_reload,
                 base,
                 project,
@@ -747,6 +757,7 @@ fn route_model_load(req: Req, tx: &mpsc::Sender<ModelLoad>) -> Result<Option<Req
         Req::ModelScopes {
             epoch,
             targets,
+            split_sites,
             base,
             project,
             mdb,
@@ -755,6 +766,7 @@ fn route_model_load(req: Req, tx: &mpsc::Sender<ModelLoad>) -> Result<Option<Req
             .send(ModelLoad::Scopes {
                 epoch,
                 targets,
+                split_sites,
                 base,
                 project,
                 mdb,
@@ -860,6 +872,7 @@ async fn room_volume_records(
             &ModelInstancesReq {
                 roots: &[room],
                 scope_roots: &[room],
+                split_sites: &[],
                 identity: ServiceIdentity {
                     base: &base,
                     project: &scope.project,
@@ -1578,6 +1591,7 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>, kind: ReadF
                     ModelLoad::Replace {
                         roots,
                         scope_targets,
+                        split_sites,
                         debt_reload,
                         base,
                         project,
@@ -1607,6 +1621,7 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>, kind: ReadF
                                     &ModelInstancesReq {
                                         roots: &roots,
                                         scope_roots: &scope_roots,
+                                        split_sites: &split_sites,
                                         identity: ServiceIdentity {
                                             base: &base,
                                             project: &project,
@@ -1633,12 +1648,20 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>, kind: ReadF
                     ModelLoad::Scopes {
                         epoch,
                         targets,
+                        split_sites,
                         base,
                         project,
                         mdb,
                         namespace,
                     } => {
                         for target in targets {
+                            // 顶层 SITE 拆成 ZONE 取（计划 T1）：只对宿主点名的那几个；其余目标
+                            // 仍是一个祖先一发。
+                            let split: &[RefU64] = if split_sites.contains(&target) {
+                                std::slice::from_ref(&target)
+                            } else {
+                                &[]
+                            };
                             if crate::sim::enabled() {
                                 // 剧本里只有房间树那根 BRAN 有几条零文件就能画的直段（逐段眼睛的演示料），
                                 // 其余目标照旧空结果。
@@ -1660,6 +1683,7 @@ pub fn spawn(ctx: egui::Context, tasks: &bevy_wasm_tasks::Tasks<'_>, kind: ReadF
                                     &ModelInstancesReq {
                                         roots: &[target],
                                         scope_roots: &[target],
+                                        split_sites: split,
                                         identity: ServiceIdentity {
                                             base: &base,
                                             project: &project,
@@ -2328,6 +2352,7 @@ mod tests {
         Req::Models {
             roots,
             scope_targets,
+            split_sites: Vec::new(),
             debt_reload,
             base: "http://127.0.0.1:8022".into(),
             project: "SAM".into(),
@@ -2357,6 +2382,7 @@ mod tests {
                 Req::ModelScopes {
                     epoch: 7,
                     targets: vec![target],
+                    split_sites: vec![target],
                     base: "http://127.0.0.1:8022".into(),
                     project: "SAM".into(),
                     mdb: "/MDB".into(),
@@ -2368,8 +2394,9 @@ mod tests {
         ));
         assert!(matches!(
             model_rx.try_recv(),
-            Ok(ModelLoad::Scopes { epoch: 7, targets, base, project, mdb, namespace })
+            Ok(ModelLoad::Scopes { epoch: 7, targets, split_sites, base, project, mdb, namespace })
                 if targets == vec![target]
+                    && split_sites == vec![target]
                     && base == "http://127.0.0.1:8022"
                     && project == "SAM"
                     && mdb == "/MDB"
@@ -2390,6 +2417,7 @@ mod tests {
                 Req::ModelScopes {
                     epoch: 8,
                     targets: vec![target],
+                    split_sites: Vec::new(),
                     base: "http://127.0.0.1:8022".into(),
                     project: "SAM".into(),
                     mdb: "/MDB".into(),
@@ -2418,9 +2446,10 @@ mod tests {
         ));
         assert!(matches!(
             model_rx.try_recv(),
-            Ok(ModelLoad::Replace { roots, scope_targets, debt_reload: true, base, project, mdb, namespace })
+            Ok(ModelLoad::Replace { roots, scope_targets, split_sites, debt_reload: true, base, project, mdb, namespace })
                 if roots == vec![RefU64::from(1)]
                     && scope_targets == vec![bran, zone]
+                    && split_sites.is_empty()
                     && base == "http://127.0.0.1:8022"
                     && project == "SAM"
                     && mdb == "/MDB"
