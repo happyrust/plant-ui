@@ -751,6 +751,86 @@ fn element_attributes_body(
     .to_string()
 }
 
+/// `GET /api/v1/element/rooms` 的一条归属（gen-model `ElementRoomsResponse.memberships[]`）。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ElementRoomMembership {
+    /// 房间 FRMW；面板不在册时为 `null`。
+    #[serde(default)]
+    pub room: Option<String>,
+    pub room_num: String,
+    /// `{前缀}-{归一化房号}`；算不出时为 `null`。
+    #[serde(default)]
+    pub room_code: Option<String>,
+    pub panel: String,
+    #[serde(default)]
+    pub inside_count: u8,
+    #[serde(default)]
+    pub center_dist: f32,
+    #[serde(default)]
+    pub via_member: bool,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ElementRoomsReply {
+    #[serde(default)]
+    pub refno: String,
+    #[serde(default)]
+    pub memberships: Vec<ElementRoomMembership>,
+    /// `durable`（库上的 `room_relate` 边）/ `memory`（常驻房间模型现算）。
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// 一个构件的全部房间归属，**由服务端算**（spec §4.13.8）。
+///
+/// 此前 plant-ui 直连库自己拼 `room_relate` 图查询，那套写法在当前的 SurrealDB fork 上恒
+/// 返回空（`SELECT VALUE <-room_relate FROM <数组>` 拿不到行），于是同一个构件后端
+/// `e3d.room.lookup` 答得出 R512、界面显示「无房间归属」。归属口径由服务端一处定义，
+/// 客户端只负责把答案画出来。
+pub async fn element_rooms(
+    base: &str,
+    refno: aios_core::RefU64,
+    project: &str,
+    mdb: &str,
+    namespace: &str,
+) -> anyhow::Result<ElementRoomsReply> {
+    let query = element_rooms_query(refno, project, mdb, namespace);
+    get(base, &format!("/api/v1/element/rooms?{query}"))
+        .await
+        .map_err(|error| {
+            let failure = failure_of(&error);
+            if failure.code == "not_found"
+                || failure.message.contains("HTTP 404")
+                || failure.message.contains("405")
+            {
+                anyhow::anyhow!("gen-model 版本不支持房间归属查询，请升级 gen-model")
+            } else {
+                error
+            }
+        })
+}
+
+/// 查询串。身份三格与 `refno` 一起走 URL（这条是 GET）。
+fn element_rooms_query(
+    refno: aios_core::RefU64,
+    project: &str,
+    mdb: &str,
+    namespace: &str,
+) -> String {
+    let mut out = Vec::new();
+    for (key, value) in [
+        ("project", project),
+        ("mdb", mdb),
+        ("namespace", namespace),
+    ] {
+        if !value.is_empty() {
+            out.push(format!("{key}={}", urlencode(value)));
+        }
+    }
+    out.push(format!("refno={}", urlencode(&refno.to_slash_string())));
+    out.join("&")
+}
+
 /// `None` 必须**整个不发** `dbnums` 键——发 `null` 或空表都不行：老服务端的
 /// 请求体解析没有这个字段，多出来的键无害，但语义上 `Some([])` 是「一个批次
 /// 都不排」，与「全范围」是两个相反的东西，混了会把勾选门变成摆设。

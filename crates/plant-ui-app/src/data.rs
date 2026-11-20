@@ -900,6 +900,60 @@ fn panel_records(
         .collect()
 }
 
+/// 服务端的房间归属 → 界面用的 [`RoomRelation`]。
+///
+/// 归属口径（强度排序、子层聚合、面板在册与否）由服务端一处定义，客户端只做字段搬运。
+/// `refno` / `panel` 从服务端的字符串形态回解；解不出的整条丢掉——那是服务端给的坏行，
+/// 画出来只会误导。
+fn element_rooms_from_service_reply(
+    reply: &crate::model_update_api::ElementRoomsReply,
+) -> Vec<plant_ui_data::room::RoomRelation> {
+    use std::str::FromStr;
+    reply
+        .memberships
+        .iter()
+        .filter_map(|m| {
+            let panel = RefU64::from_str(&m.panel).ok()?;
+            Some(plant_ui_data::room::RoomRelation {
+                room: m.room.as_deref().and_then(|r| RefU64::from_str(r).ok()),
+                room_num: m.room_num.clone(),
+                room_code: m.room_code.clone(),
+                panel,
+                inside_count: m.inside_count,
+                center_dist: m.center_dist,
+                via_member: m.via_member,
+            })
+        })
+        .collect()
+}
+
+/// 「查看所属房间」的取数：问服务端（`GET /api/v1/element/rooms`）。
+async fn element_rooms_from_service(
+    refno: RefU64,
+    scope: &Scope,
+) -> anyhow::Result<Vec<plant_ui_data::room::RoomRelation>> {
+    let base = crate::model_update_api::base_url();
+    let reply = crate::model_update_api::element_rooms(
+        &base,
+        refno,
+        &scope.project,
+        &scope.mdb,
+        &scope.ns,
+    )
+    .await?;
+    let relations = element_rooms_from_service_reply(&reply);
+    // 归属来源（`durable` 库上边表 / `memory` 常驻模型现算）与条数一起留一行：
+    // 界面显示「无房间归属」时，这一行直接区分「算过、真不属于任何房」与「取数走了哪条路」。
+    eprintln!(
+        "[房间归属] {} 服务端返回 {} 条（source={}，应答 refno={}）",
+        refno.to_pdms_str(),
+        relations.len(),
+        reply.source.as_deref().unwrap_or("unknown"),
+        reply.refno
+    );
+    Ok(relations)
+}
+
 /// 并发通道里的一次交互读：查询、回执、叫醒 UI，整段自包含。
 ///
 /// 这里只放**互相独立**的读与 HTTP 往返——它们在 [`FuturesUnordered`] 里并发
@@ -934,8 +988,11 @@ async fn handle_read(
             let _ = evt_tx.send(Evt::Props(refno, r));
         }
         Req::ElementRooms(refno) => {
+            // 归属由服务端算（`GET /api/v1/element/rooms`）：客户端自己拼 `room_relate`
+            // 图查询在当前的 SurrealDB fork 上恒返回空（`SELECT VALUE <-room_relate FROM
+            // <数组>` 拿不到行），同一个构件后端答得出、界面显示「无房间归属」。
             let r = match require_mirror_feature("房间").await {
-                Ok(()) => plant_ui_data::room::element_rooms(refno.into()).await,
+                Ok(()) => element_rooms_from_service(refno, &scope).await,
                 Err(error) => Err(error),
             };
             let _ = evt_tx.send(Evt::ElementRooms(refno, r));
