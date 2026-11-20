@@ -1,6 +1,7 @@
 //! 服务供数：读面整条经 gen-model 的 HTTP 接口——树走 `/tree/*`（e3d-io 直读 + 内存骨架）、
 //! 属性走 `/element/attributes`（e3d-io）、搜索走 `/search`（服务端快照 NAME 索引）、
-//! 三维实例走 `/model/records`（按 dbnum 分桶、一桶一源，ADR-0025）。
+//! 三维实例走 `/model/records`（按 dbnum 分桶、一桶一源，ADR-0025）、构件的房间归属走
+//! `/element/rooms`（ADR-0035）。
 //!
 //! 它不认识 SurrealDB：这一面从头到尾没有一条打库的路，`service_face_never_touches_the_store`
 //! 钉着。地址每次调用时取 `model_update_api::base_url()`，与设置窗那一格同步。
@@ -11,7 +12,7 @@ use plant_ui::task_queue::DbnumReport;
 use plant_ui_data::{Attr, EleTreeNode, RefU64};
 
 use super::{Identity, ModelInstancesReq, Progress, SearchOutcome, SubtreeBounds};
-use crate::data::{Evt, SEARCH_LIMIT};
+use crate::data::{Evt, RoomsOutcome, SEARCH_LIMIT};
 use crate::model_update_api::{self, ModelRecords, ModelRecordsRequest};
 use crate::search_index::{Scope, SearchIndexState, SubstringHits};
 
@@ -127,6 +128,21 @@ impl ServiceReadFace {
             &scope.ns,
         )
         .await
+    }
+
+    /// 归属口径（自身加全部后代、强度排序、面板在册与否）由服务端一处定义，这里只问、只分型。
+    pub async fn element_rooms(&self, refno: RefU64, scope: &Scope) -> RoomsOutcome {
+        let reply = model_update_api::element_rooms(
+            &self.base(),
+            refno,
+            &scope.project,
+            &scope.mdb,
+            &scope.ns,
+        )
+        .await;
+        crate::data::classify_element_rooms(
+            reply.map_err(|error| model_update_api::failure_of(&error)),
+        )
     }
 
     /// 服务端没有单独的「按名取一个」接口：搜一页再挑出大小写不敏感的精确命中。

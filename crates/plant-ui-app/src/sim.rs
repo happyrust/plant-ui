@@ -1886,7 +1886,11 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
             },
         },
         // 剧本里没有房间数据：空归属即「无房间归属」，界面照常走 Ready 空态。
-        Req::ElementRooms(refno) => Evt::ElementRooms(refno, Ok(Vec::new())),
+        Req::ElementRooms { refno, seq } => Evt::ElementRooms {
+            refno,
+            seq,
+            outcome: crate::data::RoomsOutcome::Ready(Vec::new()),
+        },
         // 同上：没有在册面板，右键菜单就不摆「查看房间内模型」。
         Req::PanelRooms => Evt::PanelRooms(Ok(Vec::new())),
         // 剧本里没有管段：六类分组照常量给全，计数全 0。界面据此说「这一层是通的、

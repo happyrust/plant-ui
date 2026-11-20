@@ -4,9 +4,9 @@
 //! 请求经 channel 进、结果经 channel 出，UI 每帧非阻塞地收。每个结果落地后
 //! `request_repaint`，免得空闲中的 UI 睡过结果。
 //!
-//! 读面（树 / 属性 / 搜索 / 三维实例 / 工程标识）一律经 [`ReadFace`]（ADR-0026）：
-//! 这个文件里不直接打 HTTP 读接口，也不直接查库——`data_rs_reads_only_through_read_face`
-//! 钉着。留在这里直接调的只有命令面（生成 / 更新 / 队列 / 提资）、房间的镜像门，
+//! 读面（树 / 属性 / 搜索 / 三维实例 / 工程标识 / 构件的房间归属）一律经 [`ReadFace`]（ADR-0026、
+//! ADR-0035）：这个文件里不直接打 HTTP 读接口，也不直接查库——`data_rs_reads_only_through_read_face`
+//! 钉着。留在这里直接调的只有命令面（生成 / 更新 / 队列 / 提资）、房间其余功能的镜像门，
 //! 与 MBD 尺寸标注（只有模型服务这一条路，`pipe_dimensions_go_straight_to_the_model_service`）。
 //!
 //! 显示与生成分家（ADR-0030）：模型通道上的两臂（`ModelLoad::Scopes` / `Replace`）**只查**
@@ -98,7 +98,7 @@ fn require_direct_mirror_endpoint(
 
 /// 镜像门最近一次失败的记账（门卫短路）。
 ///
-/// 房间归属是随选中预取的：镜像不通时，每换一次选中就再走一遍「查 /health + 探活
+/// 面板所属房间是随选中发的：镜像不通时，每选中一块面板就再走一遍「查 /health + 探活
 /// 2 s 超时」，几十次点选就是几十次白等。10 秒内已经确认过不通，就直接按上一次的
 /// 结论回答，不再问第二遍；冷却过后放一次真请求，通了就清账。
 struct MirrorGateFail {
@@ -178,8 +178,8 @@ pub enum Req {
     /// 选中元素的 UI 属性表。
     Props(RefU64),
     /// 选中元素的房间归属（右键「查看所属房间」子菜单与「房间」页签共用），
-    /// 与 `Props` 同拍预取。
-    ElementRooms(RefU64),
+    /// 与 `Props` 同拍预取。经读面（ADR-0035）；`seq` 由宿主递增，原样带回 `Evt::ElementRooms`。
+    ElementRooms { refno: RefU64, seq: u64 },
     /// 选中对象若是一块在册 PANEL，返回它直属的房间；普通元素返回 None。
     PanelRoom(RefU64),
     /// X-Ray 专用轻量拓扑：一间房直属的全部 PANEL。
@@ -491,11 +491,13 @@ pub enum Evt {
     Ready(anyhow::Result<ReadyInfo>),
     Children(RefU64, anyhow::Result<TreeLevel>),
     Props(RefU64, anyhow::Result<Vec<plant_ui_data::Attr>>),
-    /// 元素的房间归属，已按归属强度排序。带上请求时的 refno，晚到的旧结果要认得出来才好丢。
-    ElementRooms(
-        RefU64,
-        anyhow::Result<Vec<plant_ui_data::room::RoomRelation>>,
-    ),
+    /// 构件的房间归属，已分型。`refno` / `seq` 原样带回：宿主只采纳「仍是主选中、且是最后一次问的」
+    /// 那一份，重试前发出的旧问题晚到也盖不掉新答案。
+    ElementRooms {
+        refno: RefU64,
+        seq: u64,
+        outcome: RoomsOutcome,
+    },
     PanelRoom(RefU64, anyhow::Result<Option<RefU64>>),
     RoomPanels(RefU64, anyhow::Result<Vec<RefU64>>),
     /// 房间详情。`Ok(None)` = 这个 refno 在库里查不到（不是查询失败）。
@@ -900,6 +902,139 @@ fn panel_records(
         .collect()
 }
 
+/// 「查看所属房间」一次取数的结论（spec 045 FR-103）。读面两面各自给出，宿主照着画：
+/// 数据线程与宿主都不再拿错误文本去猜它属于哪一种。
+#[derive(Debug, Clone, PartialEq)]
+pub enum RoomsOutcome {
+    /// 有结论，已按归属强度排序。空表 = 算完了、确实不属于任何房间。
+    Ready(Vec<plant_ui_data::room::RoomRelation>),
+    /// 服务端说这份归属还没算完或判断不了（`settled` 不是 `true`），带原因。`partial` 是答复里
+    /// 已经读到的行，可能不全或已过时：可以先画，但不是结论（spec 045 FR-110）。
+    Pending {
+        reason: String,
+        partial: Vec<plant_ui_data::room::RoomRelation>,
+    },
+    /// 此刻答不了，但不是故障：服务端版本或口径不对、房间体制没就绪、服务端还没有这个构件、
+    /// 选的是层级容器、库供数一条边都没读到（判断不了算完没有）。
+    Unavailable(String),
+    /// 故障，带原文。
+    Failed(String),
+}
+
+/// 服务端没有这条查询（老版本），或有但答复不带口径（测试站点上跑过的草稿构建）时的出路。
+const ROOMS_NEED_UPGRADE: &str =
+    "当前 gen-model 不提供构件房间归属查询，请升级；或在设置里把供数切到库";
+
+/// 只认这一个口径：自身 + 全部后代（gen-model `room_membership_api::CALIBER_SELF_AND_DESCENDANTS`）。
+pub const ELEMENT_ROOMS_CALIBER: &str = "self_and_descendants";
+
+/// 只到直接成员的旧口径，只在测试站点上跑过：BRAN 自己没有实例行，选 PIPE 时一间房都拿不到。
+const LEGACY_DIRECT_MEMBERS_CALIBER: &str = "self_and_direct_members";
+
+/// 服务供数的答复 → [`RoomsOutcome`]（FR-103）。
+///
+/// 按结构分型，不看 message：没有路由（`route_missing`）、带包封的 `not_found` / `container`、其它失败；
+/// 成功时再依次看口径、房间体制状态、各行、`settled`。归属口径（自身加全部后代、强度排序、
+/// 面板在册与否）由服务端一处定义，这里只搬字段；有一行解不出就整次判失败并点名那一行
+/// ——丢掉坏行再画，等于把「漏了」画成「没有」。`settled` 不是 `true` 时行照样带出（FR-110）。
+pub fn classify_element_rooms(
+    reply: Result<crate::model_update_api::ElementRoomsReply, plant_ui::model_update::Failure>,
+) -> RoomsOutcome {
+    let reply = match reply {
+        Ok(reply) => reply,
+        Err(failure) if failure.code == crate::model_update_api::ROUTE_MISSING => {
+            return RoomsOutcome::Unavailable(ROOMS_NEED_UPGRADE.to_owned());
+        }
+        Err(failure) if failure.code == "not_found" => {
+            return RoomsOutcome::Unavailable("服务端还没有这个构件（可能尚未同步）".to_owned());
+        }
+        Err(failure) if failure.code == "container" => {
+            return RoomsOutcome::Unavailable(failure.message);
+        }
+        Err(failure) => {
+            return RoomsOutcome::Failed(format!("{}：{}", failure.code, failure.message));
+        }
+    };
+    match reply.caliber.as_deref() {
+        Some(ELEMENT_ROOMS_CALIBER) => {}
+        None => {
+            return RoomsOutcome::Unavailable(format!(
+                "{ROOMS_NEED_UPGRADE}。这一版的答复不带口径、会漏房间，列表不画"
+            ));
+        }
+        Some(LEGACY_DIRECT_MEMBERS_CALIBER) => {
+            return RoomsOutcome::Unavailable(format!(
+                "{ROOMS_NEED_UPGRADE}。这一版只算到直接成员，选管道时会漏房间，列表不画"
+            ));
+        }
+        Some(other) => {
+            return RoomsOutcome::Unavailable(format!(
+                "服务端答复的口径「{other}」本界面不认识，列表不画；请把界面与 gen-model 升到同一版本"
+            ));
+        }
+    }
+    let status = reply.status.as_deref().unwrap_or_default();
+    if !(status.eq_ignore_ascii_case("ready") || status.eq_ignore_ascii_case("degraded")) {
+        let status = if status.is_empty() { "未知" } else { status };
+        return RoomsOutcome::Unavailable(match non_blank(reply.reason.as_deref()) {
+            Some(reason) => format!("房间体制未就绪（{status}）：{reason}"),
+            None => format!("房间体制未就绪（{status}）"),
+        });
+    }
+    let mut relations = Vec::with_capacity(reply.memberships.len());
+    for (i, row) in reply.memberships.iter().enumerate() {
+        match membership_row(row) {
+            Ok(relation) => relations.push(relation),
+            Err(why) => {
+                return RoomsOutcome::Failed(format!(
+                    "服务端的房间归属答复 memberships[{i}] 解不出：{why}"
+                ));
+            }
+        }
+    }
+    let head = match reply.settled {
+        Some(true) => return RoomsOutcome::Ready(relations),
+        Some(false) => "房间归属还没算完",
+        None => "房间归属暂时判断不了",
+    };
+    RoomsOutcome::Pending {
+        reason: match non_blank(reply.settled_reason.as_deref()) {
+            Some(reason) => format!("{head}：{reason}"),
+            None => head.to_owned(),
+        },
+        partial: relations,
+    }
+}
+
+fn non_blank(text: Option<&str>) -> Option<&str> {
+    text.map(str::trim).filter(|text| !text.is_empty())
+}
+
+fn membership_row(
+    row: &crate::model_update_api::ElementRoomMembership,
+) -> Result<plant_ui_data::room::RoomRelation, String> {
+    use std::str::FromStr;
+    let parse_refno = |field: &str, raw: &str| {
+        RefU64::from_str(raw).map_err(|_| format!("{field} `{raw}` 不是 refno"))
+    };
+    let panel = parse_refno("panel", row.panel.as_deref().ok_or("缺 panel")?)?;
+    let room = row
+        .room
+        .as_deref()
+        .map(|raw| parse_refno("room", raw))
+        .transpose()?;
+    let room_num = row.room_num.clone().ok_or("缺 room_num")?;
+    Ok(plant_ui_data::room::RoomRelation {
+        room,
+        room_num,
+        room_code: row.room_code.clone(),
+        panel,
+        inside_count: row.inside_count,
+        center_dist: row.center_dist,
+        via_member: row.via_member,
+    })
+}
+
 /// 并发通道里的一次交互读：查询、回执、叫醒 UI，整段自包含。
 ///
 /// 这里只放**互相独立**的读与 HTTP 往返——它们在 [`FuturesUnordered`] 里并发
@@ -933,12 +1068,13 @@ async fn handle_read(
             let r = face.props(refno, &scope).await;
             let _ = evt_tx.send(Evt::Props(refno, r));
         }
-        Req::ElementRooms(refno) => {
-            let r = match require_mirror_feature("房间").await {
-                Ok(()) => plant_ui_data::room::element_rooms(refno.into()).await,
-                Err(error) => Err(error),
-            };
-            let _ = evt_tx.send(Evt::ElementRooms(refno, r));
+        Req::ElementRooms { refno, seq } => {
+            let outcome = face.element_rooms(refno, &scope).await;
+            let _ = evt_tx.send(Evt::ElementRooms {
+                refno,
+                seq,
+                outcome,
+            });
         }
         Req::PanelRoom(refno) => {
             let r = match require_mirror_feature("房间").await {
@@ -2070,13 +2206,265 @@ mod tests {
         assert!(!body().contains("plant_ui_data::element_props"));
     }
 
-    /// 读面（树 / 属性 / 搜索 / 三维实例 / 工程标识）在这个文件里只有一条路：`ReadFace`。
-    /// 直接打 HTTP 读接口或直接查库都是绕过供数模式——树是服务、三维是库就是从这儿漏的。
-    /// 命令面（生成 / 更新 / 队列）与房间的镜像门（`service_health`）不在禁单里。
+    /// 房间归属只经读面（ADR-0035）：这一臂不自己过镜像门、不自己问接口。镜像门放在这里，
+    /// 服务供数会因为库不通而答不了一个不靠库的问题。
+    #[test]
+    fn element_rooms_go_through_the_read_face_only() {
+        let branch = body()
+            .split_once("Req::ElementRooms { refno, seq } =>")
+            .expect("房间归属那一臂")
+            .1
+            .split_once("Req::PanelRoom(")
+            .expect("下一臂")
+            .0;
+        assert!(
+            branch.contains("face.element_rooms(refno, &scope)"),
+            "{branch}"
+        );
+        assert!(!branch.contains("require_mirror_feature"), "{branch}");
+        assert!(!branch.contains("model_update_api"), "{branch}");
+        assert!(!branch.contains("plant_ui_data::"), "{branch}");
+        assert!(branch.contains("seq,"), "序号要原样带回：{branch}");
+    }
+
+    /// 「查看所属房间」的结论按结构分（FR-103）。每一格都是一条踩过的坑：老后端没有路由曾被
+    /// 画成「无房间归属」，没算完的空表也曾被画成「无房间归属」，解不出的行曾被悄悄丢掉。
+    #[test]
+    fn element_room_replies_are_classified_by_structure() {
+        use std::str::FromStr;
+
+        use super::{
+            ELEMENT_ROOMS_CALIBER, ROOMS_NEED_UPGRADE, RoomsOutcome, classify_element_rooms,
+        };
+        use crate::model_update_api::{ElementRoomMembership, ElementRoomsReply, ROUTE_MISSING};
+        use plant_ui::model_update::Failure;
+
+        fn row() -> ElementRoomMembership {
+            ElementRoomMembership {
+                room: Some("24381_1001".into()),
+                room_num: Some("R512".into()),
+                room_code: Some("1RX-R512".into()),
+                panel: Some("24381_2002".into()),
+                inside_count: Some(8),
+                center_dist: Some(120.0),
+                via_member: false,
+            }
+        }
+        fn answer(edit: impl FnOnce(&mut ElementRoomsReply)) -> RoomsOutcome {
+            let mut reply = ElementRoomsReply {
+                refno: "24381_100677".into(),
+                caliber: Some(ELEMENT_ROOMS_CALIBER.into()),
+                source: Some("durable".into()),
+                status: Some("ready".into()),
+                settled: Some(true),
+                memberships: vec![row()],
+                ..Default::default()
+            };
+            edit(&mut reply);
+            classify_element_rooms(Ok(reply))
+        }
+        let refused =
+            |code: &str, message: &str| classify_element_rooms(Err(Failure::new(code, message)));
+        let relation = |row: ElementRoomMembership| plant_ui_data::room::RoomRelation {
+            room: row.room.map(|room| RefU64::from_str(&room).unwrap()),
+            room_num: row.room_num.unwrap(),
+            room_code: row.room_code,
+            panel: RefU64::from_str(&row.panel.unwrap()).unwrap(),
+            inside_count: row.inside_count,
+            center_dist: row.center_dist,
+            via_member: row.via_member,
+        };
+
+        let cases = [
+            (
+                "没有路由：老后端，给升级出路",
+                refused(ROUTE_MISSING, "HTTP 404: "),
+                RoomsOutcome::Unavailable(ROOMS_NEED_UPGRADE.into()),
+            ),
+            (
+                "没有口径：草稿构建，它的列表会漏房间，不画",
+                answer(|reply| reply.caliber = None),
+                RoomsOutcome::Unavailable(format!(
+                    "{ROOMS_NEED_UPGRADE}。这一版的答复不带口径、会漏房间，列表不画"
+                )),
+            ),
+            (
+                "只到直接成员的旧口径：选 PIPE 一间房都拿不到，不画",
+                answer(|reply| reply.caliber = Some("self_and_direct_members".into())),
+                RoomsOutcome::Unavailable(format!(
+                    "{ROOMS_NEED_UPGRADE}。这一版只算到直接成员，选管道时会漏房间，列表不画"
+                )),
+            ),
+            (
+                "不认识的口径：不知道它算了哪些，不画",
+                answer(|reply| reply.caliber = Some("self_only".into())),
+                RoomsOutcome::Unavailable(
+                    "服务端答复的口径「self_only」本界面不认识，列表不画；请把界面与 gen-model 升到同一版本"
+                        .into(),
+                ),
+            ),
+            (
+                "层级容器：服务端拒答的原话，不是故障",
+                refused(
+                    "container",
+                    "SITE 是层级容器，范围太大，不答房间归属：请按房间查看，或选它下面的管道 / 设备",
+                ),
+                RoomsOutcome::Unavailable(
+                    "SITE 是层级容器，范围太大，不答房间归属：请按房间查看，或选它下面的管道 / 设备".into(),
+                ),
+            ),
+            (
+                "房间体制没就绪：带服务端的原因",
+                answer(|reply| {
+                    reply.status = Some("building".into());
+                    reply.reason = Some("房间模型正在重建".into());
+                }),
+                RoomsOutcome::Unavailable("房间体制未就绪（building）：房间模型正在重建".into()),
+            ),
+            (
+                "没有状态也算没就绪",
+                answer(|reply| reply.status = None),
+                RoomsOutcome::Unavailable("房间体制未就绪（未知）".into()),
+            ),
+            (
+                "还没算完：空表不是「无房间归属」",
+                answer(|reply| {
+                    reply.settled = Some(false);
+                    reply.settled_reason = Some("库 7997 欠一次房间重算".into());
+                    reply.memberships.clear();
+                }),
+                RoomsOutcome::Pending {
+                    reason: "房间归属还没算完：库 7997 欠一次房间重算".into(),
+                    partial: Vec::new(),
+                },
+            ),
+            (
+                "还没算完但已有行（PIPE 下一条 BRAN 先生成了）：行一并带出，仍不是结论",
+                answer(|reply| {
+                    reply.settled = Some(false);
+                    reply.settled_reason = Some("生成根 24381_100700 还没按最新数据生成".into());
+                    reply.memberships.push(ElementRoomMembership {
+                        room: Some("24381_1003".into()),
+                        room_num: Some("R513".into()),
+                        inside_count: Some(3),
+                        via_member: true,
+                        ..row()
+                    });
+                }),
+                RoomsOutcome::Pending {
+                    reason: "房间归属还没算完：生成根 24381_100700 还没按最新数据生成".into(),
+                    partial: vec![
+                        relation(row()),
+                        relation(ElementRoomMembership {
+                            room: Some("24381_1003".into()),
+                            room_num: Some("R513".into()),
+                            inside_count: Some(3),
+                            via_member: true,
+                            ..row()
+                        }),
+                    ],
+                },
+            ),
+            (
+                "判断不了：与「还没算完」分开说，已有的行同样带出",
+                answer(|reply| {
+                    reply.settled = None;
+                    reply.settled_reason = Some("这个构件还没有算过房间".into());
+                }),
+                RoomsOutcome::Pending {
+                    reason: "房间归属暂时判断不了：这个构件还没有算过房间".into(),
+                    partial: vec![relation(row())],
+                },
+            ),
+            (
+                "带包封的 not_found：服务端还没有这个构件，message 里的 405 不算没有路由",
+                refused("not_found", "元素 24381/405 不存在"),
+                RoomsOutcome::Unavailable("服务端还没有这个构件（可能尚未同步）".into()),
+            ),
+            (
+                "其它失败：原文交出，message 里的 HTTP 405 也不算没有路由",
+                refused("internal", "HTTP 405: upstream"),
+                RoomsOutcome::Failed("internal：HTTP 405: upstream".into()),
+            ),
+            (
+                "成功：字段照搬，强度缺席就是缺席",
+                answer(|reply| {
+                    reply.memberships[0].inside_count = None;
+                    reply.memberships[0].center_dist = None;
+                }),
+                RoomsOutcome::Ready(vec![relation(ElementRoomMembership {
+                    inside_count: None,
+                    center_dist: None,
+                    ..row()
+                })]),
+            ),
+            (
+                "成功的空表才是「无房间归属」",
+                answer(|reply| reply.memberships.clear()),
+                RoomsOutcome::Ready(Vec::new()),
+            ),
+            (
+                "degraded 照样给答案",
+                answer(|reply| reply.status = Some("degraded".into())),
+                RoomsOutcome::Ready(vec![relation(row())]),
+            ),
+            (
+                "面板不在册：房间为空，行照样画",
+                answer(|reply| reply.memberships[0].room = None),
+                RoomsOutcome::Ready(vec![relation(ElementRoomMembership {
+                    room: None,
+                    ..row()
+                })]),
+            ),
+        ];
+        for (name, got, expected) in cases {
+            assert_eq!(got, expected, "{name}");
+        }
+
+        // 有一行解不出：整次判失败并点名那一行，不丢行再画。
+        let bad_panel = answer(|reply| {
+            reply.memberships.push(ElementRoomMembership {
+                panel: Some("garbage".into()),
+                ..row()
+            })
+        });
+        assert!(
+            matches!(&bad_panel, RoomsOutcome::Failed(text)
+                if text.contains("memberships[1]") && text.contains("panel `garbage`")),
+            "{bad_panel:?}"
+        );
+        // 还没算完时也一样：带出来的行是要画的，坏行不能悄悄丢。
+        let bad_pending = answer(|reply| {
+            reply.settled = Some(false);
+            reply.memberships[0].panel = Some("garbage".into());
+        });
+        assert!(
+            matches!(&bad_pending, RoomsOutcome::Failed(text)
+                if text.contains("memberships[0]") && text.contains("panel `garbage`")),
+            "{bad_pending:?}"
+        );
+        let no_room_num = answer(|reply| reply.memberships[0].room_num = None);
+        assert!(
+            matches!(&no_room_num, RoomsOutcome::Failed(text)
+                if text.contains("memberships[0]") && text.contains("缺 room_num")),
+            "{no_room_num:?}"
+        );
+        let no_panel = answer(|reply| reply.memberships[0].panel = None);
+        assert!(
+            matches!(&no_panel, RoomsOutcome::Failed(text) if text.contains("缺 panel")),
+            "{no_panel:?}"
+        );
+    }
+
+    /// 读面（树 / 属性 / 搜索 / 三维实例 / 工程标识 / 构件的房间归属）在这个文件里只有一条路：
+    /// `ReadFace`。直接打 HTTP 读接口或直接查库都是绕过供数模式——树是服务、三维是库就是从这儿漏的。
+    /// 命令面（生成 / 更新 / 队列）与房间其余功能的镜像门（`service_health`）不在禁单里。
     #[test]
     fn data_rs_reads_only_through_read_face() {
         let body = body();
         for forbidden in [
+            "model_update_api::element_rooms(",
+            "plant_ui_data::room::element_rooms(",
             "model_update_api::tree_roots(",
             "model_update_api::tree_children(",
             "model_update_api::tree_ancestors(",
@@ -2110,6 +2498,7 @@ mod tests {
             "face.children_resolved(",
             "face.ancestors(",
             "face.props(",
+            "face.element_rooms(",
             "face.resolve_name(",
             "face.search(",
             "face.refresh_search_index(",

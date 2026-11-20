@@ -689,11 +689,47 @@ fn room_menu_items(
     live: bool,
     cmds: &mut Vec<Cmd>,
 ) {
-    let data = match rooms {
-        RoomVm::Ready(data) | RoomVm::Loading(Some(data)) if data.refno == refno => data,
-        RoomVm::Unavailable(reason) => {
-            ui.add_enabled(false, egui::Button::new("当前运行模式未提供房间查询"))
-                .on_hover_text(reason);
+    // `conclusive` 为假：还没算完时已经读到的几行（spec 045 FR-110），照列但不标主归属。
+    let (relations, conclusive) = match rooms {
+        RoomVm::Ready(data) | RoomVm::Loading(Some(data)) if data.refno == refno => {
+            (data.relations.as_slice(), true)
+        }
+        // 还没有结论、此刻查不了都不是「无房间归属」：说清楚，点它重问一次。只在问的那一行上说。
+        RoomVm::Pending {
+            refno: pending,
+            reason,
+            partial,
+        } if *pending == refno => {
+            let label = if partial.is_empty() {
+                "房间归属还没有结论，点此重试"
+            } else {
+                "房间归属还没有结论，下面可能不全或已过时，点此重试"
+            };
+            if ui
+                .button(format!("{}  {label}", ph::HOURGLASS))
+                .on_hover_text(reason)
+                .clicked()
+            {
+                cmds.push(Cmd::RetryRooms(refno));
+                ui.close();
+            }
+            if partial.is_empty() {
+                return;
+            }
+            (partial.as_slice(), false)
+        }
+        RoomVm::Unavailable {
+            refno: unavailable,
+            reason,
+        } if *unavailable == refno => {
+            if ui
+                .button(format!("{}  此刻查不了房间归属，点此重试", ph::INFO))
+                .on_hover_text(reason)
+                .clicked()
+            {
+                cmds.push(Cmd::RetryRooms(refno));
+                ui.close();
+            }
             return;
         }
         RoomVm::Failed(_) => {
@@ -705,12 +741,12 @@ fn room_menu_items(
             return;
         }
     };
-    if data.relations.is_empty() {
+    if relations.is_empty() {
         // 没有房间归属是常态，不是错误；按钮照旧禁用，只说事实。
         ui.add_enabled(false, egui::Button::new("无房间归属"));
         return;
     }
-    for (i, rel) in data.relations.iter().enumerate() {
+    for (i, rel) in relations.iter().enumerate() {
         let mut job = LayoutJob::default();
         job.append(
             &rel.room_num,
@@ -722,7 +758,7 @@ fn room_menu_items(
             },
         );
         // 首条即最强（数据层已按 ADR-010 §5 排好），只有它标「主归属」。
-        if i == 0 {
+        if i == 0 && conclusive {
             job.append(
                 "  主归属",
                 0.0,
@@ -746,10 +782,13 @@ fn room_menu_items(
         }
         job.append(
             &format!(
-                "\n{} · 顶点 {}/8 · 距中心 {}",
-                rel.room_code.as_deref().unwrap_or("—"),
-                rel.inside_count,
-                super::room::format_dist(rel.center_dist),
+                "\n{} · 顶点 {} · 距中心 {}",
+                rel.room_code.as_deref().unwrap_or(super::room::MISSING),
+                super::room::format_inside(rel.inside_count),
+                rel.center_dist.map_or_else(
+                    || super::room::MISSING.to_owned(),
+                    super::room::format_dist
+                ),
             ),
             0.0,
             TextFormat {
@@ -767,13 +806,16 @@ fn room_menu_items(
             cmds.push(Cmd::ShowRooms(refno));
             ui.close();
         }
-        resp.on_disabled_hover_text("面板不在册（陈旧归属边），无法聚焦");
+        resp.on_disabled_hover_text("房间不明（面板不在册或共用墙），无法聚焦");
     }
     ui.separator();
     // 只给主归属那一间：右键菜单答的是「这个构件在哪」，一键直达最强那间房就够了。
     // 跨房构件要看第二间，去「房间」页签点中它再按同名芯片——那里本来就摆着
-    // 全部归属，不必把这份列表在菜单里再展开一遍。
-    if live && let Some(primary) = data.relations.first() {
+    // 全部归属，不必把这份列表在菜单里再展开一遍。还没有结论时主归属说不准，不给。
+    if live
+        && conclusive
+        && let Some(primary) = relations.first()
+    {
         let resp = ui.add_enabled(
             primary.room.is_some(),
             egui::Button::new(format!(
@@ -788,7 +830,7 @@ fn room_menu_items(
             cmds.push(Cmd::ShowRoomModel(room));
             ui.close();
         }
-        resp.on_disabled_hover_text("面板不在册（陈旧归属边），取不到房间模型");
+        resp.on_disabled_hover_text("房间不明（面板不在册或共用墙），取不到房间模型");
     }
     if ui
         .button(format!("{}  在「房间」页签中查看", ph::SIDEBAR_SIMPLE))
@@ -841,12 +883,64 @@ fn note(ui: &mut Ui, t: &Tokens, d: Density, state: PaneState, icon: &str, text:
 #[cfg(test)]
 mod tests {
     use super::{
-        RoomItem, dimension_menu_action, is_group_node, is_room_node, room_menu_action, row_id,
-        row_tags, tree_item_accessible_label, unresolved_hint,
+        RoomItem, dimension_menu_action, is_group_node, is_room_node, room_menu_action,
+        room_menu_items, row_id, row_tags, tree_item_accessible_label, unresolved_hint,
     };
     use crate::Cmd;
-    use crate::vm::{DimensionsDataVm, DimensionsVm, RowVisibility, TreeGroupLink, TreeRowVm};
+    use crate::style::tokens::Density;
+    use crate::vm::{
+        DimensionsDataVm, DimensionsVm, RoomRelationVm, RoomVm, RoomsDataVm, RowVisibility,
+        TreeGroupLink, TreeRowVm,
+    };
     use aios_core::RefU64;
+
+    /// 右键子菜单对「还没算完但已读到几行」照列这些房间（spec 045 FR-110）：顶上那枚「重试」说明
+    /// 可能不全，行上不标主归属，也不给「显示房间模型」——那一项只给主归属那间。
+    #[test]
+    fn the_room_menu_lists_a_partial_answer_without_a_primary() {
+        let refno = RefU64(7);
+        let row = RoomRelationVm {
+            room: Some(RefU64(1)),
+            room_num: "R512".into(),
+            room_code: None,
+            panel: RefU64(2),
+            inside_count: Some(8),
+            center_dist: None,
+            via_member: false,
+        };
+        let t = crate::style::theme_tokens::current();
+        let menu = |rooms: &RoomVm| {
+            super::super::painted_text(|ui| {
+                room_menu_items(
+                    ui,
+                    &t,
+                    Density::Standard,
+                    refno,
+                    rooms,
+                    true,
+                    &mut Vec::new(),
+                )
+            })
+        };
+
+        let partial = menu(&RoomVm::Pending {
+            refno,
+            reason: "房间归属还没算完".into(),
+            partial: vec![row.clone()],
+        });
+        assert!(partial.contains("下面可能不全或已过时"), "{partial}");
+        assert!(partial.contains("R512"), "{partial}");
+        assert!(!partial.contains("主归属"), "{partial}");
+        assert!(!partial.contains("显示房间模型"), "{partial}");
+
+        let settled = menu(&RoomVm::Ready(RoomsDataVm {
+            refno,
+            relations: vec![row],
+        }));
+        assert!(settled.contains("主归属"), "{settled}");
+        assert!(settled.contains("显示房间模型"), "{settled}");
+        assert!(!settled.contains("可能不全"), "{settled}");
+    }
 
     /// 房间节点要两条都满足：类型是 `FRMW`，且登记在册。
     ///
