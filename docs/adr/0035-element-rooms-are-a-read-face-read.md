@@ -1,6 +1,6 @@
 # 构件的房间归属是读面上的一条读
 
-状态：**提议**（2026-11-20 起草，同日按方案复审改口径，见 D5；按实现审核改 D4 里库供数的强度；按复审第 3 条加 D6；按复审第 6 条补 D3 末段；房间详情遇老边补 D4 末段；spec：gen-model `specs/045-element-room-membership/`，
+状态：**提议**（2026-11-20 起草，同日按方案复审改口径，见 D5；按实现审核改 D4 里库供数的强度；按复审第 3 条加 D6；按复审第 6 条补 D3 末段；房间详情遇老边补 D4 末段；按代码审核（gen-model #334 第 5 条）改 D1 / D5 里库供数认层级容器的依据；spec：gen-model `specs/045-element-room-membership/`，
 服务端契约见 gen-model `docs/specs/web-service-api.md` §4.13.8）。
 修订：`docs/plans/2026-09-07-read-face-dual-mode.md` D6（房间不动、只有库一条、服务供数下经 `mirror` 门控）——
 「构件的房间归属」这一条从 D6 里拿出来；房间的其余功能（面板所属房间、房间详情、房间浏览器、X-Ray 拓扑）不变；房间详情只按 D4 末段补成员边的老边读法。
@@ -24,12 +24,14 @@
 
 ### D1　构件的房间归属进读面
 
-`ReadFace::element_rooms(refno, scope) -> RoomsOutcome`：
+`ReadFace::element_rooms(refno, noun, scope) -> RoomsOutcome`：
 
 - **服务供数**问 `/api/v1/element/rooms`，归属口径（自身加全部后代、强度排序、面板在册与否）由服务端一处定义。
 - **库供数**查 `room_relate`（`plant_ui_data::room::element_rooms`），口径与服务端相同（D5）；先等库连接，**不过镜像门**：
   那道门要问模型服务的 `/health`，而库供数不碰模型服务（`store_face_never_touches_the_service`），启动时也已经连上库。
 - `data.rs` 的 `Req::ElementRooms` 那一臂只调读面，不过镜像门、不自己问接口（`element_rooms_go_through_the_read_face_only`）。
+- `noun` 是宿主从模型树上知道的类型（`ask_rooms` 取 `tree.noun_of`，树还没展开到它时为 `None`）。只有库供数用它
+  先拒层级容器（D5）；服务端按自己模型树上的类型判，不听客户端的。
 
 ### D2　结论分四种，由读面给出
 
@@ -89,8 +91,9 @@
   也含它自己，库供数那句要 `array::distinct`。边与服务端同一写法取：`array::flatten(($targets)<-room_relate)`。
   旧写法 `SELECT VALUE <-room_relate FROM $targets` 只遍历库里有 `pe` 记录的目标，平表化库里缺记录的构件一条边都
   出不来；`pe` 齐全的库上两种写法在 AMS 上对拍 500 个目标、3,762 行，0 差异（spec 045 背景第 4 条）。
-- **层级容器不答。** WORL / WORLD / SITE / ZONE 的后代是整库级：服务端回 422 `container`；库供数先按 `pe` 上的类型
-  拒答，不去查边（`pe` 没有这一行时类型无从知道，照常查）。两边同一句：「{类型} 是层级容器，范围太大，
+- **层级容器不答。** WORL / WORLD / SITE / ZONE 的后代是整库级：服务端回 422 `container`；库供数先按宿主给的类型、
+  再按 `pe` 上的类型拒答，不去查边。平表化库里 `pe` 常缺这一行，只看 `pe` 时选 SITE / ZONE 会对整个站点跑
+  后代查询；两头都不知道才照常查。两边同一句：「{类型} 是层级容器，范围太大，
   不答房间归属：请按房间查看，或选它下面的管道 / 设备」。
 - **库供数的空表不当结论。** 库里没有生成凭证和房间欠账可查，空表分不清「算完了、不在任何房间」和「还没算」，
   所以说「判断不了」（D2）。对拍探针拿它当空集和服务供数比，要看出「服务供数有房间、库里一条边都没有」的元素。
@@ -158,7 +161,8 @@
    `room_members_with_old_edges_rank_last_and_stay_blank`（房间详情老边，D4 末段）、
    `rooms_compare_room_sets_and_set_aside_inconclusive_answers`（含库供数没读到边、还没有结论时带出的行不比）、
    `sql_renderers_pin_tables_and_predicates`（库供数按 `anc CONTAINS` 取后代，不许出现 `pe_owner` / `anc[1]` / `FROM $targets`）、
-   `hierarchy_containers_are_refused_like_the_service`、`store_rooms_never_turn_no_edges_into_no_rooms`、
+   `hierarchy_containers_are_refused_like_the_service`、`a_container_type_known_to_the_caller_is_refused_before_any_query`、
+   `store_rooms_never_turn_no_edges_into_no_rooms`、
    `a_partial_room_answer_is_not_kept_as_the_loading_placeholder`、
    `retrying_rooms_only_reasks_membership`（D3 末段）；D6 的画法由无头渲染测试钉住：
    `a_partial_answer_is_drawn_under_its_caveat_without_a_primary`、`an_empty_pending_answer_is_only_a_reason_and_a_retry`、
