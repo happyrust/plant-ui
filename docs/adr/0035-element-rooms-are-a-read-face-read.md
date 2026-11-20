@@ -1,9 +1,9 @@
 # 构件的房间归属是读面上的一条读
 
-状态：**提议**（2026-11-20 起草，同日按方案复审改口径，见 D5；按实现审核改 D4 里库供数的强度；按复审第 3 条加 D6；按复审第 6 条补 D3 末段；spec：gen-model `specs/045-element-room-membership/`，
+状态：**提议**（2026-11-20 起草，同日按方案复审改口径，见 D5；按实现审核改 D4 里库供数的强度；按复审第 3 条加 D6；按复审第 6 条补 D3 末段；房间详情遇老边补 D4 末段；spec：gen-model `specs/045-element-room-membership/`，
 服务端契约见 gen-model `docs/specs/web-service-api.md` §4.13.8）。
 修订：`docs/plans/2026-09-07-read-face-dual-mode.md` D6（房间不动、只有库一条、服务供数下经 `mirror` 门控）——
-「构件的房间归属」这一条从 D6 里拿出来；房间的其余功能（面板所属房间、房间详情、房间浏览器、X-Ray 拓扑）不变。
+「构件的房间归属」这一条从 D6 里拿出来；房间的其余功能（面板所属房间、房间详情、房间浏览器、X-Ray 拓扑）不变；房间详情只按 D4 末段补成员边的老边读法。
 `docs/plans/room-info-feature.md` 决定 1（容器聚合直接子层）由 D5 取代。
 
 ## 背景
@@ -75,6 +75,10 @@
 不让一条老边把整次查询变成失败（spec FR-109）。房间为空（面板不在册，或服务供数下共用墙按房号挑不出
 唯一一间）时，归属行说「房间不明（面板不在册或共用墙）」。
 
+房间详情的成员列表同一条规则（spec 045 FR-112）：`RoomMemberPreview.inside_count`（与绘制层的 `RoomMemberVm`）改成
+`Option`，成员边的两格强度按可空读，同一构件跨多面板归并、排序时缺的算最弱，成员行显示「—」；房里一条老边不再让
+整个详情失败。
+
 ### D5　口径：自身 + 全部后代，两种供数一致
 
 构件的归属聚合它自己和**全部后代**的 `room_relate` 边，每间房留最强一条（spec 045 FR-002 / FR-101）。服务端答复的
@@ -136,7 +140,8 @@
    站点先升后端再发界面。
 6. 选 WORL / SITE / ZONE 时两种供数都拒答，给出按房间查看的出路。
 7. 库供数不再说一个构件「无房间归属」：一条边都没读到时说「判断不了」，可重试。
-8. 库供数遇到没有强度两格的老边不再整次失败，那两格显示「—」。房间详情的成员列表仍按非空读，不在这条 ADR 里。
+8. 库供数遇到没有强度两格的老边不再整次失败，那两格显示「—」。房间详情的成员列表同样不再因老边整次失败，缺的顶点数
+   显示「—」、排在有强度的成员后面（D4 末段）。
 9. 服务供数下「还没有结论」而答复里已有房间时，页签与右键子菜单先列出这些房间并标明可能不全或已过时；主归属、
    房号芯片与「显示房间模型」等算完再出。
 10. 归属的「重试」不再把房间 X-Ray 重新打开，也不再关掉虚拟孔洞 X-Ray；面板所属房间查失败时，要重新选中
@@ -150,6 +155,7 @@
    `store_face_never_touches_the_service` 的禁单与期望单、`only_the_latest_room_reply_for_the_primary_is_accepted`、
    `a_missing_route_is_told_apart_from_a_missing_element`、`route_detection_never_matches_message_substrings`、
    `missing_strength_reads_as_blank_not_zero`、`old_edges_without_strength_merge_as_weakest_and_stay_blank`（库供数老边）、
+   `room_members_with_old_edges_rank_last_and_stay_blank`（房间详情老边，D4 末段）、
    `rooms_compare_room_sets_and_set_aside_inconclusive_answers`（含库供数没读到边、还没有结论时带出的行不比）、
    `sql_renderers_pin_tables_and_predicates`（库供数按 `anc CONTAINS` 取后代，不许出现 `pe_owner` / `anc[1]` / `FROM $targets`）、
    `hierarchy_containers_are_refused_like_the_service`、`store_rooms_never_turn_no_edges_into_no_rooms`、
