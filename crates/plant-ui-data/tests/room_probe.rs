@@ -105,9 +105,16 @@ async fn probe_room_queries_round_trip() {
     let Some(member) = detail.members.first() else {
         return;
     };
-    let relations = room::element_rooms(member.refno.into())
+    let relations = match room::element_rooms(member.refno.into())
         .await
-        .expect("element_rooms 失败");
+        .expect("element_rooms 失败")
+    {
+        room::ElementRooms::Edges(relations) => relations,
+        room::ElementRooms::Container(noun) => panic!(
+            "房间成员 {} 被当成层级容器 {noun} 拒答",
+            member.refno.to_pdms_str()
+        ),
+    };
     println!(
         "element_rooms {}: {} 条归属，最强 {:?}",
         member.refno.to_pdms_str(),

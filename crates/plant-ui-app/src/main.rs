@@ -1641,13 +1641,14 @@ struct App {
     /// 选中 PANEL 后等待房间详情的 X-Ray 请求：(发起时的 PANEL, 房间)。
     /// 选中一换立即清空；晚到的详情只有同时匹配这两个值才可改材质。
     xray_room_pending: Option<(RefU64, RefU64)>,
-    /// 上一次已经记过日志的房间镜像失败，`消息|错误链` 拼成一个键。
+    /// 上一次已经记过日志的房间失败（镜像不通、归属查不了或查询失败），`消息|原因` 拼成一个键。
     ///
-    /// 房间归属是随选中预取的：库没起（或端口不通）时，每换一次选中就再失败一次，
-    /// 每次都记一行红底 ERROR，几十次点选就把日志刷成同一句话的复读。同一个原因只
-    /// 记一次，界面上的 `vm.rooms` 照旧每次更新成失败态；换原因、或者镜像恢复之后
-    /// 复位，下次真出事还会说。
+    /// 房间归属是随选中预取的：库没起、服务端版本不支持时，每换一次选中就再答一遍同一句，
+    /// 每次都记一行，几十次点选就把日志刷成同一句话的复读。同一个原因只记一次，界面上的
+    /// `vm.rooms` 照旧每次更新；换原因、或者答得出了之后复位，下次真出事还会说。
     mirror_error_said: Option<String>,
+    /// 最后一次房间归属请求的序号。回包只采纳序号对得上的那一份（[`accept_rooms_reply`]）。
+    rooms_seq: u64,
     xray_active_room: Option<RefU64>,
     /// 已查过的房间 -> 全部在册面板。重复点同一间房不再打一次详情查询。
     room_panel_cache: HashMap<RefU64, Vec<RefU64>>,
@@ -2962,6 +2963,7 @@ impl App {
             focus_room_frame: None,
             xray_room_pending: None,
             mirror_error_said: None,
+            rooms_seq: 0,
             xray_active_room: None,
             room_panel_cache: HashMap::new(),
             panel_rooms: HashMap::new(),
@@ -3181,33 +3183,51 @@ impl App {
                     };
                 }
                 data::Evt::Props(..) => {}
-                // 晚到的旧选中结果直接丢弃，房间归属只认当前选中（与属性同一条规矩）。
-                data::Evt::ElementRooms(refno, result)
-                    if self.vm.selection.primary() == Some(refno) =>
-                {
-                    self.vm.rooms = match result {
-                        Ok(relations) => {
-                            // 镜像回来了：清掉「同一原因只记一次」的记账，下次再断还会说。
+                // 只认当前主选中、且是最后一次问的那一份（FR-106）：换了选中的旧结果、重试前发出的
+                // 旧问题晚到，都直接丢弃。
+                data::Evt::ElementRooms {
+                    refno,
+                    seq,
+                    outcome,
+                } if accept_rooms_reply(self.vm.selection.primary(), self.rooms_seq, refno, seq) => {
+                    self.vm.rooms = match outcome {
+                        data::RoomsOutcome::Ready(relations) => {
+                            // 答得出了：清掉「同一原因只记一次」的记账，下次再出事还会说。
                             self.mirror_error_said = None;
                             RoomVm::Ready(build_rooms(refno, relations))
                         }
-                        Err(e) if e.downcast_ref::<data::MirrorFeatureUnavailable>().is_some() => {
-                            RoomVm::Unavailable(e.to_string())
+                        data::RoomsOutcome::Pending(reason) => RoomVm::Pending { refno, reason },
+                        data::RoomsOutcome::Unavailable(reason) => {
+                            let key = format!("房间归属查不了|{reason}");
+                            if self.mirror_error_said.as_deref() != Some(key.as_str()) {
+                                let el = self.tree.element(refno);
+                                self.logs.warn_of(
+                                    &mut self.vm.logs,
+                                    el,
+                                    format!("此刻查不了房间归属：{reason}"),
+                                );
+                                self.mirror_error_said = Some(key);
+                            }
+                            RoomVm::Unavailable { refno, reason }
                         }
-                        Err(e) => {
-                            let text = logs::error_chain(&e);
+                        data::RoomsOutcome::Failed(text) => {
                             let key = format!("房间归属查询失败|{text}");
                             if self.mirror_error_said.as_deref() != Some(key.as_str()) {
                                 let el = self.tree.element(refno);
-                                self.logs
-                                    .error_of(&mut self.vm.logs, el, "房间归属查询失败", &e, None);
+                                self.logs.error_of(
+                                    &mut self.vm.logs,
+                                    el,
+                                    "房间归属查询失败",
+                                    &anyhow::Error::msg(text.clone()),
+                                    None,
+                                );
                                 self.mirror_error_said = Some(key);
                             }
                             RoomVm::Failed(format!("房间归属查询失败：{text}"))
                         }
                     };
                 }
-                data::Evt::ElementRooms(..) => {}
+                data::Evt::ElementRooms { .. } => {}
                 // 尺寸标注回包（计划 B1 / B2 / B3）。帧号对不上 = 右键之后又换了目标或点了
                 // 隐藏，丢弃。对上了就落进 `vm.dimensions`（菜单据它把「查看」翻成「隐藏」，
                 // B4 的状态入口据它报数），几何翻成线段批次交给视口整层替换。
@@ -5505,8 +5525,7 @@ impl App {
                     if self.vm.selection.primary() != Some(refno) {
                         self.set_selection(Selection::single(refno));
                     } else {
-                        self.vm.rooms.begin_query();
-                        let _ = self.bridge.req.send(data::Req::ElementRooms(refno));
+                        self.ask_rooms(refno);
                     }
                     self.state.focus(Pane::Room);
                 }
@@ -7141,10 +7160,19 @@ impl App {
 
     /// 房间归属随选中预取（计划决定 5）：查询极轻，右键菜单打开的瞬间就有现成数据。
     fn refetch_rooms(&mut self, refno: RefU64) {
-        self.vm.rooms.begin_query();
-        let _ = self.bridge.req.send(data::Req::ElementRooms(refno));
+        self.ask_rooms(refno);
         self.panel_room_asked = None;
         self.ask_panel_room();
+    }
+
+    /// 只问构件的房间归属。每问一次序号加一，回包靠它认出是不是最后一次问的。
+    fn ask_rooms(&mut self, refno: RefU64) {
+        self.vm.rooms.begin_query();
+        self.rooms_seq += 1;
+        let _ = self.bridge.req.send(data::Req::ElementRooms {
+            refno,
+            seq: self.rooms_seq,
+        });
     }
 
     /// 主选中是房间面板就去查它属于哪间房（回包落地开房间 X-Ray），每个主选中只查一次。
@@ -9200,6 +9228,8 @@ mod tests {
         QueuedGenerate, enqueue_auto_generate, forget_queued_generate, generate_is_queued,
         merge_failed_mutations, next_queued_generate, queued_generate_targets, queued_show_targets,
     };
+    // 构件房间归属（spec 045 FR-106）：回包只采纳仍是主选中、且是最后一次问的那一份。
+    use super::accept_rooms_reply;
     use crate::model_update_api;
     use chrono::{TimeZone, Utc};
     use plant_ui::model_mutation;
@@ -9532,6 +9562,28 @@ mod tests {
         );
         assert_eq!(panel_room_query(Some(pipe), None, is_panel), None);
         assert_eq!(panel_room_query(None, None, is_panel), None);
+    }
+
+    /// 房间归属回包只认「仍是主选中、且是最后一次问的」（FR-106）。点过重试之后，重试前发出的
+    /// 旧问题晚到，refno 一样，只看 refno 就会拿旧的「还没算完」盖掉新的答案。
+    #[test]
+    fn only_the_latest_room_reply_for_the_primary_is_accepted() {
+        let pipe = RefU64(21);
+        let other = RefU64(22);
+        let cases = [
+            ("主选中、最后一次", Some(pipe), 7, pipe, 7, true),
+            ("主选中、重试前的旧问题", Some(pipe), 7, pipe, 6, false),
+            ("换了选中的旧结果", Some(other), 8, pipe, 7, false),
+            ("序号对得上但已不是主选中", Some(other), 7, pipe, 7, false),
+            ("选中已清空", None, 7, pipe, 7, false),
+        ];
+        for (name, primary, latest, refno, seq, accepted) in cases {
+            assert_eq!(
+                accept_rooms_reply(primary, latest, refno, seq),
+                accepted,
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -12784,6 +12836,12 @@ fn build_rooms(refno: RefU64, relations: Vec<plant_ui_data::room::RoomRelation>)
             })
             .collect(),
     }
+}
+
+/// 房间归属回包采不采纳（FR-106）：只认「仍是主选中、且是最后一次问的」那一份。只看 refno 不够：
+/// 重试前发出的旧问题 refno 相同，晚到会把重试拿到的新答案盖回去。
+fn accept_rooms_reply(primary: Option<RefU64>, latest_seq: u64, refno: RefU64, seq: u64) -> bool {
+    primary == Some(refno) && seq == latest_seq
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

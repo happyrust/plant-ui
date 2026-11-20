@@ -784,8 +784,21 @@ pub enum RoomVm {
     /// 查询在途。切换元素时保留上一份数据供绘制，避免闪烁；首次查询为 None。
     Loading(Option<RoomsDataVm>),
     Ready(RoomsDataVm),
-    /// The selected runtime does not expose the required query transport.
-    Unavailable(String),
+    /// 服务端说这份归属还没算完或判断不了（`settled` 不是 `true`），带原因。不是「没有归属」，
+    /// 也不是故障：中性提示加「重试」，取回工作完成时宿主会自己重问。带 `refno` 是因为这是某个
+    /// 构件的状态：右键落在多选集里非主选中的行上时，子菜单不拿它顶数。
+    Pending {
+        refno: RefU64,
+        reason: String,
+    },
+    /// 这一项此刻给不了：服务端没有这条查询或给的是会漏房间的早期答复、房间体制没就绪、
+    /// 服务端还没有这个构件、选的是层级容器、库供数一条边都没读到。带一句说清怎么办的话，
+    /// 界面给「重试」；带 `refno` 的缘故同 `Pending`——重试只对主选中有效，子菜单不该在别的行上
+    /// 摆一个点了没反应的钮。
+    Unavailable {
+        refno: RefU64,
+        reason: String,
+    },
     Failed(String),
 }
 
@@ -1043,17 +1056,17 @@ pub struct RoomsDataVm {
 /// 一条房间归属（数据层 `room::RoomRelation` 的绘制层镜像，字段语义见彼处）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct RoomRelationVm {
-    /// 房间 FRMW；面板不在册（陈旧边）时为 None。
+    /// 房间 FRMW；面板不在册（陈旧边）、或共用墙挑不出唯一一间时为 None，界面写「房间不明」。
     pub room: Option<RefU64>,
     pub room_num: String,
     /// 如 `1RX-R301`；算不出时不显示。
     pub room_code: Option<String>,
     /// 归属经由的面板。
     pub panel: RefU64,
-    /// 0-8，越大归属越强。
-    pub inside_count: u8,
-    pub center_dist: f32,
-    /// 归属来自直接子层成员而非元素自身（容器元素的聚合口径）。
+    /// 0-8，越大归属越强。老边没有强度时为 None，显示为空、不显示 0。
+    pub inside_count: Option<u8>,
+    pub center_dist: Option<f32>,
+    /// 归属来自某个后代而非元素自身（容器元素的聚合口径，ADR-0035 D5）。
     pub via_member: bool,
 }
 

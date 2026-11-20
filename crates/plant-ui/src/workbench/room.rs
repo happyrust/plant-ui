@@ -36,8 +36,17 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
         // 上一份数据撑住布局防闪烁；房间是全局对象，点击动作对着房间 refno 走，
         // 不会像属性编辑那样落错元素，所以命令不拦。
         RoomVm::Loading(Some(data)) | RoomVm::Ready(data) => ready(ui, t, d, vm, data, cmds),
-        RoomVm::Unavailable(reason) => {
-            note(ui, t, d, PaneState::Uninit, ph::INFO, reason);
+        // 还没算完 / 此刻给不了都不是故障，但都可能过一会儿就好（生成跑完、升级或切了供数）：
+        // 中性提示，给一枚「重试」。
+        RoomVm::Pending { refno, reason } => {
+            if note_with_retry(ui, t, d, ph::HOURGLASS, reason) {
+                cmds.push(Cmd::RetryRooms(*refno));
+            }
+        }
+        RoomVm::Unavailable { refno, reason } => {
+            if note_with_retry(ui, t, d, ph::INFO, reason) {
+                cmds.push(Cmd::RetryRooms(*refno));
+            }
         }
         RoomVm::Failed(reason) => {
             if note(ui, t, d, PaneState::Error, ph::WARNING, reason)
@@ -195,12 +204,13 @@ fn summary(
                         );
                     });
                     // 强度取自归属列表里这间房那条边；聚焦房间不在当前元素的
-                    // 归属里（切换选中的过渡帧）就不硬凑。
+                    // 归属里（切换选中的过渡帧）、或那条老边没有强度，就不硬凑。
                     let strength = data
                         .relations
                         .iter()
                         .find(|rel| rel.room == Some(det.room))
-                        .map(|rel| format!(" · 强度 {}/8", rel.inside_count))
+                        .and_then(|rel| rel.inside_count)
+                        .map(|count| format!(" · 强度 {count}/8"))
                         .unwrap_or_default();
                     ui.label(
                         RichText::new(format!(
@@ -320,21 +330,25 @@ fn relation_row(
         p.text(
             egui::pos2(rect.left() + pad + d.px(20.0), rect.top() + d.px(31.0)),
             Align2::LEFT_CENTER,
-            rel.room_code.as_deref().unwrap_or("面板不在册（陈旧边）"),
+            match (rel.room_code.as_deref(), rel.room) {
+                (Some(code), _) => code,
+                (None, Some(_)) => "房间码算不出",
+                (None, None) => "房间不明（面板不在册或共用墙）",
+            },
             Font::mono_micro(d),
             t.text_muted,
         );
         p.text(
             egui::pos2(rect.right() - pad, rect.top() + d.px(14.0)),
             Align2::RIGHT_CENTER,
-            format!("顶点 {}/8", rel.inside_count),
+            format!("顶点 {}", format_inside(rel.inside_count)),
             Font::mono_micro(d),
             t.text_secondary,
         );
         p.text(
             egui::pos2(rect.right() - pad, rect.top() + d.px(31.0)),
             Align2::RIGHT_CENTER,
-            format_dist(rel.center_dist),
+            rel.center_dist.map_or_else(|| MISSING.to_owned(), format_dist),
             Font::mono_micro(d),
             t.text_muted,
         );
@@ -477,6 +491,14 @@ fn hint_row(ui: &mut Ui, t: &Tokens, d: Density, text: &str) {
     );
 }
 
+/// 答不出的强度格显示成这个，不显示 0（老边没有 `inside_count` / `center_dist`）。
+pub(super) const MISSING: &str = "—";
+
+/// 顶点数显示：`8/8`；老边没有这一格时为 [`MISSING`]。
+pub(super) fn format_inside(count: Option<u8>) -> String {
+    count.map_or_else(|| MISSING.to_owned(), |count| format!("{count}/8"))
+}
+
 /// 距离显示：`room_relate.center_dist` 是 PDMS 毫米，米级以上换米报一位小数。
 pub(super) fn format_dist(mm: f32) -> String {
     if mm >= 1000.0 {
@@ -502,9 +524,33 @@ fn note(ui: &mut Ui, t: &Tokens, d: Density, state: PaneState, icon: &str, text:
     )
 }
 
+/// 中性提示加一枚「重试」（不是错误态，图标不变红）。返回值是「重试」是否被点。
+fn note_with_retry(ui: &mut Ui, t: &Tokens, d: Density, icon: &str, text: &str) -> bool {
+    widgets::pane_note(
+        ui,
+        t,
+        d,
+        PaneNote {
+            state: PaneState::Uninit,
+            icon,
+            text,
+            detail: None,
+            retry: true,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 缺的强度显示为空，不显示 0（spec 045 US5）：老边没有 `inside_count` 时写 0/8 就是编了一个值。
+    #[test]
+    fn missing_strength_reads_as_blank_not_zero() {
+        assert_eq!(format_inside(Some(8)), "8/8");
+        assert_eq!(format_inside(Some(0)), "0/8");
+        assert_eq!(format_inside(None), MISSING);
+    }
 
     /// 毫米进位到米的门槛与格式都钉住：菜单 meta 与页签列表两处共用，
     /// 错一处就是两处一起骗人。

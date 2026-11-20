@@ -691,9 +691,33 @@ fn room_menu_items(
 ) {
     let data = match rooms {
         RoomVm::Ready(data) | RoomVm::Loading(Some(data)) if data.refno == refno => data,
-        RoomVm::Unavailable(reason) => {
-            ui.add_enabled(false, egui::Button::new("当前运行模式未提供房间查询"))
-                .on_hover_text(reason);
+        // 还没有结论、此刻查不了都不是「无房间归属」：说清楚，点它重问一次。只在问的那一行上说。
+        RoomVm::Pending {
+            refno: pending,
+            reason,
+        } if *pending == refno => {
+            if ui
+                .button(format!("{}  房间归属还没有结论，点此重试", ph::HOURGLASS))
+                .on_hover_text(reason)
+                .clicked()
+            {
+                cmds.push(Cmd::RetryRooms(refno));
+                ui.close();
+            }
+            return;
+        }
+        RoomVm::Unavailable {
+            refno: unavailable,
+            reason,
+        } if *unavailable == refno => {
+            if ui
+                .button(format!("{}  此刻查不了房间归属，点此重试", ph::INFO))
+                .on_hover_text(reason)
+                .clicked()
+            {
+                cmds.push(Cmd::RetryRooms(refno));
+                ui.close();
+            }
             return;
         }
         RoomVm::Failed(_) => {
@@ -746,10 +770,13 @@ fn room_menu_items(
         }
         job.append(
             &format!(
-                "\n{} · 顶点 {}/8 · 距中心 {}",
-                rel.room_code.as_deref().unwrap_or("—"),
-                rel.inside_count,
-                super::room::format_dist(rel.center_dist),
+                "\n{} · 顶点 {} · 距中心 {}",
+                rel.room_code.as_deref().unwrap_or(super::room::MISSING),
+                super::room::format_inside(rel.inside_count),
+                rel.center_dist.map_or_else(
+                    || super::room::MISSING.to_owned(),
+                    super::room::format_dist
+                ),
             ),
             0.0,
             TextFormat {
@@ -767,7 +794,7 @@ fn room_menu_items(
             cmds.push(Cmd::ShowRooms(refno));
             ui.close();
         }
-        resp.on_disabled_hover_text("面板不在册（陈旧归属边），无法聚焦");
+        resp.on_disabled_hover_text("房间不明（面板不在册或共用墙），无法聚焦");
     }
     ui.separator();
     // 只给主归属那一间：右键菜单答的是「这个构件在哪」，一键直达最强那间房就够了。
@@ -788,7 +815,7 @@ fn room_menu_items(
             cmds.push(Cmd::ShowRoomModel(room));
             ui.close();
         }
-        resp.on_disabled_hover_text("面板不在册（陈旧归属边），取不到房间模型");
+        resp.on_disabled_hover_text("房间不明（面板不在册或共用墙），取不到房间模型");
     }
     if ui
         .button(format!("{}  在「房间」页签中查看", ph::SIDEBAR_SIMPLE))
