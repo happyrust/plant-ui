@@ -786,10 +786,13 @@ pub enum RoomVm {
     Ready(RoomsDataVm),
     /// 服务端说这份归属还没算完或判断不了（`settled` 不是 `true`），带原因。不是「没有归属」，
     /// 也不是故障：中性提示加「重试」，取回工作完成时宿主会自己重问。带 `refno` 是因为这是某个
-    /// 构件的状态：右键落在多选集里非主选中的行上时，子菜单不拿它顶数。
+    /// 构件的状态：右键落在多选集里非主选中的行上时，子菜单不拿它顶数。`partial` 是答复里已经
+    /// 读到的行（可能不全或已过时）：照画并标明，但不是结论——不标主归属，属性面板不出房号芯片
+    /// （spec 045 FR-110）。
     Pending {
         refno: RefU64,
         reason: String,
+        partial: Vec<RoomRelationVm>,
     },
     /// 这一项此刻给不了：服务端没有这条查询或给的是会漏房间的早期答复、房间体制没就绪、
     /// 服务端还没有这个构件、选的是层级容器、库供数一条边都没读到。带一句说清怎么办的话，
@@ -803,7 +806,8 @@ pub enum RoomVm {
 }
 
 impl RoomVm {
-    /// 开始查询下一份归属，防闪烁语义同 [`PropsVm::begin_query`]。
+    /// 开始查询下一份归属，防闪烁语义同 [`PropsVm::begin_query`]。`Pending` 带的行不留作占位：
+    /// 占位按完整列表画，会把可能不全的列表画成结论。
     pub fn begin_query(&mut self) {
         let previous = match std::mem::take(self) {
             Self::Ready(data) | Self::Loading(Some(data)) => Some(data),
@@ -1351,6 +1355,34 @@ mod tests {
         let mut first_query = PropsVm::Uninit;
         first_query.begin_query();
         assert!(matches!(first_query, PropsVm::Loading(None)));
+    }
+
+    /// 「还没算完」带的行可能不全（spec 045 FR-110）：重问期间不拿它当占位，占位是按完整列表画的。
+    #[test]
+    fn a_partial_room_answer_is_not_kept_as_the_loading_placeholder() {
+        let row = RoomRelationVm {
+            room: Some(r(9)),
+            room_num: "R512".into(),
+            room_code: None,
+            panel: r(8),
+            inside_count: Some(8),
+            center_dist: None,
+            via_member: false,
+        };
+        let mut rooms = RoomVm::Pending {
+            refno: r(1),
+            reason: "房间归属还没算完".into(),
+            partial: vec![row.clone()],
+        };
+        rooms.begin_query();
+        assert_eq!(rooms, RoomVm::Loading(None));
+
+        let mut rooms = RoomVm::Ready(RoomsDataVm {
+            refno: r(1),
+            relations: vec![row],
+        });
+        rooms.begin_query();
+        assert!(matches!(rooms, RoomVm::Loading(Some(_))));
     }
 
     /// 未加载与已隐藏都是「让它出来」。把这两档合并成 `!visible` 是最容易写错的

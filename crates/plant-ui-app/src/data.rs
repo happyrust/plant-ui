@@ -908,8 +908,12 @@ fn panel_records(
 pub enum RoomsOutcome {
     /// 有结论，已按归属强度排序。空表 = 算完了、确实不属于任何房间。
     Ready(Vec<plant_ui_data::room::RoomRelation>),
-    /// 服务端说这份归属还没算完或判断不了（`settled` 不是 `true`），带原因。
-    Pending(String),
+    /// 服务端说这份归属还没算完或判断不了（`settled` 不是 `true`），带原因。`partial` 是答复里
+    /// 已经读到的行，可能不全或已过时：可以先画，但不是结论（spec 045 FR-110）。
+    Pending {
+        reason: String,
+        partial: Vec<plant_ui_data::room::RoomRelation>,
+    },
     /// 此刻答不了，但不是故障：服务端版本或口径不对、房间体制没就绪、服务端还没有这个构件、
     /// 选的是层级容器、库供数一条边都没读到（判断不了算完没有）。
     Unavailable(String),
@@ -930,9 +934,9 @@ const LEGACY_DIRECT_MEMBERS_CALIBER: &str = "self_and_direct_members";
 /// 服务供数的答复 → [`RoomsOutcome`]（FR-103）。
 ///
 /// 按结构分型，不看 message：没有路由（`route_missing`）、带包封的 `not_found` / `container`、其它失败；
-/// 成功时再依次看口径、房间体制状态、`settled`。归属口径（自身加全部后代、强度排序、
+/// 成功时再依次看口径、房间体制状态、各行、`settled`。归属口径（自身加全部后代、强度排序、
 /// 面板在册与否）由服务端一处定义，这里只搬字段；有一行解不出就整次判失败并点名那一行
-/// ——丢掉坏行再画，等于把「漏了」画成「没有」。
+/// ——丢掉坏行再画，等于把「漏了」画成「没有」。`settled` 不是 `true` 时行照样带出（FR-110）。
 pub fn classify_element_rooms(
     reply: Result<crate::model_update_api::ElementRoomsReply, plant_ui::model_update::Failure>,
 ) -> RoomsOutcome {
@@ -977,17 +981,6 @@ pub fn classify_element_rooms(
             None => format!("房间体制未就绪（{status}）"),
         });
     }
-    let pending = match reply.settled {
-        Some(true) => None,
-        Some(false) => Some("房间归属还没算完"),
-        None => Some("房间归属暂时判断不了"),
-    };
-    if let Some(head) = pending {
-        return RoomsOutcome::Pending(match non_blank(reply.settled_reason.as_deref()) {
-            Some(reason) => format!("{head}：{reason}"),
-            None => head.to_owned(),
-        });
-    }
     let mut relations = Vec::with_capacity(reply.memberships.len());
     for (i, row) in reply.memberships.iter().enumerate() {
         match membership_row(row) {
@@ -999,7 +992,18 @@ pub fn classify_element_rooms(
             }
         }
     }
-    RoomsOutcome::Ready(relations)
+    let head = match reply.settled {
+        Some(true) => return RoomsOutcome::Ready(relations),
+        Some(false) => "房间归属还没算完",
+        None => "房间归属暂时判断不了",
+    };
+    RoomsOutcome::Pending {
+        reason: match non_blank(reply.settled_reason.as_deref()) {
+            Some(reason) => format!("{head}：{reason}"),
+            None => head.to_owned(),
+        },
+        partial: relations,
+    }
 }
 
 fn non_blank(text: Option<&str>) -> Option<&str> {
@@ -2329,15 +2333,48 @@ mod tests {
                     reply.settled_reason = Some("库 7997 欠一次房间重算".into());
                     reply.memberships.clear();
                 }),
-                RoomsOutcome::Pending("房间归属还没算完：库 7997 欠一次房间重算".into()),
+                RoomsOutcome::Pending {
+                    reason: "房间归属还没算完：库 7997 欠一次房间重算".into(),
+                    partial: Vec::new(),
+                },
             ),
             (
-                "判断不了：与「还没算完」分开说",
+                "还没算完但已有行（PIPE 下一条 BRAN 先生成了）：行一并带出，仍不是结论",
+                answer(|reply| {
+                    reply.settled = Some(false);
+                    reply.settled_reason = Some("生成根 24381_100700 还没按最新数据生成".into());
+                    reply.memberships.push(ElementRoomMembership {
+                        room: Some("24381_1003".into()),
+                        room_num: Some("R513".into()),
+                        inside_count: Some(3),
+                        via_member: true,
+                        ..row()
+                    });
+                }),
+                RoomsOutcome::Pending {
+                    reason: "房间归属还没算完：生成根 24381_100700 还没按最新数据生成".into(),
+                    partial: vec![
+                        relation(row()),
+                        relation(ElementRoomMembership {
+                            room: Some("24381_1003".into()),
+                            room_num: Some("R513".into()),
+                            inside_count: Some(3),
+                            via_member: true,
+                            ..row()
+                        }),
+                    ],
+                },
+            ),
+            (
+                "判断不了：与「还没算完」分开说，已有的行同样带出",
                 answer(|reply| {
                     reply.settled = None;
                     reply.settled_reason = Some("这个构件还没有算过房间".into());
                 }),
-                RoomsOutcome::Pending("房间归属暂时判断不了：这个构件还没有算过房间".into()),
+                RoomsOutcome::Pending {
+                    reason: "房间归属暂时判断不了：这个构件还没有算过房间".into(),
+                    partial: vec![relation(row())],
+                },
             ),
             (
                 "带包封的 not_found：服务端还没有这个构件，message 里的 405 不算没有路由",
@@ -2395,6 +2432,16 @@ mod tests {
             matches!(&bad_panel, RoomsOutcome::Failed(text)
                 if text.contains("memberships[1]") && text.contains("panel `garbage`")),
             "{bad_panel:?}"
+        );
+        // 还没算完时也一样：带出来的行是要画的，坏行不能悄悄丢。
+        let bad_pending = answer(|reply| {
+            reply.settled = Some(false);
+            reply.memberships[0].panel = Some("garbage".into());
+        });
+        assert!(
+            matches!(&bad_pending, RoomsOutcome::Failed(text)
+                if text.contains("memberships[0]") && text.contains("panel `garbage`")),
+            "{bad_pending:?}"
         );
         let no_room_num = answer(|reply| reply.memberships[0].room_num = None);
         assert!(

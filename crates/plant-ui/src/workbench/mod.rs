@@ -315,3 +315,47 @@ pub fn show(
 
     cmds
 }
+
+/// 无头渲染测试用：把 `draw` 真画几帧，按绘制顺序收出画了哪些字——行上标没标什么、顶上写没写提示，
+/// 只有画一遍才验得了。
+#[cfg(test)]
+fn painted_text(mut draw: impl FnMut(&mut egui::Ui)) -> String {
+    fn collect(shape: &egui::Shape, out: &mut String) {
+        match shape {
+            egui::Shape::Text(text) => {
+                out.push_str(text.galley.text());
+                out.push('\n');
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let ctx = egui::Context::default();
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(480.0, 900.0));
+    let mut text = String::new();
+    // 头一帧字体还没加载，`ui.label` 落成空 galley；多跑几帧再取文字。
+    for _ in 0..3 {
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        });
+        egui::Area::new("workbench-paint-test".into())
+            .fixed_pos(screen.min)
+            .show(&ctx, |ui| {
+                ui.set_min_size(screen.size());
+                ui.set_max_size(screen.size());
+                draw(ui);
+            });
+        let output = ctx.end_pass();
+        text.clear();
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut text);
+        }
+    }
+    text
+}

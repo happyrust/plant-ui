@@ -9,13 +9,14 @@
 //! 两枚动作按钮在独立壳（无实时渲染器）下不出现，与树行菜单的 live 门禁同一条
 //! 规矩。归属数据本身不吃这个门禁。
 
+use aios_core::RefU64;
 use egui::{Align2, CursorIcon, RichText, ScrollArea, Sense, Ui, vec2};
 use egui_phosphor::regular as ph;
 
 use crate::style::theme_tokens::Font;
 use crate::style::tokens::{Density, Tokens, space};
 use crate::style::widgets::{self, PaneNote, PaneState, PropRow, prop_row_ui};
-use crate::vm::{RoomDetailDataVm, RoomDetailVm, RoomVm, RoomsDataVm, WorkbenchVm};
+use crate::vm::{RoomDetailDataVm, RoomDetailVm, RoomRelationVm, RoomVm, RoomsDataVm, WorkbenchVm};
 use crate::{Cmd, IsolateMatching, ModelAction};
 
 pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Vec<Cmd>) {
@@ -38,7 +39,11 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
         RoomVm::Loading(Some(data)) | RoomVm::Ready(data) => ready(ui, t, d, vm, data, cmds),
         // 还没算完 / 此刻给不了都不是故障，但都可能过一会儿就好（生成跑完、升级或切了供数）：
         // 中性提示，给一枚「重试」。
-        RoomVm::Pending { refno, reason } => {
+        RoomVm::Pending {
+            refno,
+            reason,
+            partial,
+        } if partial.is_empty() => {
             if note_with_retry(ui, t, d, ph::HOURGLASS, reason) {
                 cmds.push(Cmd::RetryRooms(*refno));
             }
@@ -48,6 +53,12 @@ pub fn show(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Ve
                 cmds.push(Cmd::RetryRooms(*refno));
             }
         }
+        // 还没算完但已经读到几行（spec 045 FR-110）：照画，顶上写明可能不全或已过时。
+        RoomVm::Pending {
+            refno,
+            reason,
+            partial,
+        } => list(ui, t, d, vm, partial, Some((*refno, reason.as_str())), cmds),
         RoomVm::Failed(reason) => {
             if note(ui, t, d, PaneState::Error, ph::WARNING, reason)
                 && let Some(refno) = vm.selection.primary()
@@ -79,6 +90,20 @@ fn ready(
         );
         return;
     }
+    list(ui, t, d, vm, &data.relations, None, cmds);
+}
+
+/// 归属列表连同聚焦房间的详情。`unsettled` 是「还没算完」时的构件号与原因：这时列表只是答复里
+/// 已经读到的那部分，顶上写明可能不全或已过时并给「重试」，首行不标主归属（spec 045 FR-110）。
+fn list(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    vm: &WorkbenchVm,
+    relations: &[RoomRelationVm],
+    unsettled: Option<(RefU64, &str)>,
+    cmds: &mut Vec<Cmd>,
+) {
     let live = vm.view3d.as_ref().is_some_and(|v| v.live);
     let focused = detail_data(&vm.room_detail).map(|det| det.room);
     egui::Frame::new().fill(t.bg_panel).show(ui, |ui| {
@@ -88,11 +113,22 @@ fn ready(
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
+                if let Some((refno, reason)) = unsettled
+                    && unsettled_banner(ui, t, d, reason)
+                {
+                    cmds.push(Cmd::RetryRooms(refno));
+                }
                 banner(ui, t, d, &vm.room_detail, cmds);
-                summary(ui, t, d, &vm.room_detail, data, live, cmds);
-                section_header(ui, t, d, "全部归属", &data.relations.len().to_string());
-                for (i, rel) in data.relations.iter().enumerate() {
-                    relation_row(ui, t, d, i == 0, focused == rel.room, rel, cmds);
+                summary(ui, t, d, &vm.room_detail, relations, live, cmds);
+                let title = if unsettled.is_some() {
+                    "已查到的归属"
+                } else {
+                    "全部归属"
+                };
+                section_header(ui, t, d, title, &relations.len().to_string());
+                for (i, rel) in relations.iter().enumerate() {
+                    let strongest = i == 0 && unsettled.is_none();
+                    relation_row(ui, t, d, strongest, focused == rel.room, rel, cmds);
                 }
                 if let Some(det) = detail_data(&vm.room_detail) {
                     composition(ui, t, d, det);
@@ -108,6 +144,31 @@ fn detail_data(detail: &RoomDetailVm) -> Option<&RoomDetailDataVm> {
         RoomDetailVm::Ready(data) | RoomDetailVm::Loading(Some(data)) => Some(data),
         _ => None,
     }
+}
+
+/// 「还没算完」横幅（spec 045 FR-110）：下面的列表只是答复里已经读到的那部分——有的生成单元还没生成，
+/// 待重新生成的那部分挂的还是上一次的边。返回值是「重试」是否被点。
+fn unsettled_banner(ui: &mut Ui, t: &Tokens, d: Density, reason: &str) -> bool {
+    let mut retried = false;
+    egui::Frame::new()
+        .fill(t.warn_bg)
+        .inner_margin(egui::Margin::same(d.px(space::S3) as i8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = space::S1;
+            ui.label(
+                RichText::new(format!("{}  下面的房间可能不全或已过时", ph::HOURGLASS))
+                    .font(Font::meta(d))
+                    .color(t.warn),
+            );
+            ui.label(
+                RichText::new(reason)
+                    .font(Font::micro(d))
+                    .color(t.text_secondary),
+            );
+            retried = ui.add(widgets::chip(t, d, "重试", false)).clicked();
+        });
+    retried
 }
 
 /// 待重算横幅：这间房还在 gen-model 的房间重算队列里，归属数据可能过时。
@@ -159,7 +220,7 @@ fn summary(
     t: &Tokens,
     d: Density,
     detail: &RoomDetailVm,
-    data: &RoomsDataVm,
+    relations: &[RoomRelationVm],
     live: bool,
     cmds: &mut Vec<Cmd>,
 ) {
@@ -205,8 +266,7 @@ fn summary(
                     });
                     // 强度取自归属列表里这间房那条边；聚焦房间不在当前元素的
                     // 归属里（切换选中的过渡帧）、或那条老边没有强度，就不硬凑。
-                    let strength = data
-                        .relations
+                    let strength = relations
                         .iter()
                         .find(|rel| rel.room == Some(det.room))
                         .and_then(|rel| rel.inside_count)
@@ -276,7 +336,7 @@ fn relation_row(
     d: Density,
     strongest: bool,
     focused: bool,
-    rel: &crate::vm::RoomRelationVm,
+    rel: &RoomRelationVm,
     cmds: &mut Vec<Cmd>,
 ) {
     let clickable = rel.room.is_some();
@@ -560,5 +620,77 @@ mod tests {
         assert_eq!(format_dist(999.4), "999 mm");
         assert_eq!(format_dist(1000.0), "1.0 m");
         assert_eq!(format_dist(5640.0), "5.6 m");
+    }
+
+    fn relation(room: u64, room_num: &str, via_member: bool) -> RoomRelationVm {
+        RoomRelationVm {
+            room: Some(RefU64(room)),
+            room_num: room_num.into(),
+            room_code: None,
+            panel: RefU64(room + 1000),
+            inside_count: Some(8),
+            center_dist: Some(120.0),
+            via_member,
+        }
+    }
+
+    /// 把页签对着这份归属状态真画一遍，返回画出来的字。
+    fn painted(rooms: RoomVm) -> String {
+        let vm = WorkbenchVm {
+            rooms,
+            ..Default::default()
+        };
+        let t = crate::style::theme_tokens::current();
+        super::super::painted_text(|ui| show(ui, &t, Density::Standard, &vm, &mut Vec::new()))
+    }
+
+    /// 还没算完但已读到几行（spec 045 FR-110）：照画，顶上写明可能不全或已过时、带原因与「重试」；
+    /// 这不是结论，首行不标主归属。有结论时同一份行的首行照标——两种画法放在一起钉。
+    #[test]
+    fn a_partial_answer_is_drawn_under_its_caveat_without_a_primary() {
+        let rows = vec![relation(1, "R512", false), relation(3, "R513", true)];
+        let partial = painted(RoomVm::Pending {
+            refno: RefU64(7),
+            reason: "房间归属还没算完：生成根 24381_100700 还没按最新数据生成".into(),
+            partial: rows.clone(),
+        });
+        for expected in [
+            "下面的房间可能不全或已过时",
+            "生成根 24381_100700 还没按最新数据生成",
+            "重试",
+            "已查到的归属",
+            "R512",
+            "R513",
+            "来自成员",
+        ] {
+            assert!(partial.contains(expected), "缺「{expected}」：\n{partial}");
+        }
+        assert!(
+            !partial.contains("主归属"),
+            "还没算完不标主归属：\n{partial}"
+        );
+
+        let settled = painted(RoomVm::Ready(RoomsDataVm {
+            refno: RefU64(7),
+            relations: rows,
+        }));
+        assert!(settled.contains("主归属"), "{settled}");
+        assert!(settled.contains("全部归属"), "{settled}");
+        assert!(!settled.contains("可能不全"), "{settled}");
+    }
+
+    /// 还没算完、一行都没读到：只给原因与「重试」，不画空列表，更不说「没有房间归属」。
+    #[test]
+    fn an_empty_pending_answer_is_only_a_reason_and_a_retry() {
+        let text = painted(RoomVm::Pending {
+            refno: RefU64(7),
+            reason: "房间归属还没算完：库 7997 欠一次房间重算".into(),
+            partial: Vec::new(),
+        });
+        assert!(text.contains("库 7997 欠一次房间重算"), "{text}");
+        assert!(text.contains("重试"), "{text}");
+        for absent in ["已查到的归属", "可能不全", "没有房间归属"] {
+            assert!(!text.contains(absent), "不该有「{absent}」：\n{text}");
+        }
     }
 }

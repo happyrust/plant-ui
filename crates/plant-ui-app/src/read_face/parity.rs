@@ -530,7 +530,10 @@ impl RoomsReport {
                 ] {
                     let said = match outcome {
                         RoomsOutcome::Ready(_) => continue,
-                        RoomsOutcome::Pending(reason) => format!("还没有结论：{reason}"),
+                        RoomsOutcome::Pending { reason, partial } => match partial.len() {
+                            0 => format!("还没有结论：{reason}"),
+                            rows => format!("还没有结论（已读到 {rows} 间，可能不全）：{reason}"),
+                        },
                         RoomsOutcome::Unavailable(reason) => format!("查不了：{reason}"),
                         RoomsOutcome::Failed(error) => format!("失败：{error}"),
                     };
@@ -1814,15 +1817,20 @@ mod tests {
             }
         );
 
+        // 还没算完时带出来的行可能不全：哪怕与库供数一样也不比（spec 045 FR-110）。
         report.compare(
             &pipe,
-            RoomsOutcome::Pending("房间归属还没算完".into()),
-            RoomsOutcome::Ready(Vec::new()),
+            RoomsOutcome::Pending {
+                reason: "房间归属还没算完".into(),
+                partial: vec![relation("R512", Some(8))],
+            },
+            RoomsOutcome::Ready(vec![relation("R512", Some(8))]),
         );
         assert_eq!((report.compared, report.inconclusive), (3, 1));
         assert_eq!(report.inconclusive_samples.len(), 1);
         assert_eq!(report.inconclusive_samples[0].1, ReadFaceKind::Service);
         assert!(report.inconclusive_samples[0].2.contains("还没算完"));
+        assert!(report.inconclusive_samples[0].2.contains("已读到 1 间"));
 
         // 库供数一条边都没读到按空集比：服务供数也空算一致，服务供数有房间算不同。
         let no_edges = || RoomsOutcome::Unavailable(crate::read_face::store::NO_EDGES.into());

@@ -3196,7 +3196,11 @@ impl App {
                             self.mirror_error_said = None;
                             RoomVm::Ready(build_rooms(refno, relations))
                         }
-                        data::RoomsOutcome::Pending(reason) => RoomVm::Pending { refno, reason },
+                        data::RoomsOutcome::Pending { reason, partial } => RoomVm::Pending {
+                            refno,
+                            reason,
+                            partial: build_rooms(refno, partial).relations,
+                        },
                         data::RoomsOutcome::Unavailable(reason) => {
                             let key = format!("房间归属查不了|{reason}");
                             if self.mirror_error_said.as_deref() != Some(key.as_str()) {
