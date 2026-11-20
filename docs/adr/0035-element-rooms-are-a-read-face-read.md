@@ -1,6 +1,6 @@
 # 构件的房间归属是读面上的一条读
 
-状态：**提议**（2026-11-20 起草，同日按方案复审改口径，见 D5；按实现审核改 D4 里库供数的强度；spec：gen-model `specs/045-element-room-membership/`，
+状态：**提议**（2026-11-20 起草，同日按方案复审改口径，见 D5；按实现审核改 D4 里库供数的强度；按复审第 3 条加 D6；spec：gen-model `specs/045-element-room-membership/`，
 服务端契约见 gen-model `docs/specs/web-service-api.md` §4.13.8）。
 修订：`docs/plans/2026-09-07-read-face-dual-mode.md` D6（房间不动、只有库一条、服务供数下经 `mirror` 门控）——
 「构件的房间归属」这一条从 D6 里拿出来；房间的其余功能（面板所属房间、房间详情、房间浏览器、X-Ray 拓扑）不变。
@@ -43,13 +43,13 @@
 | 200，`caliber` 是 `self_and_direct_members`（只到直接成员的旧构建） | 同上，并说明它只算到直接成员、选管道时会漏房间，不画 |
 | 200，`caliber` 是别的值 | 查不了：口径不认识，请把界面与 gen-model 升到同一版本，不画 |
 | `status` 不是 `ready` / `degraded` | 查不了，带服务端的原因 |
-| `settled` 不是 `true` | 还没有结论：`false` 还没算完，`null` 暂时判断不了 |
+| `settled` 不是 `true` | 还没有结论：`false` 还没算完，`null` 暂时判断不了；答复里已有的行一并带出（D6） |
 | 带包封的 `not_found` | 查不了：服务端还没有这个构件（可能尚未同步） |
 | 带包封的 `container`（422，层级容器，D5） | 查不了，照搬服务端的原话 |
 | 其它失败 | 失败，带原文 |
 | 成功 | 有结论；空表才是「无房间归属」 |
 
-有一行解不出（缺 `panel` / `room_num`，或 refno 解不出）就整次判失败并点名 `memberships[i]`，不丢行再画。
+有一行解不出（缺 `panel` / `room_num`，或 refno 解不出）就整次判失败并点名 `memberships[i]`，不丢行再画（还没有结论时也一样）。
 
 库供数没有「还没有结论」（`store::store_rooms_outcome`）：读到边是「有结论」；一条边都没读到是「查不了」（`store::NO_EDGES`：
 库里查不到这份归属算完没有，不说成「无房间归属」，spec US4）；层级容器是「查不了」，与服务端 422 `container` 同一句；
@@ -60,7 +60,7 @@
 `Req::ElementRooms` / `Evt::ElementRooms` 带 `seq`，宿主每问一次加一；`accept_rooms_reply` 只认「仍是主选中、且是最后一次
 问的」（FR-106）。只看 refno 不够：重试前发出的旧问题晚到，会把新答案盖回去。
 
-「还没有结论」「查不了」都带构件号（`RoomVm::Pending { refno, reason }` / `RoomVm::Unavailable { refno, reason }`），
+「还没有结论」「查不了」都带构件号（`RoomVm::Pending { refno, reason, partial }` / `RoomVm::Unavailable { refno, reason }`），
 「房间」页签与右键子菜单都给「重试」；子菜单只在问的那一行上显示它们——重试只对主选中有效，右键落在多选集里
 非主选中的行上时不摆一个点了没反应的钮。「查不了」写一行警告、「失败」写一行错误，同一原因只写一次。
 
@@ -89,6 +89,21 @@
 - **归并键不动。** 服务端按房间 refno 归并；库供数照旧按房号（`merge_edges`），两间房号相同的房间在库供数下并成一行。
   对拍本来比的就是房号集合，这次不扩范围。
 
+### D6　还没有结论时，已有的行照画、标明可能不全
+
+`RoomsOutcome::Pending { reason, partial }`：服务端 `settled` 不是 `true` 时，答复里读到的行一并带出（spec 045 FR-110）。
+`partial` 不空时，「房间」页签与右键子菜单照画这些行，顶上写明「下面的房间可能不全或已过时」，连同原因与「重试」；
+页签的分组头写「已查到的归属」而不是「全部归属」。它不是结论：
+
+- 首行不标「主归属」，右键子菜单不给「显示房间模型」（那一项只给主归属那间）；
+- 属性面板不出房号芯片（`room_chip` 只认有结论）：芯片只有一格，指错房间比少一枚糟；
+- 对拍仍归「没给出结论」、不比，说明里带上已读到几间；
+- 宿主重问期间不拿它当防闪烁的占位（`RoomVm::begin_query` 只留有结论的列表）：占位是按完整列表画的。
+
+`partial` 为空时同原来：只给原因与「重试」。只有服务供数的落盘形态会答出带行的「还没有结论」：读透形态这时是
+空表，库供数没有「还没有结论」（D2）。典型是 PIPE 下一条 BRAN 已生成、新粘贴的一条还没生成；写「或已过时」，
+是因为待重新生成的根上挂的还是上一次生成的边。
+
 ## 为什么不是别的做法
 
 - **在 `data.rs` 里按面分支。** 两面的判断散在数据线程里，ADR-0026 的「`data.rs` 只经读面」就破了。
@@ -100,6 +115,9 @@
   把「漏了」画成「没有」，正是这条 ADR 要消掉的静默失败。
 - **库供数照旧，记为已知限制。** 服务端改口径以后两面答案就不一致了，库供数的空表也仍画成「无房间归属」。
 - **SITE / ZONE 也照算。** 后代是整库级，一次要扫的行数没有上限；要看一片区域里有什么，按房间看才对得上问题。
+- **还没有结论就一行不画（D6 以前）。** 服务端判得保守时（例如所在库欠一次整库房间重算），已经算好的那部分也
+  一直看不到，用户只能等或反复重试。
+- **还没有结论也照常画、不加说明。** 可能不全或过时的列表被当成结论，与把「漏了」画成「没有」是同一类错。
 
 ## 后果
 
@@ -115,17 +133,23 @@
 6. 选 WORL / SITE / ZONE 时两种供数都拒答，给出按房间查看的出路。
 7. 库供数不再说一个构件「无房间归属」：一条边都没读到时说「判断不了」，可重试。
 8. 库供数遇到没有强度两格的老边不再整次失败，那两格显示「—」。房间详情的成员列表仍按非空读，不在这条 ADR 里。
+9. 服务供数下「还没有结论」而答复里已有房间时，页签与右键子菜单先列出这些房间并标明可能不全或已过时；主归属、
+   房号芯片与「显示房间模型」等算完再出。
 
 ## 实施约束
 
-1. 回归测试：`element_room_replies_are_classified_by_structure`（各种结论，加旧口径、不认识的口径、层级容器与坏行）、
+1. 回归测试：`element_room_replies_are_classified_by_structure`（各种结论，加旧口径、不认识的口径、层级容器、坏行，
+   以及还没有结论时带出的行）、
    `element_rooms_go_through_the_read_face_only`、`data_rs_reads_only_through_read_face` 的禁单、
    `store_face_never_touches_the_service` 的禁单与期望单、`only_the_latest_room_reply_for_the_primary_is_accepted`、
    `a_missing_route_is_told_apart_from_a_missing_element`、`route_detection_never_matches_message_substrings`、
    `missing_strength_reads_as_blank_not_zero`、`old_edges_without_strength_merge_as_weakest_and_stay_blank`（库供数老边）、
-   `rooms_compare_room_sets_and_set_aside_inconclusive_answers`（含库供数没读到边）、
+   `rooms_compare_room_sets_and_set_aside_inconclusive_answers`（含库供数没读到边、还没有结论时带出的行不比）、
    `sql_renderers_pin_tables_and_predicates`（库供数按 `anc CONTAINS` 取后代，不许出现 `pe_owner` / `anc[1]` / `FROM $targets`）、
-   `hierarchy_containers_are_refused_like_the_service`、`store_rooms_never_turn_no_edges_into_no_rooms`。
+   `hierarchy_containers_are_refused_like_the_service`、`store_rooms_never_turn_no_edges_into_no_rooms`、
+   `a_partial_room_answer_is_not_kept_as_the_loading_placeholder`；D6 的画法由无头渲染测试钉住：
+   `a_partial_answer_is_drawn_under_its_caveat_without_a_primary`、`an_empty_pending_answer_is_only_a_reason_and_a_retry`、
+   `the_room_menu_lists_a_partial_answer_without_a_primary`。
 2. 客户端只依赖契约里的 `caliber` / `status` / `reason` / `settled` / `settled_reason` / `memberships`；每一格都
    `#[serde(default)]`，认旧后端靠分型，不靠反序列化报错。
 3. 库供数的层级容器类型表与 gen-model `generation_root::is_coarse_hierarchy_noun` 是同一组（WORL / WORLD / SITE / ZONE），
