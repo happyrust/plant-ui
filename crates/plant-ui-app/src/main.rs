@@ -5140,8 +5140,10 @@ impl App {
                     self.refetch_props(refno)
                 }
                 Cmd::RetryProps(_) => {}
+                // 只重问归属，同「查看所属房间」。`refetch_rooms` 会连面板所属房间一起重问，
+                // 回包重开房间 X-Ray，还把用户拨开的虚拟孔洞 X-Ray 关掉（spec 045 FR-111）。
                 Cmd::RetryRooms(refno) if self.vm.selection.primary() == Some(refno) => {
-                    self.refetch_rooms(refno)
+                    self.ask_rooms(refno)
                 }
                 // 选中早就挪走：重查回来也过不了回包那道陈旧门，不发。
                 Cmd::RetryRooms(_) => {}
@@ -7163,6 +7165,9 @@ impl App {
     }
 
     /// 房间归属随选中预取（计划决定 5）：查询极轻，右键菜单打开的瞬间就有现成数据。
+    ///
+    /// 连面板所属房间一起重问，只给主选中变化与取回工作完成用（两处都先撤了房间 X-Ray）；重试与
+    /// 「查看所属房间」只调 [`App::ask_rooms`]（spec 045 FR-111）。
     fn refetch_rooms(&mut self, refno: RefU64) {
         self.ask_rooms(refno);
         self.panel_room_asked = None;
@@ -9566,6 +9571,38 @@ mod tests {
         );
         assert_eq!(panel_room_query(Some(pipe), None, is_panel), None);
         assert_eq!(panel_room_query(None, None, is_panel), None);
+    }
+
+    /// 归属的「重试」与已选中时再点「查看所属房间」只重问归属（spec 045 FR-111）。走 `refetch_rooms`
+    /// 会连面板所属房间一起重问：回包重开房间 X-Ray，还把用户拨开的虚拟孔洞 X-Ray 关掉，
+    /// 正是 `panel_room_asked` 说的「不该又自己查回来」。
+    #[test]
+    fn retrying_rooms_only_reasks_membership() {
+        let source = include_str!("main.rs");
+        let (production, _) = source.split_once("\nmod tests {").expect("测试模块分界");
+        for head in [
+            "Cmd::RetryRooms(refno) if self.vm.selection.primary() == Some(refno) => {",
+            "Cmd::ShowRooms(refno) => {",
+        ] {
+            let arm = production
+                .split_once(head)
+                .unwrap_or_else(|| panic!("找不到 {head}"))
+                .1
+                .split_once("\n                Cmd::")
+                .expect("下一条分支")
+                .0
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(arm.contains("self.ask_rooms(refno)"), "要重问归属：{arm}");
+            for forbidden in ["refetch_rooms", "ask_panel_room", "panel_room_asked"] {
+                assert!(
+                    !arm.contains(forbidden),
+                    "只重问归属、不碰面板所属房间，却出现了 {forbidden}：{arm}"
+                );
+            }
+        }
     }
 
     /// 房间归属回包只认「仍是主选中、且是最后一次问的」（FR-106）。点过重试之后，重试前发出的
