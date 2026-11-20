@@ -5499,8 +5499,14 @@ impl App {
                 Cmd::ShowRooms(refno) => {
                     // 归属数据跟着主选中预取；对准的不是当前主选中时先把选中切
                     // 过去，页签一亮出来就有内容而不是一句「查询中」。
+                    // 已经是主选中就重问一次：预取的答案可能早于这次增量更新（粘贴后
+                    // 马上选中新支管，那时它的模型和房间边还没生成）。只重问归属，不走
+                    // `refetch_rooms`——那边会重问面板所属房间，回包又把房间 X-Ray 打开。
                     if self.vm.selection.primary() != Some(refno) {
                         self.set_selection(Selection::single(refno));
+                    } else {
+                        self.vm.rooms.begin_query();
+                        let _ = self.bridge.req.send(data::Req::ElementRooms(refno));
                     }
                     self.state.focus(Pane::Room);
                 }
