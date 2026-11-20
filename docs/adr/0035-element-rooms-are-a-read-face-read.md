@@ -1,6 +1,6 @@
 # 构件的房间归属是读面上的一条读
 
-状态：**提议**（2026-11-20 起草，同日按方案复审改口径，见 D5；按实现审核改 D4 里库供数的强度；按复审第 3 条加 D6；spec：gen-model `specs/045-element-room-membership/`，
+状态：**提议**（2026-11-20 起草，同日按方案复审改口径，见 D5；按实现审核改 D4 里库供数的强度；按复审第 3 条加 D6；按复审第 6 条补 D3 末段；spec：gen-model `specs/045-element-room-membership/`，
 服务端契约见 gen-model `docs/specs/web-service-api.md` §4.13.8）。
 修订：`docs/plans/2026-09-07-read-face-dual-mode.md` D6（房间不动、只有库一条、服务供数下经 `mirror` 门控）——
 「构件的房间归属」这一条从 D6 里拿出来；房间的其余功能（面板所属房间、房间详情、房间浏览器、X-Ray 拓扑）不变。
@@ -63,6 +63,10 @@
 「还没有结论」「查不了」都带构件号（`RoomVm::Pending { refno, reason, partial }` / `RoomVm::Unavailable { refno, reason }`），
 「房间」页签与右键子菜单都给「重试」；子菜单只在问的那一行上显示它们——重试只对主选中有效，右键落在多选集里
 非主选中的行上时不摆一个点了没反应的钮。「查不了」写一行警告、「失败」写一行错误，同一原因只写一次。
+
+「重试」与已选中时再点「查看所属房间」只重问归属（`ask_rooms`），不走 `refetch_rooms`：后者连面板所属房间一起重问，
+回包会重开房间 X-Ray、关掉用户拨开的虚拟孔洞 X-Ray（spec 045 FR-111）。`refetch_rooms` 只留给主选中变化与
+取回工作完成，这两处都先撤了房间 X-Ray。面板所属房间查失败时，要重新选中那块面板才再查。
 
 ### D4　强度缺席照实显示
 
@@ -135,6 +139,8 @@
 8. 库供数遇到没有强度两格的老边不再整次失败，那两格显示「—」。房间详情的成员列表仍按非空读，不在这条 ADR 里。
 9. 服务供数下「还没有结论」而答复里已有房间时，页签与右键子菜单先列出这些房间并标明可能不全或已过时；主归属、
    房号芯片与「显示房间模型」等算完再出。
+10. 归属的「重试」不再把房间 X-Ray 重新打开，也不再关掉虚拟孔洞 X-Ray；面板所属房间查失败时，要重新选中
+    那块面板才再查。
 
 ## 实施约束
 
@@ -147,7 +153,8 @@
    `rooms_compare_room_sets_and_set_aside_inconclusive_answers`（含库供数没读到边、还没有结论时带出的行不比）、
    `sql_renderers_pin_tables_and_predicates`（库供数按 `anc CONTAINS` 取后代，不许出现 `pe_owner` / `anc[1]` / `FROM $targets`）、
    `hierarchy_containers_are_refused_like_the_service`、`store_rooms_never_turn_no_edges_into_no_rooms`、
-   `a_partial_room_answer_is_not_kept_as_the_loading_placeholder`；D6 的画法由无头渲染测试钉住：
+   `a_partial_room_answer_is_not_kept_as_the_loading_placeholder`、
+   `retrying_rooms_only_reasks_membership`（D3 末段）；D6 的画法由无头渲染测试钉住：
    `a_partial_answer_is_drawn_under_its_caveat_without_a_primary`、`an_empty_pending_answer_is_only_a_reason_and_a_retry`、
    `the_room_menu_lists_a_partial_answer_without_a_primary`。
 2. 客户端只依赖契约里的 `caliber` / `status` / `reason` / `settled` / `settled_reason` / `memberships`；每一格都
