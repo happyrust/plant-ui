@@ -15,10 +15,13 @@
 //! - 属性：从两边共有的节点里等距抽 `--sample` 个，逐字段比，四档照 gen-model
 //!   `direct-mode-expression-dialect.md` §1.1 的口径：相同 / 只差首尾空白 / 只差括号与空格 /
 //!   不同；库供数回空表的元素（元件库元素、未同步）单独列。
+//! - 房间归属（ADR-0035）：属性那批抽样元素两面各问一次，比**房号集合**（强度与排序不比）；
+//!   库供数一条边都没读到时按空集比（服务供数也空算一致，有房间算不同）；其余某一面没给出
+//!   结论（还没算完 / 查不了 / 失败）的不比，单列。
 //! - 三维实例：抽样根各读 `model_instances`，按库分桶比 `refno + geo_hash` 集合。库号从
 //!   根的搜索命中解（refno 高 32 位是 db ref 不是库号，客户端算不出），解不出的桶按 db ref 列。
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -28,7 +31,7 @@ use plant_ui::task_queue::DbnumStatus;
 use plant_ui_data::{Attr, EleTreeNode, RefU64};
 
 use super::{Identity, ModelInstancesReq, ReadFace, ReadFaceKind, ServiceIdentity};
-use crate::data::SEARCH_LIMIT;
+use crate::data::{RoomsOutcome, SEARCH_LIMIT};
 use crate::logs::error_chain;
 use crate::model_update_api;
 use crate::search_index::{Scope, SearchIndex};
@@ -484,6 +487,86 @@ impl PropsReport {
     }
 }
 
+/// 房间归属「不同」的一条：同一个元素，两面给出的房号集合各多了哪些。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomDiff {
+    pub node: Node,
+    pub only_service: Vec<String>,
+    pub only_store: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct RoomsReport {
+    /// 比过房号集合的元素数：两面都给出了结论，或服务供数给出了结论、库供数一条边都没读到。
+    pub compared: usize,
+    /// 房号集合一致的元素数（含两面都是空集的）。
+    pub same: usize,
+    /// 其中两面都是空集的：服务供数说不在任何房间，库供数一条边都没读到。
+    pub both_empty: usize,
+    pub different: usize,
+    /// 「不同」逐条（最多 [`LIST_CAP`] 条，计数在 `different` 里）。
+    pub differences: Vec<RoomDiff>,
+    /// 某一面没给出结论（还没算完 / 查不了 / 失败）、没法比的元素数。
+    pub inconclusive: usize,
+    /// 没法比的样例：哪一面、怎么说的（最多 [`LIST_CAP`] 条）。
+    pub inconclusive_samples: Vec<(Node, ReadFaceKind, String)>,
+}
+
+impl RoomsReport {
+    /// 一个元素两面的结论归档。只比房号集合：强度服务端可以缺席，排序在强度平局时也不保证一致。
+    /// 库供数一条边都没读到时界面上说「判断不了」，这里按空集比：对拍要看出服务供数有房间、
+    /// 库里一条边都没有的元素。
+    pub fn compare(&mut self, node: &Node, service: RoomsOutcome, store: RoomsOutcome) {
+        let (service, store) = match (service, store) {
+            (RoomsOutcome::Ready(service), RoomsOutcome::Ready(store)) => (service, store),
+            (RoomsOutcome::Ready(service), store) if super::store::found_no_edges(&store) => {
+                (service, Vec::new())
+            }
+            (service, store) => {
+                self.inconclusive += 1;
+                for (side, outcome) in [
+                    (ReadFaceKind::Service, service),
+                    (ReadFaceKind::Store, store),
+                ] {
+                    let said = match outcome {
+                        RoomsOutcome::Ready(_) => continue,
+                        RoomsOutcome::Pending(reason) => format!("还没有结论：{reason}"),
+                        RoomsOutcome::Unavailable(reason) => format!("查不了：{reason}"),
+                        RoomsOutcome::Failed(error) => format!("失败：{error}"),
+                    };
+                    if self.inconclusive_samples.len() < LIST_CAP {
+                        self.inconclusive_samples.push((node.clone(), side, said));
+                    }
+                }
+                return;
+            }
+        };
+        self.compared += 1;
+        let rooms = |relations: Vec<plant_ui_data::room::RoomRelation>| {
+            relations
+                .into_iter()
+                .map(|relation| relation.room_num)
+                .collect::<BTreeSet<String>>()
+        };
+        let (service, store) = (rooms(service), rooms(store));
+        if service == store {
+            self.same += 1;
+            if service.is_empty() {
+                self.both_empty += 1;
+            }
+            return;
+        }
+        self.different += 1;
+        if self.differences.len() < LIST_CAP {
+            self.differences.push(RoomDiff {
+                node: node.clone(),
+                only_service: service.difference(&store).cloned().collect(),
+                only_store: store.difference(&service).cloned().collect(),
+            });
+        }
+    }
+}
+
 /// 三维实例按库分的一桶。
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Bucket {
@@ -626,6 +709,7 @@ pub struct Report {
     pub credentials: Vec<Credential>,
     pub levels: Vec<LevelReport>,
     pub props: PropsReport,
+    pub rooms: RoomsReport,
     pub instances: InstanceReport,
 }
 
@@ -634,7 +718,7 @@ impl Report {
     pub fn summary_line(&self) -> String {
         let roots = &self.levels[0];
         format!(
-            "roots 服务 {} / 库 {} / 共有 {}（只在服务 {}、只在库 {}、原序{}）；属性抽样 {}，不同 {} 字段；实例 {} 个桶，{} 个桶有差异",
+            "roots 服务 {} / 库 {} / 共有 {}（只在服务 {}、只在库 {}、原序{}）；属性抽样 {}，不同 {} 字段；房间归属比了 {}，不同 {}、没法比 {}；实例 {} 个桶，{} 个桶有差异",
             roots.service,
             roots.store,
             roots.common,
@@ -647,6 +731,9 @@ impl Report {
             },
             self.props.sampled,
             self.props.field_count(ValueVerdict::Different),
+            self.rooms.compared,
+            self.rooms.different,
+            self.rooms.inconclusive,
             self.instances.buckets.len(),
             self.instances
                 .buckets
@@ -1056,6 +1143,51 @@ impl Report {
             push(o, "");
         }
 
+        push(o, "## 房间归属");
+        push(o, "");
+        let r = &self.rooms;
+        push(
+            o,
+            &format!(
+                "属性那批抽样元素两面各问一次，比房号集合（库供数一条边都没读到按空集比）：比了 {}，\
+                 一致 {}（其中两面都是空集 {}），不同 {}，没法比 {}。",
+                r.compared, r.same, r.both_empty, r.different, r.inconclusive
+            ),
+        );
+        push(o, "");
+        if !r.differences.is_empty() {
+            push(o, &format!("### 不同（前 {} 条）", r.differences.len()));
+            push(o, "");
+            push(o, "| 元素 | 只在服务 | 只在库 |");
+            push(o, "|---|---|---|");
+            for diff in &r.differences {
+                push(
+                    o,
+                    &format!(
+                        "| {} | {} | {} |",
+                        cell(&diff.node.label()),
+                        cell(&diff.only_service.join("、")),
+                        cell(&diff.only_store.join("、"))
+                    ),
+                );
+            }
+            push(o, "");
+        }
+        if !r.inconclusive_samples.is_empty() {
+            push(
+                o,
+                &format!("### 没法比的样例（前 {} 条）", r.inconclusive_samples.len()),
+            );
+            push(o, "");
+            for (node, side, said) in &r.inconclusive_samples {
+                push(
+                    o,
+                    &format!("- {}：{} · {}", side.label(), node.label(), said),
+                );
+            }
+            push(o, "");
+        }
+
         push(o, "## 三维实例");
         push(o, "");
         let i = &self.instances;
@@ -1277,7 +1409,7 @@ pub async fn run(options: &Options) -> anyhow::Result<Report> {
         Node,
         anyhow::Result<Vec<Attr>>,
         anyhow::Result<Vec<Attr>>,
-    )> = futures::stream::iter(picks.into_iter().enumerate())
+    )> = futures::stream::iter(picks.iter().cloned().enumerate())
         .map(|(index, node)| {
             let service = &service;
             let store = &store;
@@ -1322,6 +1454,34 @@ pub async fn run(options: &Options) -> anyhow::Result<Report> {
         props.compared,
         props.field_count(ValueVerdict::Different),
         props.store_empty.len()
+    );
+
+    // 房间归属：同一批抽样元素，比房号集合。
+    let mut rooms = RoomsReport::default();
+    let mut results: Vec<(usize, Node, RoomsOutcome, RoomsOutcome)> =
+        futures::stream::iter(picks.into_iter().enumerate())
+            .map(|(index, node)| {
+                let service = &service;
+                let store = &store;
+                let scope = &scope;
+                async move {
+                    let (s, t) = futures::join!(
+                        service.element_rooms(node.refno, scope),
+                        store.element_rooms(node.refno, scope)
+                    );
+                    (index, node, s, t)
+                }
+            })
+            .buffer_unordered(IN_FLIGHT)
+            .collect()
+            .await;
+    results.sort_by_key(|(index, ..)| *index);
+    for (_, node, s, t) in results {
+        rooms.compare(&node, s, t);
+    }
+    eprintln!(
+        "[对拍] 房间归属：比了 {}，一致 {}，不同 {}，没法比 {}",
+        rooms.compared, rooms.same, rooms.different, rooms.inconclusive
     );
 
     // 三维实例：抽样根，先解库号，再按桶比。
@@ -1423,6 +1583,7 @@ pub async fn run(options: &Options) -> anyhow::Result<Report> {
         credentials: dbnums.dbnums.iter().map(Credential::from).collect(),
         levels,
         props,
+        rooms,
         instances,
     })
 }
@@ -1605,6 +1766,90 @@ mod tests {
         assert_eq!(classify_value("", "( 0 )"), ValueVerdict::Different);
     }
 
+    /// 房间归属只比房号集合：强度与顺序不同不算不同；库供数一条边都没读到按空集比；其余任一面
+    /// 没给出结论就不比，记下是哪一面、怎么说的。
+    #[test]
+    fn rooms_compare_room_sets_and_set_aside_inconclusive_answers() {
+        let relation =
+            |room_num: &str, inside_count: Option<u8>| plant_ui_data::room::RoomRelation {
+                room: None,
+                room_num: room_num.into(),
+                room_code: None,
+                panel: RefU64::from(1),
+                inside_count,
+                center_dist: None,
+                via_member: false,
+            };
+        let pipe = Node {
+            refno: RefU64::from(11),
+            noun: "PIPE".into(),
+            name: "/P".into(),
+        };
+        let mut report = RoomsReport::default();
+
+        report.compare(
+            &pipe,
+            RoomsOutcome::Ready(vec![relation("R512", None), relation("R301", Some(8))]),
+            RoomsOutcome::Ready(vec![relation("R301", Some(2)), relation("R512", Some(8))]),
+        );
+        report.compare(
+            &pipe,
+            RoomsOutcome::Ready(Vec::new()),
+            RoomsOutcome::Ready(Vec::new()),
+        );
+        assert_eq!((report.compared, report.same, report.both_empty), (2, 2, 1));
+
+        report.compare(
+            &pipe,
+            RoomsOutcome::Ready(vec![relation("R512", Some(8))]),
+            RoomsOutcome::Ready(vec![relation("R301", Some(8))]),
+        );
+        assert_eq!(report.different, 1);
+        assert_eq!(
+            report.differences[0],
+            RoomDiff {
+                node: pipe.clone(),
+                only_service: vec!["R512".into()],
+                only_store: vec!["R301".into()],
+            }
+        );
+
+        report.compare(
+            &pipe,
+            RoomsOutcome::Pending("房间归属还没算完".into()),
+            RoomsOutcome::Ready(Vec::new()),
+        );
+        assert_eq!((report.compared, report.inconclusive), (3, 1));
+        assert_eq!(report.inconclusive_samples.len(), 1);
+        assert_eq!(report.inconclusive_samples[0].1, ReadFaceKind::Service);
+        assert!(report.inconclusive_samples[0].2.contains("还没算完"));
+
+        // 库供数一条边都没读到按空集比：服务供数也空算一致，服务供数有房间算不同。
+        let no_edges = || RoomsOutcome::Unavailable(crate::read_face::store::NO_EDGES.into());
+        report.compare(&pipe, RoomsOutcome::Ready(Vec::new()), no_edges());
+        assert_eq!((report.compared, report.same, report.both_empty), (4, 3, 2));
+        report.compare(
+            &pipe,
+            RoomsOutcome::Ready(vec![relation("R301", Some(8))]),
+            no_edges(),
+        );
+        assert_eq!((report.compared, report.different), (5, 2));
+        assert_eq!(
+            report.differences[1],
+            RoomDiff {
+                node: pipe.clone(),
+                only_service: vec!["R301".into()],
+                only_store: Vec::new(),
+            }
+        );
+        // 服务供数自己没给出结论时照样不比，两面怎么说的都记下。
+        report.compare(&pipe, RoomsOutcome::Failed("连不上".into()), no_edges());
+        assert_eq!((report.compared, report.inconclusive), (5, 2));
+        assert_eq!(report.inconclusive_samples.len(), 3);
+        assert_eq!(report.inconclusive_samples[2].1, ReadFaceKind::Store);
+        assert!(report.inconclusive_samples[2].2.contains("没查到房间边"));
+    }
+
     #[test]
     fn props_compare_files_each_field_and_lists_empty_tables_apart() {
         let mut report = PropsReport::default();
@@ -1743,6 +1988,7 @@ mod tests {
                 ..Default::default()
             }],
             props: PropsReport::default(),
+            rooms: RoomsReport::default(),
             instances: InstanceReport::default(),
         }
     }
