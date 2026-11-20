@@ -783,8 +783,8 @@ pub struct ElementRoomsReply {
 
 /// 一个构件的全部房间归属，**由服务端算**（spec §4.13.8）。
 ///
-/// 此前 plant-ui 直连库自己拼 `room_relate` 图查询，那套写法在当前的 SurrealDB fork 上恒
-/// 返回空（`SELECT VALUE <-room_relate FROM <数组>` 拿不到行），于是同一个构件后端
+/// 此前 plant-ui 直连库自己拼 `room_relate` 图查询，那套写法要求构件在库里有 `pe` 记录、子层有
+/// `pe_owner` 边，平表化库里这两张表空或不全时恒返回空，于是同一个构件后端
 /// `e3d.room.lookup` 答得出 R512、界面显示「无房间归属」。归属口径由服务端一处定义，
 /// 客户端只负责把答案画出来。
 pub async fn element_rooms(

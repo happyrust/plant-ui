@@ -989,8 +989,8 @@ async fn handle_read(
         }
         Req::ElementRooms(refno) => {
             // 归属由服务端算（`GET /api/v1/element/rooms`）：客户端自己拼 `room_relate`
-            // 图查询在当前的 SurrealDB fork 上恒返回空（`SELECT VALUE <-room_relate FROM
-            // <数组>` 拿不到行），同一个构件后端答得出、界面显示「无房间归属」。
+            // 图查询要靠库里的 `pe` 记录和 `pe_owner` 边，平表化库里这两张表空或不全时恒返回空，
+            // 同一个构件后端答得出、界面显示「无房间归属」。
             let r = match require_mirror_feature("房间").await {
                 Ok(()) => element_rooms_from_service(refno, &scope).await,
                 Err(error) => Err(error),
