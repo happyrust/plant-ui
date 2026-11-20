@@ -209,10 +209,18 @@ impl ReadFace {
     /// 构件的房间归属（右键「查看所属房间」与「房间」页签）。服务供数问 `/api/v1/element/rooms`，
     /// 口径由服务端定；库供数按同一口径（自身 + 全部后代）查 `room_relate`。两面都已分好型，
     /// 宿主照着画。
-    pub async fn element_rooms(&self, refno: RefU64, scope: &Scope) -> RoomsOutcome {
+    ///
+    /// `noun` 是宿主从模型树上知道的类型（不知道给 `None`）。只有库供数用它先拒层级容器：
+    /// 服务端按自己模型树上的类型判，不听客户端的。
+    pub async fn element_rooms(
+        &self,
+        refno: RefU64,
+        noun: Option<&str>,
+        scope: &Scope,
+    ) -> RoomsOutcome {
         match self {
             Self::Service(face) => face.element_rooms(refno, scope).await,
-            Self::Store(face) => face.element_rooms(refno).await,
+            Self::Store(face) => face.element_rooms(refno, noun).await,
         }
     }
 

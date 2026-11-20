@@ -1468,9 +1468,10 @@ pub async fn run(options: &Options) -> anyhow::Result<Report> {
                 let store = &store;
                 let scope = &scope;
                 async move {
+                    let noun = (!node.noun.is_empty()).then_some(node.noun.as_str());
                     let (s, t) = futures::join!(
-                        service.element_rooms(node.refno, scope),
-                        store.element_rooms(node.refno, scope)
+                        service.element_rooms(node.refno, noun, scope),
+                        store.element_rooms(node.refno, noun, scope)
                     );
                     (index, node, s, t)
                 }

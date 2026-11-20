@@ -179,7 +179,12 @@ pub enum Req {
     Props(RefU64),
     /// 选中元素的房间归属（右键「查看所属房间」子菜单与「房间」页签共用），
     /// 与 `Props` 同拍预取。经读面（ADR-0035）；`seq` 由宿主递增，原样带回 `Evt::ElementRooms`。
-    ElementRooms { refno: RefU64, seq: u64 },
+    /// `noun` 是模型树上已知的类型，库供数靠它拒层级容器（平表化库里 `pe` 常缺这一行）。
+    ElementRooms {
+        refno: RefU64,
+        noun: Option<String>,
+        seq: u64,
+    },
     /// 选中对象若是一块在册 PANEL，返回它直属的房间；普通元素返回 None。
     PanelRoom(RefU64),
     /// X-Ray 专用轻量拓扑：一间房直属的全部 PANEL。
@@ -1068,8 +1073,8 @@ async fn handle_read(
             let r = face.props(refno, &scope).await;
             let _ = evt_tx.send(Evt::Props(refno, r));
         }
-        Req::ElementRooms { refno, seq } => {
-            let outcome = face.element_rooms(refno, &scope).await;
+        Req::ElementRooms { refno, noun, seq } => {
+            let outcome = face.element_rooms(refno, noun.as_deref(), &scope).await;
             let _ = evt_tx.send(Evt::ElementRooms {
                 refno,
                 seq,
@@ -2211,14 +2216,14 @@ mod tests {
     #[test]
     fn element_rooms_go_through_the_read_face_only() {
         let branch = body()
-            .split_once("Req::ElementRooms { refno, seq } =>")
+            .split_once("Req::ElementRooms { refno, noun, seq } =>")
             .expect("房间归属那一臂")
             .1
             .split_once("Req::PanelRoom(")
             .expect("下一臂")
             .0;
         assert!(
-            branch.contains("face.element_rooms(refno, &scope)"),
+            branch.contains("face.element_rooms(refno, noun.as_deref(), &scope)"),
             "{branch}"
         );
         assert!(!branch.contains("require_mirror_feature"), "{branch}");

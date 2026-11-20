@@ -97,11 +97,11 @@ impl StoreReadFace {
     }
 
     /// `room_relate` 图查询。不过镜像门：那道门要问模型服务的 `/health`，而这一面启动时已经连上
-    /// 库；模型服务不在场，库里的归属照样查得到。
-    pub async fn element_rooms(&self, refno: RefU64) -> RoomsOutcome {
+    /// 库；模型服务不在场，库里的归属照样查得到。`noun` 是界面知道的类型，层级容器靠它先拒答。
+    pub async fn element_rooms(&self, refno: RefU64, noun: Option<&str>) -> RoomsOutcome {
         let rooms = async {
             plant_ui_data::connect().await?;
-            plant_ui_data::room::element_rooms(refno.into()).await
+            plant_ui_data::room::element_rooms(refno.into(), noun).await
         };
         store_rooms_outcome(rooms.await)
     }

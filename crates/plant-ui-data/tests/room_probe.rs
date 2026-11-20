@@ -105,7 +105,7 @@ async fn probe_room_queries_round_trip() {
     let Some(member) = detail.members.first() else {
         return;
     };
-    let relations = match room::element_rooms(member.refno.into())
+    let relations = match room::element_rooms(member.refno.into(), None)
         .await
         .expect("element_rooms 失败")
     {

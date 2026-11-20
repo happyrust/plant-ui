@@ -7174,12 +7174,14 @@ impl App {
         self.ask_panel_room();
     }
 
-    /// 只问构件的房间归属。每问一次序号加一，回包靠它认出是不是最后一次问的。
+    /// 只问构件的房间归属。每问一次序号加一，回包靠它认出是不是最后一次问的。类型从模型树上取
+    /// （树还没展开到它时为 `None`），库供数靠它拒层级容器。
     fn ask_rooms(&mut self, refno: RefU64) {
         self.vm.rooms.begin_query();
         self.rooms_seq += 1;
         let _ = self.bridge.req.send(data::Req::ElementRooms {
             refno,
+            noun: self.tree.noun_of(refno).map(str::to_owned),
             seq: self.rooms_seq,
         });
     }

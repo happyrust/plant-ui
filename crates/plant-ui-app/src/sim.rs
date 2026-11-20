@@ -1886,7 +1886,7 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
             },
         },
         // 剧本里没有房间数据：空归属即「无房间归属」，界面照常走 Ready 空态。
-        Req::ElementRooms { refno, seq } => Evt::ElementRooms {
+        Req::ElementRooms { refno, seq, .. } => Evt::ElementRooms {
             refno,
             seq,
             outcome: crate::data::RoomsOutcome::Ready(Vec::new()),

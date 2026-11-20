@@ -162,18 +162,22 @@ pub enum ElementRooms {
 /// 元素的全部房间归属，按归属强度排序（最强在前，即「主归属」）。
 ///
 /// 自身边与全部后代的边一并查出；同一间房命中多条时保留最强一条，
-/// `via_member` 记录最强那条是不是来自后代。层级容器先按 `pe` 上的类型拒答，不去扫它整库级的
-/// 后代；`pe` 里没有这一行时类型无从知道，照常查。
-pub async fn element_rooms(refno: RefnoEnum) -> Result<ElementRooms> {
+/// `via_member` 记录最强那条是不是来自后代。层级容器先拒答，不去扫它整库级的后代：先看调用方
+/// 给的类型 `noun`（界面从模型树上知道），再看 `pe` 上的类型——平表化库里 `pe` 常缺这一行。
+/// 两头都不知道才照常查。
+pub async fn element_rooms(refno: RefnoEnum, noun: Option<&str>) -> Result<ElementRooms> {
+    if let Some(container) = container_of(noun) {
+        return Ok(ElementRooms::Container(container));
+    }
     let pe_key = refno.to_pe_key();
     let mut response = SUL_DB.query(element_noun_sql(&pe_key)).await?.check()?;
     let nouns: Vec<Option<String>> = response.take(0)?;
-    if let Some(noun) = nouns
-        .into_iter()
+    if let Some(container) = nouns
+        .iter()
         .flatten()
-        .find(|noun| is_hierarchy_container(noun))
+        .find_map(|noun| container_of(Some(noun.as_str())))
     {
-        return Ok(ElementRooms::Container(noun.trim().to_ascii_uppercase()));
+        return Ok(ElementRooms::Container(container));
     }
     let mut response = SUL_DB
         .query(element_edges_sql(&pe_key, refno.refno().0))
@@ -213,6 +217,12 @@ pub async fn element_rooms(refno: RefnoEnum) -> Result<ElementRooms> {
             })
             .collect(),
     ))
+}
+
+/// 是层级容器就给出规范化（去空白、大写）的类型名，答复里照它写。
+fn container_of(noun: Option<&str>) -> Option<String> {
+    noun.filter(|noun| is_hierarchy_container(noun))
+        .map(|noun| noun.trim().to_ascii_uppercase())
 }
 
 /// WORL / SITE / ZONE 这类层级容器：后代是整库级，不答归属。与 gen-model
@@ -860,6 +870,27 @@ mod tests {
         for noun in ["PIPE", "BRAN", "EQUI", "HVAC", ""] {
             assert!(!is_hierarchy_container(noun), "{noun}");
         }
+    }
+
+    /// 调用方给的类型是层级容器就就地拒答：平表化库里 `pe` 缺这一行时，选中 SITE / ZONE
+    /// 不该对整个站点跑后代查询。拒答在第一句库查询之前。
+    #[test]
+    fn a_container_type_known_to_the_caller_is_refused_before_any_query() {
+        assert_eq!(container_of(Some(" site ")).as_deref(), Some("SITE"));
+        assert_eq!(container_of(Some("ZONE")).as_deref(), Some("ZONE"));
+        assert_eq!(container_of(Some("PIPE")), None);
+        assert_eq!(container_of(None), None);
+
+        let body = include_str!("room.rs")
+            .split_once("pub async fn element_rooms(")
+            .expect("element_rooms exists")
+            .1;
+        let refused = body.find("container_of(noun)").expect("先判调用方给的类型");
+        let first_query = body.find("SUL_DB").expect("库查询");
+        assert!(
+            refused < first_query,
+            "element_rooms 要在第一句库查询之前先判调用方给的类型"
+        );
     }
 
     #[test]
