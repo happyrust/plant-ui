@@ -41,7 +41,8 @@ pub struct RoomMemberPreview {
     pub refno: RefU64,
     pub name: String,
     pub noun: String,
-    pub inside_count: u8,
+    /// 对这间房的归属强度（0-8）。老边没有这一格时为 `None`（照实显示为空，不补 0；spec 045 FR-112）。
+    pub inside_count: Option<u8>,
 }
 
 /// 一间房的详情（「房间」页签的数据源）。
@@ -279,33 +280,11 @@ pub async fn room_detail(room: RefnoEnum, preview: usize) -> Result<Option<RoomD
         return Ok(None);
     };
     let panels: Vec<RefnoEnum> = response.take(2)?;
-    let member_edges: Vec<(RefnoEnum, u8, f32)> = response.take(3)?;
+    let member_edges: Vec<MemberEdgeRow> = response.take(3)?;
     let panels: Vec<RefU64> = panels.into_iter().map(|p| p.refno()).collect();
 
-    // 同一构件跨多面板只留最强的一条。
-    let mut best: HashMap<RefU64, (u8, f32)> = HashMap::new();
-    for (member, inside_count, center_dist) in member_edges {
-        let member = member.refno();
-        let candidate = (inside_count, center_dist);
-        match best.get_mut(&member) {
-            None => {
-                best.insert(member, candidate);
-            }
-            Some(current) => {
-                if strength_cmp(candidate, *current).is_lt() {
-                    *current = candidate;
-                }
-            }
-        }
-    }
-    let member_count = best.len();
-    let mut ranked: Vec<(RefU64, u8, f32)> = best
-        .into_iter()
-        .map(|(refno, (inside, dist))| (refno, inside, dist))
-        .collect();
-    ranked.sort_by(|a, b| {
-        strength_cmp((a.1, a.2), (b.1, b.2)).then_with(|| a.0.to_pdms_str().cmp(&b.0.to_pdms_str()))
-    });
+    let mut ranked = rank_members(member_edges);
+    let member_count = ranked.len();
     let member_refnos: Vec<RefU64> = ranked.iter().map(|(refno, _, _)| *refno).collect();
     ranked.truncate(preview);
 
@@ -426,14 +405,9 @@ pub async fn rooms_overview() -> Result<Vec<RoomOverviewRow>> {
     Ok(result)
 }
 
-/// 归属强度全序（ADR-010 §5 前两键）：`inside_count` 降序 -> `center_dist` 升序。
-/// 第三键（`room_num` / refno）由调用方按语境补。
-fn strength_cmp(a: (u8, f32), b: (u8, f32)) -> std::cmp::Ordering {
-    b.0.cmp(&a.0).then_with(|| a.1.total_cmp(&b.1))
-}
-
-/// [`strength_cmp`] 的可空版，与 gen-model `room_membership_api::strength_cmp` 同一规则：缺的一格算最弱，
-/// 不当 0 / 0.0 比——`center_dist` 补 0.0 会让老边在平局里排到最前。
+/// 归属强度全序（ADR-010 §5 前两键）：`inside_count` 降序 -> `center_dist` 升序；第三键（`room_num` / refno）
+/// 由调用方按语境补。与 gen-model `room_membership_api::strength_cmp` 同一规则：缺的一格算最弱，不当 0 / 0.0 比——
+/// `center_dist` 补 0.0 会让老边在平局里排到最前。
 fn optional_strength_cmp(
     a: (Option<u8>, Option<f32>),
     b: (Option<u8>, Option<f32>),
@@ -451,6 +425,38 @@ fn optional_strength_cmp(
         (None, Some(_)) => Ordering::Greater,
         (None, None) => Ordering::Equal,
     })
+}
+
+/// 一条成员边：成员、两格强度。老边没有强度两格，按可空读——按 `u8` / `f32` 读时，房里一条老边就让整个
+/// 详情失败（spec 045 FR-112，同 FR-109）。
+type MemberEdgeRow = (RefnoEnum, Option<u8>, Option<f32>);
+
+/// 房间成员边 -> 同一构件跨多面板只留最强的一条，再按强度排出全序（平局按 refno）。
+fn rank_members(rows: Vec<MemberEdgeRow>) -> Vec<(RefU64, Option<u8>, Option<f32>)> {
+    let mut best: HashMap<RefU64, (Option<u8>, Option<f32>)> = HashMap::new();
+    for (member, inside_count, center_dist) in rows {
+        let member = member.refno();
+        let candidate = (inside_count, center_dist);
+        match best.get_mut(&member) {
+            None => {
+                best.insert(member, candidate);
+            }
+            Some(current) => {
+                if optional_strength_cmp(candidate, *current).is_lt() {
+                    *current = candidate;
+                }
+            }
+        }
+    }
+    let mut ranked: Vec<(RefU64, Option<u8>, Option<f32>)> = best
+        .into_iter()
+        .map(|(refno, (inside, dist))| (refno, inside, dist))
+        .collect();
+    ranked.sort_by(|a, b| {
+        optional_strength_cmp((a.1, a.2), (b.1, b.2))
+            .then_with(|| a.0.to_pdms_str().cmp(&b.0.to_pdms_str()))
+    });
+    ranked
 }
 
 /// 一条归属边：面板、房号、两格强度、挂边的构件。gen-model 早期写的边没有强度两格，按可空读——
@@ -613,7 +619,7 @@ fn room_detail_sql(room_key: &str) -> String {
 /// 1.6–1.8 s（空列表也要 1.0 s），直选 0.3 ms（2026-09-20 f13 隔离部署测出）。
 /// 房间详情点开后的 2.2 s 里有 1.7 s 就是这一句。没有预览成员时用 `RETURN []` 占住
 /// 第 0 槛，后面 `take(0)` 的位置不变。
-fn detail_follow_up_sql(ranked: &[(RefU64, u8, f32)], panels: &[RefU64]) -> String {
+fn detail_follow_up_sql(ranked: &[(RefU64, Option<u8>, Option<f32>)], panels: &[RefU64]) -> String {
     let member_keys = ranked
         .iter()
         .map(|(refno, _, _)| refno.to_pe_key())
@@ -809,13 +815,38 @@ mod tests {
         );
     }
 
+    /// 房间详情的成员边也有老边（spec 045 FR-112，同 FR-109）：照样归并、留空，缺的一格算最弱。同一构件有带强度的
+    /// 边就用那条；只剩老边的成员照样列出，排在有强度的后面。按 `u8` / `f32` 读时，房里一条老边就让整个详情失败。
+    #[test]
+    fn room_members_with_old_edges_rank_last_and_stay_blank() {
+        let member = |n: u64| RefnoEnum::Refno(refno(n));
+        let ranked = rank_members(vec![
+            (member(10), None, None),
+            (member(10), Some(0), Some(9.0)),
+            (member(11), None, None),
+            (member(12), Some(6), Some(2.0)),
+            (member(12), Some(6), Some(1.0)),
+        ]);
+        assert_eq!(
+            ranked,
+            vec![
+                (refno(12), Some(6), Some(1.0)),
+                (refno(10), Some(0), Some(9.0)),
+                (refno(11), None, None),
+            ]
+        );
+    }
+
     #[test]
     fn strength_ordering_matches_adr010() {
         // inside 降序优先。
-        assert!(strength_cmp((8, 9.0), (7, 0.1)).is_lt());
+        assert!(optional_strength_cmp((Some(8), Some(9.0)), (Some(7), Some(0.1))).is_lt());
         // 平局距离升序。
-        assert!(strength_cmp((6, 1.0), (6, 2.0)).is_lt());
-        assert_eq!(strength_cmp((6, 1.0), (6, 1.0)), std::cmp::Ordering::Equal);
+        assert!(optional_strength_cmp((Some(6), Some(1.0)), (Some(6), Some(2.0))).is_lt());
+        assert_eq!(
+            optional_strength_cmp((Some(6), Some(1.0)), (Some(6), Some(1.0))),
+            std::cmp::Ordering::Equal
+        );
     }
 
     /// 层级容器与 gen-model 同一组类型，大小写与空白无关；管道、分支、设备、风管照答。
@@ -873,7 +904,13 @@ mod tests {
         assert!(!detail.contains("WHERE in IN"), "{detail}");
         assert!(!detail.contains("IN (SELECT"), "{detail}");
 
-        let follow = detail_follow_up_sql(&[(refno(7), 8, 1.0), (refno(8), 7, 2.0)], &[refno(9)]);
+        let follow = detail_follow_up_sql(
+            &[
+                (refno(7), Some(8), Some(1.0)),
+                (refno(8), Some(7), Some(2.0)),
+            ],
+            &[refno(9)],
+        );
         // 名称按记录 id 直选，不许再写 WHERE id IN（SurrealDB 2.1 会全表扫 pe）。
         assert!(follow.starts_with("SELECT VALUE [id, name, noun] FROM pe:0_7, pe:0_8;"));
         assert!(!follow.contains("WHERE id IN"));

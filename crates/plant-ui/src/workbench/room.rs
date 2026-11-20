@@ -488,7 +488,7 @@ fn members(ui: &mut Ui, t: &Tokens, d: Density, det: &RoomDetailDataVm, cmds: &m
             p.text(
                 rect.right_center() - vec2(pad, 0.0),
                 Align2::RIGHT_CENTER,
-                format!("{} · {}/8", member.noun, member.inside_count),
+                format!("{} · {}", member.noun, format_inside(member.inside_count)),
                 Font::mono_micro(d),
                 t.text_muted,
             );

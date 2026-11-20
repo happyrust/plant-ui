@@ -1126,8 +1126,8 @@ pub struct RoomMemberVm {
     pub refno: RefU64,
     pub name: String,
     pub noun: String,
-    /// 0-8，对这间房的归属强度。
-    pub inside_count: u8,
+    /// 0-8，对这间房的归属强度；老边没有这一格时为 `None`（显示「—」，不补 0）。
+    pub inside_count: Option<u8>,
 }
 
 /// 尺寸标注层的状态（计划 B2）。同时只挂一条 BRAN：再看另一条就把前一条换掉，
