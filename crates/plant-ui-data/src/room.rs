@@ -569,9 +569,11 @@ fn element_edges_sql(pe_key: &str, refno_u64: u64) -> String {
     )
 }
 
+/// 按面板走图（`([..])<-room_panel_relate`），不写 `WHERE out IN [..]`：边表只有 `(in, out)` 复合索引时
+/// `IN [数组]` 静默回 0 行（见 [`room_detail_sql`] 上方的现场记录），每条归属的房间都会成空、也不报错。
 fn panel_rooms_sql(panel_keys: &[String]) -> String {
     format!(
-        "SELECT VALUE [out, in, in.name] FROM room_panel_relate WHERE out IN [{}];",
+        "SELECT VALUE [out, in, in.name] FROM array::flatten(([{}])<-room_panel_relate);",
         panel_keys.join(", ")
     )
 }
@@ -885,8 +887,12 @@ mod tests {
         assert_eq!(edges.matches("LET ").count(), 2);
 
         let panels = panel_rooms_sql(&["pe:1_10".to_string(), "pe:1_11".to_string()]);
-        assert!(panels.contains("FROM room_panel_relate WHERE out IN [pe:1_10, pe:1_11]"));
-        assert!(panels.contains("in.name"));
+        assert_eq!(
+            panels,
+            "SELECT VALUE [out, in, in.name] \
+             FROM array::flatten(([pe:1_10, pe:1_11])<-room_panel_relate);"
+        );
+        assert!(!panels.contains("WHERE"), "{panels}");
 
         let detail = room_detail_sql("pe:1_5");
         assert!(detail.contains("SELECT VALUE name FROM pe:1_5"));
