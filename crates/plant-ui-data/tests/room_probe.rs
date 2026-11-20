@@ -127,12 +127,18 @@ async fn probe_room_queries_round_trip() {
         member.refno.to_pdms_str(),
         detail.room_num,
     );
-    // 返回序必须是强度全序：inside 降、dist 升。
+    // 返回序必须是强度全序：inside 降、dist 升，缺的一格算最弱（spec 045 FR-109）。`Option` 自带的序把
+    // `None` 当最小：inside 降序时正好排最后，dist 升序时却会排最前，所以 dist 单独比。
     for pair in relations.windows(2) {
         let (a, b) = (&pair[0], &pair[1]);
+        let dist_not_after = match (a.center_dist, b.center_dist) {
+            (Some(x), Some(y)) => x <= y,
+            (_, None) => true,
+            (None, Some(_)) => false,
+        };
         assert!(
             a.inside_count > b.inside_count
-                || (a.inside_count == b.inside_count && a.center_dist <= b.center_dist),
+                || (a.inside_count == b.inside_count && dist_not_after),
             "归属排序违反 ADR-010 §5：{:?} 排在 {:?} 前",
             (&a.room_num, a.inside_count, a.center_dist),
             (&b.room_num, b.inside_count, b.center_dist),
