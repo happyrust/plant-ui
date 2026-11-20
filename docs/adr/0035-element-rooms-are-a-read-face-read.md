@@ -1,0 +1,132 @@
+# 构件的房间归属是读面上的一条读
+
+状态：**提议**（2026-11-20 起草，同日按方案复审改口径，见 D5；按实现审核改 D4 里库供数的强度；spec：gen-model `specs/045-element-room-membership/`，
+服务端契约见 gen-model `docs/specs/web-service-api.md` §4.13.8）。
+修订：`docs/plans/2026-09-07-read-face-dual-mode.md` D6（房间不动、只有库一条、服务供数下经 `mirror` 门控）——
+「构件的房间归属」这一条从 D6 里拿出来；房间的其余功能（面板所属房间、房间详情、房间浏览器、X-Ray 拓扑）不变。
+`docs/plans/room-info-feature.md` 决定 1（容器聚合直接子层）由 D5 取代。
+
+## 背景
+
+复制粘贴管道、增量更新之后，后端 `e3d.room.lookup` 答得出 R512，右键「查看所属房间」却是「无房间归属」。成因有四层：
+
+- **客户端自己拼图查询。** 最早这条读直连库拼 `room_relate`，要求构件在库里有 `pe` 记录、子层有 `pe_owner` 边；
+  平表化库里这两张表空或不全时恒返回空。
+- **修补挂错了地方。** 之前的修补把它改成问 gen-model `/api/v1/element/rooms`，却仍挂在镜像门后面（两面都先问
+  `/health.mirror` 再连库）：服务供数下库不通，就答不了一个根本不靠库的问题。
+- **答复说不清「算完没有」。** 没算完的空表被画成「无房间归属」；老后端没有这条路由，404 被当成查询失败；
+  解不出的行被悄悄丢掉。三样都是静默失败。
+- **口径只到直接成员。** 两种供数都只聚合「自身 + 直接子层」。BRAN 自己没有 `inst_relate` 行，房间边挂在更下一层的
+  管件上，选 PIPE 时一个成员都找不到。AMS 落盘库上 4 个 PIPE（含两个复制出来的）按旧口径全是空，算上全部后代
+  各有 2–9 间房。
+
+## 决定
+
+### D1　构件的房间归属进读面
+
+`ReadFace::element_rooms(refno, scope) -> RoomsOutcome`：
+
+- **服务供数**问 `/api/v1/element/rooms`，归属口径（自身加全部后代、强度排序、面板在册与否）由服务端一处定义。
+- **库供数**查 `room_relate`（`plant_ui_data::room::element_rooms`），口径与服务端相同（D5）；先等库连接，**不过镜像门**：
+  那道门要问模型服务的 `/health`，而库供数不碰模型服务（`store_face_never_touches_the_service`），启动时也已经连上库。
+- `data.rs` 的 `Req::ElementRooms` 那一臂只调读面，不过镜像门、不自己问接口（`element_rooms_go_through_the_read_face_only`）。
+
+### D2　结论分四种，由读面给出
+
+`RoomsOutcome::{Ready, Pending, Unavailable, Failed}`。服务供数按结构分型（`data::classify_element_rooms`，spec FR-103），
+不看 message 里的字串：
+
+| 服务端怎么答 | 结论 |
+|---|---|
+| 404 / 405 且包体不是错误包封（`route_missing`，老后端） | 查不了：请升级，或在设置里把供数切到库 |
+| 200 但没有 `caliber`（只在测试站点上跑过的草稿构建） | 同上，并说明它的列表会漏房间，不画 |
+| 200，`caliber` 是 `self_and_direct_members`（只到直接成员的旧构建） | 同上，并说明它只算到直接成员、选管道时会漏房间，不画 |
+| 200，`caliber` 是别的值 | 查不了：口径不认识，请把界面与 gen-model 升到同一版本，不画 |
+| `status` 不是 `ready` / `degraded` | 查不了，带服务端的原因 |
+| `settled` 不是 `true` | 还没有结论：`false` 还没算完，`null` 暂时判断不了 |
+| 带包封的 `not_found` | 查不了：服务端还没有这个构件（可能尚未同步） |
+| 带包封的 `container`（422，层级容器，D5） | 查不了，照搬服务端的原话 |
+| 其它失败 | 失败，带原文 |
+| 成功 | 有结论；空表才是「无房间归属」 |
+
+有一行解不出（缺 `panel` / `room_num`，或 refno 解不出）就整次判失败并点名 `memberships[i]`，不丢行再画。
+
+库供数没有「还没有结论」（`store::store_rooms_outcome`）：读到边是「有结论」；一条边都没读到是「查不了」（`store::NO_EDGES`：
+库里查不到这份归属算完没有，不说成「无房间归属」，spec US4）；层级容器是「查不了」，与服务端 422 `container` 同一句；
+查询出错是「失败」。所以库供数下「无房间归属」不会出现。
+
+### D3　宿主只采纳最后一次问的那一份
+
+`Req::ElementRooms` / `Evt::ElementRooms` 带 `seq`，宿主每问一次加一；`accept_rooms_reply` 只认「仍是主选中、且是最后一次
+问的」（FR-106）。只看 refno 不够：重试前发出的旧问题晚到，会把新答案盖回去。
+
+「还没有结论」「查不了」都带构件号（`RoomVm::Pending { refno, reason }` / `RoomVm::Unavailable { refno, reason }`），
+「房间」页签与右键子菜单都给「重试」；子菜单只在问的那一行上显示它们——重试只对主选中有效，右键落在多选集里
+非主选中的行上时不摆一个点了没反应的钮。「查不了」写一行警告、「失败」写一行错误，同一原因只写一次。
+
+### D4　强度缺席照实显示
+
+`RoomRelation.inside_count` / `center_dist`（以及绘制层的 `RoomRelationVm`）改成 `Option`：服务端老边没有强度时是 `null`，
+界面显示「—」，不补 0（spec US5-3）。库供数同样按可空读：老边缺这两格时留空、归并时算最弱（与服务端同一规则），
+不让一条老边把整次查询变成失败（spec FR-109）。房间为空（面板不在册，或服务供数下共用墙按房号挑不出
+唯一一间）时，归属行说「房间不明（面板不在册或共用墙）」。
+
+### D5　口径：自身 + 全部后代，两种供数一致
+
+构件的归属聚合它自己和**全部后代**的 `room_relate` 边，每间房留最强一条（spec 045 FR-002 / FR-101）。服务端答复的
+`caliber` 是 `self_and_descendants`，客户端只认这一个（`data::ELEMENT_ROOMS_CALIBER`）。
+
+- **后代怎么取。** `inst_relate.anc` 是「自身 → 顶层」整条祖先链，`anc CONTAINS <构件>` 就是全部后代，走
+  `idx_inst_relate_anc`。不再写 `anc[1] = <构件>`（服务端旧口径），也不再沿 `pe_owner` 找（库供数旧口径）。叶子件的 `anc`
+  也含它自己，库供数那句要 `array::distinct`。边与服务端同一写法取：`array::flatten(($targets)<-room_relate)`。
+  旧写法 `SELECT VALUE <-room_relate FROM $targets` 只遍历库里有 `pe` 记录的目标，平表化库里缺记录的构件一条边都
+  出不来；`pe` 齐全的库上两种写法在 AMS 上对拍 500 个目标、3,762 行，0 差异（spec 045 背景第 4 条）。
+- **层级容器不答。** WORL / WORLD / SITE / ZONE 的后代是整库级：服务端回 422 `container`；库供数先按 `pe` 上的类型
+  拒答，不去查边（`pe` 没有这一行时类型无从知道，照常查）。两边同一句：「{类型} 是层级容器，范围太大，
+  不答房间归属：请按房间查看，或选它下面的管道 / 设备」。
+- **库供数的空表不当结论。** 库里没有生成凭证和房间欠账可查，空表分不清「算完了、不在任何房间」和「还没算」，
+  所以说「判断不了」（D2）。对拍探针拿它当空集和服务供数比，要看出「服务供数有房间、库里一条边都没有」的元素。
+- **归并键不动。** 服务端按房间 refno 归并；库供数照旧按房号（`merge_edges`），两间房号相同的房间在库供数下并成一行。
+  对拍本来比的就是房号集合，这次不扩范围。
+
+## 为什么不是别的做法
+
+- **在 `data.rs` 里按面分支。** 两面的判断散在数据线程里，ADR-0026 的「`data.rs` 只经读面」就破了。
+- **服务供数答不了时退回库查。** 违反 ADR-0026（数据线程内不许据错误自行换面），而且库那条路正是会漏的那条。
+- **只改文案、不要 `settled`。** 没算完的空表仍会画成「无房间归属」。
+- **库供数也先过镜像门（与房间其余功能一致）。** 镜像门要问模型服务的 `/health`：模型服务不在场时，库里的归属
+  也查不了，而库供数本来就是为了不靠模型服务。
+- **口径只算自身 + 直接成员（原口径）。** 选 PIPE 恒为空。界面不会说「只算了一层」，只会写「无房间归属」——
+  把「漏了」画成「没有」，正是这条 ADR 要消掉的静默失败。
+- **库供数照旧，记为已知限制。** 服务端改口径以后两面答案就不一致了，库供数的空表也仍画成「无房间归属」。
+- **SITE / ZONE 也照算。** 后代是整库级，一次要扫的行数没有上限；要看一片区域里有什么，按房间看才对得上问题。
+
+## 后果
+
+1. 老 gen-model（正式版 ≤ 0.1.49）没有这条路由：服务供数下「房间」页签与右键子菜单说「请升级；或切到库供数」，可重试，
+   不再报「查询失败」。
+2. 「没有路由」按结构认（`model_update_api::ROUTE_MISSING`）：文件侧属性接口「服务端不支持」的判法一并从
+   「message 里含 405」改为认这个 code；`endpoint_missing` 的结果不变。
+3. 对拍探针多一项「房间归属」：属性那批抽样元素两面各问一次，比房号集合；库供数一条边都没读到按空集比（服务供数
+   也空算一致，有房间算不同），其余某一面没给出结论的单列。
+4. 房间其余功能仍只有库一条路，服务供数下照旧经镜像门（D6 其余部分不变）。
+5. 只算到直接成员的服务端构建（只在测试站点上跑过）配这一版界面：提示升级、不画列表。界面与 gen-model 要一起升，
+   站点先升后端再发界面。
+6. 选 WORL / SITE / ZONE 时两种供数都拒答，给出按房间查看的出路。
+7. 库供数不再说一个构件「无房间归属」：一条边都没读到时说「判断不了」，可重试。
+8. 库供数遇到没有强度两格的老边不再整次失败，那两格显示「—」。房间详情的成员列表仍按非空读，不在这条 ADR 里。
+
+## 实施约束
+
+1. 回归测试：`element_room_replies_are_classified_by_structure`（各种结论，加旧口径、不认识的口径、层级容器与坏行）、
+   `element_rooms_go_through_the_read_face_only`、`data_rs_reads_only_through_read_face` 的禁单、
+   `store_face_never_touches_the_service` 的禁单与期望单、`only_the_latest_room_reply_for_the_primary_is_accepted`、
+   `a_missing_route_is_told_apart_from_a_missing_element`、`route_detection_never_matches_message_substrings`、
+   `missing_strength_reads_as_blank_not_zero`、`old_edges_without_strength_merge_as_weakest_and_stay_blank`（库供数老边）、
+   `rooms_compare_room_sets_and_set_aside_inconclusive_answers`（含库供数没读到边）、
+   `sql_renderers_pin_tables_and_predicates`（库供数按 `anc CONTAINS` 取后代，不许出现 `pe_owner` / `anc[1]` / `FROM $targets`）、
+   `hierarchy_containers_are_refused_like_the_service`、`store_rooms_never_turn_no_edges_into_no_rooms`。
+2. 客户端只依赖契约里的 `caliber` / `status` / `reason` / `settled` / `settled_reason` / `memberships`；每一格都
+   `#[serde(default)]`，认旧后端靠分型，不靠反序列化报错。
+3. 库供数的层级容器类型表与 gen-model `generation_root::is_coarse_hierarchy_noun` 是同一组（WORL / WORLD / SITE / ZONE），
+   改一边要同步另一边。
