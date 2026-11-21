@@ -101,7 +101,8 @@ pub struct RoomClipStatus {
     pub hidden: usize,
     /// 整段在房间体内、原样画的段数。
     pub whole: usize,
-    /// 判不出管轴（网格不是棱柱、方盒短而粗，或没加载成）、截不了而原样画的段数。
+    /// 判不出管轴（网格不是棱柱、方盒短而粗，或没加载成）又跨着房间体边界、截不了而原样画的段数。
+    /// 判不出管轴但整件在房间体内 / 外的，照常记进 `whole` / `hidden`。
     pub skipped: usize,
     /// 宿主交来的截断候选（去重后）：分支几根、直管件几件。
     pub carriers: usize,
@@ -372,13 +373,9 @@ impl Prisms {
         else {
             return Prisms::default();
         };
-        let mut min = Vec3::splat(f32::INFINITY);
-        let mut max = Vec3::splat(f32::NEG_INFINITY);
-        for p in positions {
-            let p = Vec3::from_array(*p);
-            min = min.min(p);
-            max = max.max(p);
-        }
+        let Some((min, max)) = local_bounds(positions) else {
+            return Prisms::default();
+        };
         Prisms([0, 1, 2].map(|axis| Prism::along(positions, min, max, axis)))
     }
 
@@ -401,6 +398,18 @@ impl Prisms {
             }
         }
     }
+}
+
+/// 网格顶点在自己局部系里的包围盒；一个顶点都没有时为 `None`。
+fn local_bounds(positions: &[[f32; 3]]) -> Option<(Vec3, Vec3)> {
+    let mut min = Vec3::INFINITY;
+    let mut max = Vec3::NEG_INFINITY;
+    for p in positions {
+        let p = Vec3::from_array(*p);
+        min = min.min(p);
+        max = max.max(p);
+    }
+    (min.is_finite() && max.is_finite()).then_some((min, max))
 }
 
 /// 管轴两端的世界坐标（毫米、PDMS 世界系）：原型两个端面的截面中心，过子实体变换再过模型根。
@@ -923,8 +932,22 @@ impl Active {
                 },
             };
             let Some(prism) = prism else {
-                self.counts.skipped += 1;
-                self.done.insert(entity, Outcome::Skipped);
+                let outcome = match uncut_of(body, meshes.get(&mesh.0), solid) {
+                    Uncut::Whole => {
+                        self.counts.whole += 1;
+                        Outcome::Whole
+                    }
+                    Uncut::Hidden => {
+                        *visibility = Visibility::Hidden;
+                        self.counts.hidden += 1;
+                        Outcome::Hidden
+                    }
+                    Uncut::Crossing => {
+                        self.counts.skipped += 1;
+                        Outcome::Skipped
+                    }
+                };
+                self.done.insert(entity, outcome);
                 continue;
             };
             let (a, b) = axis_of(body, prism);
@@ -992,6 +1015,61 @@ fn prism_of(
             Some(LoadState::Loading | LoadState::NotLoaded) => PrismLookup::Pending,
             _ => PrismLookup::Found(Prisms::default()),
         },
+    }
+}
+
+/// 判不出管轴、截不了的一段落在房间体哪一侧。
+enum Uncut {
+    Whole,
+    Hidden,
+    /// 跨着房间体的边界；网格没加载成、判不了的也算这一类。
+    Crossing,
+}
+
+/// 按网格局部包围盒判：8 个角全在房间体内、沿包围盒最长边的中线也整段在内，才算整段在内；
+/// 角全在外、中线也整段在外，才算在外。中线补的是角看不出的那种：两头都在房外、中间穿过房间的
+/// 长件。
+fn uncut_of(body: &TubeBody, mesh: Option<&Mesh>, solid: &RoomSolid) -> Uncut {
+    let bounds = mesh.and_then(|mesh| match mesh.attribute(Mesh::ATTRIBUTE_POSITION) {
+        Some(VertexAttributeValues::Float32x3(positions)) => local_bounds(positions),
+        _ => None,
+    });
+    let Some((min, max)) = bounds else {
+        return Uncut::Crossing;
+    };
+    let world = |p: Vec3| {
+        body.root
+            .transform_point(body.base.transform_point(p))
+            .as_dvec3()
+    };
+    let inside = (0..8_u32)
+        .filter(|&corner| {
+            let pick = |axis: usize| {
+                if (corner >> axis) & 1 == 0 {
+                    min[axis]
+                } else {
+                    max[axis]
+                }
+            };
+            solid.contains_point(world(Vec3::new(pick(0), pick(1), pick(2))))
+        })
+        .count();
+    let size = max - min;
+    let axis = if size.x >= size.y && size.x >= size.z {
+        0
+    } else if size.y >= size.z {
+        1
+    } else {
+        2
+    };
+    let centre = (min + max) * 0.5;
+    let (mut a, mut b) = (centre, centre);
+    a[axis] = min[axis];
+    b[axis] = max[axis];
+    match (inside, plan_of(solid.inside_intervals(world(a), world(b)))) {
+        (8, Plan::Whole) => Uncut::Whole,
+        (0, Plan::Hidden) => Uncut::Hidden,
+        _ => Uncut::Crossing,
     }
 }
 
@@ -1606,6 +1684,22 @@ mod tests {
         *app.world().entity(entity).get::<Transform>().unwrap()
     }
 
+    fn visibility_of(app: &App, entity: Entity) -> Visibility {
+        *app.world().entity(entity).get::<Visibility>().unwrap()
+    }
+
+    /// 放一件直管件：模型根就在 `at`，网格子实体不另加变换。
+    fn spawn_component(app: &mut App, refno: RefU64, at: Vec3, mesh: Handle<Mesh>) -> Entity {
+        let root = Transform::from_translation(at);
+        spawn_body(
+            app,
+            refno,
+            root,
+            mesh,
+            TubeBody::component(Transform::IDENTITY, root),
+        )
+    }
+
     /// 穿一面墙：只留墙内那一截（子实体本身改写），墙上一片断口；根的可见性不动。整段在内的原样，
     /// 整段在外的藏起来，不是截断候选的不碰。
     #[test]
@@ -1762,7 +1856,7 @@ mod tests {
         assert_eq!(app.world().resource::<View3d>().room_clip_status(), None);
     }
 
-    /// 网格不是沿局部 Z 的棱柱：不截，原样画，计进「未能截断」。
+    /// 网格不是沿局部 Z 的棱柱、又穿着墙：不截，原样画，计进「未能截断」。
     #[test]
     fn a_non_prism_tube_is_left_alone_and_counted() {
         let bran = RefU64::from(11);
@@ -1786,6 +1880,45 @@ mod tests {
         app.update();
         assert_eq!(transform_of(&app, tube), Transform::IDENTITY);
         assert_eq!(status(&app).skipped, 1);
+    }
+
+    /// 判不出管轴的件（R220 的电缆桥架直段那样，800 × 500 × 75 的扁方盒）按包围盒定去向：整件在
+    /// 房里记整段在内，整件在房外照样不画，只有穿着墙的原样画、计进「未能截断」。关掉截断，
+    /// 藏起来的那件复原。
+    #[test]
+    fn uncuttable_pieces_wholly_inside_or_outside_count_as_whole_or_hidden() {
+        let parts = [RefU64::from(31), RefU64::from(32), RefU64::from(33)];
+        let mut app = test_app();
+        let flat = prism_mesh(
+            &[[-250.0, 0.0], [250.0, 0.0], [250.0, 75.0], [-250.0, 75.0]],
+            0.0,
+            800.0,
+        );
+        let tray = add_mesh(&mut app, turned(flat, 0));
+        activate_with(&mut app, vec![room_box()], &[], &parts, true);
+        let at = |x: f32| Vec3::new(x, 400.0, 400.0);
+        let inside = spawn_component(&mut app, parts[0], at(100.0), tray.clone());
+        let outside = spawn_component(&mut app, parts[1], at(1100.0), tray.clone());
+        let crossing = spawn_component(&mut app, parts[2], at(600.0), tray);
+        app.update();
+        app.update();
+
+        let status = status(&app);
+        assert_eq!(
+            (status.cut, status.hidden, status.whole, status.skipped),
+            (0, 1, 1, 1)
+        );
+        assert_eq!(extras(&mut app), (0, 0), "一件都没截");
+        assert_eq!(visibility_of(&app, outside), Visibility::Hidden);
+        assert_ne!(visibility_of(&app, inside), Visibility::Hidden);
+        assert_ne!(visibility_of(&app, crossing), Visibility::Hidden);
+        assert_eq!(transform_of(&app, crossing), Transform::IDENTITY);
+
+        app.world_mut()
+            .resource_mut::<View3d>()
+            .set_room_truncation(false);
+        app.update();
+        assert_eq!(visibility_of(&app, outside), Visibility::Inherited);
     }
 
     /// 直管件（FTUB 那样的实心方盒，管轴在局部 X 上）按自己名下的 refno 认，沿管轴在墙上截断、

@@ -1024,7 +1024,8 @@ pub enum TruncationVm {
         hidden: usize,
         /// 整段在房间内、原样画的段数。
         whole: usize,
-        /// 判不出管轴、截不了的段数（原样画）。
+        /// 判不出管轴又跨着墙、截不了的段数（原样画）。判不出管轴但整件在房间内 / 外的记进
+        /// `whole` / `hidden`。
         skipped: usize,
         /// 截断候选：分支几根、直管件几件。
         carriers: usize,
