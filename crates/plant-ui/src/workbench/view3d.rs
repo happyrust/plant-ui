@@ -784,7 +784,8 @@ fn truncation_chip(room: &RoomViewVm) -> TruncationChip {
         (_, false) => (
             "截断直段 关".to_owned(),
             false,
-            "整根分支显示。\n点击开启：直段只画房间体内的那一截，房间外的管件不显示。".to_owned(),
+            "整根分支显示。\n点击开启：直段与直管件只画房间体内的那一截，房间外的管件不显示。"
+                .to_owned(),
         ),
         (TruncationVm::Loading { done, total }, true) => (
             "截断直段 开 …".to_owned(),
@@ -806,22 +807,35 @@ fn truncation_chip(room: &RoomViewVm) -> TruncationChip {
                 hidden,
                 whole,
                 skipped,
+                carriers,
+                components,
+                found,
             },
             true,
         ) => {
-            let skipped = if *skipped > 0 {
-                format!(" · 未能截断 {skipped} 段")
+            let state = if *carriers == 0 && *components == 0 {
+                "这间房的成员里既没有挂直段的分支，也没有直管件，没有可截的直段。".to_owned()
+            } else if *found == 0 {
+                format!(
+                    "候选分支 {carriers} 根、直管件 {components} 件，场景里一段都没找到：\
+                     所在的 SITE / ZONE 没打开，或者这些分支没有直段。"
+                )
             } else {
-                String::new()
+                let skipped = if *skipped > 0 {
+                    format!(" · 未能截断 {skipped} 段")
+                } else {
+                    String::new()
+                };
+                format!(
+                    "只画直段与直管件在房间体内的那一截，房间外的管件不显示。\n\
+                     截断 {cut} 段 · 房间外 {hidden} 段不画 · 整段在内 {whole} 段{skipped}。\n\
+                     候选分支 {carriers} 根、直管件 {components} 件。"
+                )
             };
             (
                 "截断直段 开".to_owned(),
                 true,
-                format!(
-                    "只画直段在房间体内的那一截，房间外的管件不显示。\n\
-                     截断 {cut} 段 · 房间外 {hidden} 段不画 · 整段在内 {whole} 段{skipped}。\n\
-                     点击关闭：整根分支显示。"
-                ),
+                format!("{state}\n点击关闭：整根分支显示。"),
             )
         }
     };
@@ -1222,6 +1236,22 @@ mod tests {
             hidden,
             whole,
             skipped,
+            carriers: 2,
+            components: 1,
+            found: cut + hidden + whole + skipped,
+        }
+    }
+
+    /// 候选有几根，场景里却一段都没找到。
+    fn found_none(carriers: usize, components: usize) -> TruncationVm {
+        TruncationVm::Ready {
+            cut: 0,
+            hidden: 0,
+            whole: 0,
+            skipped: 0,
+            carriers,
+            components,
+            found: 0,
         }
     }
 
@@ -1237,8 +1267,24 @@ mod tests {
             on.hint
         );
         assert!(!on.hint.contains("未能截断"), "{}", on.hint);
+        assert!(on.hint.contains("候选分支 2 根、直管件 1 件"), "{}", on.hint);
         let skipped = truncation_chip(&room_view(true, ready(1, 0, 0, 2)));
         assert!(skipped.hint.contains("未能截断 2 段"), "{}", skipped.hint);
+
+        // 一段都没截到：不报一串零，说候选几根、为什么没截到。
+        let missing = truncation_chip(&room_view(true, found_none(4, 2)));
+        assert_eq!(missing.label, "截断直段 开");
+        assert!(
+            missing
+                .hint
+                .contains("候选分支 4 根、直管件 2 件，场景里一段都没找到"),
+            "{}",
+            missing.hint
+        );
+        assert!(missing.hint.contains("SITE / ZONE"), "{}", missing.hint);
+        assert!(!missing.hint.contains("截断 0 段"), "{}", missing.hint);
+        let none = truncation_chip(&room_view(true, found_none(0, 0)));
+        assert!(none.hint.contains("没有可截的直段"), "{}", none.hint);
 
         let busy = truncation_chip(&room_view(
             true,

@@ -5,14 +5,15 @@
 //! - **房间体图层**：宿主交来这间房在册面板的模型记录，这里把它们画成半透明（与 X-Ray 同一枚
 //!   材质）。它不挂拾取、不进可见性账，与尺寸标注层一样挂在 `SceneRoot` 旁边，所以隔离、显示 /
 //!   隐藏、整场重装都碰不到它。面板网格全部就位后，用 `plant_room` 建出房间体（判定三角网）。
-//! - **直段截断**（ADR-0028）：直段是共享单位原型按实例变换摆放的，截断就是把原型的局部 Z 区间
-//!   重映射到保留的那一截。只动直段网格那一级子实体：保留段重映射局部 Z，整段在外的子实体隐藏，
-//!   一段留下几截就补几个同原型的兄弟实体；每个截点盖一片同原型压成 2 mm 的断口，刷剖切色。模型
-//!   根的变换、可见性与包围盒都不动，eye、隔离快照与 `view.bounds` 照旧。拾取是主世界三角形上的
-//!   CPU 射线，改了变换、藏了子实体，墙外那截自然点不中。
+//! - **直段截断**（ADR-0028）：直段是共享单位原型按实例变换摆放的，截断就是把原型沿管轴的区间
+//!   重映射到保留的那一截。直管件（FTUB / STRT）是整件烘焙的网格，管轴从网格读，同样只改变换。
+//!   只动网格那一级子实体：保留段沿管轴重映射，整段在外的子实体隐藏，一段留下几截就补几个同原型的
+//!   兄弟实体；每个截点盖一片同原型压成 2 mm 的断口，刷剖切色。模型根的变换、可见性与包围盒都不动，
+//!   eye、隔离快照与 `view.bounds` 照旧。拾取是主世界三角形上的 CPU 射线，改了变换、藏了子实体，
+//!   墙外那截自然点不中。
 //!
-//! 截断只动截断候选（宿主给的 BRAN / HANG）名下的直段，每帧限量处理，重装进来的直段自动补截。
-//! 关掉、换房间、退出都先整批复原：变换还原、隐藏撤销、补出来的实体撤掉。
+//! 截断只动截断目标：宿主给的候选分支（BRAN / HANG）名下的直段，与宿主给的直管件。每帧限量处理，
+//! 重装进来的自动补截。关掉、换房间、退出都先整批复原：变换还原、隐藏撤销、补出来的实体撤掉。
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -37,8 +38,11 @@ const CAP_SCALE: f32 = 1.02;
 const SECTION_COLOR: Color = Color::srgb_u8(0xD9, 0x46, 0xEF);
 /// 每帧最多截几段。一根主管可能穿过半个厂，候选上千段时分几帧做完，HUD 报进度。
 const TUBES_PER_FRAME: usize = 256;
-/// 「沿局部 Z 的棱柱」判据的相对容差：顶点离两个端面的距离不超过长度的这个比例。
+/// 「沿某根局部轴的棱柱」判据的相对容差：顶点离两个端面的距离不超过长度的这个比例。
 const PRISM_TOL: f32 = 1e-4;
+/// 直管件的管轴判据：网格沿几根轴都算棱柱时（实心方盒三根都算），最长的那根至少是次长的这么多倍
+/// 才认它是管轴。短而粗的方盒判不出方向，宁可原样画，也不沿截面方向截错。
+const COMPONENT_AXIS_RATIO: f32 = 2.0;
 
 /// 宿主交给视口的一次房间体（直段截断计划 §4.3）。
 pub struct RoomVolumeBatch {
@@ -48,6 +52,8 @@ pub struct RoomVolumeBatch {
     pub panels: Vec<GeomInstQuery>,
     /// 截断候选：直段挂在它们名下的 BRAN / HANG。
     pub carriers: Vec<RefU64>,
+    /// 截断候选里的直管件（FTUB / STRT）：网格挂在它们自己名下。
+    pub components: Vec<RefU64>,
     /// 「截断直段」开关此刻的值。
     pub truncate: bool,
     /// 宿主已经认定房间体不全时带上原因（例如有的在册面板没有模型）。照样画半透明，但不截断。
@@ -79,8 +85,14 @@ pub struct RoomClipStatus {
     pub hidden: usize,
     /// 整段在房间体内、原样画的段数。
     pub whole: usize,
-    /// 网格不是沿局部 Z 的棱柱（或没加载成）、截不了而原样画的段数。
+    /// 判不出管轴（网格不是棱柱、方盒短而粗，或没加载成）、截不了而原样画的段数。
     pub skipped: usize,
+    /// 宿主交来的截断候选（去重后）：分支几根、直管件几件。
+    pub carriers: usize,
+    pub components: usize,
+    /// 场景里找到的、挂在候选名下的直段与直管件网格。截断开着、房间体就绪而它为 0，就是候选
+    /// 一个都没装进场景（所在的 SITE / ZONE 没打开），什么都截不到。
+    pub found: usize,
 }
 
 /// 宿主交来的房间体指令，由 [`apply_room_clip_ops`] 按序执行。
@@ -135,9 +147,25 @@ pub fn panel_bounds_mm(panels: &[GeomInstQuery]) -> Option<([f32; 3], [f32; 3])>
     bounds.map(|(min, max)| (min.to_array(), max.to_array()))
 }
 
-/// 一段直段的网格子实体（`load_models` 挂上）。截断与复原都从这里记下的原样出发。
+/// 截断对象是哪一种（`CONTEXT.md`「直段」「直管件」），决定管轴怎么认。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StraightKind {
+    /// 直段：共享单位原型按实例变换摆放，管轴按构造就是原型的局部 Z。
+    Segment,
+    /// 直管件：整件烘焙、按毫米摆的网格，管轴落在哪根局部轴上从网格读。
+    Component,
+}
+
+/// 直管件的类型名：FTUB（定长直管）与 STRT（风管等的直段）。
+pub(crate) fn is_straight_component(generic: &str) -> bool {
+    let generic = generic.trim();
+    generic.eq_ignore_ascii_case("FTUB") || generic.eq_ignore_ascii_case("STRT")
+}
+
+/// 一段直段或一件直管件的网格子实体（`load_models` 挂上）。截断与复原都从这里记下的原样出发。
 #[derive(Component, Clone)]
 pub(crate) struct TubeBody {
+    kind: StraightKind,
     /// 子实体原本的局部变换（`inst.transform`）。
     base: Transform,
     /// 所属模型根的 `world_trans`（毫米、PDMS 世界系）。根的变换装进场景之后不再改。
@@ -149,6 +177,7 @@ pub(crate) struct TubeBody {
 impl TubeBody {
     pub(crate) fn solid(base: Transform, root: Transform) -> Self {
         Self {
+            kind: StraightKind::Segment,
             base,
             root,
             invalid_line: None,
@@ -157,9 +186,19 @@ impl TubeBody {
 
     pub(crate) fn invalid(base: Transform, root: Transform, line: Handle<Mesh>) -> Self {
         Self {
+            kind: StraightKind::Segment,
             base,
             root,
             invalid_line: Some(line),
+        }
+    }
+
+    pub(crate) fn component(base: Transform, root: Transform) -> Self {
+        Self {
+            kind: StraightKind::Component,
+            base,
+            root,
+            invalid_line: None,
         }
     }
 }
@@ -193,37 +232,96 @@ pub(crate) fn setup_room_clip(
     commands.insert_resource(SectionMaterial(materials.add(section_material())));
 }
 
-/// 原型网格在自己局部系里的形状：沿局部 Z 的棱柱，两个端面的 z 与截面中心。
+/// 原型网格在自己局部系里的形状：沿某根局部轴的棱柱，两个端面在这根轴上的坐标与截面中心。
 ///
 /// 圆管原型 `CylinderV3` 是 z ∈ [0, 1]，矩形风管原型 `BoxV1` 是居中的 z ∈ [-0.5, 0.5]，
-/// 烘焙出来的管身各有各的范围，所以范围只从网格自己读，写死会把风管截偏半根。
+/// 烘焙出来的管身各有各的范围，所以范围只从网格自己读，写死会把风管截偏半根。直管件的网格是整件
+/// 烘焙的，管轴不一定在 Z 上：R220 的 FTUB 是 x ∈ [0, 1500] 的实心方盒。
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Prism {
-    z0: f32,
-    z1: f32,
-    cx: f32,
-    cy: f32,
+    /// 管轴是哪根局部轴：0 = X、1 = Y、2 = Z。
+    axis: usize,
+    /// 两个端面在管轴上的坐标。
+    a0: f32,
+    a1: f32,
+    /// 截面中心；管轴那一维恒为 0。
+    centre: Vec3,
 }
 
 impl Prism {
     /// 无效直段的虚线网格按构造就是局部 +Z 的 [0, 1]（`invalid_tubi_fallback_line_mesh`）。
     const UNIT_LINE: Prism = Prism {
-        z0: 0.0,
-        z1: 1.0,
-        cx: 0.0,
-        cy: 0.0,
+        axis: 2,
+        a0: 0.0,
+        a1: 1.0,
+        centre: Vec3::ZERO,
     };
 
-    /// 三角网全部顶点都落在两个端面上、两个端面的截面一样大，才算沿局部 Z 的棱柱。
-    /// 锥（截面两头不一样大）、中间有顶点的（开孔、布尔过的）都不算，截了会走样。
-    fn of(mesh: &Mesh) -> Option<Prism> {
-        if mesh.primitive_topology() != PrimitiveTopology::TriangleList {
+    fn length(&self) -> f32 {
+        self.a1 - self.a0
+    }
+
+    /// 管轴上坐标为 `a` 的截面中心。
+    fn point(&self, a: f32) -> Vec3 {
+        let mut point = self.centre;
+        point[self.axis] = a;
+        point
+    }
+
+    /// 三角网全部顶点都落在垂直于 `axis` 的两个端面上、两个端面的截面一样大，才算沿这根轴的棱柱。
+    /// 锥（截面两头不一样大）、中间有顶点的（开孔、布尔过的、带法兰的）都不算，截了会走样。
+    fn along(positions: &[[f32; 3]], min: Vec3, max: Vec3, axis: usize) -> Option<Prism> {
+        let length = max[axis] - min[axis];
+        if !length.is_finite() || !(length > 0.0) {
             return None;
+        }
+        let tol = length * PRISM_TOL;
+        let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
+        let empty = (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY));
+        let (mut bottom, mut top) = (empty, empty);
+        for p in positions {
+            let section = Vec2::new(p[u], p[v]);
+            let end = if (p[axis] - min[axis]).abs() <= tol {
+                &mut bottom
+            } else if (p[axis] - max[axis]).abs() <= tol {
+                &mut top
+            } else {
+                return None;
+            };
+            end.0 = end.0.min(section);
+            end.1 = end.1.max(section);
+        }
+        let span = Vec2::new(max[u] - min[u], max[v] - min[v])
+            .max_element()
+            .max(f32::EPSILON);
+        let same = (bottom.0 - top.0).abs().max_element() <= span * 1e-3
+            && (bottom.1 - top.1).abs().max_element() <= span * 1e-3;
+        (same && bottom.0.is_finite() && top.0.is_finite()).then(|| {
+            let mut centre = (min + max) * 0.5;
+            centre[axis] = 0.0;
+            Prism {
+                axis,
+                a0: min[axis],
+                a1: max[axis],
+                centre,
+            }
+        })
+    }
+}
+
+/// 原型网格沿三根局部轴各算不算棱柱，按 X、Y、Z 排；`None` = 沿那根轴不算。
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Prisms([Option<Prism>; 3]);
+
+impl Prisms {
+    fn of(mesh: &Mesh) -> Prisms {
+        if mesh.primitive_topology() != PrimitiveTopology::TriangleList {
+            return Prisms::default();
         }
         let Some(VertexAttributeValues::Float32x3(positions)) =
             mesh.attribute(Mesh::ATTRIBUTE_POSITION)
         else {
-            return None;
+            return Prisms::default();
         };
         let mut min = Vec3::splat(f32::INFINITY);
         let mut max = Vec3::splat(f32::NEG_INFINITY);
@@ -232,79 +330,74 @@ impl Prism {
             min = min.min(p);
             max = max.max(p);
         }
-        let length = max.z - min.z;
-        if !length.is_finite() || !(length > 0.0) {
-            return None;
+        Prisms([0, 1, 2].map(|axis| Prism::along(positions, min, max, axis)))
+    }
+
+    /// 按截断对象挑管轴；`None` = 截不了。直段只认局部 Z：原型按构造沿 Z 摆，单位方盒三根轴
+    /// 都算棱柱也只能是 Z。直管件取最长的那根，见 [`COMPONENT_AXIS_RATIO`]。
+    fn pick(&self, kind: StraightKind) -> Option<Prism> {
+        match kind {
+            StraightKind::Segment => self.0[2],
+            StraightKind::Component => {
+                let mut found: Vec<Prism> = self.0.iter().flatten().copied().collect();
+                found.sort_by(|a, b| b.length().total_cmp(&a.length()));
+                match found.as_slice() {
+                    [] => None,
+                    [only] => Some(*only),
+                    [longest, next, ..] => {
+                        let clear = longest.length() >= COMPONENT_AXIS_RATIO * next.length();
+                        clear.then_some(*longest)
+                    }
+                }
+            }
         }
-        let tol = length * PRISM_TOL;
-        let empty = (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY));
-        let (mut bottom, mut top) = (empty, empty);
-        for p in positions {
-            let xy = Vec2::new(p[0], p[1]);
-            let end = if (p[2] - min.z).abs() <= tol {
-                &mut bottom
-            } else if (p[2] - max.z).abs() <= tol {
-                &mut top
-            } else {
-                return None;
-            };
-            end.0 = end.0.min(xy);
-            end.1 = end.1.max(xy);
-        }
-        let span = (max.truncate() - min.truncate()).max_element().max(f32::EPSILON);
-        let same = (bottom.0 - top.0).abs().max_element() <= span * 1e-3
-            && (bottom.1 - top.1).abs().max_element() <= span * 1e-3;
-        (same && bottom.0.is_finite() && top.0.is_finite()).then_some(Prism {
-            z0: min.z,
-            z1: max.z,
-            cx: (min.x + max.x) * 0.5,
-            cy: (min.y + max.y) * 0.5,
-        })
     }
 }
 
 /// 管轴两端的世界坐标（毫米、PDMS 世界系）：原型两个端面的截面中心，过子实体变换再过模型根。
 fn axis_of(body: &TubeBody, prism: Prism) -> (DVec3, DVec3) {
-    let end = |z: f32| {
+    let end = |a: f32| {
         body.root
-            .transform_point(body.base.transform_point(Vec3::new(prism.cx, prism.cy, z)))
+            .transform_point(body.base.transform_point(prism.point(a)))
             .as_dvec3()
     };
-    (end(prism.z0), end(prism.z1))
+    (end(prism.a0), end(prism.a1))
 }
 
-/// 保留 `[t0, t1]` 那一截的子实体局部变换：原型 z ∈ [z0, z1] 映到这一截对应的 [za, zb]。
+/// 保留 `[t0, t1]` 那一截的子实体局部变换：原型沿管轴的 [a0, a1] 映到这一截对应的那一段。
 ///
-/// 重映射只沿局部 Z 缩放、平移，没有旋转，所以 `base × 它` 仍是精确的 TRS（缩放两两对角相乘）。
+/// 重映射只沿管轴缩放、平移，没有旋转，所以 `base × 它` 仍是精确的 TRS（缩放两两对角相乘）。
 fn piece_transform(base: &Transform, prism: Prism, t0: f64, t1: f64) -> Transform {
-    let span = prism.z1 - prism.z0;
-    let za = prism.z0 + t0 as f32 * span;
+    let start = prism.a0 + t0 as f32 * prism.length();
     let k = (t1 - t0) as f32;
+    let mut translation = Vec3::ZERO;
+    translation[prism.axis] = start - prism.a0 * k;
+    let mut scale = Vec3::ONE;
+    scale[prism.axis] = k;
     *base
         * Transform {
-            translation: Vec3::new(0.0, 0.0, za - prism.z0 * k),
+            translation,
             rotation: Quat::IDENTITY,
-            scale: Vec3::new(1.0, 1.0, k),
+            scale,
         }
 }
 
 /// 截点 `t` 处断口的局部变换：同一原型压成 [`CAP_THICKNESS_MM`] 厚、以截点为中心，截面绕管轴
 /// 放大 [`CAP_SCALE`]。
 fn cap_transform(base: &Transform, prism: Prism, t: f64, length_mm: f32) -> Transform {
-    let span = prism.z1 - prism.z0;
     let k = CAP_THICKNESS_MM / length_mm.max(f32::EPSILON);
-    let centre = prism.z0 + t as f32 * span;
-    let half = 0.5 * k * span;
+    let centre = prism.a0 + t as f32 * prism.length();
+    let half = 0.5 * k * prism.length();
     let s = CAP_SCALE;
+    let mut translation = (1.0 - s) * prism.centre;
+    translation[prism.axis] = centre - half - prism.a0 * k;
+    let mut scale = Vec3::splat(s);
+    scale[prism.axis] = k;
     *base
         * Transform {
-            translation: Vec3::new(
-                (1.0 - s) * prism.cx,
-                (1.0 - s) * prism.cy,
-                centre - half - prism.z0 * k,
-            ),
+            translation,
             rotation: Quat::IDENTITY,
-            scale: Vec3::new(s, s, k),
+            scale,
         }
 }
 
@@ -356,7 +449,12 @@ enum Solid {
 struct Active {
     generation: u64,
     layer: Entity,
-    carriers: HashSet<RefU64>,
+    /// 截断目标：候选分支与直管件。直段以所属分支的 refno 渲染、直管件以自己的 refno 渲染，
+    /// 所以一张表认两种。
+    targets: HashSet<RefU64>,
+    /// 去重后的候选分支数与直管件数，原样回在回执上。
+    carriers: usize,
+    components: usize,
     truncate: bool,
     panels: Vec<PanelMesh>,
     solid: Solid,
@@ -372,8 +470,8 @@ struct Active {
 #[derive(Resource, Default)]
 pub(crate) struct RoomClip {
     active: Option<Active>,
-    /// 原型网格 → 棱柱判定；`None` = 截不了。网格文件名是内容哈希，同一个资产的判定不会变。
-    prisms: HashMap<AssetId<Mesh>, Option<Prism>>,
+    /// 原型网格 → 沿三根轴的棱柱判定。网格文件名是内容哈希，同一个资产的判定不会变。
+    prisms: HashMap<AssetId<Mesh>, Prisms>,
 }
 
 /// 直段网格子实体上截断要读写的那几样。
@@ -398,6 +496,7 @@ impl Active {
         layer: Entity,
         panels: Vec<PanelMesh>,
         carriers: impl IntoIterator<Item = RefU64>,
+        components: impl IntoIterator<Item = RefU64>,
         truncate: bool,
         unavailable: Option<String>,
     ) -> Self {
@@ -406,10 +505,14 @@ impl Active {
             None if panels.is_empty() => Solid::Unavailable("在册面板没有可画的网格".into()),
             None => Solid::Loading { done: 0 },
         };
+        let carriers: HashSet<RefU64> = carriers.into_iter().collect();
+        let components: HashSet<RefU64> = components.into_iter().collect();
         Self {
             generation,
             layer,
-            carriers: carriers.into_iter().collect(),
+            carriers: carriers.len(),
+            components: components.len(),
+            targets: carriers.into_iter().chain(components).collect(),
             truncate,
             panels,
             solid,
@@ -457,6 +560,7 @@ impl Active {
             layer,
             panels,
             batch.carriers,
+            batch.components,
             batch.truncate,
             batch.unavailable,
         )
@@ -485,6 +589,9 @@ impl Active {
             hidden: self.counts.hidden,
             whole: self.counts.whole,
             skipped: self.counts.skipped,
+            carriers: self.carriers,
+            components: self.components,
+            found: self.known.len(),
         }
     }
 
@@ -569,7 +676,7 @@ impl Active {
         tubes: &mut Tubes,
         meshes: &mut Assets<Mesh>,
         assets: &AssetServer,
-        prisms: &mut HashMap<AssetId<Mesh>, Option<Prism>>,
+        prisms: &mut HashMap<AssetId<Mesh>, Prisms>,
         section: &Handle<StandardMaterial>,
     ) {
         let Solid::Ready(solid) = &self.solid else {
@@ -595,7 +702,7 @@ impl Active {
                         waiting.push(entity);
                         continue;
                     }
-                    PrismLookup::Found(prism) => prism,
+                    PrismLookup::Found(found) => found.pick(body.kind),
                 },
             };
             let Some(prism) = prism else {
@@ -645,28 +752,28 @@ impl Active {
 enum PrismLookup {
     /// 网格还在加载。
     Pending,
-    /// 有结论了；`None` = 截不了（不是棱柱，或网格没加载成）。
-    Found(Option<Prism>),
+    /// 有结论了；网格没加载成时三根轴都不算。
+    Found(Prisms),
 }
 
 fn prism_of(
     handle: &Handle<Mesh>,
     meshes: &Assets<Mesh>,
     assets: &AssetServer,
-    cache: &mut HashMap<AssetId<Mesh>, Option<Prism>>,
+    cache: &mut HashMap<AssetId<Mesh>, Prisms>,
 ) -> PrismLookup {
     if let Some(found) = cache.get(&handle.id()) {
         return PrismLookup::Found(*found);
     }
     match meshes.get(handle) {
         Some(mesh) => {
-            let prism = Prism::of(mesh);
-            cache.insert(handle.id(), prism);
-            PrismLookup::Found(prism)
+            let prisms = Prisms::of(mesh);
+            cache.insert(handle.id(), prisms);
+            PrismLookup::Found(prisms)
         }
         None => match assets.get_load_state(handle) {
             Some(LoadState::Loading | LoadState::NotLoaded) => PrismLookup::Pending,
-            _ => PrismLookup::Found(None),
+            _ => PrismLookup::Found(Prisms::default()),
         },
     }
 }
@@ -838,7 +945,7 @@ pub(crate) fn advance_room_clip(
     if active.truncate && matches!(active.solid, Solid::Ready(_)) {
         if std::mem::take(&mut active.enqueue_all) {
             for (entity, _, model, ..) in &tubes {
-                if active.carriers.contains(&model.refno) && active.known.insert(entity) {
+                if active.targets.contains(&model.refno) && active.known.insert(entity) {
                     active.queue.push_back(entity);
                 }
             }
@@ -846,7 +953,7 @@ pub(crate) fn advance_room_clip(
             // 重画 / 取回工作之后新装进来的直段：接着按这间房截。
             for entity in &added {
                 if let Ok((_, _, model, ..)) = tubes.get(entity)
-                    && active.carriers.contains(&model.refno)
+                    && active.targets.contains(&model.refno)
                     && active.known.insert(entity)
                 {
                     active.queue.push_back(entity);
@@ -945,6 +1052,39 @@ mod tests {
         }
     }
 
+    /// FTUB 烘焙网格的形状（R220 实测）：实心方盒，x ∈ [0, length]、y ∈ [-50, 50]、z ∈ [0, 50]。
+    fn ftub_box(length: f32) -> Mesh {
+        turned(
+            prism_mesh(
+                &[[-50.0, 0.0], [50.0, 0.0], [50.0, 50.0], [-50.0, 50.0]],
+                0.0,
+                length,
+            ),
+            0,
+        )
+    }
+
+    /// 把沿 z 拉出来的棱柱轮换成沿 `axis` 的（0 = X、1 = Y），轮换不改手性。
+    fn turned(mut mesh: Mesh, axis: usize) -> Mesh {
+        if let Some(VertexAttributeValues::Float32x3(positions)) =
+            mesh.attribute_mut(Mesh::ATTRIBUTE_POSITION)
+        {
+            for p in positions.iter_mut() {
+                let [x, y, z] = *p;
+                *p = match axis {
+                    0 => [z, x, y],
+                    1 => [y, z, x],
+                    _ => [x, y, z],
+                };
+            }
+        }
+        mesh
+    }
+
+    fn segment(mesh: &Mesh) -> Option<Prism> {
+        Prisms::of(mesh).pick(StraightKind::Segment)
+    }
+
     fn close(a: Vec3, b: Vec3) -> bool {
         a.distance(b) < 0.01
     }
@@ -952,22 +1092,22 @@ mod tests {
     #[test]
     fn prototypes_are_read_as_prisms_along_local_z() {
         assert_eq!(
-            Prism::of(&cylinder_v3()),
+            segment(&cylinder_v3()),
             Some(Prism {
-                z0: 0.0,
-                z1: 1.0,
-                cx: 0.0,
-                cy: 0.0
+                axis: 2,
+                a0: 0.0,
+                a1: 1.0,
+                centre: Vec3::ZERO
             })
         );
         // 风管原型居中：z 从 -0.5 起。写死 [0, 1] 就会截偏半根。
         assert_eq!(
-            Prism::of(&box_v1()),
+            segment(&box_v1()),
             Some(Prism {
-                z0: -0.5,
-                z1: 0.5,
-                cx: 0.0,
-                cy: 0.0
+                axis: 2,
+                a0: -0.5,
+                a1: 0.5,
+                centre: Vec3::ZERO
             })
         );
         // 锥：两头截面不一样大。
@@ -980,7 +1120,7 @@ mod tests {
                 p[1] *= 0.5;
             }
         }
-        assert_eq!(Prism::of(&cone), None);
+        assert_eq!(segment(&cone), None);
         // 中间有顶点：开过孔、布尔过的管身。
         let mut holed = box_v1();
         if let Some(VertexAttributeValues::Float32x3(positions)) =
@@ -988,7 +1128,45 @@ mod tests {
         {
             positions.push([0.0, 0.0, 0.1]);
         }
-        assert_eq!(Prism::of(&holed), None);
+        assert_eq!(segment(&holed), None);
+    }
+
+    /// 直管件按最长的棱柱轴认管轴：FTUB 那样的实心方盒三根轴都算棱柱，Z 只有 50 mm 高，管轴是 X；
+    /// 沿 Y 的圆管只有 Y 一根算。短而粗的方盒判不出方向，带法兰的风管（STRT）哪根都不算——都不截。
+    /// 直段照旧只认 Z。
+    #[test]
+    fn straight_components_take_the_longest_prism_axis() {
+        let slab = Prisms::of(&ftub_box(1500.0));
+        assert_eq!(
+            slab.pick(StraightKind::Component),
+            Some(Prism {
+                axis: 0,
+                a0: 0.0,
+                a1: 1500.0,
+                centre: Vec3::new(0.0, 0.0, 25.0)
+            })
+        );
+        assert_eq!(slab.pick(StraightKind::Segment).map(|prism| prism.axis), Some(2));
+
+        let pipe = Prisms::of(&turned(cylinder_v3(), 1));
+        assert_eq!(pipe.pick(StraightKind::Component).map(|prism| prism.axis), Some(1));
+        assert_eq!(pipe.pick(StraightKind::Segment), None);
+
+        assert_eq!(
+            Prisms::of(&ftub_box(150.0)).pick(StraightKind::Component),
+            None,
+            "150 mm 长不到截面 100 mm 的两倍"
+        );
+        assert_eq!(Prisms::of(&box_v1()).pick(StraightKind::Component), None);
+
+        // 风管两端各一圈法兰：离端面 6 mm 处有顶点，截面比管身大。
+        let mut flanged = ftub_box(1200.0);
+        if let Some(VertexAttributeValues::Float32x3(positions)) =
+            flanged.attribute_mut(Mesh::ATTRIBUTE_POSITION)
+        {
+            positions.extend([[6.0, -60.0, -10.0], [1194.0, 60.0, 60.0]]);
+        }
+        assert_eq!(Prisms::of(&flanged), Prisms::default());
     }
 
     /// 截 [0.3, 0.7]：原型两个端面的截面中心过「模型根 × 截段变换」后，落在管轴的 0.3 与 0.7 处，
@@ -1004,13 +1182,13 @@ mod tests {
                 .with_scale(Vec3::new(1.0, 1.0, 0.5)),
         ];
         for (mesh, base) in [(cylinder_v3(), bases[0]), (box_v1(), bases[0]), (cylinder_v3(), bases[1])] {
-            let prism = Prism::of(&mesh).unwrap();
+            let prism = segment(&mesh).unwrap();
             let body = TubeBody::solid(base, root);
             let (axis_a, axis_b) = axis_of(&body, prism);
             let (axis_a, axis_b) = (axis_a.as_vec3(), axis_b.as_vec3());
             let piece = piece_transform(&base, prism, 0.3, 0.7);
-            let start = root.transform_point(piece.transform_point(Vec3::new(0.0, 0.0, prism.z0)));
-            let end = root.transform_point(piece.transform_point(Vec3::new(0.0, 0.0, prism.z1)));
+            let start = root.transform_point(piece.transform_point(prism.point(prism.a0)));
+            let end = root.transform_point(piece.transform_point(prism.point(prism.a1)));
             assert!(close(start, axis_a.lerp(axis_b, 0.3)), "{start} vs {}", axis_a.lerp(axis_b, 0.3));
             assert!(close(end, axis_a.lerp(axis_b, 0.7)), "{end} vs {}", axis_a.lerp(axis_b, 0.7));
         }
@@ -1022,7 +1200,7 @@ mod tests {
         let a = Vec3::ZERO;
         let b = Vec3::new(0.0, 0.0, 1000.0);
         let root = tube_root(a, b);
-        let prism = Prism::of(&cylinder_v3()).unwrap();
+        let prism = segment(&cylinder_v3()).unwrap();
         let cap = cap_transform(&Transform::IDENTITY, prism, 0.5, 1000.0);
         let near = root.transform_point(cap.transform_point(Vec3::new(0.0, 0.0, 0.0)));
         let far = root.transform_point(cap.transform_point(Vec3::new(0.0, 0.0, 1.0)));
@@ -1030,6 +1208,34 @@ mod tests {
         assert!(close(far, Vec3::new(0.0, 0.0, 501.0)), "{far}");
         let rim = root.transform_point(cap.transform_point(Vec3::new(1.0, 0.0, 0.5)));
         assert!((Vec2::new(rim.x, rim.y).length() - 30.6).abs() < 0.01, "{rim}");
+    }
+
+    /// 直管件沿局部 X 截（模型根只转了个方位角）：两个端面的截面中心过「模型根 × 截段变换」后
+    /// 落在管轴的 0.3 与 0.7 处，截面不动；断口以截点为中心、沿管轴 2 mm 厚。
+    #[test]
+    fn a_component_piece_is_remapped_along_its_own_axis() {
+        let root = Transform::from_translation(Vec3::new(1000.0, 2000.0, 3000.0))
+            .with_rotation(Quat::from_rotation_z(0.7));
+        let prism = Prisms::of(&ftub_box(1500.0))
+            .pick(StraightKind::Component)
+            .unwrap();
+        let body = TubeBody::component(Transform::IDENTITY, root);
+        let (axis_a, axis_b) = axis_of(&body, prism);
+        let (axis_a, axis_b) = (axis_a.as_vec3(), axis_b.as_vec3());
+        assert!((axis_a.distance(axis_b) - 1500.0).abs() < 0.01);
+
+        let piece = piece_transform(&body.base, prism, 0.3, 0.7);
+        let start = root.transform_point(piece.transform_point(prism.point(prism.a0)));
+        let end = root.transform_point(piece.transform_point(prism.point(prism.a1)));
+        assert!(close(start, axis_a.lerp(axis_b, 0.3)), "{start}");
+        assert!(close(end, axis_a.lerp(axis_b, 0.7)), "{end}");
+        assert_eq!((piece.scale.y, piece.scale.z), (1.0, 1.0), "截面不动");
+
+        let cap = cap_transform(&body.base, prism, 0.5, 1500.0);
+        let near = root.transform_point(cap.transform_point(prism.point(prism.a0)));
+        let far = root.transform_point(cap.transform_point(prism.point(prism.a1)));
+        assert!((near.distance(far) - CAP_THICKNESS_MM).abs() < 0.01, "{near} {far}");
+        assert!(close((near + far) * 0.5, axis_a.lerp(axis_b, 0.5)));
     }
 
     fn test_app() -> App {
@@ -1046,6 +1252,16 @@ mod tests {
 
     /// 装一间房：面板网格直接进 `Assets<Mesh>`（不经文件），面板局部系就是毫米世界系。
     fn activate(app: &mut App, rooms: Vec<Mesh>, carriers: &[RefU64], truncate: bool) {
+        activate_with(app, rooms, carriers, &[], truncate);
+    }
+
+    fn activate_with(
+        app: &mut App,
+        rooms: Vec<Mesh>,
+        carriers: &[RefU64],
+        components: &[RefU64],
+        truncate: bool,
+    ) {
         let panels: Vec<PanelMesh> = rooms
             .into_iter()
             .map(|mesh| PanelMesh {
@@ -1062,6 +1278,7 @@ mod tests {
             layer,
             panels,
             carriers.iter().copied(),
+            components.iter().copied(),
             truncate,
             None,
         ));
@@ -1073,15 +1290,20 @@ mod tests {
 
     /// 在场景里放一段直段：模型根 + 一个挂着 `TubeBody` 的网格子实体。交回子实体。
     fn spawn_tube(app: &mut App, refno: RefU64, root: Transform, mesh: Handle<Mesh>, invalid: bool) -> Entity {
-        let world = app.world_mut();
-        let parent = world
-            .spawn((root, Visibility::Visible, ModelRoot { refno, owner: refno }))
-            .id();
         let body = if invalid {
             TubeBody::invalid(Transform::IDENTITY, root, mesh.clone())
         } else {
             TubeBody::solid(Transform::IDENTITY, root)
         };
+        spawn_body(app, refno, root, mesh, body)
+    }
+
+    fn spawn_body(app: &mut App, refno: RefU64, root: Transform, mesh: Handle<Mesh>, body: TubeBody) -> Entity {
+        let line = body.invalid_line.is_some();
+        let world = app.world_mut();
+        let parent = world
+            .spawn((root, Visibility::Visible, ModelRoot { refno, owner: refno }))
+            .id();
         world
             .spawn((
                 Mesh3d(mesh),
@@ -1091,7 +1313,7 @@ mod tests {
                     refno,
                     owner: refno,
                     colour: [0; 4],
-                    line: invalid,
+                    line,
                     room_shell: false,
                 },
                 ModelPickTarget { refno },
@@ -1299,6 +1521,70 @@ mod tests {
         assert_eq!(status(&app).skipped, 1);
     }
 
+    /// 直管件（FTUB 那样的实心方盒，管轴在局部 X 上）按自己名下的 refno 认，沿管轴在墙上截断、
+    /// 盖一片断口；截面方向（Y、Z）不动。所属分支不在候选里也照截。
+    #[test]
+    fn straight_components_are_cut_along_their_own_axis() {
+        let ftub = RefU64::from(31);
+        let mut app = test_app();
+        let slab = add_mesh(&mut app, ftub_box(1000.0));
+        activate_with(&mut app, vec![room_box()], &[], &[ftub], true);
+        // 管轴转到世界 +Y：从 (500, 500) 到 (500, 1500)，墙在 y = 1000，留前一半。
+        let root = Transform::from_translation(Vec3::new(500.0, 500.0, 400.0))
+            .with_rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_2));
+        let part = spawn_body(
+            &mut app,
+            ftub,
+            root,
+            slab,
+            TubeBody::component(Transform::IDENTITY, root),
+        );
+        app.update();
+        app.update();
+
+        let kept = transform_of(&app, part);
+        assert!((kept.scale.x - 0.5).abs() < 1e-6, "{kept:?}");
+        assert_eq!((kept.scale.y, kept.scale.z), (1.0, 1.0), "{kept:?}");
+        assert_eq!(extras(&mut app), (0, 1), "一截、一片断口");
+        let status = status(&app);
+        assert_eq!(
+            (status.cut, status.hidden, status.whole, status.skipped),
+            (1, 0, 0, 0)
+        );
+        assert_eq!((status.carriers, status.components, status.found), (0, 1, 1));
+    }
+
+    /// 候选一个都没装进场景（所在的 SITE / ZONE 没打开）：截不到任何一段，回执照实说候选几根、
+    /// 场景里找到 0 段，宿主据此说原因。装进来之后照样补截。
+    #[test]
+    fn the_receipt_counts_candidates_and_what_the_scene_has_of_them() {
+        let (bran, ftub) = (RefU64::from(11), RefU64::from(31));
+        let mut app = test_app();
+        let cylinder = add_mesh(&mut app, cylinder_v3());
+        activate_with(&mut app, vec![room_box()], &[bran, bran], &[ftub], true);
+        app.update();
+        app.update();
+        let empty = status(&app);
+        assert_eq!(empty.phase, RoomClipPhase::Ready);
+        assert_eq!(
+            (empty.carriers, empty.components, empty.found, empty.cut),
+            (1, 1, 0, 0),
+            "候选去重；场景里一段都没有"
+        );
+
+        spawn_tube(
+            &mut app,
+            bran,
+            tube_root(Vec3::new(500.0, 500.0, 500.0), Vec3::new(1500.0, 500.0, 500.0)),
+            cylinder,
+            false,
+        );
+        app.update();
+        app.update();
+        let later = status(&app);
+        assert_eq!((later.found, later.cut), (1, 1));
+    }
+
     /// 截断关着进房间视图：房间体照样建，直段一段不碰。
     #[test]
     fn with_truncation_off_nothing_is_touched() {
@@ -1359,6 +1645,7 @@ mod tests {
             generation: 1,
             panels: records,
             carriers: Vec::new(),
+            components: Vec::new(),
             truncate: true,
             unavailable: None,
         });
@@ -1390,6 +1677,7 @@ mod tests {
                 generation: 3,
                 panels: vec![record],
                 carriers: Vec::new(),
+                components: Vec::new(),
                 truncate: true,
                 unavailable: None,
             });
@@ -1441,7 +1729,7 @@ mod tests {
             })
             .collect();
         app.world_mut().resource_mut::<RoomClip>().active =
-            Some(Active::new(7, layer, panels, [bran], true, None));
+            Some(Active::new(7, layer, panels, [bran], std::iter::empty(), true, None));
         let tube = spawn_tube(
             &mut app,
             bran,

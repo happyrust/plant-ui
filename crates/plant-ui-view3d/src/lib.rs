@@ -2107,6 +2107,7 @@ fn load_models(
             // 整条记录就是一段直段（e3d-model 派生行 / 服务供数的 `generic = TUBI`）。旧的
             // `tubi_relate` 路径 generic 缺省成 PIPE，那一路靠实例上的 `is_tubi`。
             let tube_record = model.generic.eq_ignore_ascii_case("TUBI");
+            let straight_component = room_clip::is_straight_component(&model.generic);
             let mut root = scene.spawn((model.world_trans, visibility, ModelRoot { refno, owner }));
             // 带身份的直段根挂上身份：房间树的逐段眼睛按它点名（ADR-0033 阶段四）。
             if let Some(segment) = tube {
@@ -2167,9 +2168,14 @@ fn load_models(
                             },
                             ModelPickTarget { refno },
                         ));
-                        // 直段：房间视图截断时从这里记下的原样出发（直段截断计划 M3）。
+                        // 直段与直管件：房间视图截断时从这里记下的原样出发（直段截断计划 M3）。
                         if inst.is_tubi || tube_record {
                             mesh_entity.insert(room_clip::TubeBody::solid(
+                                inst.transform,
+                                model.world_trans,
+                            ));
+                        } else if straight_component {
+                            mesh_entity.insert(room_clip::TubeBody::component(
                                 inst.transform,
                                 model.world_trans,
                             ));
