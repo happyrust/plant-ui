@@ -12,6 +12,7 @@ export interface InitOutput {
     readonly ring_core_0_17_14__bn_mul_mont: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly wasm_bindgen_552f3910278b96d___convert__closures_____invoke___wasm_bindgen_552f3910278b96d___JsValue__core_79482a60015d25f0___result__Result_____wasm_bindgen_552f3910278b96d___JsError___true_: (a: number, b: number, c: any) => [number, number];
     readonly wasm_bindgen_552f3910278b96d___convert__closures_____invoke___js_sys_3c396537d8b4138a___Array__web_sys_361d7deadbd30849___features__gen_ResizeObserver__ResizeObserver______true_: (a: number, b: number, c: any, d: any) => void;
+    readonly wasm_bindgen_552f3910278b96d___convert__closures_____invoke___js_sys_3c396537d8b4138a___Function_fn_wasm_bindgen_552f3910278b96d___JsValue_____wasm_bindgen_552f3910278b96d___sys__Undefined___js_sys_3c396537d8b4138a___Function_fn_wasm_bindgen_552f3910278b96d___JsValue_____wasm_bindgen_552f3910278b96d___sys__Undefined_______true_: (a: number, b: number, c: any, d: any) => void;
     readonly wasm_bindgen_552f3910278b96d___convert__closures_____invoke___wasm_bindgen_552f3910278b96d___JsValue______true_: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen_552f3910278b96d___convert__closures_____invoke___wasm_bindgen_552f3910278b96d___JsValue______true__3: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen_552f3910278b96d___convert__closures_____invoke___web_sys_361d7deadbd30849___features__gen_InputEvent__InputEvent______true_: (a: number, b: number, c: any) => void;

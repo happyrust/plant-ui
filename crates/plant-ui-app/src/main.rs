@@ -382,17 +382,18 @@ fn run(canvas: &str, asset_root: String) {
     let _ = canvas;
 
     let mut app = BevyApp::new();
-    // 网格走自己的资产源，根目录可以在设置里改。**必须先于 `AssetPlugin` 注册**：
-    // 源是在那个插件建起来的那一刻定型的，晚一步 Bevy 只会打一行 error 然后无视。
-    // 浏览器端没有本地目录，网格与字体贴图一样由站点供给，那一侧不注册这个源
-    // （见 `mesh_source::asset_path` 的两个分支）。
-    #[cfg(not(target_arch = "wasm32"))]
+    // 网格走自己的资产源。**必须先于 `AssetPlugin` 注册**：源是在那个插件建起来的那一刻
+    // 定型的，晚一步 Bevy 只会打一行 error 然后无视。
+    // 桌面端这个源读本地目录，根目录可以在设置里改；浏览器端它向站点的资产根取，管住同时
+    // 发出去多少请求、取不到的重来（见 `mesh_source`）。
     {
         use bevy::asset::AssetApp;
-        app.register_asset_source(
-            plant_ui_view3d::mesh_source::SOURCE_NAME,
-            plant_ui_view3d::mesh_source::source_builder(),
-        );
+        #[cfg(not(target_arch = "wasm32"))]
+        let source = plant_ui_view3d::mesh_source::source_builder();
+        #[cfg(target_arch = "wasm32")]
+        let source =
+            plant_ui_view3d::mesh_source::source_builder(&asset_root, mesh_fetch_requested());
+        app.register_asset_source(plant_ui_view3d::mesh_source::SOURCE_NAME, source);
     }
     app.add_plugins(
         DefaultPlugins
@@ -485,6 +486,19 @@ fn look_debug_requested() -> Option<plant_ui_view3d::e3d_look::post::SglLookDebu
 fn look_debug_requested() -> Option<plant_ui_view3d::e3d_look::post::SglLookDebugView> {
     query_value(&location_search(), "look_debug")
         .and_then(|value| plant_ui_view3d::e3d_look::post::SglLookDebugView::parse(&value))
+}
+
+/// `?mesh_fetch=<路数>`（浏览器）：网格文件同时在途的请求数上限，不写就用出厂值。
+/// 排查取网格慢或被浏览器拒掉时，换个数刷新页面就能比，不必重新出包。
+#[cfg(target_arch = "wasm32")]
+fn mesh_fetch_requested() -> Option<usize> {
+    mesh_fetch_from(query_value(&location_search(), "mesh_fetch").as_deref())
+}
+
+/// `mesh_fetch` 的值：正整数才算数，别的当没写（上限由 view3d 那边夹住）。
+#[cfg(any(test, target_arch = "wasm32"))]
+fn mesh_fetch_from(value: Option<&str>) -> Option<usize> {
+    value?.trim().parse().ok().filter(|&routes| routes > 0)
 }
 
 /// 页面地址的查询串（带 `?`）；拿不到就是空串。
@@ -675,6 +689,10 @@ fn show_app(
     if let Some(progress) = view3d.take_mesh_progress() {
         app.sync_mesh_progress(progress);
     }
+    // 排在进度后面：「其中几个再点一次显示会重取」那一行要跟在「加载失败」那一行下面。
+    for event in view3d.take_mesh_retry_events() {
+        app.sync_mesh_retry(event);
+    }
     let render_states = view3d.take_render_states();
     if !render_states.is_empty() {
         app.sync_render_states(render_states);
@@ -764,7 +782,6 @@ fn show_app(
         view3d.virtual_hole_op(op);
     }
     let window_px = windows.single().ok().map(|window| window.physical_size());
-    let mut retried = 0;
     for command in app.view3d_commands.drain(..) {
         match command {
             Cmd::PickViewport(uv) => view3d.pick(uv),
@@ -782,15 +799,13 @@ fn show_app(
             Cmd::SetViewportLook(look) => view3d.set_look(look),
             Cmd::SnapView { forward, up, fit } => view3d.snap(forward, up, fit),
             Cmd::RestoreCamera(pose) => view3d.restore_camera(pose),
-            Cmd::RetryFailedMeshes => retried = view3d.retry_failed_meshes(),
+            // 重发了几个、结果如何，都等视口下一拍的回执再写日志（`sync_mesh_retry`）。
+            Cmd::RetryFailedMeshes => {
+                view3d.retry_failed_meshes();
+            }
+            Cmd::RetryRecoverableMeshes => view3d.retry_recoverable_meshes(),
             _ => unreachable!("只缓存三维命令"),
         }
-    }
-    if retried > 0 {
-        app.logs.info(
-            &mut app.vm.logs,
-            format!("正在重试 {retried} 个加载失败的网格"),
-        );
     }
     Ok(())
 }
@@ -1642,13 +1657,14 @@ struct App {
     /// 选中 PANEL 后等待房间详情的 X-Ray 请求：(发起时的 PANEL, 房间)。
     /// 选中一换立即清空；晚到的详情只有同时匹配这两个值才可改材质。
     xray_room_pending: Option<(RefU64, RefU64)>,
-    /// 上一次已经记过日志的房间镜像失败，`消息|错误链` 拼成一个键。
+    /// 上一次已经记过日志的房间失败（镜像不通、归属查不了或查询失败），`消息|原因` 拼成一个键。
     ///
-    /// 房间归属是随选中预取的：库没起（或端口不通）时，每换一次选中就再失败一次，
-    /// 每次都记一行红底 ERROR，几十次点选就把日志刷成同一句话的复读。同一个原因只
-    /// 记一次，界面上的 `vm.rooms` 照旧每次更新成失败态；换原因、或者镜像恢复之后
-    /// 复位，下次真出事还会说。
+    /// 房间归属是随选中预取的：库没起、服务端版本不支持时，每换一次选中就再答一遍同一句，
+    /// 每次都记一行，几十次点选就把日志刷成同一句话的复读。同一个原因只记一次，界面上的
+    /// `vm.rooms` 照旧每次更新；换原因、或者答得出了之后复位，下次真出事还会说。
     mirror_error_said: Option<String>,
+    /// 最后一次房间归属请求的序号。回包只采纳序号对得上的那一份（[`accept_rooms_reply`]）。
+    rooms_seq: u64,
     xray_active_room: Option<RefU64>,
     /// 已查过的房间 -> 全部在册面板。重复点同一间房不再打一次详情查询。
     room_panel_cache: HashMap<RefU64, Vec<RefU64>>,
@@ -1721,8 +1737,9 @@ struct App {
     model_scope_pending: HashSet<RefU64>,
     model_scope_epoch: u64,
     /// 「这个库有没有按当前源生成的模型」的会话级结论：`GET /dbnums/{n}/model/roots`
-    /// 探针的 `ready_total > 0`，或该库的目标真查出过 records（正写）。`false`
-    /// 不压已确认的 `true`——探针晚回的空结论不许推翻证据。
+    /// 探针说有（`DbnumModelRoots::has_model`：进程投影与落盘的账任一本有数），或该库的目标
+    /// 真查出过 records、刚生成成功（正写）。`false` 不压已确认的 `true`——探针晚回的空结论
+    /// 不许推翻证据，也不许据此再催一次生成（[`dbnum_has_model`]）。
     dbnum_model_known: HashMap<u32, bool>,
     /// 在途的库级探针（每库单飞，回包时摘掉）。
     dbnum_model_probing: HashSet<u32>,
@@ -2541,6 +2558,15 @@ fn model_visibility_plan(
     plan
 }
 
+/// 库级探针的回包并进「这个库有没有模型」的会话级结论（`App::dbnum_model_known`），返回并入
+/// 之后的结论——要不要默认重新生成，看的是这个返回值，不是探针单方面的说法。
+///
+/// 已经记成「有」的不被探针的「没有」推翻：那个「有」来自真查出来的 records 或一次成功的生成，
+/// 是证据；探针读的是服务端的账，晚到的空结论可能只是账没跟上。
+fn dbnum_has_model(known: Option<bool>, probe_has_model: bool) -> bool {
+    known == Some(true) || probe_has_model
+}
+
 /// 房间边只挂叶子构件；隐含直管则以 BRAN/HANG refno 渲染。把已经加载的、
 /// 且与房间成员相交的模型范围一并纳入隔离，避免隔离动作把同支管直段藏掉。
 fn expand_room_model_targets(
@@ -2953,6 +2979,7 @@ impl App {
             focus_room_frame: None,
             xray_room_pending: None,
             mirror_error_said: None,
+            rooms_seq: 0,
             xray_active_room: None,
             room_panel_cache: HashMap::new(),
             panel_rooms: HashMap::new(),
@@ -3172,33 +3199,55 @@ impl App {
                     };
                 }
                 data::Evt::Props(..) => {}
-                // 晚到的旧选中结果直接丢弃，房间归属只认当前选中（与属性同一条规矩）。
-                data::Evt::ElementRooms(refno, result)
-                    if self.vm.selection.primary() == Some(refno) =>
-                {
-                    self.vm.rooms = match result {
-                        Ok(relations) => {
-                            // 镜像回来了：清掉「同一原因只记一次」的记账，下次再断还会说。
+                // 只认当前主选中、且是最后一次问的那一份（FR-106）：换了选中的旧结果、重试前发出的
+                // 旧问题晚到，都直接丢弃。
+                data::Evt::ElementRooms {
+                    refno,
+                    seq,
+                    outcome,
+                } if accept_rooms_reply(self.vm.selection.primary(), self.rooms_seq, refno, seq) => {
+                    self.vm.rooms = match outcome {
+                        data::RoomsOutcome::Ready(relations) => {
+                            // 答得出了：清掉「同一原因只记一次」的记账，下次再出事还会说。
                             self.mirror_error_said = None;
                             RoomVm::Ready(build_rooms(refno, relations))
                         }
-                        Err(e) if e.downcast_ref::<data::MirrorFeatureUnavailable>().is_some() => {
-                            RoomVm::Unavailable(e.to_string())
+                        data::RoomsOutcome::Pending { reason, partial } => RoomVm::Pending {
+                            refno,
+                            reason,
+                            partial: build_rooms(refno, partial).relations,
+                        },
+                        data::RoomsOutcome::Unavailable(reason) => {
+                            let key = format!("房间归属查不了|{reason}");
+                            if self.mirror_error_said.as_deref() != Some(key.as_str()) {
+                                let el = self.tree.element(refno);
+                                self.logs.warn_of(
+                                    &mut self.vm.logs,
+                                    el,
+                                    format!("此刻查不了房间归属：{reason}"),
+                                );
+                                self.mirror_error_said = Some(key);
+                            }
+                            RoomVm::Unavailable { refno, reason }
                         }
-                        Err(e) => {
-                            let text = logs::error_chain(&e);
+                        data::RoomsOutcome::Failed(text) => {
                             let key = format!("房间归属查询失败|{text}");
                             if self.mirror_error_said.as_deref() != Some(key.as_str()) {
                                 let el = self.tree.element(refno);
-                                self.logs
-                                    .error_of(&mut self.vm.logs, el, "房间归属查询失败", &e, None);
+                                self.logs.error_of(
+                                    &mut self.vm.logs,
+                                    el,
+                                    "房间归属查询失败",
+                                    &anyhow::Error::msg(text.clone()),
+                                    None,
+                                );
                                 self.mirror_error_said = Some(key);
                             }
                             RoomVm::Failed(format!("房间归属查询失败：{text}"))
                         }
                     };
                 }
-                data::Evt::ElementRooms(..) => {}
+                data::Evt::ElementRooms { .. } => {}
                 // 尺寸标注回包（计划 B1 / B2 / B3）。帧号对不上 = 右键之后又换了目标或点了
                 // 隐藏，丢弃。对上了就落进 `vm.dimensions`（菜单据它把「查看」翻成「隐藏」，
                 // B4 的状态入口据它报数），几何翻成线段批次交给视口整层替换。
@@ -4049,24 +4098,20 @@ impl App {
                 }
                 data::Evt::SubtreeBounds { .. } => {}
                 data::Evt::ModelScopeProgress { .. } | data::Evt::ModelScope(..) => {}
-                // 库级模型预检查的回包：换代前的不认。`ready_total == 0` = 这个库没有按
-                // 当前源生成的模型——还在等 records 回包的同库目标直接默认重新生成，不必
-                // 先吃一拍查空；`ready_total > 0` / `Err` 都只记账，records 那一路照常裁决。
+                // 库级模型预检查的回包：换代前的不认。探针说这个库没有按当前源生成的模型（服务端
+                // 两本账都是零，见 `DbnumModelRoots::has_model`）——还在等 records 回包的同库目标
+                // 直接默认重新生成，不必先吃一拍查空；说有 / `Err` 都只记账，records 那一路照常裁决。
                 data::Evt::DbnumModelProbe { epoch, .. } if epoch != self.model_scope_epoch => {}
                 data::Evt::DbnumModelProbe { dbnum, result, .. } => {
                     self.dbnum_model_probing.remove(&dbnum);
                     if let Ok(roots) = result {
-                        let has_model = roots.ready_total > 0;
-                        match self.dbnum_model_known.entry(dbnum) {
-                            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                                if has_model {
-                                    entry.insert(true);
-                                }
-                            }
-                            std::collections::hash_map::Entry::Vacant(entry) => {
-                                entry.insert(has_model);
-                            }
-                        }
+                        // 先并进会话级结论再裁决：这个库真查出过 records 的话，探针晚到的「没有」
+                        // 既不改账、也不催生成。
+                        let has_model = dbnum_has_model(
+                            self.dbnum_model_known.get(&dbnum).copied(),
+                            roots.has_model(),
+                        );
+                        self.dbnum_model_known.insert(dbnum, has_model);
                         if !has_model {
                             // 只替「显示」方向的待决目标发起：隐藏方向的查空不生成。
                             let pending: Vec<RefU64> = self
@@ -4984,6 +5029,42 @@ impl App {
         }
     }
 
+    /// 重试那条线上的一件事（`View3d::take_mesh_retry_events`）写进日志：哪些再点一次「显示」
+    /// 会重取、重取发出去了、取回几个还差几个。
+    /// eye 不在这里动——取回来的网格经渲染回执（`sync_render_states`）自己会到。
+    fn sync_mesh_retry(&mut self, event: plant_ui_view3d::MeshRetryEvent) {
+        use plant_ui_view3d::MeshRetryEvent;
+        match event {
+            MeshRetryEvent::Retryable { files } => self.logs.info(
+                &mut self.vm.logs,
+                format!(
+                    "没取到的网格文件里有 {files} 个是连接中断或服务报错，再点一次「显示」会重取"
+                ),
+            ),
+            MeshRetryEvent::Started { files } => self.logs.info(
+                &mut self.vm.logs,
+                format!("正在重取 {files} 个加载失败的网格文件"),
+            ),
+            MeshRetryEvent::Finished { recovered, errors } => {
+                if recovered > 0 {
+                    self.logs.info(
+                        &mut self.vm.logs,
+                        format!("重取回来 {recovered} 个网格文件"),
+                    );
+                }
+                if !errors.is_empty() {
+                    let error = anyhow::anyhow!(errors.join("\n"));
+                    self.logs.error(
+                        &mut self.vm.logs,
+                        format!("重取之后仍有 {} 个网格文件没取到", errors.len()),
+                        &error,
+                        None,
+                    );
+                }
+            }
+        }
+    }
+
     fn log_refresh_generation(&mut self) {
         self.logs.info(
             &mut self.vm.logs,
@@ -5075,8 +5156,10 @@ impl App {
                     self.refetch_props(refno)
                 }
                 Cmd::RetryProps(_) => {}
+                // 只重问归属，同「查看所属房间」。`refetch_rooms` 会连面板所属房间一起重问，
+                // 回包重开房间 X-Ray，还把用户拨开的虚拟孔洞 X-Ray 关掉（spec 045 FR-111）。
                 Cmd::RetryRooms(refno) if self.vm.selection.primary() == Some(refno) => {
-                    self.refetch_rooms(refno)
+                    self.ask_rooms(refno)
                 }
                 // 选中早就挪走：重查回来也过不了回包那道陈旧门，不发。
                 Cmd::RetryRooms(_) => {}
@@ -5458,8 +5541,13 @@ impl App {
                 Cmd::ShowRooms(refno) => {
                     // 归属数据跟着主选中预取；对准的不是当前主选中时先把选中切
                     // 过去，页签一亮出来就有内容而不是一句「查询中」。
+                    // 已经是主选中就重问一次：预取的答案可能早于这次增量更新（粘贴后
+                    // 马上选中新支管，那时它的模型和房间边还没生成）。只重问归属，不走
+                    // `refetch_rooms`——那边会重问面板所属房间，回包又把房间 X-Ray 打开。
                     if self.vm.selection.primary() != Some(refno) {
                         self.set_selection(Selection::single(refno));
+                    } else {
+                        self.ask_rooms(refno);
                     }
                     self.state.focus(Pane::Room);
                 }
@@ -5577,7 +5665,8 @@ impl App {
                 | Cmd::SetViewportLook(_)
                 | Cmd::SnapView { fit: false, .. }
                 | Cmd::RestoreCamera(_)
-                | Cmd::RetryFailedMeshes) => self.view3d_commands.push(command),
+                | Cmd::RetryFailedMeshes
+                | Cmd::RetryRecoverableMeshes) => self.view3d_commands.push(command),
                 Cmd::Navigate(step) => {
                     self.navigate(step);
                     dirty = true;
@@ -5850,7 +5939,7 @@ impl App {
     }
 
     /// 「没有模型就默认重新生成」的自动入口：显示路径发现范围内没有已生成模型
-    /// （库级探针 `ready_total == 0`，或按祖先查 records 一条没有）时替用户发起——
+    /// （库级探针说这个库没有模型，或按祖先查 records 一条没有）时替用户发起——
     /// 与右键同一条 `GenerateModels` 通道，只是跳过确认框：这两种发现说的本来就是
     /// 「现在没有可看的」，问一次没有意义。进度屏照常进 `Running`，回执仍由
     /// [`Self::settle_models_generated`] 收，成功即按原方向显示。
@@ -7092,11 +7181,25 @@ impl App {
     }
 
     /// 房间归属随选中预取（计划决定 5）：查询极轻，右键菜单打开的瞬间就有现成数据。
+    ///
+    /// 连面板所属房间一起重问，只给主选中变化与取回工作完成用（两处都先撤了房间 X-Ray）；重试与
+    /// 「查看所属房间」只调 [`App::ask_rooms`]（spec 045 FR-111）。
     fn refetch_rooms(&mut self, refno: RefU64) {
-        self.vm.rooms.begin_query();
-        let _ = self.bridge.req.send(data::Req::ElementRooms(refno));
+        self.ask_rooms(refno);
         self.panel_room_asked = None;
         self.ask_panel_room();
+    }
+
+    /// 只问构件的房间归属。每问一次序号加一，回包靠它认出是不是最后一次问的。类型从模型树上取
+    /// （树还没展开到它时为 `None`），库供数靠它拒层级容器。
+    fn ask_rooms(&mut self, refno: RefU64) {
+        self.vm.rooms.begin_query();
+        self.rooms_seq += 1;
+        let _ = self.bridge.req.send(data::Req::ElementRooms {
+            refno,
+            noun: self.tree.noun_of(refno).map(str::to_owned),
+            seq: self.rooms_seq,
+        });
     }
 
     /// 主选中是房间面板就去查它属于哪间房（回包落地开房间 X-Ray），每个主选中只查一次。
@@ -7620,6 +7723,10 @@ impl App {
     /// `Cmd::Model(SetVisible)` 与 [`Self::show_room_model`] 共用它——房间模型
     /// 与树上点眼睛是同一件事，加载与进度反馈那一整套没有第二份的道理。
     fn set_model_visible(&mut self, refnos: Vec<RefU64>, visible: bool) {
+        // 再点一次「显示」，顺带把早先没取到、再试可能就成的网格重取一遍（连接断过、服务报过错的
+        // 那些）；隐藏方向不发。没有这样的网格时视口什么也不做，日志里也不添东西。
+        self.view3d_commands
+            .extend(visible.then_some(Cmd::RetryRecoverableMeshes));
         // 只记方向，不动 eye：图标要等三维真的画成这样再变。
         for refno in &refnos {
             let previous = self.tree.visibility_for(*refno, &self.model_scopes);
@@ -9149,6 +9256,8 @@ mod tests {
         QueuedGenerate, enqueue_auto_generate, forget_queued_generate, generate_is_queued,
         merge_failed_mutations, next_queued_generate, queued_generate_targets, queued_show_targets,
     };
+    // 构件房间归属（spec 045 FR-106）：回包只采纳仍是主选中、且是最后一次问的那一份。
+    use super::accept_rooms_reply;
     use crate::model_update_api;
     use chrono::{TimeZone, Utc};
     use plant_ui::model_mutation;
@@ -9205,6 +9314,65 @@ mod tests {
             super::query_value("?look_debug=depth_error", "look_debug")
                 .and_then(|value| SglLookDebugView::parse(&value)),
             Some(SglLookDebugView::DepthError)
+        );
+    }
+
+    /// 地址栏的 `mesh_fetch=<路数>`：正整数才算数，别的值当没写（用出厂值）。
+    #[test]
+    fn the_mesh_fetch_override_comes_from_the_query_string() {
+        let routes = |search: &str| {
+            super::mesh_fetch_from(super::query_value(search, "mesh_fetch").as_deref())
+        };
+        assert_eq!(routes("?mesh_fetch=24"), Some(24));
+        assert_eq!(routes("?look=pbr&mesh_fetch=6"), Some(6));
+        assert_eq!(super::mesh_fetch_from(Some(" 12 ")), Some(12));
+        assert_eq!(routes("?look=pbr"), None, "没写");
+        assert_eq!(routes("?mesh_fetch=0"), None, "零路等于不取，不认");
+        assert_eq!(routes("?mesh_fetch=-3"), None);
+        assert_eq!(routes("?mesh_fetch=many"), None);
+    }
+
+    /// 再点一次「显示」要顺带重取早先没取到的网格（连接断过、服务报过错的那些），不必刷新页面。
+    /// 重取哪些、结果怎么记由视口那边的测试管；这里钉住宿主的四处接线：显示方向才下发（隐藏不发）；
+    /// 命令进三维队列；视口照办；视口的回执排在进度之后逐件写进日志。
+    #[test]
+    fn showing_a_model_again_refetches_the_meshes_that_may_come_back() {
+        let source = include_str!("main.rs");
+        let (production, _) = source.split_once("\nmod tests {").expect("测试模块分界");
+        let visible_fn = production
+            .split_once("fn set_model_visible(")
+            .expect("显示/隐藏入口")
+            .1
+            .split_once("fn install_group_roots(")
+            .expect("下一个方法")
+            .0;
+        assert!(
+            visible_fn.contains(".extend(visible.then_some(Cmd::RetryRecoverableMeshes))"),
+            "重取只跟显示方向走：{visible_fn}"
+        );
+        assert!(
+            production
+                .contains("| Cmd::RetryRecoverableMeshes) => self.view3d_commands.push(command)"),
+            "重取命令要进三维队列"
+        );
+        let frame = production
+            .split_once("fn show_app(")
+            .expect("每帧入口")
+            .1
+            .split_once("enum DimensionLayerUpdate {")
+            .expect("每帧入口结尾")
+            .0;
+        assert!(
+            frame.contains("Cmd::RetryRecoverableMeshes => view3d.retry_recoverable_meshes()"),
+            "视口要照办：{frame}"
+        );
+        let progress = frame.find("view3d.take_mesh_progress()").expect("取进度");
+        let events = frame
+            .find("for event in view3d.take_mesh_retry_events() {")
+            .expect("取重试回执");
+        assert!(
+            progress < events && frame.contains("app.sync_mesh_retry(event);"),
+            "回执排在进度之后写日志：「再点一次显示会重取」要跟在「加载失败」下面：{frame}"
         );
     }
 
@@ -9422,6 +9590,60 @@ mod tests {
         );
         assert_eq!(panel_room_query(Some(pipe), None, is_panel), None);
         assert_eq!(panel_room_query(None, None, is_panel), None);
+    }
+
+    /// 归属的「重试」与已选中时再点「查看所属房间」只重问归属（spec 045 FR-111）。走 `refetch_rooms`
+    /// 会连面板所属房间一起重问：回包重开房间 X-Ray，还把用户拨开的虚拟孔洞 X-Ray 关掉，
+    /// 正是 `panel_room_asked` 说的「不该又自己查回来」。
+    #[test]
+    fn retrying_rooms_only_reasks_membership() {
+        let source = include_str!("main.rs");
+        let (production, _) = source.split_once("\nmod tests {").expect("测试模块分界");
+        for head in [
+            "Cmd::RetryRooms(refno) if self.vm.selection.primary() == Some(refno) => {",
+            "Cmd::ShowRooms(refno) => {",
+        ] {
+            let arm = production
+                .split_once(head)
+                .unwrap_or_else(|| panic!("找不到 {head}"))
+                .1
+                .split_once("\n                Cmd::")
+                .expect("下一条分支")
+                .0
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(arm.contains("self.ask_rooms(refno)"), "要重问归属：{arm}");
+            for forbidden in ["refetch_rooms", "ask_panel_room", "panel_room_asked"] {
+                assert!(
+                    !arm.contains(forbidden),
+                    "只重问归属、不碰面板所属房间，却出现了 {forbidden}：{arm}"
+                );
+            }
+        }
+    }
+
+    /// 房间归属回包只认「仍是主选中、且是最后一次问的」（FR-106）。点过重试之后，重试前发出的
+    /// 旧问题晚到，refno 一样，只看 refno 就会拿旧的「还没算完」盖掉新的答案。
+    #[test]
+    fn only_the_latest_room_reply_for_the_primary_is_accepted() {
+        let pipe = RefU64(21);
+        let other = RefU64(22);
+        let cases = [
+            ("主选中、最后一次", Some(pipe), 7, pipe, 7, true),
+            ("主选中、重试前的旧问题", Some(pipe), 7, pipe, 6, false),
+            ("换了选中的旧结果", Some(other), 8, pipe, 7, false),
+            ("序号对得上但已不是主选中", Some(other), 7, pipe, 7, false),
+            ("选中已清空", None, 7, pipe, 7, false),
+        ];
+        for (name, primary, latest, refno, seq, accepted) in cases {
+            assert_eq!(
+                accept_rooms_reply(primary, latest, refno, seq),
+                accepted,
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -10002,7 +10224,7 @@ mod tests {
 
     /// 「显示前预检查 dbnum 有没有模型，没有就默认重新生成；节点查空同样重新生成」
     /// （需求口径）。钉住五处接线：显示方向才发探针与默认生成（隐藏只查不生）；库级
-    /// 结论 `ready_total == 0` 直接进生成不绕 records；查空先试生成、发不出去才收
+    /// 结论「没有模型」直接进生成不绕 records；查空先试生成、发不出去才收
     /// 「未加载」；每 refno 每会话只自动一发；自动趟尊重生成期间翻成隐藏的方向。
     #[test]
     fn display_regenerates_when_dbnum_has_no_model() {
@@ -10072,7 +10294,7 @@ mod tests {
             "生成在途的目标不标未加载、不打提示：{empty}"
         );
 
-        // 探针回包：换代的不认；`ready_total == 0` 才催生成，且只替显示方向的待决目标。
+        // 探针回包：换代的不认；并进库级结论之后仍是「没有模型」才催生成，且只替显示方向的待决目标。
         assert!(
             source
                 .contains("Evt::DbnumModelProbe { epoch, .. } if epoch != self.model_scope_epoch"),
@@ -10085,7 +10307,16 @@ mod tests {
             .split_once("data::Evt::ResolvedName")
             .expect("下一臂")
             .0;
-        assert!(probe.contains("roots.ready_total > 0"), "就绪判据：{probe}");
+        // 就绪判据要两本账合看（服务重启后进程那本是空的），再并进会话级结论——这一臂自己去读
+        // `ready_total` 的话，重启过的服务会让显示路径把每个库现成的模型再生成一遍。
+        assert!(
+            probe.contains("dbnum_has_model(") && probe.contains("roots.has_model()"),
+            "就绪判据：{probe}"
+        );
+        assert!(
+            !probe.contains("ready_total"),
+            "探针那一臂不许绕过 has_model 自己去读 ready_total：{probe}"
+        );
         assert!(
             probe.contains("pending_direction.get(target).copied()"),
             "探针只替显示方向的待决目标发起：{probe}"
@@ -10421,6 +10652,22 @@ mod tests {
                 "{head}：{body}"
             );
         }
+    }
+
+    /// 探针回包并进库级结论：已经有证据说「有」的库（真查出过 records、或刚生成成功），探针晚到的
+    /// 「没有」推不翻它，也就不会把现成的模型再生成一遍；没有别的证据时听探针的。
+    #[test]
+    fn a_late_probe_cannot_overturn_models_already_seen() {
+        use super::dbnum_has_model;
+        assert!(
+            dbnum_has_model(Some(true), false),
+            "见过模型的库不因探针说没有而重新生成"
+        );
+        assert!(dbnum_has_model(Some(true), true));
+        assert!(dbnum_has_model(None, true));
+        assert!(dbnum_has_model(Some(false), true), "探针说有了就改口");
+        assert!(!dbnum_has_model(None, false), "没有别的证据时听探针的");
+        assert!(!dbnum_has_model(Some(false), false));
     }
 
     /// `timeout` 回执（服务端 120 s 预算到点、后台继续）不发显示，其余失败也不发（ADR-0030 实施约束 3）。
@@ -12680,6 +12927,12 @@ fn build_rooms(refno: RefU64, relations: Vec<plant_ui_data::room::RoomRelation>)
             })
             .collect(),
     }
+}
+
+/// 房间归属回包采不采纳（FR-106）：只认「仍是主选中、且是最后一次问的」那一份。只看 refno 不够：
+/// 重试前发出的旧问题 refno 相同，晚到会把重试拿到的新答案盖回去。
+fn accept_rooms_reply(primary: Option<RefU64>, latest_seq: u64, refno: RefU64, seq: u64) -> bool {
+    primary == Some(refno) && seq == latest_seq
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

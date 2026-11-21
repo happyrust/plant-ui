@@ -46,6 +46,8 @@ use plant_ui::{
 
 pub mod e3d_look;
 mod look_materials;
+#[cfg(any(target_arch = "wasm32", test))]
+mod mesh_fetch;
 pub mod mesh_source;
 mod render_gate;
 mod room_clip;
@@ -375,7 +377,12 @@ pub struct View3d {
     failed_meshes: Vec<LoadingMesh>,
     /// 已经重新发出、还没有结果的那些。
     retrying_meshes: Vec<RetryingMesh>,
-    retry_requested: bool,
+    /// 宿主要求重试，以及重来哪些；`retry_meshes` 下一帧照办。
+    retry_requested: Option<RetryScope>,
+    /// 正在进行的这一轮重试的账。
+    retry_round: RetryRound,
+    /// 重试那条线上发生了什么，等宿主来取。
+    mesh_retry_events: Vec<MeshRetryEvent>,
     mesh_progress: Option<MeshLoadProgress>,
     desired_visibility: HashMap<RefU64, bool>,
     /// 每个模型在场景里的**实际**渲染结果。与 `desired_visibility` 分开记：
@@ -693,8 +700,39 @@ impl View3d {
         if self.failed_meshes.is_empty() {
             return 0;
         }
-        self.retry_requested = true;
+        self.retry_requested = Some(RetryScope::All);
         self.failed_meshes.len()
+    }
+
+    /// 重来一遍失败的网格里**再试可能就成**的那些：连接断了、服务报错、文件读坏了。
+    /// 用户再点一次「显示」时由宿主发起。
+    ///
+    /// 「没有这个文件」的不在此列：再问还是没有，每点一次显示都去问一遍，只是给日志
+    /// 添两行报错。那种失败要等换网格目录（[`Self::retry_failed_meshes`]）或模型重新装载。
+    pub fn retry_recoverable_meshes(&mut self) {
+        // 已经要「全部重来」了就不覆盖：那一个的范围更大。
+        if !self.failed_meshes.is_empty() && self.retry_requested.is_none() {
+            self.retry_requested = Some(RetryScope::Recoverable);
+        }
+    }
+
+    /// 取走重试那条线上新发生的事，按先后排好；每件只交付一次。
+    pub fn take_mesh_retry_events(&mut self) -> Vec<MeshRetryEvent> {
+        std::mem::take(&mut self.mesh_retry_events)
+    }
+
+    /// 重发出去的都有了结果（或者连同模型一起被卸掉了）：把这一轮的账交出去。
+    fn finish_retry_round(&mut self) {
+        let round = std::mem::take(&mut self.retry_round);
+        if !round.open {
+            return;
+        }
+        let recovered = round.results.values().filter(|kept| kept.is_none()).count();
+        let mut errors: Vec<String> = round.results.into_values().flatten().collect();
+        // 账是散列表，不排一下的话同一批失败每次列出来的顺序都不一样。
+        errors.sort();
+        self.mesh_retry_events
+            .push(MeshRetryEvent::Finished { recovered, errors });
     }
 
     /// 取一拍 mesh 文件加载进度；终态只交付一次。
@@ -859,6 +897,23 @@ impl MeshLoadProgress {
     }
 }
 
+/// 重试那条线上的一件事，经 [`View3d::take_mesh_retry_events`] 交给宿主。
+///
+/// 数的都是网格文件——一个文件被多少个实例共用都只算一次。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MeshRetryEvent {
+    /// 刚有了结果的这一批里，有这么多个文件没取到、但再试可能就成：
+    /// [`View3d::retry_recoverable_meshes`] 会重发它们。「没有这个文件」的不算在内。
+    Retryable { files: usize },
+    /// 一轮重试发出去了：重发了这么多个文件。
+    Started { files: usize },
+    /// 这一轮重发的都有了结果：取回来几个；还是没取到的，每个文件一条 `路径: 原因`。
+    Finished {
+        recovered: usize,
+        errors: Vec<String>,
+    },
+}
+
 /// 尺寸标注层的一批线段（计划 B3）。
 ///
 /// 坐标是 **PDMS 毫米（契约 `source_mm`）**，与模型几何过同一个装载变换（[`scene_transform`]：
@@ -904,14 +959,76 @@ struct RetryingMesh {
 
 /// 重发之后多久，还没见它动过就认账。
 ///
-/// `AssetServer::reload` 不给回执，只能等状态自己翻。没有这道兜底的话，一个压根
-/// 没被重发的网格会永远挂在重试队列里，界面上那个红点也就永远不落地。
+/// 重发（`AssetServer::load`）当场就把失败态翻成加载中，正常用不到这个时限。留着是
+/// 兜底：万一有一个压根没被重发出去，它不该永远挂在重试队列里，让界面上那个红点
+/// 永远不落地。
 const RETRY_GRACE: Duration = Duration::from_secs(3);
 
 impl RetryingMesh {
     /// 这一刻的失败态算不算数。
     fn settling(&self) -> bool {
         self.started || self.asked_at.elapsed() >= RETRY_GRACE
+    }
+}
+
+/// 一次重试重来哪些失败的网格。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryScope {
+    /// 全部：网格目录换过了，原先没有的文件现在可能有了。
+    All,
+    /// 只要再试可能就成的：「没有这个文件」以外的那些。
+    Recoverable,
+}
+
+impl RetryScope {
+    /// 停在 `state` 的这个失败网格，这一次要不要重来。
+    fn covers(self, state: Option<&LoadState>) -> bool {
+        match self {
+            Self::All => true,
+            Self::Recoverable => !missing_file(state),
+        }
+    }
+}
+
+/// 这个加载状态是不是「没有这个文件」——再问一遍也还是没有的那种失败。
+fn missing_file(state: Option<&LoadState>) -> bool {
+    use bevy::asset::AssetLoadError;
+    use bevy::asset::io::AssetReaderError;
+    matches!(
+        state,
+        Some(LoadState::Failed(error))
+            if matches!(
+                error.as_ref(),
+                AssetLoadError::AssetReaderError(AssetReaderError::NotFound(_))
+            )
+    )
+}
+
+/// 进行中的一轮重试的账。一轮从重发出去起，到重发的都有了结果为止；还没完的时候
+/// 又来一次重发，并进同一轮。
+#[derive(Default)]
+struct RetryRound {
+    open: bool,
+    /// 每个网格文件在这一轮里的结果：取回来了记 `None`，没取到记 `路径: 原因`。
+    /// 按文件记——同一个文件的下一个实例不再记。
+    results: HashMap<String, Option<String>>,
+}
+
+impl RetryRound {
+    /// `path` 重发出去了。这一轮里它已经有过结果的话划掉，以这一次为准。
+    fn resent(&mut self, path: &str) {
+        self.open = true;
+        self.results.remove(path);
+    }
+
+    fn recovered(&mut self, path: &str) {
+        self.results.entry(path.to_owned()).or_insert(None);
+    }
+
+    fn failed(&mut self, path: &str, error: &dyn std::fmt::Display) {
+        self.results
+            .entry(path.to_owned())
+            .or_insert_with(|| Some(format!("{path}: {error}")));
     }
 }
 
@@ -1286,7 +1403,9 @@ fn setup(
         loading_meshes: Vec::new(),
         failed_meshes: Vec::new(),
         retrying_meshes: Vec::new(),
-        retry_requested: false,
+        retry_requested: None,
+        retry_round: RetryRound::default(),
+        mesh_retry_events: Vec::new(),
         mesh_progress: None,
         desired_visibility: HashMap::new(),
         render_states: HashMap::new(),
@@ -2287,6 +2406,19 @@ fn update_mesh_progress(mut view: ResMut<View3d>, assets: Res<AssetServer>) {
                 )
             })
             .collect();
+        // 失败的里头再试可能就成的有几个文件，告诉宿主一声：那些再点一次「显示」会重取。
+        let retryable = failed
+            .iter()
+            .filter(|mesh| {
+                RetryScope::Recoverable.covers(assets.get_load_state(&mesh.handle).as_ref())
+            })
+            .map(|mesh| mesh.path.as_str())
+            .collect::<HashSet<_>>()
+            .len();
+        if retryable > 0 {
+            view.mesh_retry_events
+                .push(MeshRetryEvent::Retryable { files: retryable });
+        }
         view.failed_meshes.extend(failed);
     }
 }
@@ -2296,28 +2428,41 @@ fn update_mesh_progress(mut view: ResMut<View3d>, assets: Res<AssetServer>) {
 /// 与 [`update_mesh_progress`] 分开走：那一份每帧从 `loading_meshes` 从头重算整批
 /// 计数，而重试只补个别网格——混进同一份账里会把同一个模型早先成功的那些数抹掉。
 fn retry_meshes(mut view: ResMut<View3d>, assets: Res<AssetServer>) {
-    if view.retry_requested {
-        view.retry_requested = false;
+    if let Some(scope) = view.retry_requested {
+        view.retry_requested = None;
+        let (again, left): (Vec<LoadingMesh>, Vec<LoadingMesh>) =
+            std::mem::take(&mut view.failed_meshes)
+                .into_iter()
+                .partition(|mesh| scope.covers(assets.get_load_state(&mesh.handle).as_ref()));
+        view.failed_meshes = left;
+        // 一个网格文件可以被许多实例共用，重发一次就够。
+        let files: HashSet<String> = again.iter().map(|mesh| mesh.path.clone()).collect();
+        for path in &files {
+            // 用 `load` 不用 `reload`：对失败过的资产，`load` 当场把状态翻成加载中；
+            // `reload` 要等读取器把文件交出来才翻，取不到的话干脆不翻。网页端的文件要
+            // 排队、要走网络，交出来之前早过了 `RETRY_GRACE`，还在路上的那些会被当成
+            // 又失败了一次。
+            let _same: Handle<Mesh> = assets.load(path.as_str());
+            view.retry_round.resent(path);
+        }
+        if !files.is_empty() {
+            view.mesh_retry_events
+                .push(MeshRetryEvent::Started { files: files.len() });
+        }
         let asked_at = Instant::now();
-        let retrying: Vec<_> = view
-            .failed_meshes
-            .drain(..)
-            .map(|mesh| RetryingMesh {
+        view.retrying_meshes
+            .extend(again.into_iter().map(|mesh| RetryingMesh {
                 mesh,
                 asked_at,
                 started: false,
-            })
-            .collect();
-        let mut reloaded = HashSet::new();
-        for entry in &retrying {
-            // 一个网格文件可以被许多实例共用，重发一次就够。
-            if reloaded.insert(entry.mesh.path.clone()) {
-                assets.reload(entry.mesh.path.as_str());
-            }
-        }
-        view.retrying_meshes.extend(retrying);
+            }));
     }
     if view.retrying_meshes.is_empty() {
+        // 没有在等的了，这一轮却还开着：等着的那些连同模型一起被卸掉了。先只读着判断——
+        // 绝大多数帧走的是这条路，不该每帧都把 `View3d` 标成改过。
+        if view.retry_round.open {
+            view.finish_retry_round();
+        }
         return;
     }
     let mut settled_now = Vec::new();
@@ -2330,11 +2475,15 @@ fn retry_meshes(mut view: ResMut<View3d>, assets: Res<AssetServer>) {
                     state.mesh_loaded += 1;
                     state.mesh_failed = state.mesh_failed.saturating_sub(1);
                 }
+                view.retry_round.recovered(&entry.mesh.path);
                 settled_now.push(entry.mesh.refno);
             }
-            // 还是失败态，但重发是丢进 IO 任务池的，状态要过几帧才翻——在亲眼见到
-            // 它离开失败态之前，这个 `Failed` 说的还是上一轮的事，不是这次的结论。
-            Some(LoadState::Failed(_)) if entry.settling() => still_failed.push(entry.mesh),
+            // 在亲眼见到它离开失败态之前，这个 `Failed` 说的还是上一轮的事，不是这次的
+            // 结论（见 `RETRY_GRACE`）。
+            Some(LoadState::Failed(error)) if entry.settling() => {
+                view.retry_round.failed(&entry.mesh.path, &error);
+                still_failed.push(entry.mesh);
+            }
             Some(LoadState::Failed(_)) => in_flight.push(entry),
             _ => {
                 entry.started = true;
@@ -2345,6 +2494,9 @@ fn retry_meshes(mut view: ResMut<View3d>, assets: Res<AssetServer>) {
     view.retrying_meshes = in_flight;
     view.failed_meshes.extend(still_failed);
     view.render_dirty.extend(settled_now);
+    if view.retrying_meshes.is_empty() {
+        view.finish_retry_round();
+    }
 }
 
 fn apply_resize(
@@ -3117,7 +3269,9 @@ pub(crate) fn blank_view() -> View3d {
         loading_meshes: Vec::new(),
         failed_meshes: Vec::new(),
         retrying_meshes: Vec::new(),
-        retry_requested: false,
+        retry_requested: None,
+        retry_round: RetryRound::default(),
+        mesh_retry_events: Vec::new(),
         mesh_progress: None,
         desired_visibility: HashMap::new(),
         render_states: HashMap::new(),
@@ -4642,8 +4796,8 @@ mod tests {
         assert_eq!((reported[0].mesh_loaded, reported[0].mesh_failed), (1, 1));
     }
 
-    /// 重发是丢进 IO 任务池的，状态要过几帧才翻。在亲眼见到它离开失败态之前，
-    /// 那一刻的 `Failed` 说的还是上一轮的事——照单全收的话重试会当场自我否定。
+    /// 在亲眼见到它离开失败态之前，那一刻的 `Failed` 说的还是上一轮的事——照单全收的话
+    /// 重试会当场自我否定。
     #[test]
     fn a_stale_failure_does_not_settle_a_fresh_retry() {
         let mut entry = RetryingMesh {
@@ -4672,15 +4826,383 @@ mod tests {
     fn retrying_needs_something_to_retry() {
         let mut view = test_view();
         assert_eq!(view.retry_failed_meshes(), 0);
-        assert!(!view.retry_requested);
+        view.retry_recoverable_meshes();
+        assert_eq!(view.retry_requested, None);
 
         view.failed_meshes.push(LoadingMesh {
             refno: RefU64::from(1),
             path: "meshes://a.mesh".into(),
             handle: Handle::default(),
         });
+        view.retry_recoverable_meshes();
+        assert_eq!(view.retry_requested, Some(RetryScope::Recoverable));
         assert_eq!(view.retry_failed_meshes(), 1);
-        assert!(view.retry_requested);
+        assert_eq!(view.retry_requested, Some(RetryScope::All));
+        // 「全部重来」已经在等了，范围小的那个不把它盖掉。
+        view.retry_recoverable_meshes();
+        assert_eq!(view.retry_requested, Some(RetryScope::All));
+    }
+
+    /// 一轮重试的账按文件记：同一轮里重发了第二次的，以后一次的结果为准；没取到的按路径排好。
+    #[test]
+    fn a_retry_round_keeps_the_latest_result_of_each_file() {
+        let mut view = test_view();
+        view.finish_retry_round();
+        assert!(
+            view.take_mesh_retry_events().is_empty(),
+            "没开过的一轮不报结果"
+        );
+
+        for path in ["b.mesh", "d.mesh", "a.mesh", "c.mesh"] {
+            view.retry_round.resent(path);
+        }
+        view.retry_round.failed("b.mesh", &"503");
+        view.retry_round.failed("d.mesh", &"没有应答");
+        view.retry_round.failed("a.mesh", &"503");
+        view.retry_round.recovered("c.mesh");
+        // 同一个文件的下一个实例不再记。
+        view.retry_round.recovered("c.mesh");
+        view.retry_round.failed("c.mesh", &"503");
+        // b 又重发了一次，这回取到了。
+        view.retry_round.resent("b.mesh");
+        view.retry_round.recovered("b.mesh");
+        view.finish_retry_round();
+
+        assert_eq!(
+            view.take_mesh_retry_events(),
+            vec![MeshRetryEvent::Finished {
+                recovered: 2,
+                errors: vec!["a.mesh: 503".to_owned(), "d.mesh: 没有应答".to_owned()],
+            }]
+        );
+        assert!(!view.retry_round.open, "报完结果这一轮就关了");
+    }
+
+    /// 转帧，把重试那条线上的事攒起来，直到一轮重试结束。
+    fn retry_events(app: &mut App) -> Vec<MeshRetryEvent> {
+        let mut events = Vec::new();
+        for _ in 0..300 {
+            app.update();
+            events.extend(
+                app.world_mut()
+                    .resource_mut::<View3d>()
+                    .take_mesh_retry_events(),
+            );
+            if matches!(events.last(), Some(MeshRetryEvent::Finished { .. })) {
+                return events;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("重试一直没有结果：{events:?}");
+    }
+
+    /// 转帧直到有 `count` 个网格记成了失败。
+    fn wait_for_failed_meshes(app: &mut App, count: usize) {
+        for _ in 0..300 {
+            app.update();
+            if app.world().resource::<View3d>().failed_mesh_count() == count {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("等不到 {count} 个失败的网格");
+    }
+
+    /// 一个能被 [`MeshLoader`] 读出来的网格文件。
+    fn a_mesh_file() -> Vec<u8> {
+        PlantMesh {
+            indices: vec![0, 1, 2],
+            vertices: vec![Vec3::ZERO, Vec3::X, Vec3::Y],
+            normals: vec![Vec3::Z; 3],
+            ..Default::default()
+        }
+        .ser_to_bytes()
+    }
+
+    /// 整条重试链走一遍：取不到 → 记失败 → 重试还是取不到 → 文件有了 → 重试取回来，
+    /// 每一步的账都要对得上。
+    ///
+    /// 文件「先没有、后来有了」是桌面端换了网格目录的情形，走的是「全部重来」。
+    #[test]
+    fn a_failed_mesh_is_retried_until_it_comes_back() {
+        let dir = std::env::temp_dir().join(format!(
+            "plant-ui-mesh-retry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let refno = RefU64::from(7);
+        let path = "late.mesh";
+        let mut view = test_view();
+        view.render_states.insert(
+            refno,
+            RenderState {
+                visible: true,
+                mesh_total: 2,
+                mesh_immediate: 0,
+                mesh_loaded: 0,
+                mesh_failed: 0,
+            },
+        );
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            AssetPlugin {
+                file_path: dir.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+        ))
+        .init_asset::<Mesh>()
+        .init_asset_loader::<MeshLoader>()
+        .insert_resource(view)
+        .add_systems(Update, (update_mesh_progress, retry_meshes).chain());
+        let handle: Handle<Mesh> = app.world().resource::<AssetServer>().load(path);
+        // 同一个文件被两个实例用到：失败数按实例记，重试结果按文件记。
+        for _ in 0..2 {
+            app.world_mut()
+                .resource_mut::<View3d>()
+                .loading_meshes
+                .push(LoadingMesh {
+                    refno,
+                    path: path.into(),
+                    handle: handle.clone(),
+                });
+        }
+        let counts = |app: &App| {
+            let state = &app.world().resource::<View3d>().render_states[&refno];
+            (state.mesh_loaded, state.mesh_failed)
+        };
+        let retry_all = |app: &mut App| {
+            app.world_mut()
+                .resource_mut::<View3d>()
+                .retry_failed_meshes()
+        };
+
+        wait_for_failed_meshes(&mut app, 2);
+        assert_eq!(counts(&app), (0, 2));
+        assert!(
+            app.world_mut()
+                .resource_mut::<View3d>()
+                .take_mesh_retry_events()
+                .is_empty(),
+            "缺文件的失败不提示重取；没重试过也就没有重试结果"
+        );
+
+        // 文件还是没有：重试一轮，如实报还是没取到。
+        assert_eq!(retry_all(&mut app), 2);
+        let events = retry_events(&mut app);
+        let [
+            MeshRetryEvent::Started { files: 1 },
+            MeshRetryEvent::Finished {
+                recovered: 0,
+                errors,
+            },
+        ] = events.as_slice()
+        else {
+            panic!("两个实例用的是同一个文件，只重发一次：{events:?}");
+        };
+        assert_eq!(errors.len(), 1, "也只报一条");
+        assert!(errors[0].contains(path));
+        assert_eq!(app.world().resource::<View3d>().failed_mesh_count(), 2);
+        assert_eq!(counts(&app), (0, 2));
+
+        // 文件有了：再重试一轮就取回来，失败的账清零。
+        std::fs::write(dir.join(path), a_mesh_file()).unwrap();
+        assert_eq!(retry_all(&mut app), 2);
+        assert_eq!(
+            retry_events(&mut app),
+            vec![
+                MeshRetryEvent::Started { files: 1 },
+                MeshRetryEvent::Finished {
+                    recovered: 1,
+                    errors: Vec::new(),
+                },
+            ]
+        );
+        let view = app.world().resource::<View3d>();
+        assert_eq!(view.failed_mesh_count(), 0);
+        assert!(view.retrying_meshes.is_empty());
+        assert_eq!(counts(&app), (2, 0));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 再点一次「显示」发起的那种重试只管再试可能就成的：服务报过错的文件重取，
+    /// 「没有这个文件」的不去再问一遍——那一种要等「全部重来」。
+    ///
+    /// 「服务报错」用本地目录摆不出来，这里接一个由测试说了算的来源，照网页端读取器的
+    /// 报法（`HttpError`）报。
+    #[test]
+    fn showing_again_retries_only_what_may_come_back() {
+        use bevy::asset::io::{AssetReader, AssetReaderError, AssetSource, PathStream, VecReader};
+        use std::path::Path;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        enum Served {
+            File(Vec<u8>),
+            Status(u16),
+        }
+
+        /// 没登记过的路径就是「没有这个文件」。
+        #[derive(Clone, Default)]
+        struct Scripted(Arc<Mutex<HashMap<String, Served>>>);
+
+        impl Scripted {
+            fn serve(&self, path: &str, served: Served) {
+                self.0.lock().unwrap().insert(path.to_owned(), served);
+            }
+        }
+
+        impl AssetReader for Scripted {
+            async fn read<'a>(
+                &'a self,
+                path: &'a Path,
+            ) -> Result<impl Reader + 'a, AssetReaderError> {
+                let served = self
+                    .0
+                    .lock()
+                    .unwrap()
+                    .get(&*path.to_string_lossy())
+                    .cloned();
+                match served {
+                    Some(Served::File(bytes)) => Ok(VecReader::new(bytes)),
+                    Some(Served::Status(status)) => Err(AssetReaderError::HttpError(status)),
+                    None => Err(AssetReaderError::NotFound(path.to_owned())),
+                }
+            }
+
+            async fn read_meta<'a>(
+                &'a self,
+                path: &'a Path,
+            ) -> Result<impl Reader + 'a, AssetReaderError> {
+                Err::<VecReader, _>(AssetReaderError::NotFound(path.to_owned()))
+            }
+
+            async fn read_directory<'a>(
+                &'a self,
+                path: &'a Path,
+            ) -> Result<Box<PathStream>, AssetReaderError> {
+                Err(AssetReaderError::NotFound(path.to_owned()))
+            }
+
+            async fn is_directory<'a>(&'a self, _path: &'a Path) -> Result<bool, AssetReaderError> {
+                Ok(false)
+            }
+        }
+
+        let gone = RefU64::from(8);
+        let flaky = RefU64::from(9);
+        let meshes = Scripted::default();
+        meshes.serve("flaky.mesh", Served::Status(503));
+        let mut view = test_view();
+        for refno in [gone, flaky] {
+            view.render_states.insert(
+                refno,
+                RenderState {
+                    visible: true,
+                    mesh_total: 1,
+                    mesh_immediate: 0,
+                    mesh_loaded: 0,
+                    mesh_failed: 0,
+                },
+            );
+        }
+        let source = meshes.clone();
+        let mut app = App::new();
+        app.register_asset_source(
+            "scripted",
+            AssetSource::build().with_reader(move || Box::new(source.clone())),
+        )
+        .add_plugins((MinimalPlugins, AssetPlugin::default()))
+        .init_asset::<Mesh>()
+        .init_asset_loader::<MeshLoader>()
+        .insert_resource(view)
+        .add_systems(Update, (update_mesh_progress, retry_meshes).chain());
+        for (refno, path) in [
+            (gone, "scripted://gone.mesh"),
+            (flaky, "scripted://flaky.mesh"),
+        ] {
+            let handle: Handle<Mesh> = app.world().resource::<AssetServer>().load(path);
+            app.world_mut()
+                .resource_mut::<View3d>()
+                .loading_meshes
+                .push(LoadingMesh {
+                    refno,
+                    path: path.into(),
+                    handle,
+                });
+        }
+        let counts = |app: &App, refno: RefU64| {
+            let state = &app.world().resource::<View3d>().render_states[&refno];
+            (state.mesh_loaded, state.mesh_failed)
+        };
+        let show_again = |app: &mut App| {
+            app.world_mut()
+                .resource_mut::<View3d>()
+                .retry_recoverable_meshes();
+        };
+        let one_file_came_back = vec![
+            MeshRetryEvent::Started { files: 1 },
+            MeshRetryEvent::Finished {
+                recovered: 1,
+                errors: Vec::new(),
+            },
+        ];
+
+        wait_for_failed_meshes(&mut app, 2);
+        assert_eq!(
+            app.world_mut()
+                .resource_mut::<View3d>()
+                .take_mesh_retry_events(),
+            vec![MeshRetryEvent::Retryable { files: 1 }],
+            "两个都没取到，再试可能就成的只有服务报错的那一个"
+        );
+
+        // 服务还在报错：重取一轮，如实报还是没取到；缺的那个文件没人去问。
+        show_again(&mut app);
+        let events = retry_events(&mut app);
+        let [
+            MeshRetryEvent::Started { files: 1 },
+            MeshRetryEvent::Finished {
+                recovered: 0,
+                errors,
+            },
+        ] = events.as_slice()
+        else {
+            panic!("只该重发服务报错的那一个：{events:?}");
+        };
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("flaky.mesh"), "{errors:?}");
+        assert_eq!(app.world().resource::<View3d>().failed_mesh_count(), 2);
+
+        // 两个文件现在都取得到了：再点一次显示，取回来的只有服务报过错的那个。
+        meshes.serve("gone.mesh", Served::File(a_mesh_file()));
+        meshes.serve("flaky.mesh", Served::File(a_mesh_file()));
+        show_again(&mut app);
+        assert_eq!(retry_events(&mut app), one_file_came_back);
+        assert_eq!(counts(&app, flaky), (1, 0));
+        assert_eq!(counts(&app, gone), (0, 1));
+        assert_eq!(app.world().resource::<View3d>().failed_mesh_count(), 1);
+
+        // 只剩「没有这个文件」的那个：再点显示不去问，也不往日志里添东西。
+        show_again(&mut app);
+        for _ in 0..5 {
+            app.update();
+        }
+        let mut view = app.world_mut().resource_mut::<View3d>();
+        assert!(view.take_mesh_retry_events().is_empty());
+        assert_eq!(view.retry_requested, None, "请求收到了，只是没有可重发的");
+        assert_eq!(view.failed_mesh_count(), 1);
+
+        // 「全部重来」才轮到它。
+        assert_eq!(view.retry_failed_meshes(), 1);
+        assert_eq!(retry_events(&mut app), one_file_came_back);
+        assert_eq!(counts(&app, gone), (1, 0));
+        assert_eq!(app.world().resource::<View3d>().failed_mesh_count(), 0);
     }
 
     /// 网格还在装的模型不回执：eye 不许抢在画面前面变成「已显示」。

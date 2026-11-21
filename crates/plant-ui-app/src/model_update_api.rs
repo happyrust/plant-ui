@@ -38,6 +38,13 @@ impl std::fmt::Display for ApiError {
 
 impl std::error::Error for ApiError {}
 
+/// 「这台服务端没有这条路由」：404 / 405 且包体不是错误包封（路由层回的，处理器根本没跑）。
+///
+/// 带包封的 404 `not_found` 是处理器说「没有这个对象」，不是没有路由。两者按结构分，不按 message
+/// 里的子串分——refno 里碰巧带 `405` 的错误不该被认成「服务端不支持」。
+/// [`error_packet`] 在 message 里仍写 `HTTP {status}: …`，[`endpoint_missing`] 的结果不变。
+pub const ROUTE_MISSING: &str = "route_missing";
+
 /// 从 `anyhow` 链上把结构化失败取回来；取不到就归到 internal，
 /// 界面那一类会把原始 message 收进「详情」默认折起。
 pub fn failure_of(error: &anyhow::Error) -> Failure {
@@ -253,14 +260,30 @@ fn dbnum_model_path(
 
 /// `GET /api/v1/dbnums/{dbnum}/model/roots` 的库级就绪快照（gen-model `dbnum_model_roots`）。
 ///
-/// `ready` 的判据本身就要求回执按冻结时的当前源 `sesno` 生成（含必要的发布 ACK），所以
-/// `ready_total > 0` = 库里有现成且仍是最新的模型（「已生成」）；`= 0` = 没生成过或全部
-/// 落后。显示路径拿它做库级预检查：`0` 时不等 records 回空就直接默认重新生成。
+/// `ready` 的判据本身就要求回执按冻结时的当前源 `sesno` 生成（含必要的发布 ACK），所以「有根
+/// 就绪」= 库里有现成且仍是最新的模型（「已生成」）。服务端为它记了两本账，这里各读一格，合起来
+/// 才是结论（[`Self::has_model`]）。显示路径拿它做库级预检查：两本账都说没有时，不等 records 回空
+/// 就直接默认重新生成。
 #[derive(Debug, Default, Clone, Copy, Deserialize)]
 pub struct DbnumModelRoots {
-    /// 已就绪（按当前源生成）的根数。
+    /// 已就绪（按当前源生成）的根数——**服务进程自己的投影**（回包里的
+    /// `ready_source = process_projection`）：服务一重启就从零记起，库里的模型一根没少它也是 0。
     #[serde(default)]
     pub ready_total: usize,
+    /// 落盘的账（库级凭证 ∨ 进程账本）认可的就绪根数，服务重启不清零。没有这一格的老服务端读成
+    /// `None`，不当成 0——「没说」与「说了没有」不是一回事。
+    #[serde(default)]
+    pub durable_ready_total: Option<usize>,
+}
+
+impl DbnumModelRoots {
+    /// 这个库有没有按当前源生成的模型：两本账任一本说有就是有。
+    ///
+    /// 只看 `ready_total` 的话，服务重启之后每个库都会被说成「没有模型」，显示路径就会把库里
+    /// 现成的模型再生成一遍。
+    pub fn has_model(&self) -> bool {
+        self.ready_total > 0 || self.durable_ready_total.is_some_and(|ready| ready > 0)
+    }
 }
 
 /// 库级模型探针：问「这个库现在有没有按当前源生成的模型」。一次根枚举快照，大库秒级——
@@ -661,11 +684,7 @@ pub async fn element_attributes(
     )
     .await
     .map_err(|error| {
-        let failure = failure_of(&error);
-        if failure.code == "not_found"
-            || failure.message.contains("HTTP 404")
-            || failure.message.contains("405")
-        {
+        if failure_of(&error).code == ROUTE_MISSING {
             anyhow::anyhow!("gen-model 版本不支持文件侧属性，请升级 gen-model")
         } else {
             error
@@ -733,6 +752,99 @@ fn element_attributes_body(
         "refno": refno.to_slash_string(),
     })
     .to_string()
+}
+
+/// `GET /api/v1/element/rooms` 的一条归属（gen-model `room_membership_api::RoomMembership`，接口文档 §4.13.8）。
+///
+/// 服务端答不出的格是 `null`，这里照收 `None`，不补 0。`room_num` / `panel` 缺席也先收成 `None`，
+/// 由 `data::classify_element_rooms` 整次判失败并点名那一行——在这里让反序列化报错，只得到一句不带行号的错。
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+pub struct ElementRoomMembership {
+    /// 房间 FRMW（`a_b`）；面板不在册、或共用墙按房号也挑不出唯一一间时为 `null`。
+    #[serde(default)]
+    pub room: Option<String>,
+    #[serde(default)]
+    pub room_num: Option<String>,
+    /// `{前缀}-{归一化房号}`；算不出时为 `null`。
+    #[serde(default)]
+    pub room_code: Option<String>,
+    #[serde(default)]
+    pub panel: Option<String>,
+    /// 老边没有强度时为 `null`。
+    #[serde(default)]
+    pub inside_count: Option<u8>,
+    #[serde(default)]
+    pub center_dist: Option<f32>,
+    #[serde(default)]
+    pub via_member: bool,
+}
+
+/// `GET /api/v1/element/rooms` 的答复（§4.13.8）。每一格都 `#[serde(default)]`：测试站点上跑过的草稿构建
+/// 没有 `caliber` / `status` / `settled`，要能解出来再由分型认出它，而不是在这里报一句解析失败。
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+pub struct ElementRoomsReply {
+    #[serde(default)]
+    pub refno: String,
+    /// 口径（`self_and_descendants`）。缺席 = 草稿构建，`self_and_direct_members` = 只到直接成员的旧构建，
+    /// 两者的列表都会漏房间。
+    #[serde(default)]
+    pub caliber: Option<String>,
+    /// `durable`（库上的 `room_relate` 边）/ `memory`（常驻房间模型现算）。
+    #[serde(default)]
+    pub source: Option<String>,
+    /// 房间体制此刻的状态，与 `/spatial/rooms` 同一份词表。
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// 这份归属算完没有：`true` 算完；`false` 还没算完；`null` 判不了。
+    #[serde(default)]
+    pub settled: Option<bool>,
+    #[serde(default)]
+    pub settled_reason: Option<String>,
+    #[serde(default)]
+    pub memberships: Vec<ElementRoomMembership>,
+}
+
+/// 一个构件的全部房间归属，**由服务端算**（gen-model 接口文档 §4.13.8）。
+///
+/// 此前 plant-ui 直连库自己拼 `room_relate` 图查询，那套写法要求构件在库里有 `pe` 记录、子层有
+/// `pe_owner` 边，平表化库里这两张表空或不全时恒返回空，于是同一个构件后端
+/// `e3d.room.lookup` 答得出 R512、界面显示「无房间归属」。归属口径由服务端一处定义，
+/// 客户端只负责把答案画出来。
+///
+/// 失败原样交出（带 [`ApiError`]）：「没有路由」「没有这个构件」与其它错误由 `data::classify_element_rooms`
+/// 按 `code` 分型，这里不改写成一句话。
+pub async fn element_rooms(
+    base: &str,
+    refno: aios_core::RefU64,
+    project: &str,
+    mdb: &str,
+    namespace: &str,
+) -> anyhow::Result<ElementRoomsReply> {
+    let query = element_rooms_query(refno, project, mdb, namespace);
+    get(base, &format!("/api/v1/element/rooms?{query}")).await
+}
+
+/// 查询串。身份三格与 `refno` 一起走 URL（这条是 GET）。
+fn element_rooms_query(
+    refno: aios_core::RefU64,
+    project: &str,
+    mdb: &str,
+    namespace: &str,
+) -> String {
+    let mut out = Vec::new();
+    for (key, value) in [
+        ("project", project),
+        ("mdb", mdb),
+        ("namespace", namespace),
+    ] {
+        if !value.is_empty() {
+            out.push(format!("{key}={}", urlencode(value)));
+        }
+    }
+    out.push(format!("refno={}", urlencode(&refno.to_slash_string())));
+    out.join("&")
 }
 
 /// `None` 必须**整个不发** `dbnums` 键——发 `null` 或空表都不行：老服务端的
@@ -1508,12 +1620,13 @@ fn request_text(response: ehttp::Response) -> anyhow::Result<String> {
     String::from_utf8(response.bytes).context("模型更新服务响应不是 UTF-8")
 }
 
-/// 解错误包封。`code` 缺失时按状态码兜底——422 是前置条件不满足、409 是任务冲突、
-/// 504 是超时，其余一律 internal。
+/// 解错误包封。`code` 缺失时按状态码兜底——404 / 405 是「这台服务端没有这条路由」（[`ROUTE_MISSING`]）、
+/// 422 是前置条件不满足、409 是任务冲突、504 是超时，其余一律 internal。
 fn error_packet(status: u16, body: &str) -> Failure {
     let packet = serde_json::from_str::<ErrorResponse>(body).unwrap_or_default();
     let code = packet.code.unwrap_or_else(|| {
         match status {
+            404 | 405 => ROUTE_MISSING,
             422 => "precondition",
             409 => "conflict",
             504 => "timeout",
@@ -1724,6 +1837,38 @@ mod tests {
             "",
             "没勾这一格时不留标点"
         );
+    }
+
+    /// 库级预检查要两本账合起来看：服务重启之后进程那本从零记起（`ready_total = 0`），模型其实都在，
+    /// 落盘那本（`durable_ready_total`）说得清。只读前一格就会把现成的模型当成没生成过。
+    #[test]
+    fn a_restarted_service_still_reports_the_models_it_has_on_disk() {
+        let roots = |body: &str| serde_json::from_str::<DbnumModelRoots>(body).unwrap();
+        // 接口文档 §4.5.1C 的例子：刚重启过的服务，进程投影是空的，落盘的账说 2720 根都在。
+        let restarted = roots(
+            r#"{"source":"direct","task_id":null,"dbnum":7997,"source_sesno":264,"total":2720,
+                "ready_total":0,"ready_source":"process_projection","durable_ready_total":2720,
+                "only_ready":false,"roots":[]}"#,
+        );
+        assert_eq!(
+            (restarted.ready_total, restarted.durable_ready_total),
+            (0, Some(2720))
+        );
+        assert!(restarted.has_model(), "重启不等于没有模型");
+
+        assert!(
+            !roots(r#"{"total":12,"ready_total":0,"durable_ready_total":0}"#).has_model(),
+            "两本账都说没有，才是真没有"
+        );
+        assert!(roots(r#"{"ready_total":3,"durable_ready_total":0}"#).has_model());
+
+        // 没有落盘那一格的回包（老服务端不给；带 `task_id` 的任务快照给的是 null）：只能按进程那本认。
+        let old = roots(r#"{"total":12,"ready_total":0}"#);
+        assert_eq!(old.durable_ready_total, None, "没说不能读成 0");
+        assert!(!old.has_model());
+        let task = roots(r#"{"ready_total":5,"durable_ready_total":null}"#);
+        assert_eq!(task.durable_ready_total, None);
+        assert!(task.has_model());
     }
 
     /// generate 的四档状态对界面是四件不同的事，压成布尔就分不出「重做过了」与
@@ -2185,6 +2330,39 @@ mod tests {
             "HTTP 500: boom"
         )));
         assert!(!pending_endpoint_retired(&anyhow::anyhow!("解析响应失败")));
+    }
+
+    /// 「没有路由」按结构判（spec 045 FR-104）：404 / 405 且包体不是错误包封 → `route_missing`；带包封的
+    /// 404 仍是 `not_found`（处理器说没有这个对象）。两者在 [`endpoint_missing`] 眼里的结果都不变。
+    #[test]
+    fn a_missing_route_is_told_apart_from_a_missing_element() {
+        let bare = error_packet(404, "");
+        assert_eq!(bare.code, ROUTE_MISSING);
+        assert!(bare.message.starts_with("HTTP 404"), "{}", bare.message);
+        assert_eq!(error_packet(405, "Method Not Allowed").code, ROUTE_MISSING);
+
+        let enveloped = error_packet(
+            404,
+            r#"{"code":"not_found","message":"元素 24381/140525 不存在"}"#,
+        );
+        assert_eq!(enveloped.code, "not_found");
+
+        let wrap = |failure: Failure| anyhow::Error::new(ApiError(failure));
+        assert!(endpoint_missing(&wrap(error_packet(404, ""))));
+        assert!(endpoint_missing(&wrap(error_packet(405, ""))));
+        assert!(endpoint_missing(&wrap(enveloped)));
+        assert!(!endpoint_missing(&wrap(error_packet(500, ""))));
+    }
+
+    /// 子串判法不许回来：refno 里碰巧带 `405` 的错误（如 24381/140525）不该被认成「服务端不支持」。
+    #[test]
+    fn route_detection_never_matches_message_substrings() {
+        let source = include_str!("model_update_api.rs");
+        let api = &source[..source.find("mod tests {").expect("测试模块")];
+        assert!(
+            !api.contains(".contains(\"405\")"),
+            "按 code 判，不按 message 子串判"
+        );
     }
 
     /// 连不上、超时、握手不成对用的人是同一件事：服务够不着，没有任何数据被改动，

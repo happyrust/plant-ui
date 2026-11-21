@@ -8,6 +8,6 @@ async fn concurrent_room_queries_reuse_the_connection() {
     for result in results { result.expect("concurrent connect"); }
     plant_ui_data::connect().await.expect("repeated connect");
     let refno = "24384/26599".parse::<plant_ui_data::RefU64>().unwrap().into();
-    plant_ui_data::room::element_rooms(refno).await.expect("element rooms");
+    plant_ui_data::room::element_rooms(refno, None).await.expect("element rooms");
     plant_ui_data::room::panel_room(refno).await.expect("panel room");
 }

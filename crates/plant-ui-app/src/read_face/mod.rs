@@ -1,12 +1,14 @@
-//! 供数模式的读面（ADR-0026）：模型树 / 属性 / 搜索 / 三维实例 / 工程标识从哪儿读。
+//! 供数模式的读面（ADR-0026）：模型树 / 属性 / 搜索 / 三维实例 / 工程标识 / 构件的房间归属
+//! 从哪儿读。
 //!
 //! 一个 enum、两个实现——**服务供数**（`Service`，经 gen-model HTTP，底下是 e3d-io 与
 //! e3d-model）与**库供数**（`Store`，直连 SurrealDB；保留档，给已落盘的 rocksdb 部署、
 //! 老版本模型服务与对拍用）。选择只在 `data::spawn` 与热切那一拍发生，`data.rs` 的读调用
 //! 全部经它，数据线程内不许根据错误自行换面。
 //!
-//! 不在这里的两样：**房间**——它只有库一条路，服务供数下经 `/health.mirror` 门控懒连
-//! （计划 D6）；**命令面**——生成（右键「重新生成模型」）/ 手动更新 / 队列 / 提资 / 命令查询
+//! 不在这里的两样：**房间的其余功能**（面板所属房间、房间详情、房间浏览器……）——只有库一条路，
+//! 服务供数下经 `/health.mirror` 门控懒连（计划 D6）；构件的房间归属已经进来了（ADR-0035）；
+//! **命令面**——生成（右键「重新生成模型」）/ 手动更新 / 队列 / 提资 / 命令查询
 //! 永远走模型服务（计划 D3），所以 `model_instances` 只读、生成留在 `data.rs` 的命令臂。
 //!
 //! 为什么是 enum 不是 `dyn Trait`：恰好两个变体、穷尽匹配；`async fn` 直接写、不上
@@ -17,7 +19,7 @@ use std::sync::mpsc;
 
 use plant_ui_data::{Attr, EleTreeNode, NameHit, RefU64};
 
-use crate::data::Evt;
+use crate::data::{Evt, RoomsOutcome};
 use crate::model_update_api::{ModelRecords, TreeLevel};
 use crate::search_index::{Scope, SearchIndex, SubstringHits};
 
@@ -201,6 +203,24 @@ impl ReadFace {
         match self {
             Self::Service(face) => face.props(refno, scope).await,
             Self::Store(face) => face.props(refno).await,
+        }
+    }
+
+    /// 构件的房间归属（右键「查看所属房间」与「房间」页签）。服务供数问 `/api/v1/element/rooms`，
+    /// 口径由服务端定；库供数按同一口径（自身 + 全部后代）查 `room_relate`。两面都已分好型，
+    /// 宿主照着画。
+    ///
+    /// `noun` 是宿主从模型树上知道的类型（不知道给 `None`）。只有库供数用它先拒层级容器：
+    /// 服务端按自己模型树上的类型判，不听客户端的。
+    pub async fn element_rooms(
+        &self,
+        refno: RefU64,
+        noun: Option<&str>,
+        scope: &Scope,
+    ) -> RoomsOutcome {
+        match self {
+            Self::Service(face) => face.element_rooms(refno, scope).await,
+            Self::Store(face) => face.element_rooms(refno, noun).await,
         }
     }
 

@@ -3,17 +3,20 @@
 //!
 //! 这是**保留档**（计划 D1）：给已落盘的 rocksdb 部署、老版本模型服务与对拍用。九条读
 //! 从 v0.1.9（`4ec446f5a:crates/plant-ui-app/src/data.rs`）**逐字**接回，不顺手「改进」——
-//! 改了就没有对拍的参照。服务供数有而它缺的格由 M3 在界面上标出来，这里不猜。
+//! 改了就没有对拍的参照。服务供数有而它缺的格由 M3 在界面上标出来，这里不猜。构件的房间归属
+//! （ADR-0035）是后加的一条，不是从 v0.1.9 接回的：口径跟服务供数一致（自身 + 全部后代，
+//! spec 045 FR-101）。
 //!
 //! 它不认识模型服务：这一面从头到尾没有一条打 HTTP 读接口的路，
 //! `store_face_never_touches_the_service` 钉着。命令面（生成等）本来就不在读面里。
 
 use std::sync::mpsc;
 
+use plant_ui_data::room::ElementRooms;
 use plant_ui_data::{Attr, EleTreeNode, RefU64};
 
 use super::{Identity, Progress, SearchOutcome, SubtreeBounds};
-use crate::data::Evt;
+use crate::data::{Evt, RoomsOutcome};
 use crate::model_update_api::ModelRecords;
 use crate::search_index::{Scope, SearchIndex, SubstringHits};
 
@@ -93,6 +96,16 @@ impl StoreReadFace {
         plant_ui_data::element_props(refno.into()).await
     }
 
+    /// `room_relate` 图查询。不过镜像门：那道门要问模型服务的 `/health`，而这一面启动时已经连上
+    /// 库；模型服务不在场，库里的归属照样查得到。`noun` 是界面知道的类型，层级容器靠它先拒答。
+    pub async fn element_rooms(&self, refno: RefU64, noun: Option<&str>) -> RoomsOutcome {
+        let rooms = async {
+            plant_ui_data::connect().await?;
+            plant_ui_data::room::element_rooms(refno.into(), noun).await
+        };
+        store_rooms_outcome(rooms.await)
+    }
+
     pub async fn resolve_name(&self, name: &str) -> anyhow::Result<Option<RefU64>> {
         plant_ui_data::resolve_name(name).await
     }
@@ -155,8 +168,71 @@ impl StoreReadFace {
     }
 }
 
+/// 库供数一条房间边都没读到时的说法。库里没有生成凭证与房间欠账可查，空表分不清「算完了、不在
+/// 任何房间」与「还没算」，所以不说成「没有房间归属」（spec 045 US4）。
+pub const NO_EDGES: &str = "没查到房间边：库供数查不到这份归属算完没有，判断不了它在不在房间里";
+
+/// 库供数这一次是不是一条边都没读到。对拍拿它当空集和服务供数比；对拍只编进原生目标，
+/// wasm 上它没有调用点。
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub fn found_no_edges(outcome: &RoomsOutcome) -> bool {
+    matches!(outcome, RoomsOutcome::Unavailable(reason) if reason == NO_EDGES)
+}
+
+/// 库供数的答案 → [`RoomsOutcome`]。层级容器的说法与 gen-model 的 422 `container` 同一句。
+fn store_rooms_outcome(answer: anyhow::Result<ElementRooms>) -> RoomsOutcome {
+    match answer {
+        Ok(ElementRooms::Edges(relations)) if relations.is_empty() => {
+            RoomsOutcome::Unavailable(NO_EDGES.to_owned())
+        }
+        Ok(ElementRooms::Edges(relations)) => RoomsOutcome::Ready(relations),
+        Ok(ElementRooms::Container(noun)) => RoomsOutcome::Unavailable(format!(
+            "{noun} 是层级容器，范围太大，不答房间归属：请按房间查看，或选它下面的管道 / 设备"
+        )),
+        Err(error) => RoomsOutcome::Failed(crate::logs::error_chain(&error)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// 库供数一条边都没读到时说「判断不了」，不画成「没有房间归属」（spec 045 US4）；层级容器与
+    /// 服务端同一句拒答；有边才画列表。
+    #[test]
+    fn store_rooms_never_turn_no_edges_into_no_rooms() {
+        use super::{NO_EDGES, found_no_edges, store_rooms_outcome};
+        use crate::data::RoomsOutcome;
+        use plant_ui_data::room::{ElementRooms, RoomRelation};
+
+        let empty = store_rooms_outcome(Ok(ElementRooms::Edges(Vec::new())));
+        assert_eq!(empty, RoomsOutcome::Unavailable(NO_EDGES.into()));
+        assert!(found_no_edges(&empty));
+
+        let site = store_rooms_outcome(Ok(ElementRooms::Container("SITE".into())));
+        assert!(
+            matches!(&site, RoomsOutcome::Unavailable(text)
+                if text.starts_with("SITE 是层级容器") && text.contains("按房间查看")),
+            "{site:?}"
+        );
+        assert!(!found_no_edges(&site));
+
+        let relation = RoomRelation {
+            room: None,
+            room_num: "R301".into(),
+            room_code: None,
+            panel: plant_ui_data::RefU64(42),
+            inside_count: Some(8),
+            center_dist: Some(1.0),
+            via_member: true,
+        };
+        let found = store_rooms_outcome(Ok(ElementRooms::Edges(vec![relation.clone()])));
+        assert_eq!(found, RoomsOutcome::Ready(vec![relation]));
+        assert!(!found_no_edges(&found));
+        assert!(matches!(
+            store_rooms_outcome(Err(anyhow::anyhow!("库断了"))),
+            RoomsOutcome::Failed(text) if text.contains("库断了")
+        ));
+    }
+
     /// 库供数从头到尾不打模型服务的读接口：这一面若哪天悄悄读了 `/tree/*` 或
     /// `/search`，就是按读面混源（ADR-0026）。
     #[test]
@@ -177,6 +253,8 @@ mod tests {
             "model_update_api::dbnum_report",
             "model_update_api::service_health",
             "model_update_api::generate_model",
+            "model_update_api::element_rooms",
+            "require_mirror_feature",
             "base_url(",
         ] {
             assert!(
@@ -193,6 +271,7 @@ mod tests {
             "plant_ui_data::child_nodes(",
             "plant_ui_data::ancestor_refnos(",
             "plant_ui_data::element_props(",
+            "plant_ui_data::room::element_rooms(",
             "plant_ui_data::resolve_name(",
             "plant_ui_data::search_names_by_prefix(",
             "plant_ui_data::model_instances_with_progress(",

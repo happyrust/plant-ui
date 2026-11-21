@@ -1,13 +1,13 @@
 //! 房间查询：`room_relate` / `room_panel_relate` -> 与绘制无关的纯数据。
 //!
 //! 口径与 gen-model ADR-010 §5 一致：归属强度 = `inside_count` 降序 ->
-//! `center_dist` 升序 -> `room_num` 升序。容器聚合、命名校验等六条取向见
-//! `docs/plans/room-info-feature.md` 第四节。
+//! `center_dist` 升序 -> `room_num` 升序。命名校验等取向见 `docs/plans/room-info-feature.md`
+//! 第四节；其中决定 1（容器聚合直接子层）已由 ADR-0035 D5 改成下面的口径。
 //!
 //! 归属边挂在**叶子元素**上（`fn::room_code` 开头那段 EQUI/BRAN 归口是死代码，
-//! 别被它迷惑）；容器元素照 `fn::get_room_names` 的模式聚合**直接子层**
-//! （`pe_owner` 边：in = 子，out = 父）。再深一层的几何件（EQUI -> SUBE -> 件）
-//! 一期不追，追层数是数据侧口径问题，先与 `fn::get_room_names` 保持一致。
+//! 别被它迷惑）；构件的归属聚合**自身 + 全部后代**（`inst_relate.anc` 含该构件的行），与 gen-model
+//! `GET /api/v1/element/rooms` 同口径（spec 045 FR-002 / FR-101）：BRAN 自己没有实例行，只聚合直接子层
+//! 时选 PIPE 一间房都拿不到。WORL / SITE / ZONE 这类层级容器不答。
 
 use std::collections::{HashMap, HashSet};
 
@@ -17,7 +17,7 @@ use anyhow::Result;
 /// 元素对一间房的一条归属（同房多面板已归并成最强一条）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct RoomRelation {
-    /// 房间 FRMW。面板不在册时（命名不合规房间的陈旧边）为 `None`。
+    /// 房间 FRMW。面板不在册时（命名不合规房间的陈旧边），或服务供数下共用墙按房号挑不出唯一一间时为 `None`。
     pub room: Option<RefU64>,
     /// 房号（`room_relate.room_num`，如 `R301`）。
     pub room_num: String,
@@ -26,11 +26,12 @@ pub struct RoomRelation {
     pub room_code: Option<String>,
     /// 归属经由的面板（该房间下最强的那条边）。
     pub panel: RefU64,
-    /// 元素 AABB 八顶点落在面板内的个数（0-8），主排序键。
-    pub inside_count: u8,
-    /// 元素中心到面板中心的距离，平局时越小越强。
-    pub center_dist: f32,
-    /// 这条归属来自直接子层成员而非元素自身（容器元素的聚合口径，决定 1）。
+    /// 元素 AABB 八顶点落在面板内的个数（0-8），主排序键。老边没有这一格时为 `None`（两种供数都是，
+    /// 照实显示为空，不补 0）。
+    pub inside_count: Option<u8>,
+    /// 元素中心到面板中心的距离，平局时越小越强。缺席同上。
+    pub center_dist: Option<f32>,
+    /// 这条归属来自某个后代而非元素自身（容器元素的聚合口径，ADR-0035 D5）。
     pub via_member: bool,
 }
 
@@ -40,7 +41,8 @@ pub struct RoomMemberPreview {
     pub refno: RefU64,
     pub name: String,
     pub noun: String,
-    pub inside_count: u8,
+    /// 对这间房的归属强度（0-8）。老边没有这一格时为 `None`（照实显示为空，不补 0；spec 045 FR-112）。
+    pub inside_count: Option<u8>,
 }
 
 /// 一间房的详情（「房间」页签的数据源）。
@@ -175,17 +177,44 @@ pub struct RoomOverviewRow {
     pub pending_recalc: bool,
 }
 
+/// 库供数一次构件归属查询的答案。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ElementRooms {
+    /// 自身与全部后代上读到的边，每间房留最强一条、按强度排好。空表只说明一条边都没读到，
+    /// 不等于「不在任何房间」：库里查不到这份归属算完没有。
+    Edges(Vec<RoomRelation>),
+    /// 层级容器（带类型名）：后代是整库级，不答。
+    Container(String),
+}
+
 /// 元素的全部房间归属，按归属强度排序（最强在前，即「主归属」）。
 ///
-/// 自身边与直接子层聚合边一并查出；同一间房命中多条时保留最强一条，
-/// `via_member` 记录最强那条是不是来自子层。
-pub async fn element_rooms(refno: RefnoEnum) -> Result<Vec<RoomRelation>> {
+/// 自身边与全部后代的边一并查出；同一间房命中多条时保留最强一条，
+/// `via_member` 记录最强那条是不是来自后代。层级容器先拒答，不去扫它整库级的后代：先看调用方
+/// 给的类型 `noun`（界面从模型树上知道），再看 `pe` 上的类型——平表化库里 `pe` 常缺这一行。
+/// 两头都不知道才照常查。
+pub async fn element_rooms(refno: RefnoEnum, noun: Option<&str>) -> Result<ElementRooms> {
+    if let Some(container) = container_of(noun) {
+        return Ok(ElementRooms::Container(container));
+    }
     let pe_key = refno.to_pe_key();
-    let mut response = SUL_DB.query(element_edges_sql(&pe_key)).await?.check()?;
+    let mut response = SUL_DB.query(element_noun_sql(&pe_key)).await?.check()?;
+    let nouns: Vec<Option<String>> = response.take(0)?;
+    if let Some(container) = nouns
+        .iter()
+        .flatten()
+        .find_map(|noun| container_of(Some(noun.as_str())))
+    {
+        return Ok(ElementRooms::Container(container));
+    }
+    let mut response = SUL_DB
+        .query(element_edges_sql(&pe_key, refno.refno().0))
+        .await?
+        .check()?;
     // 槛 0 / 1 是 LET $kids / LET $targets，边表在第 2 槛。
-    let rows: Vec<(RefnoEnum, String, u8, f32, RefnoEnum)> = response.take(2)?;
+    let rows: Vec<EdgeRow> = response.take(2)?;
     if rows.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ElementRooms::Edges(Vec::new()));
     }
     let merged = merge_edges(refno.refno(), rows);
 
@@ -197,23 +226,40 @@ pub async fn element_rooms(refno: RefnoEnum) -> Result<Vec<RoomRelation>> {
         .map(|(panel, room, name)| (panel.refno(), (room.refno(), name)))
         .collect();
 
-    Ok(merged
-        .into_iter()
-        .map(|e| {
-            let hit = by_panel.get(&e.panel);
-            RoomRelation {
-                room: hit.map(|(room, _)| *room),
-                room_code: hit
-                    .and_then(|(_, name)| name.as_deref())
-                    .and_then(|name| room_code_of(name, &e.room_num)),
-                room_num: e.room_num,
-                panel: e.panel,
-                inside_count: e.inside_count,
-                center_dist: e.center_dist,
-                via_member: e.via_member,
-            }
-        })
-        .collect())
+    Ok(ElementRooms::Edges(
+        merged
+            .into_iter()
+            .map(|e| {
+                let hit = by_panel.get(&e.panel);
+                RoomRelation {
+                    room: hit.map(|(room, _)| *room),
+                    room_code: hit
+                        .and_then(|(_, name)| name.as_deref())
+                        .and_then(|name| room_code_of(name, &e.room_num)),
+                    room_num: e.room_num,
+                    panel: e.panel,
+                    inside_count: e.inside_count,
+                    center_dist: e.center_dist,
+                    via_member: e.via_member,
+                }
+            })
+            .collect(),
+    ))
+}
+
+/// 是层级容器就给出规范化（去空白、大写）的类型名，答复里照它写。
+fn container_of(noun: Option<&str>) -> Option<String> {
+    noun.filter(|noun| is_hierarchy_container(noun))
+        .map(|noun| noun.trim().to_ascii_uppercase())
+}
+
+/// WORL / SITE / ZONE 这类层级容器：后代是整库级，不答归属。与 gen-model
+/// `generation_root::is_coarse_hierarchy_noun` 同一组类型，那边回 422 `container`。
+fn is_hierarchy_container(noun: &str) -> bool {
+    let noun = noun.trim();
+    ["WORL", "WORLD", "SITE", "ZONE"]
+        .iter()
+        .any(|container| noun.eq_ignore_ascii_case(container))
 }
 
 /// 一块在册 PANEL 直属的房间 FRMW。普通元素与陈旧面板返回 `None`。
@@ -272,33 +318,11 @@ pub async fn room_detail(room: RefnoEnum, preview: usize) -> Result<Option<RoomD
         return Ok(None);
     };
     let panels: Vec<RefnoEnum> = response.take(2)?;
-    let member_edges: Vec<(RefnoEnum, u8, f32)> = response.take(3)?;
+    let member_edges: Vec<MemberEdgeRow> = response.take(3)?;
     let panels: Vec<RefU64> = panels.into_iter().map(|p| p.refno()).collect();
 
-    // 同一构件跨多面板只留最强的一条。
-    let mut best: HashMap<RefU64, (u8, f32)> = HashMap::new();
-    for (member, inside_count, center_dist) in member_edges {
-        let member = member.refno();
-        let candidate = (inside_count, center_dist);
-        match best.get_mut(&member) {
-            None => {
-                best.insert(member, candidate);
-            }
-            Some(current) => {
-                if strength_cmp(candidate, *current).is_lt() {
-                    *current = candidate;
-                }
-            }
-        }
-    }
-    let member_count = best.len();
-    let mut ranked: Vec<(RefU64, u8, f32)> = best
-        .into_iter()
-        .map(|(refno, (inside, dist))| (refno, inside, dist))
-        .collect();
-    ranked.sort_by(|a, b| {
-        strength_cmp((a.1, a.2), (b.1, b.2)).then_with(|| a.0.to_pdms_str().cmp(&b.0.to_pdms_str()))
-    });
+    let mut ranked = rank_members(member_edges);
+    let member_count = ranked.len();
     let member_refnos: Vec<RefU64> = ranked.iter().map(|(refno, _, _)| *refno).collect();
     ranked.truncate(preview);
 
@@ -424,26 +448,75 @@ pub async fn rooms_overview() -> Result<Vec<RoomOverviewRow>> {
     Ok(result)
 }
 
-/// 归属强度全序（ADR-010 §5 前两键）：`inside_count` 降序 -> `center_dist` 升序。
-/// 第三键（`room_num` / refno）由调用方按语境补。
-fn strength_cmp(a: (u8, f32), b: (u8, f32)) -> std::cmp::Ordering {
-    b.0.cmp(&a.0).then_with(|| a.1.total_cmp(&b.1))
+/// 归属强度全序（ADR-010 §5 前两键）：`inside_count` 降序 -> `center_dist` 升序；第三键（`room_num` / refno）
+/// 由调用方按语境补。与 gen-model `room_membership_api::strength_cmp` 同一规则：缺的一格算最弱，不当 0 / 0.0 比——
+/// `center_dist` 补 0.0 会让老边在平局里排到最前。
+fn optional_strength_cmp(
+    a: (Option<u8>, Option<f32>),
+    b: (Option<u8>, Option<f32>),
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let inside = match (a.0, b.0) {
+        (Some(x), Some(y)) => y.cmp(&x),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    };
+    inside.then_with(|| match (a.1, b.1) {
+        (Some(x), Some(y)) => x.total_cmp(&y),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    })
 }
+
+/// 一条成员边：成员、两格强度。老边没有强度两格，按可空读——按 `u8` / `f32` 读时，房里一条老边就让整个
+/// 详情失败（spec 045 FR-112，同 FR-109）。
+type MemberEdgeRow = (RefnoEnum, Option<u8>, Option<f32>);
+
+/// 房间成员边 -> 同一构件跨多面板只留最强的一条，再按强度排出全序（平局按 refno）。
+fn rank_members(rows: Vec<MemberEdgeRow>) -> Vec<(RefU64, Option<u8>, Option<f32>)> {
+    let mut best: HashMap<RefU64, (Option<u8>, Option<f32>)> = HashMap::new();
+    for (member, inside_count, center_dist) in rows {
+        let member = member.refno();
+        let candidate = (inside_count, center_dist);
+        match best.get_mut(&member) {
+            None => {
+                best.insert(member, candidate);
+            }
+            Some(current) => {
+                if optional_strength_cmp(candidate, *current).is_lt() {
+                    *current = candidate;
+                }
+            }
+        }
+    }
+    let mut ranked: Vec<(RefU64, Option<u8>, Option<f32>)> = best
+        .into_iter()
+        .map(|(refno, (inside, dist))| (refno, inside, dist))
+        .collect();
+    ranked.sort_by(|a, b| {
+        optional_strength_cmp((a.1, a.2), (b.1, b.2))
+            .then_with(|| a.0.to_pdms_str().cmp(&b.0.to_pdms_str()))
+    });
+    ranked
+}
+
+/// 一条归属边：面板、房号、两格强度、挂边的构件。gen-model 早期写的边没有强度两格，按可空读——
+/// 按 `u8` / `f32` 读时一条老边就让整次查询失败（spec 045 FR-109）。
+type EdgeRow = (RefnoEnum, String, Option<u8>, Option<f32>, RefnoEnum);
 
 #[derive(Debug, Clone, PartialEq)]
 struct MergedEdge {
     panel: RefU64,
     room_num: String,
-    inside_count: u8,
-    center_dist: f32,
+    inside_count: Option<u8>,
+    center_dist: Option<f32>,
     via_member: bool,
 }
 
-/// 自身边 ∪ 子层聚合边 -> 每间房保留最强一条，再按强度排出全序。
-fn merge_edges(
-    self_refno: RefU64,
-    rows: Vec<(RefnoEnum, String, u8, f32, RefnoEnum)>,
-) -> Vec<MergedEdge> {
+/// 自身边 ∪ 后代的边 -> 每间房保留最强一条，再按强度排出全序。
+fn merge_edges(self_refno: RefU64, rows: Vec<EdgeRow>) -> Vec<MergedEdge> {
     let mut best: HashMap<String, MergedEdge> = HashMap::new();
     for (panel, room_num, inside_count, center_dist, holder) in rows {
         let candidate = MergedEdge {
@@ -460,7 +533,7 @@ fn merge_edges(
             Some(current) => {
                 // 平局保自身边：via_member 的强度信息一样时，「自己在房里」比
                 // 「成员在房里」说得更直接。
-                let ord = strength_cmp(
+                let ord = optional_strength_cmp(
                     (candidate.inside_count, candidate.center_dist),
                     (current.inside_count, current.center_dist),
                 )
@@ -473,7 +546,7 @@ fn merge_edges(
     }
     let mut merged: Vec<MergedEdge> = best.into_values().collect();
     merged.sort_by(|a, b| {
-        strength_cmp(
+        optional_strength_cmp(
             (a.inside_count, a.center_dist),
             (b.inside_count, b.center_dist),
         )
@@ -514,26 +587,36 @@ fn valid_room_num(num: &str) -> bool {
         && bytes[1..].iter().all(|b| b.is_ascii_digit())
 }
 
-/// 自身边 ∪ 直接子层边，子层与边都按记录 id 图遍历（`X<-pe_owner`、`<-room_relate`），
-/// 不写 `WHERE out = X`：SurrealDB 2.1 对 `pe_owner` / `room_relate` 的 `out` 不走任何索引，
-/// AMS 两库 332k 条 `pe_owner` + 64k 条 `room_relate` 两次全表扫 1.7–2.6 s（子层为空、
-/// 甚至记录不存在也一样），图遍历三句合计 0.02–0.03 s（2026-09-20 f13 隔离部署，34 个子 /
-/// 79 条边等五组逐行比对一致）。选中元素后「归属加载中…」那 2.4–3.0 s 里 ~2.2 s 就是这两句。
+/// 构件自己的类型，按记录 id 直选。记录不在时回空表。
+fn element_noun_sql(pe_key: &str) -> String {
+    format!("SELECT VALUE noun FROM {pe_key};")
+}
+
+/// 自身边 ∪ 全部后代的边。后代按 `inst_relate.anc CONTAINS <构件>` 取（`anc` 是「自身 → 顶层」整条
+/// 祖先链，走 `idx_inst_relate_anc`；与 gen-model `room_membership_api::edges_sql` 同口径），不再沿
+/// `pe_owner` 找——那只到直接子层，平表化库里还是空的。叶子件的 `anc` 也含它自己，所以要 `array::distinct`。
 ///
-/// 数组变量不能直接接图边——`$targets<-room_relate` 会少行——要 `SELECT VALUE <-room_relate
-/// FROM $targets` 逐个取再 `array::flatten`。前两槛是 LET，边表在第 2 槛。
-fn element_edges_sql(pe_key: &str) -> String {
+/// 边按记录 id 图遍历（`<-room_relate`），不写 `WHERE out = X`：SurrealDB 2.1 对 `room_relate` 的 `out`
+/// 不走任何索引，AMS 上全表扫 1.7–2.6 s（2026-09-20 f13 隔离部署）。写法与 gen-model `edges_sql` 相同：
+/// `($targets)<-room_relate` 是每个目标一个边数组，要 `array::flatten` 摊成一边一行，不摊会丢掉同一构件的
+/// 其余房间。不许写 `SELECT VALUE <-room_relate FROM $targets`：`FROM` 只遍历库里有 `pe` 记录的目标，
+/// 平表化库里缺记录的构件一条边都出不来（AMS 上 24383/66477 就这样答成「无房间归属」）。`pe` 齐全的库上
+/// 两种写法对拍 500 个目标、3,762 行无差异（gen-model spec 045 背景第 4 条）。
+/// 前两槛是 LET，边表在第 2 槛。
+fn element_edges_sql(pe_key: &str, refno_u64: u64) -> String {
     format!(
-        "LET $kids = (SELECT VALUE in FROM {pe_key}<-pe_owner); \
-         LET $targets = array::append($kids, {pe_key}); \
+        "LET $kids = (SELECT VALUE in FROM inst_relate WHERE anc CONTAINS {refno_u64}); \
+         LET $targets = array::distinct(array::append($kids, {pe_key})); \
          SELECT VALUE [in, room_num, inside_count, center_dist, out] \
-         FROM array::flatten(SELECT VALUE <-room_relate FROM $targets);"
+         FROM array::flatten(($targets)<-room_relate);"
     )
 }
 
+/// 按面板走图（`([..])<-room_panel_relate`），不写 `WHERE out IN [..]`：边表只有 `(in, out)` 复合索引时
+/// `IN [数组]` 静默回 0 行（见 [`room_detail_sql`] 上方的现场记录），每条归属的房间都会成空、也不报错。
 fn panel_rooms_sql(panel_keys: &[String]) -> String {
     format!(
-        "SELECT VALUE [out, in, in.name] FROM room_panel_relate WHERE out IN [{}];",
+        "SELECT VALUE [out, in, in.name] FROM array::flatten(([{}])<-room_panel_relate);",
         panel_keys.join(", ")
     )
 }
@@ -581,7 +664,7 @@ fn room_detail_sql(room_key: &str) -> String {
 /// 1.6–1.8 s（空列表也要 1.0 s），直选 0.3 ms（2026-09-20 f13 隔离部署测出）。
 /// 房间详情点开后的 2.2 s 里有 1.7 s 就是这一句。没有预览成员时用 `RETURN []` 占住
 /// 第 0 槛，后面 `take(0)` 的位置不变。
-fn detail_follow_up_sql(ranked: &[(RefU64, u8, f32)], panels: &[RefU64]) -> String {
+fn detail_follow_up_sql(ranked: &[(RefU64, Option<u8>, Option<f32>)], panels: &[RefU64]) -> String {
     let member_keys = ranked
         .iter()
         .map(|(refno, _, _)| refno.to_pe_key())
@@ -639,18 +722,23 @@ mod tests {
         RefU64(n)
     }
 
-    fn edge(
-        panel: u64,
-        room_num: &str,
-        inside: u8,
-        dist: f32,
-        holder: u64,
-    ) -> (RefnoEnum, String, u8, f32, RefnoEnum) {
+    fn edge(panel: u64, room_num: &str, inside: u8, dist: f32, holder: u64) -> EdgeRow {
         (
             RefnoEnum::Refno(refno(panel)),
             room_num.to_string(),
-            inside,
-            dist,
+            Some(inside),
+            Some(dist),
+            RefnoEnum::Refno(refno(holder)),
+        )
+    }
+
+    /// gen-model 早期写的边：没有强度两格。
+    fn old_edge(panel: u64, room_num: &str, holder: u64) -> EdgeRow {
+        (
+            RefnoEnum::Refno(refno(panel)),
+            room_num.to_string(),
+            None,
+            None,
             RefnoEnum::Refno(refno(holder)),
         )
     }
@@ -709,7 +797,7 @@ mod tests {
                 .iter()
                 .map(|e| (e.room_num.as_str(), e.panel.0, e.inside_count))
                 .collect::<Vec<_>>(),
-            vec![("R300", 14, 8), ("R301", 12, 8), ("R302", 13, 2)],
+            vec![("R300", 14, Some(8)), ("R301", 12, Some(8)), ("R302", 13, Some(2))],
         );
     }
 
@@ -740,33 +828,135 @@ mod tests {
         assert_eq!(r302.panel, refno(13));
     }
 
+    /// 老边没有强度两格（spec 045 FR-109）：照样归并、照实留空，缺的一格算最弱。同一间房有带强度的边就用那条；
+    /// 只剩老边的房间照样列出，排在有强度的房间后面。按 `u8` / `f32` 读时，一条老边就让整次查询失败。
+    #[test]
+    fn old_edges_without_strength_merge_as_weakest_and_stay_blank() {
+        let rows = vec![
+            old_edge(11, "R301", 1),
+            edge(12, "R301", 0, 9.0, 42),
+            old_edge(13, "R302", 42),
+        ];
+        let merged = merge_edges(refno(1), rows);
+        assert_eq!(
+            merged
+                .iter()
+                .map(|e| (
+                    e.room_num.as_str(),
+                    e.panel.0,
+                    e.inside_count,
+                    e.center_dist
+                ))
+                .collect::<Vec<_>>(),
+            vec![("R301", 12, Some(0), Some(9.0)), ("R302", 13, None, None)],
+        );
+        assert!(merged.iter().all(|e| e.via_member));
+
+        assert!(optional_strength_cmp((Some(0), Some(9.0)), (None, None)).is_lt());
+        assert!(optional_strength_cmp((Some(3), None), (Some(3), Some(1.0))).is_gt());
+        assert_eq!(
+            optional_strength_cmp((None, None), (None, None)),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    /// 房间详情的成员边也有老边（spec 045 FR-112，同 FR-109）：照样归并、留空，缺的一格算最弱。同一构件有带强度的
+    /// 边就用那条；只剩老边的成员照样列出，排在有强度的后面。按 `u8` / `f32` 读时，房里一条老边就让整个详情失败。
+    #[test]
+    fn room_members_with_old_edges_rank_last_and_stay_blank() {
+        let member = |n: u64| RefnoEnum::Refno(refno(n));
+        let ranked = rank_members(vec![
+            (member(10), None, None),
+            (member(10), Some(0), Some(9.0)),
+            (member(11), None, None),
+            (member(12), Some(6), Some(2.0)),
+            (member(12), Some(6), Some(1.0)),
+        ]);
+        assert_eq!(
+            ranked,
+            vec![
+                (refno(12), Some(6), Some(1.0)),
+                (refno(10), Some(0), Some(9.0)),
+                (refno(11), None, None),
+            ]
+        );
+    }
+
     #[test]
     fn strength_ordering_matches_adr010() {
         // inside 降序优先。
-        assert!(strength_cmp((8, 9.0), (7, 0.1)).is_lt());
+        assert!(optional_strength_cmp((Some(8), Some(9.0)), (Some(7), Some(0.1))).is_lt());
         // 平局距离升序。
-        assert!(strength_cmp((6, 1.0), (6, 2.0)).is_lt());
-        assert_eq!(strength_cmp((6, 1.0), (6, 1.0)), std::cmp::Ordering::Equal);
+        assert!(optional_strength_cmp((Some(6), Some(1.0)), (Some(6), Some(2.0))).is_lt());
+        assert_eq!(
+            optional_strength_cmp((Some(6), Some(1.0)), (Some(6), Some(1.0))),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    /// 层级容器与 gen-model 同一组类型，大小写与空白无关；管道、分支、设备、风管照答。
+    #[test]
+    fn hierarchy_containers_are_refused_like_the_service() {
+        for noun in ["WORL", "WORLD", "SITE", "zone", " SITE "] {
+            assert!(is_hierarchy_container(noun), "{noun}");
+        }
+        for noun in ["PIPE", "BRAN", "EQUI", "HVAC", ""] {
+            assert!(!is_hierarchy_container(noun), "{noun}");
+        }
+    }
+
+    /// 调用方给的类型是层级容器就就地拒答：平表化库里 `pe` 缺这一行时，选中 SITE / ZONE
+    /// 不该对整个站点跑后代查询。拒答在第一句库查询之前。
+    #[test]
+    fn a_container_type_known_to_the_caller_is_refused_before_any_query() {
+        assert_eq!(container_of(Some(" site ")).as_deref(), Some("SITE"));
+        assert_eq!(container_of(Some("ZONE")).as_deref(), Some("ZONE"));
+        assert_eq!(container_of(Some("PIPE")), None);
+        assert_eq!(container_of(None), None);
+
+        let body = include_str!("room.rs")
+            .split_once("pub async fn element_rooms(")
+            .expect("element_rooms exists")
+            .1;
+        let refused = body.find("container_of(noun)").expect("先判调用方给的类型");
+        let first_query = body.find("SUL_DB").expect("库查询");
+        assert!(
+            refused < first_query,
+            "element_rooms 要在第一句库查询之前先判调用方给的类型"
+        );
     }
 
     #[test]
     fn sql_renderers_pin_tables_and_predicates() {
-        let edges = element_edges_sql("pe:1_2");
-        // 子层与归属边都按记录 id 图遍历，不许再写 WHERE out = …（SurrealDB 2.1 全表扫
-        // pe_owner / room_relate）；前两槛是 LET，element_rooms() 从第 2 槛取边表。
-        assert!(edges.starts_with("LET $kids = (SELECT VALUE in FROM pe:1_2<-pe_owner);"));
-        assert!(edges.contains("LET $targets = array::append($kids, pe:1_2);"));
+        assert_eq!(element_noun_sql("pe:1_2"), "SELECT VALUE noun FROM pe:1_2;");
+
+        let edges = element_edges_sql("pe:1_2", (1 << 32) | 2);
+        // 后代按 inst_relate.anc 取，与服务端同口径：沿 pe_owner 只到直接子层，选 PIPE 一间房都拿不到。
+        // 归属边按记录 id 图遍历，不许再写 WHERE out = …（SurrealDB 2.1 全表扫 room_relate）；
+        // 也不许写 FROM $targets：只遍历有 pe 记录的目标，平表化库里缺记录的构件一条边都出不来。
+        // 前两槛是 LET，element_rooms() 从第 2 槛取边表。
+        assert!(edges.starts_with(
+            "LET $kids = (SELECT VALUE in FROM inst_relate WHERE anc CONTAINS 4294967298);"
+        ));
+        assert!(edges.contains("LET $targets = array::distinct(array::append($kids, pe:1_2));"));
         assert!(edges.contains(
             "SELECT VALUE [in, room_num, inside_count, center_dist, out] \
-             FROM array::flatten(SELECT VALUE <-room_relate FROM $targets);"
+             FROM array::flatten(($targets)<-room_relate);"
         ));
+        assert!(!edges.contains("FROM $targets"), "{edges}");
+        assert!(!edges.contains("pe_owner"), "{edges}");
+        assert!(!edges.contains("anc[1]"), "{edges}");
         assert!(!edges.contains("WHERE out ="));
         assert!(!edges.contains("FROM room_relate WHERE"));
         assert_eq!(edges.matches("LET ").count(), 2);
 
         let panels = panel_rooms_sql(&["pe:1_10".to_string(), "pe:1_11".to_string()]);
-        assert!(panels.contains("FROM room_panel_relate WHERE out IN [pe:1_10, pe:1_11]"));
-        assert!(panels.contains("in.name"));
+        assert_eq!(
+            panels,
+            "SELECT VALUE [out, in, in.name] \
+             FROM array::flatten(([pe:1_10, pe:1_11])<-room_panel_relate);"
+        );
+        assert!(!panels.contains("WHERE"), "{panels}");
 
         let detail = room_detail_sql("pe:1_5");
         assert!(detail.contains("SELECT VALUE name FROM pe:1_5"));
@@ -784,7 +974,13 @@ mod tests {
         assert!(!detail.contains("WHERE in IN"), "{detail}");
         assert!(!detail.contains("IN (SELECT"), "{detail}");
 
-        let follow = detail_follow_up_sql(&[(refno(7), 8, 1.0), (refno(8), 7, 2.0)], &[refno(9)]);
+        let follow = detail_follow_up_sql(
+            &[
+                (refno(7), Some(8), Some(1.0)),
+                (refno(8), Some(7), Some(2.0)),
+            ],
+            &[refno(9)],
+        );
         // 名称按记录 id 直选，不许再写 WHERE id IN（SurrealDB 2.1 会全表扫 pe）。
         assert!(follow.starts_with("SELECT VALUE [id, name, noun] FROM pe:0_7, pe:0_8;"));
         assert!(!follow.contains("WHERE id IN"));
