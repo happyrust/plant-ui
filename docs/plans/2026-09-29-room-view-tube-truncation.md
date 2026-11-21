@@ -17,7 +17,7 @@
   gen-model ADR-010 §3 与 `src/fast_model/room_predicate.rs`（唯一判定口径）。
 - 设计依据：`design/plant-ui.pen` S13-B（房间页签 + 视口聚焦，HUD「房间视图 · R301」）。芯片四态与断口特写在 M4 补稿
   （还没补）。
-- 状态：**M1–M4 已实现（2026-09-30），M5 实机验收未做。M0 只做了前一半：纯库暂住本仓 `crates/plant-room`，
+- 状态：**M1–M4 已实现（2026-09-30），M5 实机验收已做（2026-11-21）。M0 只做了前一半：纯库暂住本仓 `crates/plant-room`，
   gen-model 还没改用它。** 与计划不同的地方和验证情况见 §十。
 
 ---
@@ -350,7 +350,7 @@ M0 与 M1 可以并行。M2 依赖 M0，M3 依赖 M2。M4 里 HUD 与设置那�
 | M2 房间体图层 | 完成 | `plant-ui-view3d/src/room_clip.rs` |
 | M3 直段截断 | 完成 | 同上；`lib.rs` 的 `load_models` 给直段挂 `TubeBody` |
 | M4 宿主 + HUD + 设置 | 代码完成，设计稿没补 | `plant-ui-app/src/main.rs`、`plant-ui/src/{lib,vm,settings}.rs`、`workbench/view3d.rs` |
-| M5 实机验收 | 未做 | |
+| M5 实机验收 | 完成（2026-11-21） | `docs/evidence/2026-11-21-room-view-truncation-acceptance.md` |
 
 ### 与计划不同的地方
 
@@ -359,7 +359,8 @@ M0 与 M1 可以并行。M2 依赖 M0，M3 依赖 M2。M4 里 HUD 与设置那�
 - **线段求穿越点**（§4.2 第 1 步）：不走 BVH 射线，改为逐三角 f64 包围盒粗筛再求交。管轴多半沿坐标轴，打在墙面
   三角零厚度包围盒的边界上是 `0 × ∞`。重心坐标放宽 1e-9，轴线正好过面板对角线时不会漏掉交点。
 - **成员身份**（§4.5）：没在 `room_detail_sql` 的边表上加投影，直接按记录 id 分块直选（每块 1000 个）。这就是计划里
-  「拖成秒级就改」的那条路，先走了。耗时还没在 AMS 上量。
+  「拖成秒级就改」的那条路，先走了。M5 在 AMS 上量了：成员 9657 的 R144 一次 `room_detail` 456 ms，
+  千把成员的房间几十毫秒，没拖成秒级。
 - **宿主纯函数**（§4.4）：`room_view_targets` 落成 `room_view_isolate(detail, truncate, scopes, with_panels)`，直接给出
   `Isolate` 指令；兜底取景是 `room_view_fallback_focus`。房间体取不到时面板照旧进隔离（`with_panels`），至少看得见墙。
 - **房间体不可用有两道门**：
@@ -383,10 +384,14 @@ M0 与 M1 可以并行。M2 依赖 M0，M3 依赖 M2。M4 里 HUD 与设置那�
   - M3 第 5 条射线拾取：断口挂着 BRAN 的 `ModelPickTarget` 有测；「打在截掉的位置落空」靠的是 Bevy 按
     `GlobalTransform` 求交、跳过不可见实体，没有端到端测；
   - M3 第 3 条里的 `render_states` 不变。
-- 没在实库 / AMS 上跑过，§五 M5 全部待做。
+- 实机（M5，2026-11-21，AMS 库）：桌面端 R320 / L507 / R286 三间房进入、切开关都对，R320 走了取回工作与退出；
+  浏览器端 L507 走了一遍，回执与桌面一字不差，芯片的选择刷新即回缺省；亮 / 暗两套主题 × E3D / PBR 两种外观下断口都看得清。
+  完成定义第 5、7 条没在实机上验。记录：`docs/evidence/2026-11-21-room-view-truncation-acceptance.md`。
 
 ### 还没做
 
 - gen-model 改用本库（M0 后一半）。
 - `design/plant-ui.pen` 补稿：芯片四态 + 断口特写。
-- M5 实机验收：三间房截图，候选数、截断耗时、`room_detail` 耗时，桌面与浏览器各走一遍，两套主题下核对剖切色。
+- 完成定义第 5 条（点断口选中分支）与第 7 条（房间体不完整时不截）的实机验证，M5 没做到。
+- 房间视图里另装模型（比如在房间树上给别的房间「加载模型」）不会重新隔离，新装的照常显示（M5 时看到的，
+  验收记录 §6）。要不要跟着隔离没定。
