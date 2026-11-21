@@ -69,6 +69,9 @@ pub struct RoomDetail {
     /// 参考号，以所属分支的 refno 渲染，所以截断只动这些分支名下的直段。第二部分不能省：旧的全量
     /// 重建路径不测直段，一根只有管件在册的分支得靠成员的父才认得出来。
     pub tube_carriers: Vec<RefU64>,
+    /// 直段截断要截的直管件（FTUB / STRT），按成员强度序去重。它们有自己的参考号、网格挂在
+    /// 自己名下，不随分支走。
+    pub straight_components: Vec<RefU64>,
 }
 
 /// 一个成员往上一层的身份：自己的 noun、父的 refno 与 noun（截断候选的归并材料）。
@@ -106,6 +109,31 @@ pub fn tube_carriers_of(members: &[RefU64], lineage: &HashMap<RefU64, Lineage>) 
         }
     }
     carriers
+}
+
+/// 直管件：有自己参考号的直管构件，E3D 的 FTUB（定长直管）与 STRT（风管等的直段）。
+fn is_straight_component(noun: Option<&str>) -> bool {
+    noun.map(str::trim)
+        .is_some_and(|noun| noun.eq_ignore_ascii_case("FTUB") || noun.eq_ignore_ascii_case("STRT"))
+}
+
+/// 成员里的直管件（[`RoomDetail::straight_components`] 的口径），按 `members` 的顺序首见去重。
+/// `lineage` 里没有的成员跳过。
+pub fn straight_components_of(
+    members: &[RefU64],
+    lineage: &HashMap<RefU64, Lineage>,
+) -> Vec<RefU64> {
+    let mut seen = HashSet::new();
+    members
+        .iter()
+        .copied()
+        .filter(|member| {
+            lineage
+                .get(member)
+                .is_some_and(|line| is_straight_component(line.noun.as_deref()))
+        })
+        .filter(|member| seen.insert(*member))
+        .collect()
 }
 
 /// 一次直选多少个成员。大房间的成员上千，一条语句里塞几千个记录 id 既难读也难排查，按块走。
@@ -329,10 +357,14 @@ pub async fn room_detail(room: RefnoEnum, preview: usize) -> Result<Option<RoomD
         })
         .collect();
 
-    let tube_carriers = if member_refnos.is_empty() {
-        Vec::new()
+    let (tube_carriers, straight_components) = if member_refnos.is_empty() {
+        (Vec::new(), Vec::new())
     } else {
-        tube_carriers_of(&member_refnos, &member_lineage(&member_refnos).await?)
+        let lineage = member_lineage(&member_refnos).await?;
+        (
+            tube_carriers_of(&member_refnos, &lineage),
+            straight_components_of(&member_refnos, &lineage),
+        )
     };
 
     let room_num = room_num_of_name(&name);
@@ -347,6 +379,7 @@ pub async fn room_detail(room: RefnoEnum, preview: usize) -> Result<Option<RoomD
         members,
         pending_recalc,
         tube_carriers,
+        straight_components,
     }))
 }
 
@@ -1013,6 +1046,25 @@ mod tests {
         ]);
         assert_eq!(tube_carriers_of(&[hang, bran], &lineage), vec![hang, bran]);
         assert!(tube_carriers_of(&[], &lineage).is_empty());
+    }
+
+    /// 直管件 = 成员里的 FTUB / STRT（大小写、空白不论），按成员强度序首见去重。它们的父是分支，
+    /// 分支照样进截断候选；弯头不是直管件。
+    #[test]
+    fn straight_components_are_ftub_and_strt_members_in_rank_order() {
+        let (strt, ftub, elbo, stale) = (refno(50), refno(51), refno(52), refno(99));
+        let lineage = HashMap::from([
+            (strt, lineage("STRT", Some((60, "BRAN")))),
+            (ftub, lineage(" ftub ", Some((61, "BRAN")))),
+            (elbo, lineage("ELBO", Some((61, "BRAN")))),
+        ]);
+        let members = vec![strt, elbo, ftub, stale, strt];
+        assert_eq!(straight_components_of(&members, &lineage), vec![strt, ftub]);
+        assert_eq!(
+            tube_carriers_of(&members, &lineage),
+            vec![refno(60), refno(61)]
+        );
+        assert!(straight_components_of(&[], &lineage).is_empty());
     }
 
     /// 直选按记录 id，不回退成整表扫；四格顺序就是反序列化的元组顺序。

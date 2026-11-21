@@ -858,20 +858,36 @@ fn truncation_vm(status: &plant_ui_view3d::RoomClipStatus) -> TruncationVm {
             hidden: status.hidden,
             whole: status.whole,
             skipped: status.skipped,
+            carriers: status.carriers,
+            components: status.components,
+            found: status.found,
         },
         RoomClipPhase::Unavailable(reason) => TruncationVm::Unavailable(reason.clone()),
     }
 }
 
-/// 截断做完那一句日志的正文。
+/// 截断做完那一句日志的正文。一段都没找到时不报一串零，说候选几根、为什么没截到。
 fn truncation_summary(status: &plant_ui_view3d::RoomClipStatus) -> String {
+    if status.carriers == 0 && status.components == 0 {
+        return "没有可截的直段：这间房的成员里既没有挂直段的分支，也没有直管件".to_owned();
+    }
+    let candidates = format!(
+        "候选分支 {} 根、直管件 {} 件",
+        status.carriers, status.components
+    );
+    if status.found == 0 {
+        return format!(
+            "没有截到直段：{candidates}，场景里一段都没找到\
+             （所在的 SITE / ZONE 没打开，或者这些分支没有直段）"
+        );
+    }
     let skipped = if status.skipped > 0 {
         format!(" · 未能截断 {} 段", status.skipped)
     } else {
         String::new()
     };
     format!(
-        "截断 {} 段 · 房间外 {} 段不画 · 整段在内 {} 段{skipped}",
+        "截断 {} 段 · 房间外 {} 段不画 · 整段在内 {} 段{skipped}（{candidates}）",
         status.cut, status.hidden, status.whole
     )
 }
@@ -7418,6 +7434,7 @@ impl App {
                 generation: epoch,
                 panels: records,
                 carriers: ctx.detail.tube_carriers.clone(),
+                components: ctx.detail.straight_components.clone(),
                 truncate,
                 unavailable,
             }));
@@ -9672,6 +9689,7 @@ mod tests {
             members: Vec::new(),
             pending_recalc: false,
             tube_carriers: refnos(carriers),
+            straight_components: Vec::new(),
         }
     }
 
@@ -9726,7 +9744,8 @@ mod tests {
         assert!(!room_volume_is_current(&ctx, 5, RefU64(2)));
     }
 
-    /// 视口回执照原样进 HUD；做完那一句日志说清各几段，「未能截断」只在有的时候说。
+    /// 视口回执照原样进 HUD；做完那一句日志说清各几段与候选几根，「未能截断」只在有的时候说。
+    /// 一段都没找到时不报一串零，说为什么没截到。
     #[test]
     fn truncation_receipts_map_onto_the_hud_and_the_log() {
         use plant_ui_view3d::{RoomClipPhase, RoomClipStatus};
@@ -9738,6 +9757,9 @@ mod tests {
             hidden: 5,
             whole: 7,
             skipped,
+            carriers: 4,
+            components: 2,
+            found: 15 + skipped,
         };
         assert_eq!(
             truncation_vm(&status(RoomClipPhase::Ready, 0)),
@@ -9745,7 +9767,10 @@ mod tests {
                 cut: 3,
                 hidden: 5,
                 whole: 7,
-                skipped: 0
+                skipped: 0,
+                carriers: 4,
+                components: 2,
+                found: 15,
             }
         );
         assert_eq!(
@@ -9758,9 +9783,32 @@ mod tests {
         );
         assert_eq!(
             truncation_summary(&status(RoomClipPhase::Ready, 0)),
-            "截断 3 段 · 房间外 5 段不画 · 整段在内 7 段"
+            "截断 3 段 · 房间外 5 段不画 · 整段在内 7 段（候选分支 4 根、直管件 2 件）"
         );
-        assert!(truncation_summary(&status(RoomClipPhase::Ready, 2)).ends_with(" · 未能截断 2 段"));
+        assert!(
+            truncation_summary(&status(RoomClipPhase::Ready, 2))
+                .contains("整段在内 7 段 · 未能截断 2 段（")
+        );
+
+        let nothing_found = RoomClipStatus {
+            cut: 0,
+            hidden: 0,
+            whole: 0,
+            found: 0,
+            ..status(RoomClipPhase::Ready, 0)
+        };
+        let summary = truncation_summary(&nothing_found);
+        assert!(
+            summary.starts_with("没有截到直段：候选分支 4 根、直管件 2 件，场景里一段都没找到"),
+            "{summary}"
+        );
+        assert!(summary.contains("SITE / ZONE"), "{summary}");
+        let no_candidates = RoomClipStatus {
+            carriers: 0,
+            components: 0,
+            ..nothing_found
+        };
+        assert!(truncation_summary(&no_candidates).starts_with("没有可截的直段"));
     }
 
     /// 房间体图层有三处必须撤（计划 M4 验收）：退出房间视图、重连 / 换面的复位、房间体兜底
