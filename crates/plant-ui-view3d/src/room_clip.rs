@@ -2,9 +2,10 @@
 //!
 //! 放在一处，是因为后一件完全依赖前一件：
 //!
-//! - **房间体图层**：宿主交来这间房在册面板的模型记录，这里把它们画成半透明（与 X-Ray 同一枚
-//!   材质）。它不挂拾取、不进可见性账，与尺寸标注层一样挂在 `SceneRoot` 旁边，所以隔离、显示 /
-//!   隐藏、整场重装都碰不到它。面板网格全部就位后，用 `plant_room` 建出房间体（判定三角网）。
+//! - **房间体图层**：宿主交来这间房在册面板的模型记录，这里把它们画成半透明的房间体：受光照的
+//!   正反两档淡蓝填充，加上特征边线（墙角、墙与地面 / 顶板的交线）。它不挂拾取、不进可见性账，
+//!   与尺寸标注层一样挂在 `SceneRoot` 旁边，所以隔离、显示 / 隐藏、整场重装都碰不到它。面板网格
+//!   全部就位后，用 `plant_room` 建出房间体（判定三角网）。
 //! - **直段截断**（ADR-0028）：直段是共享单位原型按实例变换摆放的，截断就是把原型沿管轴的区间
 //!   重映射到保留的那一截。直管件（FTUB / STRT）是整件烘焙的网格，管轴从网格读，同样只改变换。
 //!   只动网格那一级子实体：保留段沿管轴重映射，整段在外的子实体隐藏，一段留下几截就补几个同原型的
@@ -23,10 +24,12 @@ use bevy::math::DVec3;
 use bevy::pbr::{NotShadowCaster, NotShadowReceiver};
 use bevy::prelude::*;
 use bevy::render::mesh::{PrimitiveTopology, VertexAttributeValues};
+use bevy::render::render_asset::RenderAssetUsages;
+use bevy::render::render_resource::Face;
 use plant_room::{RoomSolid, panel_tri_mesh};
 
 use super::{
-    ModelMesh, ModelPickTarget, View3d, XRayMaterial, invalid_tubi_fallback_line_mesh,
+    ModelMesh, ModelPickTarget, View3d, fallback_line_material, invalid_tubi_fallback_line_mesh,
     mesh_source, scene_bounds_from_mm, scene_transform,
 };
 
@@ -43,6 +46,19 @@ const PRISM_TOL: f32 = 1e-4;
 /// 直管件的管轴判据：网格沿几根轴都算棱柱时（实心方盒三根都算），最长的那根至少是次长的这么多倍
 /// 才认它是管轴。短而粗的方盒判不出方向，宁可原样画，也不沿截面方向截错。
 const COMPONENT_AXIS_RATIO: f32 = 2.0;
+/// 房间体填充的淡蓝（与 X-Ray 同一个色相）与正反两档的不透明度。从房外看，朝向相机的近墙与顶板
+/// 盖在房内设备上，只留一层薄纱；背向相机的远墙与地面在设备后面当底，浓一点把房间的形状托出来。
+const ROOM_FILL_RGB: [u8; 3] = [89, 169, 255];
+const ROOM_FRONT_ALPHA: u8 = 24;
+const ROOM_BACK_ALPHA: u8 = 56;
+/// 房间体的特征边线：深一档的蓝，在深色与浅色两套视口底色上都看得清。
+const ROOM_EDGE_COLOR: Color = Color::srgb_u8(38, 132, 255);
+/// 特征边的折角阈值：相邻两面的法线夹角超过它，公共边就画出来。墙角、墙与地面 / 顶板的交线是
+/// 90°，同一面墙剖分出来的对角线是 0°。
+const FEATURE_EDGE_DEG: f32 = 20.0;
+/// 焊点的网格边长占网格包围盒最长边的比例。烘焙网格每个三角形各带一份顶点，同一个角上的几份
+/// 坐标相同，落进同一格。
+const WELD_REL: f64 = 1e-5;
 
 /// 宿主交给视口的一次房间体（直段截断计划 §4.3）。
 pub struct RoomVolumeBatch {
@@ -225,11 +241,44 @@ fn section_material() -> StandardMaterial {
     }
 }
 
+/// 房间体图层的三枚材质：正面一档、背面一档填充与特征边线。
+#[derive(Resource, Default)]
+pub(crate) struct RoomVolumeMaterials {
+    front: Handle<StandardMaterial>,
+    back: Handle<StandardMaterial>,
+    edges: Handle<StandardMaterial>,
+}
+
+/// 房间体填充：受光照的半透明淡蓝，墙面按朝向分出明暗。`front` 只画朝向相机的面，否则只画
+/// 背向相机的面。
+fn room_fill_material(front: bool) -> StandardMaterial {
+    let [r, g, b] = ROOM_FILL_RGB;
+    let alpha = if front { ROOM_FRONT_ALPHA } else { ROOM_BACK_ALPHA };
+    StandardMaterial {
+        base_color: Color::srgba_u8(r, g, b, alpha),
+        alpha_mode: AlphaMode::Blend,
+        perceptual_roughness: 1.0,
+        reflectance: 0.0,
+        // 背面一档靠它把法线翻向相机，照亮的是看得见的那一侧。
+        double_sided: true,
+        cull_mode: Some(if front { Face::Back } else { Face::Front }),
+        // 两档挂在同一个位置上，排序距离相同：正面一档排后画，叠在背面一档上。小于 1 才不落成
+        // 渲染管线里的深度偏移。
+        depth_bias: if front { 0.5 } else { 0.0 },
+        ..default()
+    }
+}
+
 pub(crate) fn setup_room_clip(
     mut commands: Commands,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     commands.insert_resource(SectionMaterial(materials.add(section_material())));
+    commands.insert_resource(RoomVolumeMaterials {
+        front: materials.add(room_fill_material(true)),
+        back: materials.add(room_fill_material(false)),
+        edges: materials.add(fallback_line_material(ROOM_EDGE_COLOR)),
+    });
 }
 
 /// 原型网格在自己局部系里的形状：沿某根局部轴的棱柱，两个端面在这根轴上的坐标与截面中心。
@@ -437,6 +486,118 @@ struct PanelMesh {
     handle: Handle<Mesh>,
     /// 网格局部 → 毫米世界：`world_trans × inst.transform`。
     matrix: Mat4,
+    /// 这个网格实例在图层里的壳：两档填充与特征边线都挂在它下面。
+    shell: Entity,
+    /// 背面一档、正面一档两片填充。
+    fills: [Entity; 2],
+    /// 网格还没加载好，特征边线还没补。
+    outline_pending: bool,
+}
+
+/// 一块面板网格的轮廓。
+struct PanelOutline {
+    /// 特征边（折角超过阈值的棱、敞口的边）连成的 `LineList`；一条都没有为 `None`。
+    lines: Option<Mesh>,
+    /// 闭合、绕向一致而且有向体积为负：三角形法线朝里，正反两档要对调着画。
+    inward: bool,
+}
+
+/// 焊好之后的一条边。
+struct WeldedEdge {
+    /// 第一个面的法线。
+    normal: Vec3,
+    faces: u32,
+    /// 有面与第一个面的折角超过阈值。PDMS 网格的绕向不保证一致，按法线夹角的绝对值判，
+    /// 翻了面的三角形不会画出假棱。
+    crease: bool,
+    /// 各面沿这条边走的方向之和（顺 +1、逆 -1）：绕向一致的闭合网格上每条边一正一反。
+    turn: i32,
+}
+
+impl PanelOutline {
+    fn of(mesh: &Mesh) -> Option<PanelOutline> {
+        let (vertices, indices) = triangles_of(mesh)?;
+        let (min, max) = vertices
+            .iter()
+            .fold((Vec3::INFINITY, Vec3::NEG_INFINITY), |(min, max), v| {
+                (min.min(*v), max.max(*v))
+            });
+        let cell = f64::from((max - min).max_element()) * WELD_REL;
+        if !cell.is_finite() || cell <= 0.0 {
+            return None;
+        }
+        let mut cells: HashMap<[i64; 3], u32> = HashMap::new();
+        let mut points: Vec<Vec3> = Vec::new();
+        let welded: Vec<u32> = vertices
+            .iter()
+            .map(|v| {
+                let key = (v.as_dvec3() / cell).round().as_i64vec3().to_array();
+                *cells.entry(key).or_insert_with(|| {
+                    points.push(*v);
+                    points.len() as u32 - 1
+                })
+            })
+            .collect();
+        let cos = FEATURE_EDGE_DEG.to_radians().cos();
+        let mut edges: HashMap<(u32, u32), WeldedEdge> = HashMap::new();
+        let mut volume = 0.0_f64;
+        for tri in indices.chunks_exact(3) {
+            let corner = |k: usize| welded.get(tri[k] as usize).copied();
+            let (Some(a), Some(b), Some(c)) = (corner(0), corner(1), corner(2)) else {
+                continue;
+            };
+            if a == b || b == c || a == c {
+                continue;
+            }
+            let [pa, pb, pc] = [a, b, c].map(|i| points[i as usize]);
+            let normal = (pb - pa).cross(pc - pa).normalize_or_zero();
+            if normal == Vec3::ZERO {
+                continue;
+            }
+            volume += pa.as_dvec3().dot(pb.as_dvec3().cross(pc.as_dvec3()));
+            for (u, w) in [(a, b), (b, c), (c, a)] {
+                let turn = if u < w { 1 } else { -1 };
+                edges
+                    .entry((u.min(w), u.max(w)))
+                    .and_modify(|edge| {
+                        edge.faces += 1;
+                        edge.crease |= normal.dot(edge.normal).abs() < cos;
+                        edge.turn += turn;
+                    })
+                    .or_insert(WeldedEdge {
+                        normal,
+                        faces: 1,
+                        crease: false,
+                        turn,
+                    });
+            }
+        }
+        if edges.is_empty() {
+            return None;
+        }
+        let closed = edges.values().all(|edge| edge.faces == 2 && edge.turn == 0);
+        let mut feature: Vec<(u32, u32)> = edges
+            .iter()
+            .filter(|(_, edge)| edge.faces != 2 || edge.crease)
+            .map(|(key, _)| *key)
+            .collect();
+        feature.sort_unstable();
+        let lines = (!feature.is_empty()).then(|| {
+            let positions: Vec<[f32; 3]> = feature
+                .iter()
+                .flat_map(|&(u, w)| [u, w])
+                .map(|i| points[i as usize].to_array())
+                .collect();
+            let normals = vec![[0.0, 1.0, 0.0]; positions.len()];
+            Mesh::new(PrimitiveTopology::LineList, RenderAssetUsages::default())
+                .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+                .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+        });
+        Some(PanelOutline {
+            lines,
+            inward: closed && volume < 0.0,
+        })
+    }
 }
 
 enum Solid {
@@ -524,11 +685,12 @@ impl Active {
         }
     }
 
-    /// 生成房间体图层：每块面板一个挂点、每个网格实例一个半透明子实体。
+    /// 生成房间体图层：每块面板一个挂点，每个网格实例一个壳、壳下背面与正面两片填充。特征边线
+    /// 等网格加载好再补（[`Active::outline_panels`]）。
     fn spawn(
         commands: &mut Commands,
         assets: &AssetServer,
-        xray: &Handle<StandardMaterial>,
+        materials: &RoomVolumeMaterials,
         batch: RoomVolumeBatch,
     ) -> Self {
         let layer = commands
@@ -541,17 +703,26 @@ impl Active {
                 .id();
             for inst in &record.insts {
                 let handle: Handle<Mesh> = assets.load(mesh_source::asset_path(&inst.geo_hash));
-                commands.spawn((
-                    Mesh3d(handle.clone()),
-                    MeshMaterial3d(xray.clone()),
-                    inst.transform,
-                    NotShadowCaster,
-                    NotShadowReceiver,
-                    ChildOf(panel),
-                ));
+                let shell = commands
+                    .spawn((inst.transform, Visibility::Inherited, ChildOf(panel)))
+                    .id();
+                let fills = [&materials.back, &materials.front].map(|material| {
+                    commands
+                        .spawn((
+                            Mesh3d(handle.clone()),
+                            MeshMaterial3d(material.clone()),
+                            NotShadowCaster,
+                            NotShadowReceiver,
+                            ChildOf(shell),
+                        ))
+                        .id()
+                });
                 panels.push(PanelMesh {
                     handle,
                     matrix: record.world_trans.compute_matrix() * inst.transform.compute_matrix(),
+                    shell,
+                    fills,
+                    outline_pending: true,
                 });
             }
         }
@@ -592,6 +763,52 @@ impl Active {
             carriers: self.carriers,
             components: self.components,
             found: self.known.len(),
+        }
+    }
+
+    /// 网格加载好的面板补上特征边线。三角形法线朝里的（或变换带镜像的）把两片填充的材质对调，
+    /// 正面那一档始终是朝向相机的那一侧。加载失败的不再等。
+    fn outline_panels(
+        &mut self,
+        commands: &mut Commands,
+        assets: &AssetServer,
+        meshes: &mut Assets<Mesh>,
+        materials: &RoomVolumeMaterials,
+    ) {
+        for panel in self.panels.iter_mut().filter(|panel| panel.outline_pending) {
+            let outline = match meshes.get(&panel.handle) {
+                Some(mesh) => PanelOutline::of(mesh),
+                None if matches!(
+                    assets.get_load_state(&panel.handle),
+                    Some(LoadState::Loading | LoadState::NotLoaded)
+                ) =>
+                {
+                    continue;
+                }
+                None => None,
+            };
+            panel.outline_pending = false;
+            let Some(outline) = outline else {
+                continue;
+            };
+            if outline.inward != (panel.matrix.determinant() < 0.0) {
+                let [back, front] = panel.fills;
+                commands
+                    .entity(back)
+                    .insert(MeshMaterial3d(materials.front.clone()));
+                commands
+                    .entity(front)
+                    .insert(MeshMaterial3d(materials.back.clone()));
+            }
+            if let Some(lines) = outline.lines {
+                commands.spawn((
+                    Mesh3d(meshes.add(lines)),
+                    MeshMaterial3d(materials.edges.clone()),
+                    NotShadowCaster,
+                    NotShadowReceiver,
+                    ChildOf(panel.shell),
+                ));
+            }
         }
     }
 
@@ -891,7 +1108,7 @@ pub(crate) fn apply_room_clip_ops(
     mut view: ResMut<View3d>,
     mut clip: ResMut<RoomClip>,
     assets: Res<AssetServer>,
-    xray: Res<XRayMaterial>,
+    materials: Res<RoomVolumeMaterials>,
     mut tubes: Tubes,
 ) {
     if view.room_clip_ops.is_empty() {
@@ -904,7 +1121,7 @@ pub(crate) fn apply_room_clip_ops(
                 if let Some(mut old) = clip.active.take() {
                     old.teardown(&mut commands, &mut tubes);
                 }
-                clip.active = Some(Active::spawn(&mut commands, &assets, &xray.0, batch));
+                clip.active = Some(Active::spawn(&mut commands, &assets, &materials, batch));
             }
             RoomClipOp::Truncate(on) => {
                 if let Some(active) = clip.active.as_mut()
@@ -925,7 +1142,8 @@ pub(crate) fn apply_room_clip_ops(
     view.room_clip_status = clip.active.as_ref().map(Active::status);
 }
 
-/// 每帧推进：面板网格齐了就建房间体，把候选直段排进来，截这一拍的配额，发回执。
+/// 每帧推进：面板网格到了就补特征边线，齐了就建房间体，把候选直段排进来，截这一拍的配额，
+/// 发回执。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn advance_room_clip(
     mut commands: Commands,
@@ -934,6 +1152,7 @@ pub(crate) fn advance_room_clip(
     assets: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
     section: Res<SectionMaterial>,
+    materials: Res<RoomVolumeMaterials>,
     added: Query<Entity, Added<TubeBody>>,
     mut tubes: Tubes,
 ) {
@@ -941,6 +1160,7 @@ pub(crate) fn advance_room_clip(
     let Some(active) = active.as_mut() else {
         return;
     };
+    active.outline_panels(&mut commands, &assets, &mut meshes, &materials);
     active.settle_solid(&assets, &meshes);
     if active.truncate && matches!(active.solid, Solid::Ready(_)) {
         if std::mem::take(&mut active.enqueue_all) {
@@ -978,7 +1198,6 @@ mod tests {
     use crate::ModelRoot;
     use bevy::asset::AssetPlugin;
     use bevy::render::mesh::Indices;
-    use bevy::render::render_asset::RenderAssetUsages;
 
     /// 把一个简单多边形沿 z 拉成闭合棱柱网格。盖面按顶点 0 扇形三角化。
     fn prism_mesh(polygon: &[[f32; 2]], z0: f32, z1: f32) -> Mesh {
@@ -1243,7 +1462,7 @@ mod tests {
         app.add_plugins((MinimalPlugins, AssetPlugin::default()))
             .init_asset::<Mesh>()
             .insert_resource(crate::blank_view())
-            .insert_resource(XRayMaterial(Handle::default()))
+            .init_resource::<RoomVolumeMaterials>()
             .insert_resource(SectionMaterial(Handle::default()))
             .init_resource::<RoomClip>()
             .add_systems(Update, (apply_room_clip_ops, advance_room_clip).chain());
@@ -1262,17 +1481,17 @@ mod tests {
         components: &[RefU64],
         truncate: bool,
     ) {
-        let panels: Vec<PanelMesh> = rooms
-            .into_iter()
-            .map(|mesh| PanelMesh {
-                handle: app.world_mut().resource_mut::<Assets<Mesh>>().add(mesh),
-                matrix: Mat4::IDENTITY,
-            })
-            .collect();
         let layer = app
             .world_mut()
             .spawn((Transform::IDENTITY, Visibility::Visible, RoomVolumeLayer))
             .id();
+        let panels: Vec<PanelMesh> = rooms
+            .into_iter()
+            .map(|mesh| {
+                let handle = add_mesh(app, mesh);
+                panel_mesh(app, layer, handle)
+            })
+            .collect();
         app.world_mut().resource_mut::<RoomClip>().active = Some(Active::new(
             7,
             layer,
@@ -1286,6 +1505,54 @@ mod tests {
 
     fn add_mesh(app: &mut App, mesh: Mesh) -> Handle<Mesh> {
         app.world_mut().resource_mut::<Assets<Mesh>>().add(mesh)
+    }
+
+    /// 一块面板网格在图层里的壳与两片填充，与 `Active::spawn` 挂的一样。
+    fn panel_mesh(app: &mut App, layer: Entity, handle: Handle<Mesh>) -> PanelMesh {
+        let materials = app.world().resource::<RoomVolumeMaterials>();
+        let (back, front) = (materials.back.clone(), materials.front.clone());
+        let world = app.world_mut();
+        let shell = world
+            .spawn((Transform::IDENTITY, Visibility::Inherited, ChildOf(layer)))
+            .id();
+        let fills = [back, front].map(|material| {
+            world
+                .spawn((Mesh3d(handle.clone()), MeshMaterial3d(material), ChildOf(shell)))
+                .id()
+        });
+        PanelMesh {
+            handle,
+            matrix: Mat4::IDENTITY,
+            shell,
+            fills,
+            outline_pending: true,
+        }
+    }
+
+    /// 每个三角形各带一份顶点（烘焙网格的样子）；`flip` 顺带把绕向反过来。
+    fn unshared(mesh: &Mesh, flip: bool) -> Mesh {
+        let (vertices, indices) = triangles_of(mesh).unwrap();
+        let positions: Vec<[f32; 3]> = indices
+            .chunks_exact(3)
+            .flat_map(|tri| {
+                if flip {
+                    [tri[0], tri[2], tri[1]]
+                } else {
+                    [tri[0], tri[1], tri[2]]
+                }
+            })
+            .map(|i| vertices[i as usize].to_array())
+            .collect();
+        Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
+            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    }
+
+    /// 特征边的条数与「法线朝里」的判定。
+    fn outline(mesh: &Mesh) -> (usize, bool) {
+        let outline = PanelOutline::of(mesh).expect("有三角形");
+        let lines = outline.lines.expect("有特征边");
+        assert_eq!(lines.primitive_topology(), PrimitiveTopology::LineList);
+        (lines.count_vertices() / 2, outline.inward)
     }
 
     /// 在场景里放一段直段：模型根 + 一个挂着 `TubeBody` 的网格子实体。交回子实体。
@@ -1657,7 +1924,7 @@ mod tests {
         assert_eq!(view.room_frame_bounds, None);
     }
 
-    /// 房间体图层（计划 M2 验收）：每个面板网格实例一个半透明子实体，点不中（不挂
+    /// 房间体图层（计划 M2 验收）：每个面板网格实例正反两片半透明填充，点不中（不挂
     /// `ModelPickTarget`）、不进选中与可见性账（不挂 `ModelMesh`）；撤掉时整层连子实体一起带走，
     /// 回执也跟着没了。
     #[test]
@@ -1688,7 +1955,7 @@ mod tests {
         assert_eq!(layers.iter(world).count(), 1);
         let mut shells = world.query_filtered::<Entity, With<Mesh3d>>();
         let shells: Vec<Entity> = shells.iter(world).collect();
-        assert_eq!(shells.len(), 2, "两个网格实例各一个子实体");
+        assert_eq!(shells.len(), 4, "两个网格实例各正反两片填充");
         for shell in shells {
             let shell = world.entity(shell);
             assert!(!shell.contains::<ModelPickTarget>(), "房间体点不中");
@@ -1707,6 +1974,79 @@ mod tests {
         assert_eq!(app.world().resource::<View3d>().room_clip_status(), None);
     }
 
+    /// 特征边：方盒房间 12 条棱、L 形房间 18 条；同一面上剖分出来的对角线不画，敞口的边画。
+    /// 烘焙网格每个三角形各带一份顶点，焊上之后画出一样的棱；法线朝里的闭合体认得出来。
+    #[test]
+    fn panel_outlines_are_creases_and_open_edges() {
+        assert_eq!(outline(&room_box()), (12, false));
+        assert_eq!(outline(&l_room()), (18, false));
+        assert_eq!(outline(&unshared(&room_box(), false)), (12, false));
+        assert_eq!(outline(&unshared(&l_room(), true)), (18, true));
+
+        let quad = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
+            .with_inserted_attribute(
+                Mesh::ATTRIBUTE_POSITION,
+                vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+            )
+            .with_inserted_indices(Indices::U32(vec![0, 1, 2, 0, 2, 3]));
+        assert_eq!(outline(&quad), (4, false), "敞口的四条边画、对角线不画；不闭合就不论朝向");
+
+        let segment = Mesh::new(PrimitiveTopology::LineList, RenderAssetUsages::default())
+            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, vec![[0.0; 3], [1.0, 0.0, 0.0]]);
+        assert!(PanelOutline::of(&segment).is_none(), "不是三角网的不认");
+    }
+
+    /// 房间体的面板网格到了就补特征边线，挂在那个网格实例的壳下，只补一次；法线朝里的那块把
+    /// 两片填充的材质对调。
+    #[test]
+    fn the_room_volume_outlines_its_panels_once_they_load() {
+        let mut app = test_app();
+        app.init_asset::<StandardMaterial>();
+        let mut assets = app.world_mut().resource_mut::<Assets<StandardMaterial>>();
+        let materials = RoomVolumeMaterials {
+            front: assets.add(StandardMaterial::default()),
+            back: assets.add(StandardMaterial::default()),
+            edges: assets.add(StandardMaterial::default()),
+        };
+        let (front, back, edges) = (materials.front.id(), materials.back.id(), materials.edges.id());
+        app.insert_resource(materials);
+        activate(&mut app, vec![room_box(), unshared(&room_box(), true)], &[], false);
+        app.update();
+        app.update();
+
+        let clip = app.world().resource::<RoomClip>();
+        let panels: Vec<(Entity, [Entity; 2])> = clip
+            .active
+            .as_ref()
+            .unwrap()
+            .panels
+            .iter()
+            .map(|panel| (panel.shell, panel.fills))
+            .collect();
+        let world = app.world_mut();
+        let mut drawn = world.query::<(&Mesh3d, &MeshMaterial3d<StandardMaterial>, &ChildOf)>();
+        let lines: Vec<(Handle<Mesh>, Entity)> = drawn
+            .iter(world)
+            .filter(|(_, material, _)| material.0.id() == edges)
+            .map(|(mesh, _, parent)| (mesh.0.clone(), parent.parent()))
+            .collect();
+        let mut shells: Vec<Entity> = lines.iter().map(|(_, shell)| *shell).collect();
+        shells.sort();
+        let mut expected: Vec<Entity> = panels.iter().map(|(shell, _)| *shell).collect();
+        expected.sort();
+        assert_eq!(shells, expected, "每块面板一份，只补一次");
+        for (mesh, _) in &lines {
+            let mesh = world.resource::<Assets<Mesh>>().get(mesh).unwrap();
+            assert_eq!(mesh.primitive_topology(), PrimitiveTopology::LineList);
+            assert_eq!(mesh.count_vertices(), 24, "方盒 12 条棱");
+        }
+        let material_of = |entity: Entity| {
+            world.get::<MeshMaterial3d<StandardMaterial>>(entity).unwrap().0.id()
+        };
+        assert_eq!(panels[0].1.map(material_of), [back, front], "法线朝外：两档各就各位");
+        assert_eq!(panels[1].1.map(material_of), [front, back], "法线朝里：两档对调");
+    }
+
     /// 面板网格有一块没加载成：房间体不全，宁可不截——回执说缺几块，直段一段不碰。
     #[test]
     fn a_missing_panel_mesh_makes_the_room_volume_unavailable() {
@@ -1723,10 +2063,7 @@ mod tests {
             .id();
         let panels = [good, gone]
             .into_iter()
-            .map(|handle| PanelMesh {
-                handle,
-                matrix: Mat4::IDENTITY,
-            })
+            .map(|handle| panel_mesh(&mut app, layer, handle))
             .collect();
         app.world_mut().resource_mut::<RoomClip>().active =
             Some(Active::new(7, layer, panels, [bran], std::iter::empty(), true, None));
@@ -1759,6 +2096,7 @@ mod tests {
             .init_asset::<crate::e3d_look::material::SglLookMaterial>()
             .init_resource::<crate::look_materials::LookMaterials>()
             .insert_resource(crate::e3d_look::env_cube::SglEnvCube(None))
+            .insert_resource(crate::XRayMaterial(Handle::default()))
             .add_systems(Update, crate::apply_materials.after(advance_room_clip));
         // PBR 外观：材质是 StandardMaterial，断口的剖切色也是，一把尺子量到底。
         app.world_mut().resource_mut::<View3d>().look.mode = plant_ui::LookMode::Pbr;
