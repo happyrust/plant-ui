@@ -1,8 +1,13 @@
 //! plant-ui：绘制层（组件层 + 各屏纯绘制函数 + Vm 定义）。
 //! 不认识数据库、不认识 Bevy：输入 &Vm，输出 Vec<Cmd>。
 
+/// 新入口「三维数据提资」：带提资前检查的任务窗。旧入口「三维数据接口」是 `data_publish`，两者并排。
+pub mod data_handover;
 pub mod data_publish;
+/// 提资前检查的契约与判据（纯函数），`data_handover` 拿它画。
+pub mod data_publish_check;
 pub mod fonts;
+pub mod help;
 pub mod increment_records;
 pub mod manual_data_publish;
 pub mod model_mutation;
@@ -576,6 +581,12 @@ pub enum Cmd {
     GetWork,
     /// 打开设置任务窗。
     OpenSettings,
+    /// 打开帮助与快捷键指引窗口。
+    OpenHelp,
+    /// 打开「关于 布置平台」窗口并刷新前后端版本信息。
+    OpenAbout,
+    /// 手动刷新模型后端与数据服务版本信息。
+    RefreshVersions,
     /// 打开三维数据发布任务窗。
     OpenDataPublish,
     OpenManualDataPublish,
@@ -583,6 +594,11 @@ pub enum Cmd {
     /// 提交三维数据发布请求；实际发送由宿主负责。
     SubmitDataPublish(data_publish::PublishRequest),
     LookupDataPublishDeletions(data_publish::PublishRequest),
+    /// 调用 rs-server `/api/metadata/previews` 只读提取预览数据。
+    PreviewDataPublish(data_publish::PublishRequest),
+    /// 新入口「三维数据提资」（`data_handover`）的动作：打开、提资前检查、更新到最新、预览、查待删除、
+    /// 提交。旧入口「三维数据接口」照旧走上面那几条，两边的回包各落各的状态。
+    DataHandover(data_handover::Action),
     /// 打开并刷新模型增量更新预览。
     OpenModelUpdate,
     /// 重新读取当前项目的增量范围。
@@ -742,6 +758,8 @@ pub enum Cmd {
         /// 在有意识的情况下决定要不要连盘上那份一起清。
         purge_meshes: bool,
     },
+    /// Spec 041：节点所在库缺入库数据确认框的选择（先解析保存 / 直接生成 / 取消）。
+    NodeDataIngestChoice(model_mutation::DataIngestChoice),
     /// 导入 AMS 虚拟孔洞表（xlsx/csv；ADR-0031 阶段一）。只打开文件选择：
     /// 原生端走系统对话框，浏览器端走隐藏的 `<input type=file>`；解析与映射都在
     /// 宿主拿到字节之后做，这条命令本身不带数据。

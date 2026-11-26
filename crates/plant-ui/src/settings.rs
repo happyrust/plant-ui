@@ -100,6 +100,37 @@ impl ReadFaceKind {
     }
 }
 
+/// 服务供数模式下模型树（`/api/v1/tree/*` 与 `/api/v1/search`）使用的数据源。
+///
+/// 落盘字面是 `direct` / `db`：
+/// - `Direct`（默认）：由 gen-model 经 `e3d-io` 直接读取 E3D 项目数据文件；
+/// - `Db`：由 gen-model 直接查询 SurrealDB 中的 `MDB` / `pe` / `pe_owner` 表。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TreeSourceKind {
+    #[default]
+    Direct,
+    Db,
+}
+
+impl TreeSourceKind {
+    pub const ALL: [Self; 2] = [Self::Direct, Self::Db];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Direct => "E3D 项目数据",
+            Self::Db => "数据库查询接口",
+        }
+    }
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Db => "db",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -110,6 +141,8 @@ pub struct Settings {
     /// 供数模式。老 `settings.ron` 没这一格就是服务供数（`serde(default)`）。
     /// 它描述的是这台机器能不能碰到库，随 `model_api_url` 一起按机器落盘，不进项目 bundle。
     pub read_face: ReadFaceKind,
+    /// 服务供数模式下模型树的数据源（`direct` = E3D 项目数据直读，默认；`db` = SurrealDB 查询接口）。
+    pub tree_source: TreeSourceKind,
     /// 网格文件所在的目录。**空串是明确的「我没指定」**，那一格让给环境变量，
     /// 再退到出厂默认 `<资产根>/meshes`；解出来的实际路径由宿主放进
     /// [`State::mesh_dir_hint`] 当占位提示显示。
@@ -137,6 +170,7 @@ impl Default for Settings {
             model_api_url: DEFAULT_MODEL_API_URL.to_owned(),
             data_api_url: DEFAULT_DATA_API_URL.to_owned(),
             read_face: ReadFaceKind::Service,
+            tree_source: TreeSourceKind::Direct,
             mesh_dir: String::new(),
             tree_full_names: false,
             room_view_truncate_tubes: true,
@@ -154,6 +188,8 @@ pub struct State {
     /// 供数模式那一格为什么改不了。`Some` = 环境变量压过了设置（`PLANT_READ_FACE` 在场，
     /// 计划 D11）：下拉灰掉、悬停与右下小字都说这一句。宿主填，绘制层不读环境变量。
     pub read_face_lock: Option<String>,
+    /// 模型树数据源那一格为什么改不了（`PLANT_TREE_SOURCE` 在场）。
+    pub tree_source_lock: Option<String>,
     /// 边线 / 伪阴影在这台设备上为什么不可用（E3D 外观移植计划阶段四）。`Some` = 渲染器说没有半浮点颜色附件
     /// （WebGL2 缺 `EXT_color_buffer_float`）：两格灰掉、悬停说这一句；设置里的值照存照发，换台机器就生效。宿主填。
     pub post_effects_lock: Option<String>,
@@ -384,6 +420,53 @@ pub fn show(ctx: &egui::Context, t: &Tokens, d: Density, state: &mut State) -> O
                     if let Some(lock) = read_face_lock.as_deref() {
                         // 同「网格目录」的校验提示：外面这层 `horizontal` 挡住 `with_layout` 吃掉
                         // 剩余竖直空间，这一行才贴在它解释的那个下拉底下。
+                        ui.horizontal(|ui| {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(RichText::new(lock).small().color(t.warn));
+                            });
+                        });
+                    }
+                    let tree_source_lock = state.tree_source_lock.clone();
+                    let store_face_active = state.draft.read_face == ReadFaceKind::Store;
+                    let tree_source_enabled = !store_face_active && tree_source_lock.is_none();
+                    setting_row(
+                        ui,
+                        t,
+                        "模型树数据源",
+                        "仅服务供数下生效：E3D 项目数据（e3d-io 文件直读）或数据库查询接口（SurrealDB）",
+                        |ui| {
+                            let selected_label = if store_face_active {
+                                "数据库查询接口（库供数）"
+                            } else {
+                                state.draft.tree_source.label()
+                            };
+                            let combo = ui.add_enabled_ui(tree_source_enabled, |ui| {
+                                ComboBox::from_id_salt("plant-tree-source")
+                                    .selected_text(selected_label)
+                                    .width(160.0)
+                                    .show_ui(ui, |ui| {
+                                        for kind in TreeSourceKind::ALL {
+                                            ui.selectable_value(
+                                                &mut state.draft.tree_source,
+                                                kind,
+                                                kind.label(),
+                                            );
+                                        }
+                                    })
+                                    .response
+                            });
+                            if store_face_active {
+                                combo.inner.on_disabled_hover_text(
+                                    "库供数模式下模型树直连 SurrealDB 数据库；切回服务供数后可选择 E3D 项目数据或数据库查询接口",
+                                );
+                            } else if let Some(lock) = tree_source_lock.as_deref() {
+                                combo.inner.on_disabled_hover_text(lock);
+                            }
+                        },
+                    );
+                    if !store_face_active
+                        && let Some(lock) = tree_source_lock.as_deref()
+                    {
                         ui.horizontal(|ui| {
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 ui.label(RichText::new(lock).small().color(t.warn));
@@ -933,6 +1016,71 @@ mod tests {
         assert!(
             disabled_widgets(&ctx) > locked,
             "锁只灰三行；切到 web PBR 整节（预设 / 配色 / 渐变 / 恢复按钮）都灰，必须更多"
+        );
+    }
+
+    #[test]
+    fn tree_source_defaults_to_direct_and_round_trips() {
+        assert_eq!(Settings::default().tree_source, TreeSourceKind::Direct);
+        assert_eq!(TreeSourceKind::default(), TreeSourceKind::Direct);
+        assert_eq!(TreeSourceKind::Direct.label(), "E3D 项目数据");
+        assert_eq!(TreeSourceKind::Db.label(), "数据库查询接口");
+        for kind in TreeSourceKind::ALL {
+            assert_eq!(
+                serde_json::to_string(&kind).unwrap(),
+                format!("\"{}\"", kind.key())
+            );
+        }
+    }
+
+    #[test]
+    fn tree_source_lock_and_store_face_disable_the_dropdown() {
+        let ctx = egui::Context::default();
+        let mut state = State::default();
+        state.open();
+        for _ in 0..3 {
+            one_frame(&ctx, &mut state);
+        }
+        let baseline = disabled_widgets(&ctx);
+
+        state.tree_source_lock = Some("由 PLANT_TREE_SOURCE=db 压过".to_owned());
+        for _ in 0..3 {
+            one_frame(&ctx, &mut state);
+        }
+        assert!(
+            disabled_widgets(&ctx) > baseline,
+            "环境变量压过时模型树数据源下拉必须灰掉"
+        );
+
+        state.tree_source_lock = None;
+        state.draft.read_face = ReadFaceKind::Store;
+        for _ in 0..3 {
+            one_frame(&ctx, &mut state);
+        }
+        assert!(
+            disabled_widgets(&ctx) > baseline,
+            "库供数模式下模型树数据源下拉必须灰掉"
+        );
+    }
+
+    #[test]
+    fn tree_source_lock_keeps_settings_window_height_stable() {
+        let ctx = egui::Context::default();
+        let window_id = egui::Id::new(WINDOW_ID);
+        let mut state = State::default();
+        state.tree_source_lock = Some("由 PLANT_TREE_SOURCE=db 压过".to_owned());
+        state.open();
+        let heights: Vec<f32> = (0..8)
+            .map(|_| {
+                one_frame(&ctx, &mut state);
+                ctx.memory(|memory| memory.area_rect(window_id).unwrap().height())
+            })
+            .collect();
+        assert!(
+            heights[2..]
+                .windows(2)
+                .all(|pair| (pair[1] - pair[0]).abs() < f32::EPSILON),
+            "tree_source_lock 下设置窗口高度逐帧增长：{heights:?}"
         );
     }
 }

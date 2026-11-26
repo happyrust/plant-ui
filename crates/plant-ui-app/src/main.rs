@@ -7,6 +7,7 @@
 
 mod command;
 mod data;
+mod data_handover;
 mod data_publish_api;
 mod dimension_layer;
 mod focus_bounds;
@@ -78,7 +79,7 @@ use plant_ui::vm::{
     RoomTreeConfirmVm, RoomTreeDataVm, RoomTreeVm, RoomViewVm, RoomVm, RoomsDataVm,
     RowVisibility, SearchHitVm, SearchRunVm, SearchVm, Selection, SpoolingDataVm,
     SpoolingGroupVm, SpoolingMemberVm, SpoolingMembersVm, SpoolingRowVm, SpoolingVm, SubIndexVm,
-    TreeGroupLink, TreeRowVm, TreeVm, TruncationVm, View3dVm, WorkbenchVm,
+    TreeGroupLink, TreeRowVm, TreeVm, TruncationVm, UserProfileVm, View3dVm, WorkbenchVm,
 };
 use plant_ui::virtual_hole::{VirtualHoleOp, VirtualHoleReceipt, VirtualHoleStatus};
 use plant_ui::workbench::{self, Pane, WorkbenchState};
@@ -98,9 +99,13 @@ fn main() {
         }
         return;
     }
-    let gallery = args.iter().any(|a| a == "--gallery");
-    if gallery {
-        run_gallery().expect("组件画廊启动失败");
+    // `--gallery` 进组件画廊；`--gallery=<场景名>` 直接摆出某扇任务窗的某个形态（见 `gallery.rs`）。
+    let gallery = args
+        .iter()
+        .find(|a| a.as_str() == "--gallery" || a.starts_with("--gallery="));
+    if let Some(arg) = gallery {
+        let scene = arg.strip_prefix("--gallery=").unwrap_or_default();
+        run_gallery(scene).expect("组件画廊启动失败");
     } else if let Err(error) = run_native() {
         eprintln!("plant-ui 启动失败：{error:#}");
         std::process::exit(1);
@@ -129,6 +134,12 @@ pub fn start(canvas: String, config_json: String) -> Result<(), wasm_bindgen::Js
     }
     data_publish_api::set_base_url(config.data_api_url)
         .map_err(|error| wasm_bindgen::JsValue::from_str(&error.to_string()))?;
+    if config.auth_token.is_some() {
+        data_publish_api::set_auth_token(config.auth_token);
+    }
+    if config.auth_user.is_some() {
+        data_publish_api::set_initial_user(config.auth_user);
+    }
     if config.auto_gen_mesh {
         console_warn("旧配置的 auto_gen_mesh 由模型服务负责，客户端不会在本地生成 mesh");
     }
@@ -191,6 +202,20 @@ fn run_native() -> anyhow::Result<()> {
     if let Some(warning) = read_face.warning.clone() {
         warnings.push(warning);
     }
+    let tree_source = settings_store::resolve_tree_source(
+        settings.tree_source,
+        std::env::var_os(settings_store::TREE_SOURCE_ENV),
+    );
+    if let Some(warning) = tree_source.warning.clone() {
+        warnings.push(warning);
+    }
+    model_update_api::set_tree_source(
+        if read_face.kind == settings::ReadFaceKind::Service {
+            tree_source.kind
+        } else {
+            settings::TreeSourceKind::Direct
+        },
+    );
     let default_mesh_dir =
         settings_store::resolve_mesh_dir("", std::env::var_os(PLANT_MESH_DIR), &asset_root);
     let mesh_dir = settings_store::resolve_mesh_dir(
@@ -209,6 +234,7 @@ fn run_native() -> anyhow::Result<()> {
         settings,
         default_mesh_dir: default_mesh_dir.to_string_lossy().into_owned(),
         read_face,
+        tree_source,
         warnings,
     });
 
@@ -344,11 +370,23 @@ fn configure_native_access_point() -> anyhow::Result<std::path::PathBuf> {
 const PLANT_MESH_DIR: &str = "PLANT_MESH_DIR";
 
 #[cfg(not(target_arch = "wasm32"))]
-fn run_gallery() -> eframe::Result {
+fn run_gallery(scene: &str) -> eframe::Result {
+    // 场景名后缀 `@dark` 换深色主题（画板多是深色的）。
+    let (scene, dark) = match scene.strip_suffix("@dark") {
+        Some(name) => (name, true),
+        None => (scene, false),
+    };
+    let app = gallery::GalleryApp::with_scene(scene);
+    // 场景窗口的标题带上场景名：一眼看得出这不是主程序。
+    let title = if scene.is_empty() {
+        "rs-plant".to_owned()
+    } else {
+        format!("rs-plant 画廊 · {scene}")
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1600.0, 1000.0])
-            .with_title("rs-plant"),
+            .with_title(title),
         ..Default::default()
     };
     eframe::run_native(
@@ -359,8 +397,8 @@ fn run_gallery() -> eframe::Result {
             let weights_ready = defs.font_data.contains_key(fonts::MEDIUM);
             cc.egui_ctx.set_fonts(defs);
             set_weight_families_ready(weights_ready);
-            theme_tokens::apply(&cc.egui_ctx, &Tokens::light(), Density::Standard);
-            Ok(Box::new(gallery::GalleryApp::default()))
+            theme_tokens::apply(&cc.egui_ctx, &Tokens::of(dark), Density::Standard);
+            Ok(Box::new(app))
         }),
     )
 }
@@ -499,6 +537,31 @@ fn mesh_fetch_requested() -> Option<usize> {
 #[cfg(any(test, target_arch = "wasm32"))]
 fn mesh_fetch_from(value: Option<&str>) -> Option<usize> {
     value?.trim().parse().ok().filter(|&routes| routes > 0)
+}
+
+/// 解析 URL 查询参数里的 `room` refno（如 `24381_5062` 或 `24381/5062`）。
+#[cfg(any(test, target_arch = "wasm32"))]
+fn parse_url_refno(raw: &str) -> Option<RefU64> {
+    let s = raw.trim().trim_start_matches('=');
+    let (a, b) = s.split_once('_').or_else(|| s.split_once('/'))?;
+    Some(RefU64::from_two_nums(a.parse().ok()?, b.parse().ok()?))
+}
+
+/// 浏览器地址栏带 `?tab=room_tree` / `?room=<refno>` 时，连接就绪后自动切到房间树并定位该房间。
+#[cfg(target_arch = "wasm32")]
+fn url_initial_room_tree_requested() -> (bool, Option<RefU64>) {
+    let search = location_search();
+    let room = query_value(&search, "room").and_then(|v| parse_url_refno(&v));
+    let tab_room = room.is_some()
+        || query_value(&search, "tab")
+            .as_deref()
+            .is_some_and(|t| t.eq_ignore_ascii_case("room_tree") || t.eq_ignore_ascii_case("rooms"));
+    (tab_room, room)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn url_initial_room_tree_requested() -> (bool, Option<RefU64>) {
+    (false, None)
 }
 
 /// 页面地址的查询串（带 `?`）；拿不到就是空串。
@@ -1540,6 +1603,9 @@ struct App {
     room_tree_reveal: Option<RoomNodeId>,
     /// 根清单还没到就被点了「在房间树查看」的那间房：清单到了再定位。
     room_tree_reveal_room: Option<RefU64>,
+    /// URL 查询参数（`?tab=room_tree&room=<refno>`）带进来的首次跳转目标；连接就绪后消费一次。
+    url_initial_tab_room_tree: bool,
+    url_initial_room: Option<RefU64>,
     /// 「加载模型」落地后要取景的目标：全部目标的范围查询都回来了才 `FocusGroup`（理由同
     /// `pending_room_frame`：范围没回来前视口手上没有它们的包围盒）。
     room_tree_frame: Option<Vec<RefU64>>,
@@ -1558,14 +1624,20 @@ struct App {
     /// 所以它不在模型树里——这一层自成一套入口。
     spooling: SpoolingModel,
     data_publish_state: DataPublishState,
+    /// 新入口「三维数据提资」（带提资前检查）。旧入口是上面的 `data_publish_state`，两扇窗各用各的状态；
+    /// 命令与回包的处置在 `data_handover.rs`。
+    data_handover_state: plant_ui::data_handover::State,
     manual_data_publish_state: ManualDataPublishState,
     project_picker_state: ProjectPickerState,
     settings_state: SettingsState,
+    help_state: plant_ui::help::State,
     model_api_url: String,
     data_api_url: String,
     /// 这一刻实际生效的供数模式（ADR-0026）。数据线程里的读面就是按它造的；设置项被
     /// `PLANT_READ_FACE` 压过时它与 `settings_state.saved.read_face` 不同。
     read_face: settings::ReadFaceKind,
+    /// 服务供数模式下模型树使用的数据源（`Direct` = E3D 项目数据，`Db` = SurrealDB 查询接口）。
+    tree_source: settings::TreeSourceKind,
     /// 当前 MDB 名（带前导 `/`），连库时取回。模型更新的预览与执行都要带上它
     /// ——本期执行范围就是照这个 MDB 解出来的 DESI 库号。
     mdb: String,
@@ -1591,6 +1663,10 @@ struct App {
     mutation_epoch: u64,
     /// 确认框打开到回执落地之间的那一趟：是哪件事、窗上的标题与右键那几行。`None` = 没在跑。
     mutation_run: Option<MutationRun>,
+    /// Spec 041：本会话用户选过「直接生成」的库号，避免反复弹框询问同一个库。
+    direct_generate_dbnums: HashSet<u32>,
+    /// Spec 041：正在预检或等待用户三选一（先解析保存 / 直接生成 / 取消）的待生成请求。
+    pending_data_ingest: Option<PendingDataIngest>,
     /// generate 成功、正等显示回包替换旧几何的目标。右键之前这些目标名下的模型可能已经在
     /// 场景里（旧产物）；它们的 records 回包到了要先卸掉已加载的同名模型再装，否则
     /// `claim_unloaded_model_refnos` 会把重算过的几何当成「已经有了」。
@@ -1949,6 +2025,16 @@ fn hit_row(hit: plant_ui_data::NameHit, desi_dbs: &[u32]) -> SearchHitVm {
 /// 2026-10-10 清理模型计划）。
 ///
 /// 只记是哪件事、标题与右键那几行：客户端不清点、不解根，没有名单要守。
+struct PendingDataIngest {
+    epoch: u64,
+    targets: Vec<RefU64>,
+    label: String,
+    reason: String,
+    force: bool,
+    auto: bool,
+    dbnum: Option<u32>,
+}
+
 struct MutationRun {
     kind: model_mutation::Kind,
     label: String,
@@ -2840,6 +2926,27 @@ fn settled_pending_roots(
         .collect()
 }
 
+fn format_logged_in_user_log(user: &startup::AuthUser) -> String {
+    let display = user.display_name();
+    let major = user.user_major.trim();
+    if major.is_empty() {
+        format!("当前登录用户：{display}")
+    } else {
+        format!("当前登录用户：{display}（专业：{major}）")
+    }
+}
+
+fn user_profile_from_auth(user: &startup::AuthUser, auth_source: &str) -> UserProfileVm {
+    UserProfileVm {
+        user_name: user.user_name.trim().to_owned(),
+        chinese_name: user.chinese_name.trim().to_owned(),
+        user_major: user.user_major.trim().to_owned(),
+        b_designer: user.b_designer,
+        authenticated: true,
+        auth_source: auth_source.to_owned(),
+    }
+}
+
 /// 解出这一刻**实际生效**的接入点。
 ///
 /// 走 `try_get_db_option`：`get_db_option` 读不着配置时会 panic，而「读不着」恰恰是这块
@@ -2898,19 +3005,44 @@ impl App {
         let read_face = startup
             .map(|startup| startup.read_face.kind)
             .unwrap_or_default();
+        let tree_source = startup
+            .map(|startup| startup.tree_source.kind)
+            .unwrap_or(adopted.tree_source);
+        model_update_api::set_tree_source(
+            if read_face == settings::ReadFaceKind::Service {
+                tree_source
+            } else {
+                settings::TreeSourceKind::Direct
+            },
+        );
         let mut settings_state = SettingsState::default();
         settings_state.mesh_dir_hint = startup
             .map(|startup| startup.default_mesh_dir.clone())
             .unwrap_or_default();
         // 环境变量压过设置时，设置窗那一格锁上并说明为什么（计划 D11）。
         settings_state.read_face_lock = startup.and_then(|startup| startup.read_face.lock_notice());
+        settings_state.tree_source_lock =
+            startup.and_then(|startup| startup.tree_source.lock_notice());
         let tree_full_names = adopted.tree_full_names;
         settings_state.adopt(adopted);
+        let initial_auth_user = data_publish_api::initial_user();
+        let fallback_name = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
+        let initial_user_profile = match initial_auth_user.as_ref() {
+            Some(user) => user_profile_from_auth(user, "普华跳转 (/forward)"),
+            None => UserProfileVm {
+                user_name: fallback_name.clone(),
+                authenticated: false,
+                auth_source: "未认证（匿名访问）".to_owned(),
+                ..Default::default()
+            },
+        };
+        let initial_user_name = initial_user_profile.badge_label(&fallback_name);
         let mut app = Self {
             // 连接前不摆任何工程数据：项目 / 库标识等 Ready 事件带真实值。
             // 接入点是例外——它说的是「这次冲着谁去」，连不上时反而最该看得见。
             vm: WorkbenchVm {
-                user: std::env::var("USERNAME").unwrap_or_else(|_| "user".into()),
+                user: initial_user_name,
+                user_profile: initial_user_profile,
                 access_point: access_point_vm(&model_api_url, &data_api_url, read_face),
                 // 下拉靠它说清这两路命中覆盖到哪儿（计划 §5.5）。
                 search: SearchVm {
@@ -2930,18 +3062,23 @@ impl App {
             room_tree_confirm: None,
             room_tree_reveal: None,
             room_tree_reveal_room: None,
+            url_initial_tab_room_tree: url_initial_room_tree_requested().0,
+            url_initial_room: url_initial_room_tree_requested().1,
             room_tree_frame: None,
             room_tree_internal_selection: false,
             tube_visibility: HashMap::new(),
             tube_pending: HashMap::new(),
             spooling: SpoolingModel::default(),
             data_publish_state: DataPublishState::default(),
+            data_handover_state: Default::default(),
             manual_data_publish_state: ManualDataPublishState::default(),
             project_picker_state: ProjectPickerState::new(Vec::new(), false),
             settings_state,
+            help_state: plant_ui::help::State::default(),
             model_api_url,
             data_api_url,
             read_face,
+            tree_source,
             mdb: String::new(),
             namespace: String::new(),
             desi_dbs: Vec::new(),
@@ -2950,6 +3087,8 @@ impl App {
             mutation: None,
             mutation_epoch: 0,
             mutation_run: None,
+            direct_generate_dbnums: HashSet::new(),
+            pending_data_ingest: None,
             regenerate_refresh: HashSet::new(),
             // 队列面板按它决定库行「模型来源」画不画、轮询失败怎么说（计划 §5.5）。
             queue: task_queue::Vm::new(read_face),
@@ -3047,6 +3186,16 @@ impl App {
             app.logs.warn(&mut app.vm.logs, w.clone());
         }
         app.logs.info(&mut app.vm.logs, "正在连接数据源…");
+        app.request_service_versions();
+        if let Some(user) = initial_auth_user {
+            app.logs
+                .info(&mut app.vm.logs, format_logged_in_user_log(&user));
+        } else {
+            #[cfg(target_arch = "wasm32")]
+            let _ = app.bridge.req.send(data::Req::FetchCurrentUser {
+                base: app.data_api_url.clone(),
+            });
+        }
         app
     }
 
@@ -3126,6 +3275,14 @@ impl App {
                             self.model_reload_restore = Some(snapshot);
                             self.get_work();
                         }
+                    }
+                    if let Some(room) = self.url_initial_room.take() {
+                        self.url_initial_tab_room_tree = false;
+                        self.reveal_room_in_tree(room);
+                    } else if std::mem::take(&mut self.url_initial_tab_room_tree) {
+                        self.state.focus(Pane::RoomTree);
+                        self.room_tree_load(false);
+                        self.rebuild_room_tree();
                     }
                     dirty = true;
                 }
@@ -4338,6 +4495,14 @@ impl App {
                     self.settle_models_cleaned(outcomes);
                     dirty = true;
                 }
+                data::Evt::NodeDataIngestPreflight { epoch, result } => {
+                    self.settle_data_ingest_preflight(epoch, result);
+                    dirty = true;
+                }
+                data::Evt::NodeDataIngestEnqueue { result, .. } => {
+                    self.settle_data_ingest_enqueue(result);
+                    dirty = true;
+                }
                 data::Evt::Ancestors(refno, Ok(chain)) => {
                     // 同一条链可能是两件事要的：一次定位，或者一次「新增子树该刷哪一层」
                     // 的锚点解析。两边各取所需，互不干扰。
@@ -4684,6 +4849,9 @@ impl App {
                             // 取回工作旁那行提示从这份 `/dbnums` 算：队列轮询常驻
                             // （忙 1 s / 闲 5 s），提示随每拍刷新，不再单独打一次水位表。
                             self.vm.watermark_lag = Some(self.queue.watermark_lag());
+                            if let Some(health) = &self.queue.health {
+                                self.vm.versions.apply_health(health);
+                            }
                             match plan {
                                 AutoRefresh::FullReload => {
                                     self.get_work_with_models_for_tasks(true, task_ids)
@@ -4782,6 +4950,21 @@ impl App {
                         }
                     }
                 }
+                data::Evt::DataPublishPreview(result) => match result {
+                    Ok(preview) => {
+                        let first_selected = (!preview.datacenter.instances.is_empty()).then_some(0);
+                        self.data_publish_state.preview_layer =
+                            data_publish::PreviewLayerChoice::Datacenter;
+                        self.data_publish_state.preview_selected_instance = first_selected;
+                        self.data_publish_state.preview_status =
+                            data_publish::PreviewStatus::Ready(preview);
+                    }
+                    Err(error) => {
+                        self.data_publish_state.preview_status =
+                            data_publish::PreviewStatus::Failed(logs::error_chain(&error));
+                    }
+                },
+                data::Evt::DataHandover(evt) => self.settle_data_handover(ctx, evt),
                 data::Evt::RoomCodePublish(result) => {
                     self.manual_data_publish_state.submitting = false;
                     self.handle_publish_result(
@@ -4790,6 +4973,41 @@ impl App {
                         "/send_room_code_to_data_center",
                         result,
                     );
+                }
+                data::Evt::CurrentUser(result) => {
+                    if let Ok(Some(user)) = result {
+                        let auth_source = if data_publish_api::auth_token().is_some() {
+                            "普华跳转 (/forward)"
+                        } else {
+                            "服务会话 (/get_user)"
+                        };
+                        let profile = user_profile_from_auth(&user, auth_source);
+                        let display = profile.badge_label(&self.vm.user);
+                        self.vm.user_profile = profile;
+                        if !display.is_empty() && self.vm.user != display {
+                            self.vm.user = display;
+                        }
+                        self.logs
+                            .info(&mut self.vm.logs, format_logged_in_user_log(&user));
+                    }
+                }
+                data::Evt::ServiceVersions {
+                    backend_health,
+                    data_service,
+                } => {
+                    self.vm.versions.loading = false;
+                    match backend_health {
+                        Ok(health) => self.vm.versions.apply_health(&health),
+                        Err(err) => self.vm.versions.backend_error = Some(err),
+                    }
+                    match data_service {
+                        Ok(meta) => {
+                            self.vm.versions.data_service_version = meta.version.trim().to_owned();
+                            self.vm.versions.data_service_error = None;
+                        }
+                        Err(err) => self.vm.versions.data_service_error = Some(err),
+                    }
+                    dirty = true;
                 }
                 data::Evt::CommandQuery {
                     epoch,
@@ -5310,8 +5528,15 @@ impl App {
                 Cmd::OpenProjectPicker => self.project_picker_state.open = true,
                 Cmd::LoadProject(_) => self.project_picker_state.open = false,
                 Cmd::OpenSettings => self.settings_state.open(),
+                Cmd::OpenHelp => self.help_state.open_help(),
+                Cmd::OpenAbout => {
+                    self.help_state.open_about();
+                    self.request_service_versions();
+                }
+                Cmd::RefreshVersions => self.request_service_versions(),
                 Cmd::OpenDataPublish => self.data_publish_state.open = true,
                 Cmd::OpenManualDataPublish => self.manual_data_publish_state.open = true,
+                Cmd::DataHandover(action) => self.apply_data_handover(action),
                 Cmd::SubmitDataPublish(request) => {
                     if self
                         .bridge
@@ -5350,6 +5575,20 @@ impl App {
                             &anyhow::anyhow!("数据服务线程不可用"),
                             None,
                         );
+                    }
+                }
+                Cmd::PreviewDataPublish(request) => {
+                    if self
+                        .bridge
+                        .req
+                        .send(data::Req::PreviewDataPublish {
+                            base: self.data_api_url.clone(),
+                            request,
+                        })
+                        .is_err()
+                    {
+                        self.data_publish_state.preview_status =
+                            data_publish::PreviewStatus::Failed("数据服务线程不可用".into());
                     }
                 }
                 Cmd::SubmitRoomCodePublish(request) => {
@@ -5681,6 +5920,7 @@ impl App {
                     accepted,
                     purge_meshes,
                 } => self.settle_mutation_confirm(accepted, purge_meshes),
+                Cmd::NodeDataIngestChoice(choice) => self.settle_data_ingest_choice(choice),
             }
         }
         if dirty {
@@ -5997,8 +6237,11 @@ impl App {
         for target in &targets {
             self.auto_generate_attempted.insert(*target);
         }
-        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         let label = regenerate_label(self.tree.label(targets[0]), targets.len());
+        if self.try_begin_data_ingest_preflight(targets.clone(), label.clone(), reason.to_string(), false, true) {
+            return targets;
+        }
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         let cancel = std::sync::Arc::<std::sync::atomic::AtomicBool>::default();
         self.mutation_run = Some(MutationRun {
             kind: model_mutation::Kind::Regenerate,
@@ -6197,6 +6440,13 @@ impl App {
         if dbnum.is_some() && !self.model_service_executable() {
             self.mutation_run = None;
             self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+            return;
+        }
+        if kind == model_mutation::Kind::Regenerate
+            && dbnum.is_none()
+            && self.try_begin_data_ingest_preflight(targets.clone(), label.clone(), String::new(), true, false)
+        {
+            self.mutation_run = None;
             return;
         }
         // 「一并删除网格文件」只对两个清理档有意义：重新生成走 `force = true`（服务端先删
@@ -8192,6 +8442,38 @@ impl App {
         }
     }
 
+    /// 仅在服务供数下切换模型树数据源（`Direct` ↔ `Db`），清掉本地树缓存并经 `GetWork` 重拉根层，
+    /// 保持已加载的三维几何不动。
+    fn switch_tree_source(&mut self, kind: settings::TreeSourceKind) {
+        let from = self.tree_source;
+        self.tree_source = kind;
+        model_update_api::set_tree_source(kind);
+        self.search_epoch = self.search_epoch.wrapping_add(1);
+        self.vm.search = SearchVm {
+            coverage: self.read_face,
+            ..SearchVm::default()
+        };
+        self.search_hit_dbs.clear();
+        self.tree.children.clear();
+        self.tree.parent.clear();
+        self.tree.group_links.clear();
+        self.tree.unresolved.clear();
+        self.tree.stored_views.clear();
+        self.tree.expanded.clear();
+        self.tree.loading.clear();
+        self.tree.roots.clear();
+        self.tree.group_roots.clear();
+        self.rebuild_tree();
+        let line = format!(
+            "模型树数据源：{} → {}；正在重载模型树",
+            from.label(),
+            kind.label()
+        );
+        self.command_output(line.clone());
+        self.logs.info(&mut self.vm.logs, line);
+        self.start_get_work(Vec::new(), false);
+    }
+
     fn reconnect(&mut self) {
         self.reset_for_reconnect();
         self.logs.info(&mut self.vm.logs, "正在重连数据源…");
@@ -8420,6 +8702,21 @@ impl App {
 
     /// 让下一帧立刻去取一份新快照。按下暂停 / 入队之后等满一拍再刷新，界面会有
     /// 一秒钟在说刚被推翻的话。
+    fn request_service_versions(&mut self) {
+        self.vm.versions.loading = true;
+        if self
+            .bridge
+            .req
+            .send(data::Req::FetchServiceVersions {
+                model_base: self.model_api_url.clone(),
+                data_base: self.data_api_url.clone(),
+            })
+            .is_err()
+        {
+            self.vm.versions.loading = false;
+        }
+    }
+
     fn poll_queue_now(&mut self) {
         let now = Instant::now();
         self.last_queue_poll = now.checked_sub(QUEUE_POLL_IDLE).unwrap_or(now);
@@ -8517,6 +8814,7 @@ impl App {
                     total: self.room_tree.total(),
                     matched: self.room_tree.filtered_roots().len(),
                     filter: self.room_tree.filter.clone(),
+                    hide_empty: self.room_tree.hide_empty,
                     note,
                     errors: self.room_tree.errors_vm(),
                     reveal: self.room_tree_reveal.clone(),
@@ -8699,6 +8997,7 @@ impl App {
             RoomTreeAction::Load => self.room_tree_load(false),
             RoomTreeAction::Refresh => self.room_tree_load(true),
             RoomTreeAction::SetFilter(text) => self.room_tree.filter = text,
+            RoomTreeAction::SetHideEmpty(hide) => self.room_tree.hide_empty = hide,
             RoomTreeAction::ToggleExpand(id) => match self.room_tree.toggle_expand(&id) {
                 Some(ExpandNeed::Tree(room)) => self.ensure_room_tree(room),
                 Some(ExpandNeed::Leaves(node, selector)) => self.ensure_room_leaves(node, selector),
@@ -9224,6 +9523,272 @@ impl App {
                 *frame = false;
             }
         }
+    }
+
+    /// Spec 041：在真正发 `GenerateModels` 前，先向后端做一次只读预检（`GET /api/v1/node/model-status`），
+    /// 看目标所在库是否缺入库数据（`action == "would_enqueue"`）。本会话已选过「直接生成」的库跳过预检。
+    fn try_begin_data_ingest_preflight(
+        &mut self,
+        targets: Vec<RefU64>,
+        label: String,
+        reason: String,
+        force: bool,
+        auto: bool,
+    ) -> bool {
+        let Some(first) = targets.first().copied() else {
+            return false;
+        };
+        if let Some(dbnum) = self.tree.dbnum_of(first)
+            && self.direct_generate_dbnums.contains(&dbnum)
+        {
+            return false;
+        }
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+        let epoch = self.mutation_epoch;
+        let sent = self
+            .bridge
+            .req
+            .send(data::Req::NodeDataIngestPreflight {
+                epoch,
+                refno: first,
+                base: self.model_api_url.clone(),
+                project: self.vm.project.clone(),
+                mdb: self.mdb.clone(),
+                namespace: self.namespace.clone(),
+            })
+            .is_ok();
+        if !sent {
+            return false;
+        }
+        self.pending_data_ingest = Some(PendingDataIngest {
+            epoch,
+            targets,
+            label: label.clone(),
+            reason,
+            force,
+            auto,
+            dbnum: self.tree.dbnum_of(first),
+        });
+        self.vm.regen_busy = true;
+        self.mutation = Some(model_mutation::Vm::Running {
+            kind: model_mutation::Kind::Regenerate,
+            label,
+        });
+        true
+    }
+
+    fn settle_data_ingest_preflight(
+        &mut self,
+        epoch: u64,
+        result: anyhow::Result<Option<model_update_api::NodeDataIngestBlock>>,
+    ) {
+        if self.pending_data_ingest.as_ref().map(|p| p.epoch) != Some(epoch) {
+            return;
+        }
+        if let Ok(Some(block)) = &result
+            && block.enabled
+            && let Some(lib) = block
+                .libraries
+                .iter()
+                .find(|l| l.action == "would_enqueue" && !self.direct_generate_dbnums.contains(&l.dbnum))
+        {
+            if let Some(pending) = self.pending_data_ingest.as_mut() {
+                pending.dbnum = Some(lib.dbnum);
+                let label = pending.label.clone();
+                let is_manual_regen = !pending.auto;
+                self.vm.regen_busy = false;
+                self.mutation = Some(model_mutation::Vm::ConfirmDataIngest {
+                    label,
+                    dbnum: lib.dbnum,
+                    prerequisites: lib.prerequisites.clone(),
+                    message: lib.message.clone(),
+                    is_manual_regen,
+                });
+                return;
+            }
+        }
+        if let Ok(Some(block)) = &result
+            && block.enabled
+            && let Some(lib) = block.libraries.first()
+            && !lib.message.trim().is_empty()
+            && matches!(lib.action.as_str(), "already_in_flight" | "blocked")
+        {
+            self.logs.info(
+                &mut self.vm.logs,
+                format!("库 db{} 入库提示：{}", lib.dbnum, lib.message.trim()),
+            );
+        }
+        let Some(pending) = self.pending_data_ingest.take() else {
+            return;
+        };
+        self.vm.regen_busy = false;
+        self.mutation = None;
+        self.dispatch_generate_models(
+            pending.targets,
+            pending.label,
+            &pending.reason,
+            pending.force,
+            pending.auto,
+        );
+    }
+
+    fn settle_data_ingest_choice(&mut self, choice: model_mutation::DataIngestChoice) {
+        self.mutation = None;
+        let Some(pending) = self.pending_data_ingest.take() else {
+            return;
+        };
+        match choice {
+            model_mutation::DataIngestChoice::Cancel => {
+                self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+                self.mutation_run = None;
+                self.vm.regen_busy = false;
+                if pending.auto {
+                    for target in &pending.targets {
+                        self.auto_generate_attempted.remove(target);
+                        self.tree.pending_direction.remove(target);
+                        self.tree.pending_visibility.remove(target);
+                    }
+                }
+                self.logs.info(
+                    &mut self.vm.logs,
+                    format!("{}：已取消生成与入库", pending.label),
+                );
+            }
+            model_mutation::DataIngestChoice::GenerateOnly => {
+                if let Some(dbnum) = pending.dbnum {
+                    self.direct_generate_dbnums.insert(dbnum);
+                }
+                self.dispatch_generate_models(
+                    pending.targets,
+                    pending.label,
+                    &pending.reason,
+                    pending.force,
+                    pending.auto,
+                );
+            }
+            model_mutation::DataIngestChoice::IngestAndGenerate => {
+                if let Some(first) = pending.targets.first().copied() {
+                    let _ = self.bridge.req.send(data::Req::NodeDataIngestEnqueue {
+                        epoch: self.mutation_epoch,
+                        refno: first,
+                        base: self.model_api_url.clone(),
+                        project: self.vm.project.clone(),
+                        mdb: self.mdb.clone(),
+                        namespace: self.namespace.clone(),
+                    });
+                    if let Some(dbnum) = pending.dbnum {
+                        self.logs.info(
+                            &mut self.vm.logs,
+                            format!(
+                                "已请求将库 db{dbnum} 排入后台解析保存（含 PE 与属性），同时继续生成显示模型…"
+                            ),
+                        );
+                    }
+                }
+                self.dispatch_generate_models(
+                    pending.targets,
+                    pending.label,
+                    &pending.reason,
+                    pending.force,
+                    pending.auto,
+                );
+            }
+        }
+    }
+
+    fn settle_data_ingest_enqueue(
+        &mut self,
+        result: anyhow::Result<Option<model_update_api::NodeDataIngestBlock>>,
+    ) {
+        match result {
+            Ok(Some(block)) => {
+                if let Some(lib) = block.libraries.first() {
+                    let tail = if let Some(tid) = lib.task_id.as_deref().filter(|s| !s.is_empty()) {
+                        format!("（任务 {tid}）")
+                    } else {
+                        String::new()
+                    };
+                    let msg = if lib.message.trim().is_empty() {
+                        format!("库 db{} 入库状态：{}{tail}", lib.dbnum, lib.action)
+                    } else {
+                        format!("库 db{}：{}{} ", lib.dbnum, lib.message.trim(), tail)
+                    };
+                    self.logs.info(&mut self.vm.logs, msg.trim().to_string());
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.logs.warn(
+                    &mut self.vm.logs,
+                    format!("整库解析保存排入失败（模型显示照常继续）：{error:#}"),
+                );
+            }
+        }
+    }
+
+    fn dispatch_generate_models(
+        &mut self,
+        targets: Vec<RefU64>,
+        label: String,
+        reason: &str,
+        force: bool,
+        auto: bool,
+    ) -> Vec<RefU64> {
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+        let cancel = std::sync::Arc::<std::sync::atomic::AtomicBool>::default();
+        self.mutation_run = Some(MutationRun {
+            kind: model_mutation::Kind::Regenerate,
+            label: label.clone(),
+            targets: targets.clone(),
+            dbnum: None,
+            auto,
+            cancel: cancel.clone(),
+        });
+        let sent = self
+            .bridge
+            .req
+            .send(data::Req::GenerateModels {
+                epoch: self.mutation_epoch,
+                refnos: targets.clone(),
+                force,
+                cancel,
+                base: self.model_api_url.clone(),
+                project: self.vm.project.clone(),
+                mdb: self.mdb.clone(),
+                namespace: self.namespace.clone(),
+            })
+            .is_ok();
+        if !sent {
+            self.mutation_run = None;
+            self.logs.warn(
+                &mut self.vm.logs,
+                format!("{label}：数据线程已关闭，这一趟没有开始"),
+            );
+            return Vec::new();
+        }
+        if auto {
+            self.logs.info(
+                &mut self.vm.logs,
+                format!(
+                    "{label}：{reason}，默认重新生成（{} 个目标，服务端预算 120 秒，超时自动续跑补齐）…",
+                    targets.len()
+                ),
+            );
+        } else {
+            self.logs.info(
+                &mut self.vm.logs,
+                format!(
+                    "开始重新生成 {label} 的模型（{} 个目标，服务端自己解根、预算 120 秒）…",
+                    targets.len()
+                ),
+            );
+        }
+        self.vm.regen_busy = true;
+        self.mutation = Some(model_mutation::Vm::Running {
+            kind: model_mutation::Kind::Regenerate,
+            label,
+        });
+        targets
     }
 }
 
@@ -13146,6 +13711,19 @@ impl App {
             &self.vm,
             &mut self.data_publish_state,
         ));
+        // 新入口「三维数据提资」。它与旧入口共用预览与确认删除两扇子窗，所以旧入口开着时它让位；
+        // 反过来由 `apply_data_handover` 在打开它时收起旧入口。
+        if self.data_publish_state.open {
+            self.data_handover_state.open = false;
+        }
+        cmds.extend(plant_ui::data_handover::show(
+            ui.ctx(),
+            &t,
+            d,
+            &self.vm,
+            &self.queue,
+            &mut self.data_handover_state,
+        ));
         cmds.extend(manual_data_publish::show(
             ui.ctx(),
             &t,
@@ -13201,6 +13779,13 @@ impl App {
         ));
         self.refresh_mesh_dir_status();
         let saved = settings::show(ui.ctx(), &t, d, &mut self.settings_state);
+        cmds.extend(plant_ui::help::show(
+            ui.ctx(),
+            &t,
+            d,
+            &self.vm,
+            &mut self.help_state,
+        ));
         if self.settings_state.take_browse_request() {
             self.browse_mesh_dir();
         }
@@ -13217,16 +13802,39 @@ impl App {
         if let Some(saved) = saved {
             theme_tokens::apply(ui.ctx(), &saved.theme.tokens(), saved.density);
             let moved = self.model_api_url != saved.model_api_url;
+            let data_moved = self.data_api_url != saved.data_api_url;
             self.model_api_url = saved.model_api_url.clone();
             self.data_api_url = saved.data_api_url.clone();
             // 接入点面板报的必须是这一刻真正在用的地址，而不是启动时解出来那份。
             self.vm.access_point.model_api_url = self.model_api_url.clone();
             self.vm.access_point.data_api_url = self.data_api_url.clone();
+            if data_moved {
+                #[cfg(target_arch = "wasm32")]
+                let _ = self.bridge.req.send(data::Req::FetchCurrentUser {
+                    base: self.data_api_url.clone(),
+                });
+            }
             // 换了服务地址，那条长连接还挂在旧地址上——不重开的话队列明细会一直
             // 指着一台没人管的服务。
             if moved {
+                self.vm.versions.backend_version.clear();
+                self.vm.versions.backend_build_id.clear();
+                self.vm.versions.backend_e3d_model_build_id.clear();
+                self.vm.versions.backend_e3d_io_build_id.clear();
+                self.vm.versions.backend_e3d_attlib_build_id.clear();
+                self.vm.versions.backend_read_mode.clear();
+                self.vm.versions.backend_data_face.clear();
+                self.vm.versions.backend_started_at.clear();
+                self.vm.versions.backend_error = None;
                 self.reopen_queue_feed(ui.ctx());
                 self.poll_queue_now();
+            }
+            if data_moved {
+                self.vm.versions.data_service_version.clear();
+                self.vm.versions.data_service_error = None;
+            }
+            if moved || data_moved {
+                self.request_service_versions();
             }
             self.persist_settings(&saved);
             // 无名元素短名 / 全称只是同一份数据换个展平口径，重新展平就够，不重查。
@@ -13237,6 +13845,11 @@ impl App {
                     self.rebuild_tree();
                 }
             }
+            let next_tree_source = if self.settings_state.tree_source_lock.is_some() {
+                self.tree_source
+            } else {
+                saved.tree_source
+            };
             // 供数模式变了就热切（ADR-0026）：先落盘再换，换面失败也不丢这次改动——
             // 界面停在未连接态，下拉可再改回去。
             if let Some(kind) = read_face_switch(
@@ -13244,7 +13857,19 @@ impl App {
                 saved.read_face,
                 self.settings_state.read_face_lock.is_some(),
             ) {
+                self.tree_source = next_tree_source;
+                model_update_api::set_tree_source(
+                    if kind == settings::ReadFaceKind::Service {
+                        next_tree_source
+                    } else {
+                        settings::TreeSourceKind::Direct
+                    },
+                );
                 self.switch_read_face(kind);
+            } else if self.read_face == settings::ReadFaceKind::Service
+                && next_tree_source != self.tree_source
+            {
+                self.switch_tree_source(next_tree_source);
             }
             ui.ctx().request_repaint();
         }

@@ -119,6 +119,10 @@ pub struct TaskEntry {
     pub units_done: Option<u32>,
     #[serde(default)]
     pub total_units: Option<u32>,
+    /// 数据段的入库进度（gen-model Spec 041 FR-060）：只有整库解析保存那一路写。老服务端没有这一格，
+    /// 缺席就整格不画。
+    #[serde(default, deserialize_with = "lenient")]
+    pub data_progress: Option<DataProgress>,
     #[serde(default)]
     pub events_seen: u64,
     /// 房间轮的 `{panels, elements, dead_letters}`；数据批次没有这一格。
@@ -143,6 +147,17 @@ pub struct TaskEntry {
     /// `GET /tasks/{id}/changes`。老服务端 / 非数据批次没有这格，不画。
     #[serde(default)]
     pub changes_total: Option<u32>,
+}
+
+/// 数据段的入库进度：已确认写进库的元素数 / 冻结点那一刻要写的元素数（与 gen-model
+/// `task_registry::DataProgress` 同形）。`total` 缺席 = 分母还没有（索引没读完），界面只写已存多少、
+/// 不画进度条。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub struct DataProgress {
+    #[serde(default)]
+    pub done: u64,
+    #[serde(default)]
+    pub total: Option<u64>,
 }
 
 /// 一批的元素级变化清单（`GET /tasks/{id}/changes`，gen-model 2026-10-24 W3）。字段全宽容：服务端只给事实，
@@ -261,6 +276,16 @@ pub struct RoomCounts {
 /// `room_incremental` 撑「房间增量没开」，`queue_paused` 是暂停横幅的兜底来源。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Health {
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub build_id: String,
+    #[serde(default)]
+    pub e3d_model_build_id: String,
+    #[serde(default)]
+    pub e3d_io_build_id: String,
+    #[serde(default)]
+    pub e3d_attlib_build_id: String,
     #[serde(default)]
     pub project: String,
     #[serde(default)]

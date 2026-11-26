@@ -413,6 +413,55 @@ pub fn segmented<T: Copy + PartialEq>(
     changed
 }
 
+/// 单行文本输入：定高 `input_h()`、文字垂直居中、内边距与焦点描边统一由令牌控制。
+pub fn text_input(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    id: egui::Id,
+    value: &mut String,
+    hint: &str,
+    width: f32,
+) -> Response {
+    let (rect, frame_resp) = ui.allocate_exact_size(vec2(width, d.input_h()), Sense::click());
+    let frame_resp = frame_resp.on_hover_cursor(egui::CursorIcon::Text);
+    let focused = ui.memory(|m| m.has_focus(id));
+    let stroke = if focused {
+        t.accent
+    } else if frame_resp.hovered() {
+        t.border_strong
+    } else {
+        t.border
+    };
+    fill_rect(ui, rect, radius::MD, t.bg_input, Some(stroke));
+
+    let text_rect = rect.shrink2(vec2(d.px(10.0), 0.0));
+    let mut field = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(text_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    let resp = field.add(
+        egui::TextEdit::singleline(value)
+            .id(id)
+            .frame(egui::Frame::NONE)
+            .background_color(Color32::TRANSPARENT)
+            .margin(egui::Margin::ZERO)
+            .desired_width(text_rect.width())
+            .font(Font::label(d))
+            .text_color(t.text_primary)
+            .hint_text(
+                egui::RichText::new(hint)
+                    .font(Font::label(d))
+                    .color(t.text_muted),
+            ),
+    );
+    if frame_resp.clicked() && !resp.has_focus() {
+        resp.request_focus();
+    }
+    resp
+}
+
 // ---------------------------------------------------------------- 行
 
 /// 行首图标。模型树的类型图标是 PDMS 导出的图片纹理而不是字形，只支持字形的话

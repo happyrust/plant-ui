@@ -303,6 +303,24 @@ pub enum Req {
         mdb: String,
         namespace: String,
     },
+    /// Spec 041：显示 / 重新生成模型前的只读预检，查看目标节点所在库是否缺入库数据。
+    NodeDataIngestPreflight {
+        epoch: u64,
+        refno: RefU64,
+        base: String,
+        project: String,
+        mdb: String,
+        namespace: String,
+    },
+    /// Spec 041：用户确认「先解析保存」后，将节点所在库（含前置系统库）排入后台入库队列。
+    NodeDataIngestEnqueue {
+        epoch: u64,
+        refno: RefU64,
+        base: String,
+        project: String,
+        mdb: String,
+        namespace: String,
+    },
     /// 右键「清理模型」（2026-10-10 清理模型计划）：对选中的每个目标**各一发**
     /// `DELETE /model/subtree?refno&confirm`，服务端按子树删产物行、不重算。与生成同形：
     /// 顺序跑完整批，回执整批回（`Evt::ModelsCleaned`），宿主再把成功目标名下的模型卸掉。
@@ -416,6 +434,19 @@ pub enum Req {
         base: String,
         request: PublishRequest,
     },
+    PreviewDataPublish {
+        base: String,
+        request: PublishRequest,
+    },
+    /// 向数据中心（rs-server）查询当前已登录用户（`/get_user`）。
+    FetchCurrentUser {
+        base: String,
+    },
+    /// 并发查询模型后端 (`/api/v1/health`) 与数据服务 (`/api/metadata/meta`) 的版本号。
+    FetchServiceVersions {
+        model_base: String,
+        data_base: String,
+    },
     LookupDataPublishDeletions {
         base: String,
         request: PublishRequest,
@@ -424,6 +455,9 @@ pub enum Req {
         base: String,
         request: RoomCodePublishRequest,
     },
+    /// 新入口「三维数据提资」的请求（提资前检查、更新到最新、预览、查待删除、提交），见 `data_handover`。
+    /// 旧入口「三维数据接口」照旧走上面那几条。
+    DataHandover(crate::data_handover::Req),
     CommandQuery {
         epoch: u64,
         label: String,
@@ -608,6 +642,16 @@ pub enum Evt {
             anyhow::Result<crate::model_update_api::CleanupReply>,
         )>,
     },
+    /// Spec 041：节点所在库入库预检回执。
+    NodeDataIngestPreflight {
+        epoch: u64,
+        result: anyhow::Result<Option<crate::model_update_api::NodeDataIngestBlock>>,
+    },
+    /// Spec 041：节点确认「先解析保存」后的入队回执。
+    NodeDataIngestEnqueue {
+        epoch: u64,
+        result: anyhow::Result<Option<crate::model_update_api::NodeDataIngestBlock>>,
+    },
     /// 目标的祖先链，「自己 -> 上级 -> …」序。带上请求时的那个 refno：
     /// 连续定位只算最后一次，晚到的旧链要认得出来才好丢。
     Ancestors(RefU64, anyhow::Result<Vec<RefU64>>),
@@ -651,8 +695,16 @@ pub enum Evt {
         PublishRequest,
         anyhow::Result<crate::data_publish_api::SubmitResult>,
     ),
+    DataPublishPreview(anyhow::Result<plant_ui::data_publish::PublishPreviewData>),
     DataPublishDeletions(anyhow::Result<Vec<plant_ui::data_publish::DeletionCandidate>>),
     RoomCodePublish(anyhow::Result<crate::data_publish_api::SubmitResult>),
+    /// 新入口「三维数据提资」的回包，见 `data_handover`。
+    DataHandover(crate::data_handover::Evt),
+    CurrentUser(anyhow::Result<Option<crate::startup::AuthUser>>),
+    ServiceVersions {
+        backend_health: Result<plant_ui::task_queue::Health, String>,
+        data_service: Result<crate::data_publish_api::DataServiceMeta, String>,
+    },
     CommandQuery {
         epoch: u64,
         label: String,
@@ -1181,6 +1233,44 @@ async fn handle_read(
                 substring: outcome.substring,
             });
         }
+        Req::NodeDataIngestPreflight {
+            epoch,
+            refno,
+            base,
+            project,
+            mdb,
+            namespace,
+        } => {
+            let ref_str = refno.to_string();
+            let result = crate::model_update_api::node_model_status_data_ingest(
+                &base,
+                &ref_str,
+                &project,
+                &mdb,
+                &namespace,
+            )
+            .await;
+            let _ = evt_tx.send(Evt::NodeDataIngestPreflight { epoch, result });
+        }
+        Req::NodeDataIngestEnqueue {
+            epoch,
+            refno,
+            base,
+            project,
+            mdb,
+            namespace,
+        } => {
+            let ref_str = refno.to_string();
+            let result = crate::model_update_api::node_data_ingest(
+                &base,
+                &ref_str,
+                &project,
+                &mdb,
+                &namespace,
+            )
+            .await;
+            let _ = evt_tx.send(Evt::NodeDataIngestEnqueue { epoch, result });
+        }
         Req::GenerateModels {
             epoch,
             refnos,
@@ -1447,6 +1537,30 @@ async fn handle_read(
         Req::DataPublish { base, request } => {
             let result = crate::data_publish_api::submit(&base, &request).await;
             let _ = evt_tx.send(Evt::DataPublish(request, result));
+        }
+        Req::PreviewDataPublish { base, request } => {
+            let result = crate::data_publish_api::preview(&base, &request).await;
+            let _ = evt_tx.send(Evt::DataPublishPreview(result));
+        }
+        Req::DataHandover(req) => {
+            let _ = evt_tx.send(Evt::DataHandover(crate::data_handover::handle(req).await));
+        }
+        Req::FetchCurrentUser { base } => {
+            let result = crate::data_publish_api::fetch_current_user(&base).await;
+            let _ = evt_tx.send(Evt::CurrentUser(result));
+        }
+        Req::FetchServiceVersions {
+            model_base,
+            data_base,
+        } => {
+            let (backend_res, data_res) = futures::join!(
+                crate::model_update_api::service_health(&model_base),
+                crate::data_publish_api::fetch_meta(&data_base),
+            );
+            let _ = evt_tx.send(Evt::ServiceVersions {
+                backend_health: backend_res.map_err(|err| crate::logs::error_chain(&err)),
+                data_service: data_res.map_err(|err| crate::logs::error_chain(&err)),
+            });
         }
         Req::CommandQuery {
             epoch,

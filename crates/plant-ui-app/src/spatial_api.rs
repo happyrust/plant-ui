@@ -75,9 +75,11 @@ fn query_string(pairs: &[(&str, String)]) -> String {
     }
 }
 
-/// `GET /api/v1/spatial/rooms` 的路径。
+/// `GET /api/v1/spatial/rooms?member_counts=1` 的路径。
 pub fn rooms_path(identity: &Identity) -> String {
-    format!("/api/v1/spatial/rooms{}", query_string(&identity.query()))
+    let mut pairs = identity.query();
+    pairs.push(("member_counts", "1".to_owned()));
+    format!("/api/v1/spatial/rooms{}", query_string(&pairs))
 }
 
 /// `GET /api/v1/spatial/rooms/{a_b}/tree?tubes=1[&unit=a_b | &other_noun=NOUN]` 的路径。
@@ -159,7 +161,7 @@ mod tests {
     fn the_paths_carry_identity_and_always_ask_for_tubes() {
         assert_eq!(
             rooms_path(&identity()),
-            "/api/v1/spatial/rooms?project=AMS&mdb=%2FALL&namespace=ams"
+            "/api/v1/spatial/rooms?project=AMS&mdb=%2FALL&namespace=ams&member_counts=1"
         );
         let room = RefU64::from_two_nums(24384, 12);
         assert_eq!(

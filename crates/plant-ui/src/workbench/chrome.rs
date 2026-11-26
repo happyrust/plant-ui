@@ -47,6 +47,7 @@ pub fn title_bar(
                         .font(Font::strong(d))
                         .color(t.text_primary),
                 );
+                version_badge(ui, t, d, vm, cmds);
                 // 连接成功前没有工程标识，这一段整体不画（不摆空芯片）。
                 if !vm.project.is_empty() {
                     divider(ui, t, d);
@@ -77,12 +78,7 @@ pub fn title_bar(
                     }
                     notification_bell(ui, t, d);
                     divider(ui, t, d);
-                    ui.label(
-                        RichText::new(&vm.user)
-                            .font(Font::meta(d))
-                            .color(t.text_secondary),
-                    );
-                    avatar(ui, t, d, &vm.user);
+                    user_badge(ui, t, d, vm);
                     divider(ui, t, d);
                     super::search::search_box(ui, t, d, vm, search, cmds);
                 });
@@ -207,6 +203,20 @@ pub fn command_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: 
                         cmds.push(Cmd::OpenDataPublish);
                         ui.close();
                     }
+                    // 新入口，与上面那一项并排：同一组提资接口，多一道提资前检查（数据不是最新就先更新，
+                    // 追平了才让提交）。旧的那一项原样保留。
+                    if ui
+                        .add(command_menu_action(
+                            d,
+                            ph::SHIELD_CHECK,
+                            "三维数据提资",
+                            "先检查再提资",
+                        ))
+                        .clicked()
+                    {
+                        cmds.push(Cmd::DataHandover(crate::data_handover::Action::Open));
+                        ui.close();
+                    }
                     if ui
                         .add(command_menu_action(
                             d,
@@ -231,8 +241,51 @@ pub fn command_bar(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: 
                 if ui.add(command_menu_button(d, "设置", false)).clicked() {
                     cmds.push(Cmd::OpenSettings);
                 }
-                ui.add_enabled(false, command_menu_button(d, "帮助", false))
-                    .on_disabled_hover_text("帮助中心尚未接入当前工作台");
+                let help = ui.add(command_menu_button(d, "帮助", true));
+                let help_popup = egui::Popup::menu(&help);
+                open_menu_marker(ui, t, d, &help, help_popup.is_open());
+                help_popup.show(|ui| {
+                    ui.set_min_width(d.px(236.0));
+                    if ui
+                        .add(command_menu_action(
+                            d,
+                            ph::QUESTION,
+                            "使用指引与快捷键",
+                            "操作与视图",
+                        ))
+                        .clicked()
+                    {
+                        cmds.push(Cmd::OpenHelp);
+                        ui.close();
+                    }
+                    if ui
+                        .add(command_menu_action(
+                            d,
+                            ph::TERMINAL_WINDOW,
+                            "命令行参考",
+                            "运行 help",
+                        ))
+                        .clicked()
+                    {
+                        cmds.push(Cmd::FocusPane(super::Pane::CommandLine));
+                        cmds.push(Cmd::SubmitCommand("help".to_owned()));
+                        ui.close();
+                    }
+                    ui.separator();
+                    let ver_tag = crate::help::app_version_tag();
+                    if ui
+                        .add(command_menu_action(
+                            d,
+                            ph::INFO,
+                            "关于 布置平台",
+                            &ver_tag,
+                        ))
+                        .clicked()
+                    {
+                        cmds.push(Cmd::OpenAbout);
+                        ui.close();
+                    }
+                });
 
                 ui.add_space(space::S2);
                 divider(ui, t, d);
@@ -664,15 +717,299 @@ fn logo(ui: &mut Ui, t: &Tokens, d: Density) {
     ui.painter().galley(pos, g, t.accent_ink);
 }
 
-fn avatar(ui: &mut Ui, t: &Tokens, d: Density, name: &str) {
-    let s = d.px(22.0);
-    let (rect, _) = ui.allocate_exact_size(vec2(s, s), Sense::hover());
-    ui.painter()
-        .circle_filled(rect.center(), s / 2.0, t.accent_bg);
-    let ch: String = name.chars().take(1).collect();
-    let g = ui.painter().layout_no_wrap(ch, Font::micro(d), t.accent);
-    ui.painter()
-        .galley(rect.center() - g.size() / 2.0, g, t.accent);
+fn version_badge(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm, cmds: &mut Vec<Cmd>) {
+    let tag = crate::help::app_version_tag();
+    let galley = ui
+        .painter()
+        .layout_no_wrap(tag.clone(), Font::mono_micro(d), t.text_secondary);
+    let pad_x = d.px(6.0);
+    let pill_w = galley.size().x + pad_x * 2.0;
+    let pill_h = d.px(18.0);
+    let (rect, resp) = ui.allocate_exact_size(vec2(pill_w, pill_h), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let (bg, fg, border) = if resp.hovered() {
+            (t.bg_hover, t.accent, t.accent)
+        } else {
+            (t.bg_header, t.text_secondary, t.border)
+        };
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(radius::SM), bg);
+        ui.painter().rect_stroke(
+            rect,
+            CornerRadius::same(radius::SM),
+            Stroke::new(1.0, border),
+            StrokeKind::Inside,
+        );
+        let text_galley = ui
+            .painter()
+            .layout_no_wrap(tag, Font::mono_micro(d), fg);
+        ui.painter()
+            .galley(rect.center() - text_galley.size() * 0.5, text_galley, fg);
+    }
+    let tip = version_badge_tooltip(vm);
+    if resp.on_hover_text(tip).clicked() {
+        cmds.push(Cmd::OpenAbout);
+    }
+}
+
+fn version_badge_tooltip(vm: &WorkbenchVm) -> String {
+    let mut lines = vec![format!("前端 (plant-ui): {}", crate::help::app_version_tag())];
+    if !vm.versions.backend_version.trim().is_empty() {
+        lines.push(format!(
+            "模型后端 (aios-database): {}",
+            crate::vm::ServiceVersionsVm::display_version(&vm.versions.backend_version)
+        ));
+    }
+    if !vm.versions.data_service_version.trim().is_empty() {
+        lines.push(format!(
+            "数据服务 (rs-server): {}",
+            crate::vm::ServiceVersionsVm::display_version(&vm.versions.data_service_version)
+        ));
+    }
+    lines.push("点击查看版本与服务详情".to_owned());
+    lines.join("\n")
+}
+
+fn user_badge(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
+    let profile = &vm.user_profile;
+    let label_text = profile.badge_label(&vm.user);
+    let initial = profile.avatar_initial(&vm.user);
+    let text_color = if profile.authenticated {
+        t.text_primary
+    } else {
+        t.text_secondary
+    };
+    let label_galley = ui.painter().layout_no_wrap(
+        label_text,
+        Font::meta(d),
+        text_color,
+    );
+    let pad_x = d.px(6.0);
+    let avatar_size = d.px(22.0);
+    let gap = d.px(6.0);
+    let pill_w = pad_x + avatar_size + gap + label_galley.size().x + pad_x;
+    let pill_h = d.px(28.0);
+
+    let (rect, resp) = ui.allocate_exact_size(vec2(pill_w, pill_h), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        if resp.hovered() {
+            ui.painter()
+                .rect_filled(rect, CornerRadius::same(radius::MD), t.bg_hover);
+        }
+        let avatar_center = pos2(rect.left() + pad_x + avatar_size * 0.5, rect.center().y);
+        let (avatar_bg, avatar_fg) = if profile.authenticated {
+            (t.accent_bg, t.accent)
+        } else {
+            (t.bg_header, t.text_muted)
+        };
+        ui.painter()
+            .circle_filled(avatar_center, avatar_size * 0.5, avatar_bg);
+        let initial_galley = ui
+            .painter()
+            .layout_no_wrap(initial, Font::micro(d), avatar_fg);
+        ui.painter().galley(
+            avatar_center - initial_galley.size() * 0.5,
+            initial_galley,
+            avatar_fg,
+        );
+        let text_pos = pos2(
+            rect.left() + pad_x + avatar_size + gap,
+            rect.center().y - label_galley.size().y * 0.5,
+        );
+        ui.painter().galley(text_pos, label_galley, text_color);
+    }
+
+    resp.on_hover_ui(|ui| user_detail_popup(ui, t, d, vm));
+}
+
+fn compact_auth_source(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if let Some((head, _)) = trimmed.split_once(" (") {
+        head.trim()
+    } else if trimmed.is_empty() {
+        "未认证"
+    } else {
+        trimmed
+    }
+}
+
+fn compact_major_and_role(profile: &crate::vm::UserProfileVm) -> String {
+    let major = profile.user_major.trim();
+    let role = profile.role_label();
+    match (major.is_empty(), role == "—") {
+        (false, false) => format!("{major} · {role}"),
+        (false, true) => major.to_owned(),
+        (true, false) => role.to_owned(),
+        (true, true) => String::new(),
+    }
+}
+
+fn user_detail_popup(ui: &mut Ui, t: &Tokens, d: Density, vm: &WorkbenchVm) {
+    let profile = &vm.user_profile;
+    let chinese = profile.chinese_name.trim();
+    let account = if profile.user_name.trim().is_empty() {
+        vm.user.trim()
+    } else {
+        profile.user_name.trim()
+    };
+    let display = profile.badge_label(&vm.user);
+    let two_line_name = !chinese.is_empty() && !account.is_empty() && chinese != account;
+    let card_w = d.px(236.0);
+    let header_h = if two_line_name { d.px(34.0) } else { d.px(28.0) };
+
+    ui.set_width(card_w);
+    ui.set_max_width(card_w);
+    ui.spacing_mut().item_spacing.y = d.px(6.0);
+
+    // Popup has unbounded vertical space, so avoid `horizontal_centered` (which stretches to
+    // `available_height`); pin the header band to exact height instead.
+    ui.allocate_ui_with_layout(
+        vec2(card_w, header_h),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = space::S2;
+            let avatar_size = d.px(26.0);
+            let (avatar_rect, _) =
+                ui.allocate_exact_size(vec2(avatar_size, avatar_size), Sense::hover());
+            let (avatar_bg, avatar_fg, avatar_border) = if profile.authenticated {
+                (t.accent_bg, t.accent, t.accent)
+            } else {
+                (t.bg_header, t.text_muted, t.border)
+            };
+            ui.painter()
+                .circle_filled(avatar_rect.center(), avatar_size * 0.5, avatar_bg);
+            ui.painter().circle_stroke(
+                avatar_rect.center(),
+                avatar_size * 0.5,
+                Stroke::new(1.0, avatar_border),
+            );
+            let initial = profile.avatar_initial(&vm.user);
+            let initial_galley = ui
+                .painter()
+                .layout_no_wrap(initial, Font::label(d), avatar_fg);
+            ui.painter().galley(
+                avatar_rect.center() - initial_galley.size() * 0.5,
+                initial_galley,
+                avatar_fg,
+            );
+
+            if two_line_name {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = d.px(1.0);
+                    ui.label(
+                        RichText::new(chinese)
+                            .font(Font::strong(d))
+                            .color(t.text_primary),
+                    );
+                    ui.label(
+                        RichText::new(account)
+                            .font(Font::mono_micro(d))
+                            .color(t.text_muted),
+                    );
+                });
+            } else {
+                ui.label(
+                    RichText::new(&display)
+                        .font(Font::strong(d))
+                        .color(t.text_primary),
+                );
+            }
+
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let (status_text, status_kind) = if profile.authenticated {
+                    ("已登录", Status::Success)
+                } else {
+                    ("未登录", Status::Neutral)
+                };
+                ui.add(widgets::status_tag(t, d, status_text, status_kind));
+            });
+        },
+    );
+
+    let project_line = if vm.project.is_empty() {
+        String::new()
+    } else if vm.project_code.trim().is_empty() {
+        vm.project.clone()
+    } else {
+        format!("{} · {}", vm.project, vm.project_code.trim())
+    };
+
+    egui::Frame::new()
+        .fill(t.bg_header)
+        .stroke(Stroke::new(1.0, t.border))
+        .corner_radius(CornerRadius::same(radius::MD))
+        .inner_margin(Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = d.px(4.0);
+            if profile.authenticated {
+                user_detail_row(ui, t, d, "账号", account, true, true);
+                if !chinese.is_empty() {
+                    user_detail_row(ui, t, d, "姓名", chinese, false, false);
+                }
+                let major_role = compact_major_and_role(profile);
+                if !major_role.is_empty() {
+                    user_detail_row(ui, t, d, "专业", &major_role, false, false);
+                }
+                user_detail_row(
+                    ui,
+                    t,
+                    d,
+                    "来源",
+                    compact_auth_source(&profile.auth_source),
+                    false,
+                    false,
+                );
+                if !project_line.is_empty() {
+                    user_detail_row(ui, t, d, "项目", &project_line, true, false);
+                }
+            } else {
+                if !project_line.is_empty() {
+                    user_detail_row(ui, t, d, "项目", &project_line, true, false);
+                }
+                ui.label(
+                    RichText::new("通过 /forward?token=... 自动登录")
+                        .font(Font::micro(d))
+                        .color(t.text_muted),
+                );
+            }
+        });
+}
+
+fn user_detail_row(
+    ui: &mut Ui,
+    t: &Tokens,
+    d: Density,
+    label: &str,
+    value: &str,
+    mono: bool,
+    primary: bool,
+) {
+    let row_w = ui.available_width();
+    ui.allocate_ui_with_layout(
+        vec2(row_w, d.px(16.0)),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.label(
+                RichText::new(label)
+                    .font(Font::micro(d))
+                    .color(t.text_muted),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let trimmed = value.trim();
+                let text = if trimmed.is_empty() { "—" } else { trimmed };
+                let color = if trimmed.is_empty() {
+                    t.text_muted
+                } else if primary {
+                    t.text_primary
+                } else {
+                    t.text_secondary
+                };
+                let font = if mono { Font::mono_micro(d) } else { Font::micro(d) };
+                ui.label(RichText::new(text).font(font).color(color));
+            });
+        },
+    );
 }
 
 pub fn divider(ui: &mut Ui, t: &Tokens, d: Density) {
@@ -940,5 +1277,72 @@ mod tests {
             .is_empty(),
             "只有模型水位落后也值得画那一行"
         );
+    }
+
+    #[test]
+    fn user_profile_formats_badge_initial_and_role() {
+        let with_cn = crate::vm::UserProfileVm {
+            user_name: "KANGWP".into(),
+            chinese_name: "康文平".into(),
+            user_major: "GY".into(),
+            b_designer: true,
+            authenticated: true,
+            auth_source: "普华跳转 (/forward)".into(),
+        };
+        assert_eq!(with_cn.badge_label("user"), "康文平 (KANGWP)");
+        assert_eq!(with_cn.avatar_initial("user"), "康");
+        assert_eq!(with_cn.role_label(), "设计人员");
+
+        let account_only = crate::vm::UserProfileVm {
+            user_name: "kangwp".into(),
+            chinese_name: String::new(),
+            user_major: "test".into(),
+            b_designer: false,
+            authenticated: true,
+            auth_source: "普华跳转 (/forward)".into(),
+        };
+        assert_eq!(account_only.badge_label("user"), "kangwp");
+        assert_eq!(account_only.avatar_initial("user"), "K");
+        assert_eq!(account_only.role_label(), "普通用户");
+
+        let guest = crate::vm::UserProfileVm::default();
+        assert_eq!(guest.badge_label("user"), "user");
+        assert_eq!(guest.avatar_initial("user"), "U");
+        assert_eq!(guest.role_label(), "—");
+
+        assert_eq!(super::compact_auth_source("普华跳转 (/forward)"), "普华跳转");
+        assert_eq!(
+            super::compact_auth_source("未认证（匿名访问）"),
+            "未认证（匿名访问）"
+        );
+        assert_eq!(super::compact_auth_source("  "), "未认证");
+        assert_eq!(super::compact_major_and_role(&with_cn), "GY · 设计人员");
+        assert_eq!(super::compact_major_and_role(&account_only), "test · 普通用户");
+        assert_eq!(super::compact_major_and_role(&guest), "");
+    }
+
+    #[test]
+    fn title_bar_renders_frontend_version_and_tooltip_lists_backend_versions() {
+        let mut vm = crate::vm::WorkbenchVm::default();
+        vm.versions.backend_version = "0.1.55".into();
+        vm.versions.data_service_version = "0.2".into();
+
+        let tip = super::version_badge_tooltip(&vm);
+        assert!(tip.contains(&crate::help::app_version_tag()), "{tip}");
+        assert!(tip.contains("v0.1.55"), "{tip}");
+        assert!(tip.contains("v0.2"), "{tip}");
+
+        let t = crate::style::tokens::Tokens::light();
+        let d = crate::style::tokens::Density::Standard;
+        let vis = crate::workbench::DockVisibility::default();
+        let mut search = crate::workbench::search::State::default();
+        let rendered = crate::workbench::painted_text(|ui| {
+            let mut cmds = Vec::new();
+            super::title_bar(ui, &t, d, &vm, vis, &mut search, &mut cmds);
+            super::command_bar(ui, &t, d, &vm, &mut cmds);
+        });
+        assert!(rendered.contains("布置平台"), "{rendered}");
+        assert!(rendered.contains(&crate::help::app_version_tag()), "{rendered}");
+        assert!(rendered.contains("帮助"), "{rendered}");
     }
 }

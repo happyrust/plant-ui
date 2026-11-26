@@ -24,7 +24,7 @@
 |---|---|---|---|
 | 模型增量更新（两步向导） | [model-update.md](./model-update.md) | 已实现（向导两步化、死信拆分等 2026-08-05 画板先行） | `model_update.rs` |
 | 任务队列视图 | [task-queue.md](./task-queue.md) | 已实现 | `task_queue.rs` |
-| 三维数据提资 | [data-publish.md](./data-publish.md) | 已实现 | `data_publish.rs` + `plant-ui-app/data_publish_api.rs` |
+| 三维数据提资（两个入口：旧「三维数据接口」；新「三维数据提资」带提资前检查） | [data-publish.md](./data-publish.md) | 已实现（新入口到按库放行这一档，画板 S15 族，ADR-0036） | `data_publish.rs`、`data_handover.rs`、`data_publish_check.rs` + `plant-ui-app/data_publish_api.rs`、`data_handover.rs` |
 | 项目选择 | [project-picker.md](./project-picker.md) | 已实现（画板 S5 未画，代码先行） | `project_picker.rs` |
 | 设置 | [settings.md](./settings.md) | 已实现（画板 S6 未画，代码先行） | `settings.rs` |
 

@@ -13,7 +13,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use plant_ui::settings::{ReadFaceKind, Settings};
+use plant_ui::settings::{ReadFaceKind, Settings, TreeSourceKind};
 
 const DIR_NAME: &str = "config";
 const FILE_NAME: &str = "settings.ron";
@@ -24,6 +24,9 @@ const SETTINGS_FILE_ENV: &str = "PLANT_UI_SETTINGS_FILE";
 /// 只管树的 `PLANT_TREE_DATA_MODE`——两个开关管一件事就是两处会漂的口径。
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub const READ_FACE_ENV: &str = "PLANT_READ_FACE";
+/// 开发期压过服务供数模式下模型树数据源的环境变量。认 `direct` / `e3d` 与 `db` / `database`。
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub const TREE_SOURCE_ENV: &str = "PLANT_TREE_SOURCE";
 
 fn resolve_path(override_path: Option<OsString>, fallback: PathBuf) -> Result<PathBuf> {
     let Some(raw) = override_path.filter(|value| !value.to_string_lossy().trim().is_empty()) else {
@@ -178,6 +181,59 @@ pub fn check_mesh_dir(dir: &str) -> plant_ui::settings::MeshDirStatus {
     }
 }
 
+/// 这次启动实际生效的模型树数据源（仅服务供数下生效），以及是否被环境变量压过。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedTreeSource {
+    pub kind: TreeSourceKind,
+    pub overridden: bool,
+    pub warning: Option<String>,
+}
+
+impl ResolvedTreeSource {
+    pub fn lock_notice(&self) -> Option<String> {
+        self.overridden.then(|| {
+            format!(
+                "由 {TREE_SOURCE_ENV}={} 压过，改这一格这次不会生效；撤掉环境变量再启动才按设置走",
+                self.kind.key()
+            )
+        })
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub fn resolve_tree_source(
+    configured: TreeSourceKind,
+    env: Option<OsString>,
+) -> ResolvedTreeSource {
+    let Some(raw) = env.filter(|value| !value.to_string_lossy().trim().is_empty()) else {
+        return ResolvedTreeSource {
+            kind: configured,
+            ..Default::default()
+        };
+    };
+    let raw = raw.to_string_lossy();
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "direct" | "e3d" => ResolvedTreeSource {
+            kind: TreeSourceKind::Direct,
+            overridden: true,
+            warning: None,
+        },
+        "db" | "database" | "surreal" => ResolvedTreeSource {
+            kind: TreeSourceKind::Db,
+            overridden: true,
+            warning: None,
+        },
+        other => ResolvedTreeSource {
+            kind: configured,
+            overridden: false,
+            warning: Some(format!(
+                "{TREE_SOURCE_ENV}={other:?} 认不出来（只认 direct / db），这次按设置里的「{}」",
+                configured.label()
+            )),
+        },
+    }
+}
+
 /// 启动时解析一次的设置与网格目录。
 ///
 /// 宿主在起 Bevy 之前算好放这儿，`App::new` 从这里取——两处各解一遍优先级迟早会
@@ -190,6 +246,8 @@ pub struct Startup {
     /// 这次启动实际生效的供数模式（设置项被 `PLANT_READ_FACE` 压过时与 `settings.read_face`
     /// 不同）。数据线程按它造读面，设置窗按它决定那一格能不能改。
     pub read_face: ResolvedReadFace,
+    /// 这次启动实际生效的模型树数据源（仅服务供数下生效；被 `PLANT_TREE_SOURCE` 压过时锁定）。
+    pub tree_source: ResolvedTreeSource,
     /// 读设置时出的岔子，进日志面板。
     pub warnings: Vec<String>,
 }
@@ -255,6 +313,7 @@ mod tests {
             model_api_url: "http://10.0.0.9:8021".into(),
             data_api_url: "http://10.0.0.9:9099".into(),
             read_face: ReadFaceKind::Store,
+            tree_source: TreeSourceKind::Db,
             mesh_dir: "D:/models/meshes".into(),
             tree_full_names: true,
             room_view_truncate_tubes: false,
@@ -272,6 +331,7 @@ mod tests {
             ron::ser::to_string_pretty(&settings, ron::ser::PrettyConfig::default()).unwrap();
         // 落盘字面是计划 D11 写的那两个小写单词，手改文件的人照着写就行。
         assert!(text.contains("read_face: store"), "{text}");
+        assert!(text.contains("tree_source: db"), "{text}");
         assert!(text.contains("preset: sgl_machine"), "{text}");
         assert!(text.contains("colour_scheme: by_type"), "{text}");
         assert!(text.contains("aa: fxaa"), "{text}");
@@ -351,6 +411,7 @@ mod tests {
         )"#;
         let settings = ron::from_str::<Settings>(text).unwrap();
         assert_eq!(settings.read_face, ReadFaceKind::Service);
+        assert_eq!(settings.tree_source, TreeSourceKind::Direct);
         assert_eq!(settings.mesh_dir, "D:/models/meshes");
         // 「截断直段」是后加的一格：老文件没有它就按出厂值开着。
         assert!(settings.room_view_truncate_tubes);
@@ -400,5 +461,36 @@ mod tests {
             status,
             plant_ui::settings::MeshDirStatus::Unreachable(_)
         ));
+    }
+
+    #[test]
+    fn resolve_tree_source_prefers_environment_then_setting() {
+        assert_eq!(
+            resolve_tree_source(TreeSourceKind::Direct, Some(" db ".into())),
+            ResolvedTreeSource {
+                kind: TreeSourceKind::Db,
+                overridden: true,
+                warning: None,
+            }
+        );
+        assert_eq!(
+            resolve_tree_source(TreeSourceKind::Db, Some("E3D".into())),
+            ResolvedTreeSource {
+                kind: TreeSourceKind::Direct,
+                overridden: true,
+                warning: None,
+            }
+        );
+        assert_eq!(
+            resolve_tree_source(TreeSourceKind::Db, None),
+            ResolvedTreeSource {
+                kind: TreeSourceKind::Db,
+                ..Default::default()
+            }
+        );
+        let invalid = resolve_tree_source(TreeSourceKind::Db, Some("parquet".into()));
+        assert_eq!(invalid.kind, TreeSourceKind::Db);
+        assert!(!invalid.overridden);
+        assert!(invalid.warning.is_some());
     }
 }

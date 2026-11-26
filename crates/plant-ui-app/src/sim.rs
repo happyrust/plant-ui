@@ -38,8 +38,8 @@ use plant_ui::model_update::{
     UnitStatus, ZonePreview,
 };
 use plant_ui::task_queue::{
-    CatalogueReconcile, DbnumStatus, Health, KIND_DATA_BATCH, KIND_ROOM_RECALC, ModelSource, Poll,
-    QueueRow, QueueSnapshot, RoomCounts, TaskEntry, TaskStep,
+    CatalogueReconcile, DataProgress, DbnumStatus, Health, KIND_DATA_BATCH, KIND_ROOM_RECALC,
+    ModelSource, Poll, QueueRow, QueueSnapshot, RoomCounts, TaskEntry, TaskStep,
 };
 use plant_ui_data::{Attr, AttrKind, EleTreeNode, RefU64};
 
@@ -950,6 +950,7 @@ impl Engine {
                 }),
                 // 剧本里的服务端不声明能力块：和没有这一块的老服务端同一档（取记录不打包）。
                 capabilities: Default::default(),
+                ..Default::default()
             }),
             pending: self.pending.clone(),
             pending_known: true,
@@ -1114,6 +1115,7 @@ impl Engine {
             end_sesno_time: self.e3d_stamp(batch.end_at_ago_h),
             units_done: generating.then_some(batch.units_done),
             total_units: generating.then_some(batch.units.len() as u32),
+            data_progress: self.data_progress(batch),
             events_seen: batch.events_seen,
             detail: None,
             result,
@@ -1146,6 +1148,7 @@ impl Engine {
             end_sesno_time: None,
             units_done: Some(room.done),
             total_units: Some(room.total),
+            data_progress: None,
             events_seen: 0,
             detail: Some(room.counts()),
             result: None,
@@ -1154,6 +1157,92 @@ impl Engine {
             supersedes: Vec::new(),
             changes_total: None,
         }
+    }
+
+    // ------------------------------------------------ 提资前检查（新入口「三维数据提资」）
+
+    /// 首次导入那一批在「应用中」阶段的解析保存进度（gen-model Spec 041 FR-060 的剧本版）：分母取一个
+    /// 定数，分子按这一阶段走过的时间比例算。增量批次没有这一格。
+    fn data_progress(&self, batch: &SimBatch) -> Option<DataProgress> {
+        const TOTAL: u64 = 250_000;
+        let Stage::Applying { until } = batch.stage else {
+            return None;
+        };
+        let first_import = self
+            .dbs
+            .iter()
+            .any(|db| db.dbnum == batch.dbnum && db.initialization_required);
+        if !first_import {
+            return None;
+        }
+        let left = (until - Utc::now()).num_milliseconds().clamp(0, APPLY_MS);
+        Some(DataProgress {
+            done: TOTAL * (APPLY_MS - left) as u64 / APPLY_MS as u64,
+            total: Some(TOTAL),
+        })
+    }
+
+    /// `GET /api/v1/node/model-status` 的剧本版，只答提资前检查用得上的那几格：节点挂在哪个库上（见
+    /// [`sim_check_dbnum`]）、库的两枚水位、此刻有没有它的批次在跑。读透形态不入库，整次检查不适用。
+    pub fn publish_check(&self, refnos: &[RefU64]) -> plant_ui::data_publish_check::Outcome {
+        use plant_ui::data_publish_check::{
+            ElementCheck, ElementFact, NodeIngestBlock, NodeIngestLib, NodeLibrary,
+            NodeModelStatus, settle,
+        };
+        let elements = refnos
+            .iter()
+            .map(|refno| {
+                let db = sim_check_dbnum(*refno)
+                    .and_then(|dbnum| self.dbs.iter().find(|db| db.dbnum == dbnum));
+                let fact = match db {
+                    None => ElementFact::Gone,
+                    Some(db) => {
+                        let running = self
+                            .batches
+                            .iter()
+                            .any(|batch| batch.dbnum == db.dbnum && batch.running());
+                        let initialized = db.applied > 0;
+                        let verdict = if running {
+                            "updating"
+                        } else if initialized {
+                            "latest"
+                        } else {
+                            "not_generated"
+                        };
+                        ElementFact::Checked(Box::new(NodeModelStatus {
+                            dbnum: db.dbnum,
+                            verdict: verdict.to_owned(),
+                            library: NodeLibrary {
+                                file_latest_sesno: db.latest.into(),
+                                file_latest_time: self.e3d_stamp(db.latest_at_ago_h),
+                                applied_sesno: db.applied.into(),
+                                initialized,
+                                model_verdict: Some(
+                                    if initialized { "in_sync" } else { "not_judged" }.to_owned(),
+                                ),
+                                data_batch_running: running,
+                                ..Default::default()
+                            },
+                            data_ingest: self.service.read_through().then(|| NodeIngestBlock {
+                                enabled: true,
+                                libraries: vec![NodeIngestLib {
+                                    dbnum: db.dbnum,
+                                    verdict: "not_applicable".into(),
+                                    action: "none".into(),
+                                    ..Default::default()
+                                }],
+                            }),
+                            ..Default::default()
+                        }))
+                    }
+                };
+                ElementCheck {
+                    refno: *refno,
+                    fact,
+                }
+            })
+            .collect();
+        settle(elements, crate::data_handover::clock())
     }
 
     pub fn set_paused(&mut self, paused: bool) {
@@ -2042,11 +2131,49 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
             }),
         ),
         Req::LookupDataPublishDeletions { .. } => Evt::DataPublishDeletions(Ok(Vec::new())),
+        Req::PreviewDataPublish { .. } => {
+            Evt::DataPublishPreview(Ok(plant_ui::data_publish::PublishPreviewData::default()))
+        }
         Req::RoomCodePublish { .. } => {
             Evt::RoomCodePublish(Ok(crate::data_publish_api::SubmitResult {
                 message: "模拟模式：已受理（未真正提交）".into(),
                 login_url: None,
             }))
+        }
+        // 新入口「三维数据提资」：检查照剧本答，更新走同一个 execute（先落后的库、再需初始化的库），
+        // 预览 / 查待删除 / 提交与旧入口一样是空结果与「未真正提交」。
+        Req::DataHandover(req) => {
+            use crate::data_handover::{Evt as Handover, Req as Ask};
+            Evt::DataHandover(match req {
+                Ask::Check { epoch, refnos, .. } => Handover::Check {
+                    epoch,
+                    outcome: engine.publish_check(&refnos),
+                },
+                Ask::Update {
+                    lagging,
+                    needs_init,
+                    ..
+                } => {
+                    let first = (!lagging.is_empty()).then(|| Ok(engine.execute(Some(&lagging))));
+                    let second =
+                        (!needs_init.is_empty()).then(|| Ok(engine.execute(Some(&needs_init))));
+                    Handover::Update {
+                        lagging: first.map(|result| Box::new((lagging, result))),
+                        needs_init: second.map(|result| Box::new((needs_init, result))),
+                    }
+                }
+                Ask::Preview { .. } => {
+                    Handover::Preview(Ok(plant_ui::data_publish::PublishPreviewData::default()))
+                }
+                Ask::LookupDeletions { .. } => Handover::Deletions(Ok(Vec::new())),
+                Ask::Publish { request, .. } => Handover::Published(
+                    request,
+                    Ok(crate::data_publish_api::SubmitResult {
+                        message: "模拟模式：已受理（未真正提交）".into(),
+                        login_url: None,
+                    }),
+                ),
+            })
         }
         Req::CommandQuery {
             epoch,
@@ -2084,11 +2211,51 @@ pub fn handle(engine: &mut Engine, req: crate::data::Req, evt_tx: &std::sync::mp
                 result,
             }
         }
+        Req::NodeDataIngestPreflight { epoch, .. } => Evt::NodeDataIngestPreflight {
+            epoch,
+            result: Ok(None),
+        },
+        Req::NodeDataIngestEnqueue { epoch, .. } => Evt::NodeDataIngestEnqueue {
+            epoch,
+            result: Ok(None),
+        },
+        Req::FetchCurrentUser { .. } => Evt::CurrentUser(Ok(None)),
+        Req::FetchServiceVersions { .. } => Evt::ServiceVersions {
+            backend_health: Ok(Health {
+                version: "0.1.55".into(),
+                build_id: "0.1.55+sim".into(),
+                ..Default::default()
+            }),
+            data_service: Ok(crate::data_publish_api::DataServiceMeta {
+                version: "0.2".into(),
+            }),
+        },
         Req::Models { .. } | Req::ModelScopes { .. } => {
             unreachable!("模型请求已在桥上路由到专用通道")
         }
     };
     let _ = evt_tx.send(evt);
+}
+
+/// 提资前检查的剧本：树上的节点各挂在一个剧本库上，凑齐「落后 / 已是最新 / 需初始化 / 已阻断」四种行：
+/// `/SIM-SITE-A` 与 Z1 一支（含那根 BRAN）在 db7001，`/SIM-Z2` 在 db7002（都落后），`/SIM-PANEL-7` 在
+/// db7003（已是最新），`/SIM-EQ-305` 在 db7006（需初始化），`/SIM-SITE-B` 在 db7004（文件回退）。不在表里的
+/// 节点按「文件里已经没有这个元素」答。
+fn sim_check_dbnum(refno: RefU64) -> Option<u32> {
+    [
+        (9001u64, 7001u32),
+        (9101, 7001),
+        (9201, 7001),
+        (9301, 7001),
+        (9202, 7001),
+        (9102, 7002),
+        (9203, 7003),
+        (9204, 7006),
+        (9002, 7004),
+    ]
+    .into_iter()
+    .find(|(node, _)| RefU64::from(*node) == refno)
+    .map(|(_, dbnum)| dbnum)
 }
 
 /// 剧本里的在册房间：两间有树、一间空房壳（`panel_count == 0`，树恒答不出）。清单故意乱序，
@@ -2102,6 +2269,7 @@ fn spatial_rooms_fixture() -> plant_ui::room_tree::RoomsResponse {
         dbnum: Some(9001),
         panel_count: panels,
         panel_refnos: (0..panels).map(|i| format!("9001_{}", 700 + i)).collect(),
+        member_count: None,
     };
     RoomsResponse {
         status: "ready".into(),

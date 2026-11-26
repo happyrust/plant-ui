@@ -47,6 +47,9 @@ pub struct RoomListItem {
     /// 在册边界面板的 `a_b` 列表；旧服务端可能未下发。
     #[serde(default)]
     pub panel_refnos: Vec<String>,
+    /// 归属构件数（`member_counts=1` 下发；未知或老服务端为 `None`）。
+    #[serde(default)]
+    pub member_count: Option<u64>,
 }
 
 /// `GET /api/v1/spatial/rooms`：在册房间清单 + 房间体制此刻的状态。
@@ -486,11 +489,13 @@ fn shared_tag(shared: u32) -> RoomTreeTagVm {
 }
 
 /// 在册房间清单里的一间 → 页签根节点（树未取回：`count` None、没有子层、`leaves_inline` false
-/// 表示还要取）。`panel_count == 0` 的在册房在源模型里就没有边界面板（空房壳）：成员恒空、
-/// `rooms/{refno}/tree` 恒答不出，直接标成叶子（`count: 0`），不给展开钮、不发请求。
+/// 表示还要取）。`panel_count == 0` 或 `member_count == Some(0)` 的在册房没有构件：
+/// 直接标成叶子（`count: 0`），不给展开钮、不发请求。
 pub fn room_root_node(room: &RoomListItem) -> Option<RoomTreeNode> {
     let refno = parse_refno(&room.refno)?;
-    let empty = room.panel_count == 0;
+    let no_panels = room.panel_count == 0;
+    let no_members = room.member_count == Some(0);
+    let empty = no_panels || no_members;
     let name = name_or_none(room.name.as_ref());
     let mut node = RoomTreeNode::bare(
         RoomNodeId::Room(refno),
@@ -500,8 +505,10 @@ pub fn room_root_node(room: &RoomListItem) -> Option<RoomTreeNode> {
     node.refno = Some(refno);
     node.count = empty.then_some(0);
     node.leaves_inline = empty;
-    node.meta = if empty {
+    node.meta = if no_panels {
         "空房".to_owned()
+    } else if no_members {
+        "0 个构件".to_owned()
     } else {
         String::new()
     };
@@ -510,8 +517,12 @@ pub fn room_root_node(room: &RoomListItem) -> Option<RoomTreeNode> {
         name,
         Some(room.refno.clone()),
         room.dbnum.map(|dbnum| format!("库 {dbnum}")),
-        Some(if empty {
+        Some(if no_panels {
             "空房间（无边界面板）".to_owned()
+        } else if no_members {
+            format!("{} 块面板 · 0 个构件", room.panel_count)
+        } else if let Some(count) = room.member_count {
+            format!("{} 块面板 · {} 个构件", room.panel_count, count)
         } else {
             format!("{} 块面板", room.panel_count)
         }),
@@ -982,6 +993,8 @@ pub enum RoomTreeAction {
     Refresh,
     /// 顶部搜索框：按房间号 / 名称 / refno 过滤根清单。
     SetFilter(String),
+    /// 顶部过滤选项：隐藏空房间（无边界面板或 0 构件）。
+    SetHideEmpty(bool),
     /// 点箭头 / 双击行：房间根第一次展开去取它的树，叶子未内联的单元 / noun 组展开时补叶子。
     ToggleExpand(RoomNodeId),
     /// 点行：树内选中，并把能落到 refno 上的那部分写进全局选择集（直段行 = 所属 BRAN）。
@@ -1062,17 +1075,20 @@ pub struct RoomTreeModel {
     pub loading: HashSet<RoomNodeId>,
     errors: Vec<(RoomNodeId, String)>,
     pub filter: String,
+    pub hide_empty: bool,
     /// 树内选中的行（点选顺序）；最后一次单点 / Ctrl 点的那一行是锚（Shift 区间的另一端）。
     selected: Vec<RoomNodeId>,
     anchor: Option<RoomNodeId>,
 }
 
 impl RoomTreeModel {
-    /// 全部清掉（刷新 / 换项目 / 重连）。过滤词留着：那是用户敲的，不是数据。
+    /// 全部清掉（刷新 / 换项目 / 重连）。过滤词与过滤开关留着：那是用户设的，不是数据。
     pub fn clear(&mut self) {
         let filter = std::mem::take(&mut self.filter);
+        let hide_empty = self.hide_empty;
         *self = Self {
             filter,
+            hide_empty,
             ..Self::default()
         };
     }
@@ -1146,9 +1162,10 @@ impl RoomTreeModel {
         self.fetched.contains(&room)
     }
 
-    /// `panel_count == 0` 的在册房：源模型里没有边界面板，树恒答不出，不发请求。
+    /// `panel_count == 0` 或 `member_count == Some(0)` 的在册房：没有构件，树恒空，不发请求。
     pub fn is_empty_room(&self, room: RefU64) -> bool {
-        self.root(room).is_some_and(|item| item.panel_count == 0)
+        self.root(room)
+            .is_some_and(|item| item.panel_count == 0 || item.member_count == Some(0))
     }
 
     /// 这间房的树还要去取（没取过、不是空房、也不在途）。
@@ -1344,12 +1361,15 @@ impl RoomTreeModel {
         out
     }
 
-    /// 过滤后的根清单（按房间号 / 名字 / refno 的子串，不分大小写；refno 认 `a_b` 与 `a/b`）。
+    /// 过滤后的根清单（按空房过滤 + 房间号 / 名字 / refno 的子串，不分大小写；refno 认 `a_b` 与 `a/b`）。
     pub fn filtered_roots(&self) -> Vec<&RoomListItem> {
         let q = self.filter.trim().to_lowercase();
         self.roots
             .iter()
             .filter(|room| {
+                if self.hide_empty && (room.panel_count == 0 || room.member_count == Some(0)) {
+                    return false;
+                }
                 q.is_empty()
                     || room.room_num.to_lowercase().contains(&q)
                     || room
@@ -1726,6 +1746,7 @@ mod tests {
             dbnum: Some(1),
             panel_count: panels,
             panel_refnos: Vec::new(),
+            member_count: None,
         }
     }
 
@@ -2070,6 +2091,40 @@ mod tests {
             model.toggle_expand(&RoomNodeId::Room(r(1, 100))),
             Some(ExpandNeed::Tree(r(1, 100)))
         );
+    }
+
+    #[test]
+    fn zero_member_room_has_no_expand_arrow_and_hide_empty_filters_both() {
+        let mut no_panel = room_item("1_300", "R300", Some("无面板"), 0);
+        no_panel.member_count = Some(0);
+        let mut zero_member = room_item("1_301", "R301", Some("有面板无构件"), 2);
+        zero_member.member_count = Some(0);
+        let mut with_members = room_item("1_100", "R101", Some("有构件"), 2);
+        with_members.member_count = Some(5);
+        let unknown_members = room_item("1_200", "R202", Some("未知构件数"), 1);
+
+        let mut model = RoomTreeModel::default();
+        model.set_roots(RoomsResponse {
+            status: STATUS_READY.into(),
+            reason: None,
+            definition_version: None,
+            rooms: vec![no_panel, zero_member, with_members, unknown_members],
+        });
+
+        let zero_node = model.node(&RoomNodeId::Room(r(1, 301))).unwrap();
+        assert_eq!(zero_node.meta, "0 个构件");
+        assert!(!zero_node.has_children());
+        assert!(!model.needs_tree(r(1, 301)));
+        assert_eq!(model.toggle_expand(&RoomNodeId::Room(r(1, 301))), None);
+
+        assert_eq!(model.filtered_roots().len(), 4);
+        model.hide_empty = true;
+        let kept: Vec<_> = model
+            .filtered_roots()
+            .into_iter()
+            .map(|r| r.room_num.as_str())
+            .collect();
+        assert_eq!(kept, ["R101", "R202"]);
     }
 
     #[test]

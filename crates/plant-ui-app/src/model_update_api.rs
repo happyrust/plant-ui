@@ -378,6 +378,35 @@ pub(crate) struct ResolvedTreeReply {
     view: Option<String>,
 }
 
+static TREE_SOURCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// 设置模型树与搜索请求使用的数据源（仅服务供数下生效：`Direct` / `Db`）。
+pub fn set_tree_source(kind: plant_ui::settings::TreeSourceKind) {
+    let raw = match kind {
+        plant_ui::settings::TreeSourceKind::Direct => 0,
+        plant_ui::settings::TreeSourceKind::Db => 1,
+    };
+    TREE_SOURCE.store(raw, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 当前生效的模型树数据源。
+pub fn tree_source() -> plant_ui::settings::TreeSourceKind {
+    match TREE_SOURCE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => plant_ui::settings::TreeSourceKind::Db,
+        _ => plant_ui::settings::TreeSourceKind::Direct,
+    }
+}
+
+fn append_tree_source(path: &str, source: plant_ui::settings::TreeSourceKind) -> String {
+    match source {
+        plant_ui::settings::TreeSourceKind::Direct => path.to_owned(),
+        plant_ui::settings::TreeSourceKind::Db => {
+            let sep = if path.contains('?') { '&' } else { '?' };
+            format!("{path}{sep}source=db")
+        }
+    }
+}
+
 /// 树上的一层子节点。`links` 与 `nodes` 一一对应：分组成员行带 [`TreeGroupLink`]，
 /// 主链上的行为 `None`。
 #[derive(Debug)]
@@ -423,10 +452,14 @@ struct TreeRootDb {
     dbnum: Option<u32>,
 }
 
-fn require_direct(source: &str) -> anyhow::Result<()> {
+fn validate_tree_source(
+    actual: &str,
+    expected: plant_ui::settings::TreeSourceKind,
+) -> anyhow::Result<()> {
+    let expected_key = expected.key();
     anyhow::ensure!(
-        source == "direct",
-        "模型树接口返回了非 direct 数据源: {source}"
+        actual == expected_key,
+        "模型树接口返回了非 {expected_key} 数据源: {actual}"
     );
     Ok(())
 }
@@ -460,8 +493,10 @@ fn fill_legacy_default_names(nodes: &mut [aios_core::pdms_types::EleTreeNode]) {
 }
 
 pub async fn tree_roots(base: &str) -> anyhow::Result<Vec<aios_core::pdms_types::EleTreeNode>> {
-    let mut reply: TreeNodesReply = get(base, "/api/v1/tree/roots").await?;
-    require_direct(&reply.source)?;
+    let source = tree_source();
+    let path = append_tree_source("/api/v1/tree/roots", source);
+    let mut reply: TreeNodesReply = get(base, &path).await?;
+    validate_tree_source(&reply.source, source)?;
     fill_legacy_default_names(&mut reply.nodes);
     Ok(reply.nodes)
 }
@@ -473,8 +508,10 @@ pub async fn tree_roots(base: &str) -> anyhow::Result<Vec<aios_core::pdms_types:
 /// `EleTreeNode` 反序列化，那一格就被丢掉了。模型更新面板要靠它认库，所以这里重解一遍
 /// 同一份回执，最后只交出「库号 + SITE 名」两格。
 pub async fn tree_root_dbs(base: &str) -> anyhow::Result<Vec<(u32, String)>> {
-    let reply: TreeRootDbReply = get(base, "/api/v1/tree/roots").await?;
-    require_direct(&reply.source)?;
+    let source = tree_source();
+    let path = append_tree_source("/api/v1/tree/roots", source);
+    let reply: TreeRootDbReply = get(base, &path).await?;
+    validate_tree_source(&reply.source, source)?;
     Ok(root_dbs(reply.nodes))
 }
 
@@ -498,12 +535,16 @@ pub async fn tree_children(
     base: &str,
     refno: aios_core::RefU64,
 ) -> anyhow::Result<Vec<aios_core::pdms_types::EleTreeNode>> {
-    let path = format!(
-        "/api/v1/tree/children?refno={}",
-        urlencode(&refno.to_slash_string())
+    let source = tree_source();
+    let path = append_tree_source(
+        &format!(
+            "/api/v1/tree/children?refno={}",
+            urlencode(&refno.to_slash_string())
+        ),
+        source,
     );
     let mut reply: TreeNodesReply = get(base, &path).await?;
-    require_direct(&reply.source)?;
+    validate_tree_source(&reply.source, source)?;
     fill_legacy_default_names(&mut reply.nodes);
     Ok(reply.nodes)
 }
@@ -515,18 +556,30 @@ pub async fn tree_children_resolved(
     base: &str,
     refno: aios_core::RefU64,
 ) -> anyhow::Result<TreeLevel> {
-    let path = format!(
-        "/api/v1/tree/children?refno={}&resolved=1",
-        urlencode(&refno.to_slash_string())
+    let source = tree_source();
+    let path = append_tree_source(
+        &format!(
+            "/api/v1/tree/children?refno={}&resolved=1",
+            urlencode(&refno.to_slash_string())
+        ),
+        source,
     );
     let reply: ResolvedTreeReply = get(base, &path).await?;
-    reply.into_level()
+    reply.into_level_for(source)
 }
 
 impl ResolvedTreeReply {
     /// 回执落成树上的一层。与取数分开：分组契约的用例直接喂 gen-model 形状的回执。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn into_level(self) -> anyhow::Result<TreeLevel> {
-        require_direct(&self.source)?;
+        self.into_level_for(plant_ui::settings::TreeSourceKind::Direct)
+    }
+
+    pub(crate) fn into_level_for(
+        self,
+        expected: plant_ui::settings::TreeSourceKind,
+    ) -> anyhow::Result<TreeLevel> {
+        validate_tree_source(&self.source, expected)?;
         let (mut nodes, links): (Vec<_>, Vec<_>) = self
             .nodes
             .into_iter()
@@ -557,12 +610,14 @@ impl ResolvedTreeReply {
 pub async fn tree_group_roots(
     base: &str,
 ) -> anyhow::Result<Vec<aios_core::pdms_types::EleTreeNode>> {
-    let mut reply: TreeNodesReply = match get(base, "/api/v1/tree/roots?nouns=GPWL").await {
+    let source = tree_source();
+    let path = append_tree_source("/api/v1/tree/roots?nouns=GPWL", source);
+    let mut reply: TreeNodesReply = match get(base, &path).await {
         Ok(reply) => reply,
         Err(error) if failure_of(&error).code == "bad_request" => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
-    require_direct(&reply.source)?;
+    validate_tree_source(&reply.source, source)?;
     reply
         .nodes
         .retain(|node| node.noun.eq_ignore_ascii_case("GPWL"));
@@ -574,12 +629,16 @@ pub async fn tree_ancestors(
     base: &str,
     refno: aios_core::RefU64,
 ) -> anyhow::Result<Vec<aios_core::RefU64>> {
-    let path = format!(
-        "/api/v1/tree/ancestors?refno={}",
-        urlencode(&refno.to_slash_string())
+    let source = tree_source();
+    let path = append_tree_source(
+        &format!(
+            "/api/v1/tree/ancestors?refno={}",
+            urlencode(&refno.to_slash_string())
+        ),
+        source,
     );
     let reply: TreeAncestorsReply = get(base, &path).await?;
-    require_direct(&reply.source)?;
+    validate_tree_source(&reply.source, source)?;
     Ok(reply
         .refnos
         .into_iter()
@@ -607,7 +666,10 @@ pub async fn search_names(
     query: &str,
     limit: usize,
 ) -> anyhow::Result<Vec<plant_ui_data::NameHit>> {
-    let path = format!("/api/v1/search?query={}&limit={}", urlencode(query), limit);
+    let path = append_tree_source(
+        &format!("/api/v1/search?query={}&limit={}", urlencode(query), limit),
+        tree_source(),
+    );
     let reply: SearchReply = get(base, &path).await?;
     reply
         .items
@@ -1270,6 +1332,140 @@ pub async fn generate_model(
             Err(error) => return Err(error),
         };
     Ok(reply.into_reply(legacy_endpoint))
+}
+
+/// Spec 041：`GET /api/v1/node/model-status` 与 `POST /api/v1/node/data-ingest` 共用的单库结论。
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct NodeDataIngestLib {
+    pub dbnum: u32,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub intent: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    /// 随这次带出或并入的前置系统库的库号。服务端给的是 `[{dbnum, task_id}]`（gen-model
+    /// `node_generate_ingest::Prerequisite`），这里只用库号，见 [`prerequisite_dbnums`]。
+    #[serde(default, deserialize_with = "prerequisite_dbnums")]
+    pub prerequisites: Vec<u32>,
+    #[serde(default)]
+    pub message: String,
+}
+
+/// 前置系统库一格的宽容解法：服务端的形状是 `[{dbnum, task_id}]`，裸库号数组也认。按 `Vec<u32>` 直解的话，
+/// 只要带出了系统库，整块「数据」就解不动、预检整个失败。
+fn prerequisite_dbnums<'de, D>(deserializer: D) -> Result<Vec<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Item {
+        Dbnum(u32),
+        Row { dbnum: u32 },
+    }
+    Ok(Vec::<Item>::deserialize(deserializer)?
+        .into_iter()
+        .map(|item| match item {
+            Item::Dbnum(dbnum) | Item::Row { dbnum } => dbnum,
+        })
+        .collect())
+}
+
+/// Spec 041：节点缺数据时要不要先解析保存的「数据」块。
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct NodeDataIngestBlock {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub libraries: Vec<NodeDataIngestLib>,
+}
+
+#[derive(Deserialize)]
+struct NodeDataIngestEnvelope {
+    #[serde(default)]
+    data_ingest: Option<NodeDataIngestBlock>,
+}
+
+/// 只读预检 `GET /api/v1/node/model-status` 的 `data_ingest` 块（Spec 041）。
+/// 老服务端没有该路由（404/405）或缺少 `data_ingest` 字段时返回 `Ok(None)`，不阻断原有生成路径。
+pub async fn node_model_status_data_ingest(
+    base: &str,
+    refno: &str,
+    project: &str,
+    mdb: &str,
+    namespace: &str,
+) -> anyhow::Result<Option<NodeDataIngestBlock>> {
+    let query = node_model_status_query(refno, project, mdb, namespace);
+    match get::<NodeDataIngestEnvelope>(base, &query).await {
+        Ok(env) => Ok(env.data_ingest),
+        Err(error) if endpoint_missing(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// `GET /api/v1/node/model-status` 的请求行：一个节点 + 服务身份三件套（空着的那一格不带）。
+fn node_model_status_query(refno: &str, project: &str, mdb: &str, namespace: &str) -> String {
+    let mut query = format!(
+        "/api/v1/node/model-status?refno={}",
+        url_encode_param(refno)
+    );
+    for (key, value) in [("project", project), ("mdb", mdb), ("namespace", namespace)] {
+        if !value.is_empty() {
+            query.push_str(&format!("&{key}={}", url_encode_param(value)));
+        }
+    }
+    query
+}
+
+/// 提资前检查用的整份 `GET /api/v1/node/model-status` 应答（gen-model 接口文档 §4.5.3）。只读。
+///
+/// 失败原样交出去，不像 [`node_model_status_data_ingest`] 那样把 404 吞成 `None`：没有这条路由、元素不存在、
+/// 连不上是三种出路，由调用方按错误码分开处置（`data_handover::outcome_of`）。
+pub async fn node_model_status(
+    base: &str,
+    refno: &str,
+    project: &str,
+    mdb: &str,
+    namespace: &str,
+) -> anyhow::Result<plant_ui::data_publish_check::NodeModelStatus> {
+    get(
+        base,
+        &node_model_status_query(refno, project, mdb, namespace),
+    )
+    .await
+}
+
+/// 人确认「先解析保存」后调用 `POST /api/v1/node/data-ingest`（Spec 041）：把节点所在库（含前置系统库）排入入库队列。
+pub async fn node_data_ingest(
+    base: &str,
+    refno: &str,
+    project: &str,
+    mdb: &str,
+    namespace: &str,
+) -> anyhow::Result<Option<NodeDataIngestBlock>> {
+    let body = serde_json::json!({
+        "refno": refno,
+        "project": project,
+        "mdb": mdb,
+        "namespace": namespace,
+    })
+    .to_string();
+    let env: NodeDataIngestEnvelope =
+        post(base, "/api/v1/node/data-ingest", body, Duration::from_secs(30)).await?;
+    Ok(env.data_ingest)
+}
+
+fn url_encode_param(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 #[derive(Deserialize)]
@@ -2365,6 +2561,38 @@ mod tests {
         );
     }
 
+    /// Spec 041 的前置系统库一格：服务端给 `[{dbnum, task_id}]`，按库号数组直解会让整块「数据」解不动
+    /// ——带出系统库的那一次预检就整个失败。两种形状都要认，缺席照旧是空。
+    #[test]
+    fn data_ingest_prerequisites_parse_in_the_server_shape() {
+        let block: NodeDataIngestBlock = serde_json::from_str(
+            r#"{"enabled": true, "libraries": [{
+                "dbnum": 7997, "action": "would_enqueue", "intent": "first_import", "task_id": null,
+                "prerequisites": [{"dbnum": 7001, "task_id": "t-1"}, {"dbnum": 7002, "task_id": "t-2"}],
+                "message": "可以先解析保存"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(block.libraries[0].prerequisites, vec![7001, 7002]);
+        let bare: NodeDataIngestLib =
+            serde_json::from_str(r#"{"dbnum": 1, "prerequisites": [3, 4]}"#).unwrap();
+        assert_eq!(bare.prerequisites, vec![3, 4]);
+        let absent: NodeDataIngestLib = serde_json::from_str(r#"{"dbnum": 1}"#).unwrap();
+        assert!(absent.prerequisites.is_empty());
+    }
+
+    /// 提资前检查与生成预检打的是同一条请求行：节点转义，身份三件套只带非空的。
+    #[test]
+    fn node_model_status_query_escapes_the_refno_and_skips_empty_identity() {
+        assert_eq!(
+            node_model_status_query("24381/535", "ProjAMS", "/ALL", "aios"),
+            "/api/v1/node/model-status?refno=24381%2F535&project=ProjAMS&mdb=%2FALL&namespace=aios"
+        );
+        assert_eq!(
+            node_model_status_query("24381_535", "", "", ""),
+            "/api/v1/node/model-status?refno=24381_535"
+        );
+    }
+
     /// 连不上、超时、握手不成对用的人是同一件事：服务够不着，没有任何数据被改动，
     /// 直接重试即可。统一归 `timeout`，界面才给得出「可以直接重试」那句话。
     #[test]
@@ -2543,5 +2771,27 @@ mod tests {
                 (7997, "SITE 2".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn append_and_validate_tree_source_match_direct_and_db() {
+        use plant_ui::settings::TreeSourceKind;
+
+        assert_eq!(
+            append_tree_source("/api/v1/tree/roots", TreeSourceKind::Direct),
+            "/api/v1/tree/roots"
+        );
+        assert_eq!(
+            append_tree_source("/api/v1/tree/roots", TreeSourceKind::Db),
+            "/api/v1/tree/roots?source=db"
+        );
+        assert_eq!(
+            append_tree_source("/api/v1/tree/children?refno=1/2", TreeSourceKind::Db),
+            "/api/v1/tree/children?refno=1/2&source=db"
+        );
+        assert!(validate_tree_source("direct", TreeSourceKind::Direct).is_ok());
+        assert!(validate_tree_source("db", TreeSourceKind::Db).is_ok());
+        assert!(validate_tree_source("direct", TreeSourceKind::Db).is_err());
+        assert!(validate_tree_source("db", TreeSourceKind::Direct).is_err());
     }
 }

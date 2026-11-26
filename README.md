@@ -124,7 +124,7 @@ cargo build -p rs-plant --bin inspect
 | 为什么这么定 | `docs/adr/`（0005 起，共 29 份） |
 | 某项功能做什么、不做什么 | `docs/features/` |
 | 施工顺序与验收口径 | `docs/plans/` |
-| 界面字段逐格出处 | `design/QUEUE-FIELD-MAP.md`（任务队列）、`design/MODEL-UPDATE-FIELD-MAP.md`（增量更新） |
+| 界面字段逐格出处 | `design/QUEUE-FIELD-MAP.md`（任务队列）、`design/MODEL-UPDATE-FIELD-MAP.md`（增量更新）、`design/DATA-PUBLISH-FIELD-MAP.md`（三维数据提资） |
 | 设计令牌与画板 | `design/DESIGN-SYSTEM.md`、`design/*.pen` |
 | 实机证据 | `docs/evidence/` |
 | 界面上会不一样的地方 | `CHANGELOG.md` |

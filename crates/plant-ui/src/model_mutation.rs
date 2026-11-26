@@ -97,6 +97,17 @@ impl Kind {
     }
 }
 
+/// Spec 041：节点所在库缺入库数据时，确认框里的三个选择。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataIngestChoice {
+    /// 先把整库排进入库队列（保存 PE 与属性），同时照常生成并显示模型。
+    IngestAndGenerate,
+    /// 不解析保存，仅按需生成显示模型（本会话记住该库，不再反复问）。
+    GenerateOnly,
+    /// 取消本次生成与入库。
+    Cancel,
+}
+
 /// 确认框此刻在说什么。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Vm {
@@ -110,6 +121,15 @@ pub enum Vm {
         label: String,
         dbnum: Option<u32>,
         purge_meshes: bool,
+    },
+    /// Spec 041：生成显示模型前，发现目标节点所在的库缺入库数据（没有 PE / 属性），
+    /// 问人要不要把整库排进入库队列。
+    ConfirmDataIngest {
+        label: String,
+        dbnum: u32,
+        prerequisites: Vec<u32>,
+        message: String,
+        is_manual_regen: bool,
     },
     /// 等房间参照模型装载 / 重建完。这一档今天只有「重新生成房间」用到：重建请求
     /// 已经发出、服务端收不回，所以按钮是「后台继续」——只摘进度屏，服务端照跑到底。
@@ -141,6 +161,7 @@ impl Vm {
     pub fn label(&self) -> &str {
         match self {
             Self::Confirm { label, .. }
+            | Self::ConfirmDataIngest { label, .. }
             | Self::WaitingResident { label, .. }
             | Self::Running { label, .. }
             | Self::Failed { label, .. } => label,
@@ -153,6 +174,7 @@ impl Vm {
             | Self::WaitingResident { kind, .. }
             | Self::Running { kind, .. }
             | Self::Failed { kind, .. } => *kind,
+            Self::ConfirmDataIngest { .. } => Kind::Regenerate,
         }
     }
 }
@@ -196,7 +218,13 @@ pub fn show(
     let mut open = true;
     // 跑起来之后不给叉。这一档关窗关不掉任何东西——请求已经在服务端跑了。
     let closable = !matches!(vm, Vm::Running { .. });
-    let mut window = egui::Window::new(vm.kind().title())
+    let is_data_ingest = matches!(vm, Vm::ConfirmDataIngest { .. });
+    let title = if is_data_ingest {
+        "先解析保存所在库？"
+    } else {
+        vm.kind().title()
+    };
+    let mut window = egui::Window::new(title)
         .id(egui::Id::new("plant-model-mutation"))
         .collapsible(false)
         .resizable(false)
@@ -214,10 +242,14 @@ pub fn show(
     // 关窗等于不做。窗口右上角那个叉与「取消」必须是同一件事，不然人以为
     // 自己躲开了这个决定。
     if closable && !open {
-        cmds.push(Cmd::ModelMutationConfirm {
-            accepted: false,
-            purge_meshes: false,
-        });
+        if is_data_ingest {
+            cmds.push(Cmd::NodeDataIngestChoice(DataIngestChoice::Cancel));
+        } else {
+            cmds.push(Cmd::ModelMutationConfirm {
+                accepted: false,
+                purge_meshes: false,
+            });
+        }
     }
     cmds
 }
@@ -281,6 +313,75 @@ fn body(ui: &mut egui::Ui, t: &Tokens, d: Density, vm: &mut Vm, cmds: &mut Vec<C
                         accepted: false,
                         purge_meshes: false,
                     });
+                }
+            });
+        }
+        Vm::ConfirmDataIngest {
+            label,
+            dbnum,
+            prerequisites,
+            message,
+            is_manual_regen,
+        } => {
+            let verb = if *is_manual_regen {
+                "重新生成"
+            } else {
+                "显示"
+            };
+            ui.label(
+                RichText::new(format!(
+                    "{label} 所在的库 db{dbnum} 还没有解析保存入库数据（缺少 PE 与属性）。要在{verb}模型的同时把整库排入后台解析保存吗？"
+                ))
+                .color(t.text_primary),
+            );
+            ui.add_space(d.px(6.0));
+            if !prerequisites.is_empty() {
+                let pre = prerequisites
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join("、");
+                ui.label(
+                    RichText::new(format!(
+                        "将连带先入库前置系统库：{pre}；队列暂停时也会仅放行本次带出的库。"
+                    ))
+                    .small()
+                    .color(t.text_muted),
+                );
+                ui.add_space(d.px(4.0));
+            }
+            if !message.trim().is_empty() {
+                ui.label(RichText::new(message.as_str()).small().color(t.text_muted));
+                ui.add_space(d.px(4.0));
+            }
+            ui.label(
+                RichText::new(
+                    "· 先解析保存：后台入库整个库（保存 PE、属性与模型），同时立即照常生成并显示当前模型。\n\
+                     · 直接生成：只按需生成当前模型用于显示，不保存 PE 与属性（本次会话对 db{dbnum} 不再重复询问）。"
+                        .replace("{dbnum}", &dbnum.to_string()),
+                )
+                .small()
+                .color(t.text_muted),
+            );
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        widgets::button(t, d, "先解析保存")
+                            .icon(egui_phosphor::regular::DATABASE)
+                            .primary(),
+                    )
+                    .clicked()
+                {
+                    cmds.push(Cmd::NodeDataIngestChoice(
+                        DataIngestChoice::IngestAndGenerate,
+                    ));
+                }
+                if ui.add(widgets::button(t, d, "直接生成")).clicked() {
+                    cmds.push(Cmd::NodeDataIngestChoice(DataIngestChoice::GenerateOnly));
+                }
+                if ui.add(widgets::button(t, d, "取消")).clicked() {
+                    cmds.push(Cmd::NodeDataIngestChoice(DataIngestChoice::Cancel));
                 }
             });
         }
@@ -400,7 +501,10 @@ fn resident_phase_label(phase: &str) -> &str {
 /// 失败是 `Error`。
 pub fn tone(vm: &Vm) -> Status {
     match vm {
-        Vm::Confirm { .. } | Vm::WaitingResident { .. } | Vm::Running { .. } => Status::Warn,
+        Vm::Confirm { .. }
+        | Vm::ConfirmDataIngest { .. }
+        | Vm::WaitingResident { .. }
+        | Vm::Running { .. } => Status::Warn,
         Vm::Failed { .. } => Status::Error,
     }
 }
@@ -412,7 +516,7 @@ fn queue_note(vm: &Vm, queued: usize) -> Option<String> {
         return None;
     }
     match vm {
-        Vm::Confirm { .. } => Some(format!(
+        Vm::Confirm { .. } | Vm::ConfirmDataIngest { .. } => Some(format!(
             "另有 {queued} 个目标在排队等默认生成：这一框确认或取消之后才会接着发。"
         )),
         Vm::WaitingResident { .. } | Vm::Running { .. } => Some(format!(

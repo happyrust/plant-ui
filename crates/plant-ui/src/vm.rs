@@ -3,6 +3,117 @@ use aios_core::RefU64;
 use crate::style::tokens::Status;
 use crate::virtual_hole::VirtualHoleStatus;
 
+/// 当前用户的详细信息（标题栏右侧用户徽章 + hover 详情卡）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UserProfileVm {
+    /// 登录账号（如 `KANGWP`）。
+    pub user_name: String,
+    /// 中文姓名（来自普华人员表 `pb_human.Name`，离线可能为空）。
+    pub chinese_name: String,
+    /// 所属专业（来自 `/forward` 或 `/get_user`）。
+    pub user_major: String,
+    /// 是否设计人员。
+    pub b_designer: bool,
+    /// 是否已通过服务端登录认证（`/forward` Bearer 或会话）。
+    pub authenticated: bool,
+    /// 认证来源说明（如 `普华跳转 (/forward)`、`服务会话 (/get_user)`、`未认证（匿名访问）`）。
+    pub auth_source: String,
+}
+
+impl UserProfileVm {
+    /// 标题栏右侧徽章展示名称：同时有中文名与账号且不同时展示 `中文名 (账号)`，
+    /// 否则取非空中文名 / 账号 / 回退文案。
+    pub fn badge_label(&self, fallback: &str) -> String {
+        let user = self.user_name.trim();
+        let chinese = self.chinese_name.trim();
+        match (chinese.is_empty(), user.is_empty()) {
+            (false, false) if chinese != user => format!("{chinese} ({user})"),
+            (false, _) => chinese.to_owned(),
+            (true, false) => user.to_owned(),
+            (true, true) => {
+                let fb = fallback.trim();
+                if fb.is_empty() {
+                    "user".to_owned()
+                } else {
+                    fb.to_owned()
+                }
+            }
+        }
+    }
+
+    /// 头像圆圈中的单字符首字母（取中文名首字或账号首字符大写）。
+    pub fn avatar_initial(&self, fallback: &str) -> String {
+        let source = self
+            .chinese_name
+            .trim()
+            .chars()
+            .next()
+            .or_else(|| self.user_name.trim().chars().next())
+            .or_else(|| fallback.trim().chars().next())
+            .unwrap_or('U');
+        source.to_uppercase().collect()
+    }
+
+    pub fn role_label(&self) -> &'static str {
+        if !self.authenticated {
+            "—"
+        } else if self.b_designer {
+            "设计人员"
+        } else {
+            "普通用户"
+        }
+    }
+}
+
+/// 前端 / 模型后端（aios-database）/ 数据服务（rs-server）版本与构建摘要。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServiceVersionsVm {
+    pub loading: bool,
+    pub backend_version: String,
+    pub backend_build_id: String,
+    pub backend_e3d_model_build_id: String,
+    pub backend_e3d_io_build_id: String,
+    pub backend_e3d_attlib_build_id: String,
+    pub backend_read_mode: String,
+    pub backend_data_face: String,
+    pub backend_started_at: String,
+    pub backend_error: Option<String>,
+    pub data_service_version: String,
+    pub data_service_error: Option<String>,
+}
+
+impl ServiceVersionsVm {
+    /// 从 `/api/v1/health` 快照同步后端版本与构建标识，并清除上一次后端查询错误。
+    pub fn apply_health(&mut self, health: &crate::task_queue::Health) {
+        self.backend_version = health.version.trim().to_owned();
+        self.backend_build_id = health.build_id.trim().to_owned();
+        self.backend_e3d_model_build_id = health.e3d_model_build_id.trim().to_owned();
+        self.backend_e3d_io_build_id = health.e3d_io_build_id.trim().to_owned();
+        self.backend_e3d_attlib_build_id = health.e3d_attlib_build_id.trim().to_owned();
+        self.backend_read_mode = health
+            .data_read_mode
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        self.backend_data_face = health.data_face.trim().to_owned();
+        self.backend_started_at = health.started_at.trim().to_owned();
+        self.backend_error = None;
+    }
+
+    /// 统一版本号显示格式（补齐前导 `v`，空串显示 `—`）。
+    pub fn display_version(raw: &str) -> String {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            "—".to_owned()
+        } else if trimmed.starts_with('v') || trimmed.starts_with('V') {
+            trimmed.to_owned()
+        } else {
+            format!("v{trimmed}")
+        }
+    }
+}
+
 /// 主工作台视图模型（外壳字段随 M1 各视图逐步补齐）。
 ///
 /// 外壳原则：宁可少一格，也不摆一个永远是 0 的假数字。所以 gen-model 侧口径的
@@ -16,6 +127,8 @@ pub struct WorkbenchVm {
     pub project_code: String,
     /// 当前用户（标题栏右侧）。
     pub user: String,
+    /// 当前用户的详细信息（标题栏右侧 user 徽章 hover 展示）。
+    pub user_profile: UserProfileVm,
     /// 数据源是否就绪（状态栏指示点）。
     pub data_source_ok: bool,
     /// 数据树、属性与三维都越过同一个增量刷新屏障后递增。自动化用它确认自己
@@ -112,6 +225,8 @@ pub struct WorkbenchVm {
     pub access_point: AccessPointVm,
     /// 导航历史在命令栏那两枚箭头上的只读投影。栈本身归宿主。
     pub nav: NavHistoryVm,
+    /// 前端 / 模型后端 / 数据服务的版本与构建信息（「关于」弹窗与顶栏版本角标使用）。
+    pub versions: ServiceVersionsVm,
 }
 
 /// 导航历史的只读投影：绘制层只需要「能不能退 / 进」、目标叫什么、右键列表画哪几条。
@@ -841,6 +956,8 @@ pub struct RoomTreeDataVm {
     pub matched: usize,
     /// 宿主此刻的过滤词（绘制层的输入框跟它对齐：「在房间树查看」会把挡住目标的过滤词清掉）。
     pub filter: String,
+    /// 是否过滤空房间（无边界面板或 0 构件）。
+    pub hide_empty: bool,
     /// `degraded` 时服务端给的原因，跟在状态行后面。
     pub note: Option<String>,
     /// 取树 / 补叶子失败的节点，逐条列在树上方。

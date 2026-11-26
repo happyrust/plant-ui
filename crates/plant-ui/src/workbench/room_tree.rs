@@ -185,6 +185,19 @@ fn header(
                         .font(Font::micro(d))
                         .color(t.text_muted),
                 );
+                let mut hide_empty = data.hide_empty;
+                if ui
+                    .checkbox(
+                        &mut hide_empty,
+                        RichText::new("过滤空房间")
+                            .font(Font::micro(d))
+                            .color(t.text_secondary),
+                    )
+                    .on_hover_text("隐藏无边界面板或 0 构件的空房间")
+                    .changed()
+                {
+                    cmds.push(Cmd::RoomTree(RoomTreeAction::SetHideEmpty(hide_empty)));
+                }
             });
             for error in &data.errors {
                 let line = format!("{}：{}", error.label, error.message);

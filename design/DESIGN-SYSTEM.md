@@ -2,7 +2,8 @@
 
 设计源文件：`design/plant-ui.pen`（Pencil 打开，勿用文本编辑器；原名 `rs-plant3d-ui.pen`，2026-07-27 已 rename 归位，见 `docs/plans/task-queue-rollout.md` 第九节第 3 条）
 HTML 参照：`design/export/*.html`（离线可看，含精确尺寸与颜色）
-字段对照：`design/MODEL-UPDATE-FIELD-MAP.md`（模型更新八张画板）与 `design/QUEUE-FIELD-MAP.md`（任务队列视图），都是实现的验收基准
+字段对照：`design/MODEL-UPDATE-FIELD-MAP.md`（模型更新八张画板）、`design/QUEUE-FIELD-MAP.md`（任务队列视图）与 `design/DATA-PUBLISH-FIELD-MAP.md`（三维数据提资新入口，S15 族），都是实现的验收基准
+S15 族不在 `plant-ui.pen` 里：它们单独放在 `design/三维数据提资.pen`，令牌与组件写法照本文件，导出图在 `design/export/S15*.png`
 
 ---
 
@@ -49,6 +50,10 @@ S2 / S2-B 退为历史参照。
 | S12-C 任务队列 · 终态行内明细形态表 | 1040×720 | 是 | 队列行三种终态（succeeded / partial / failed）的展开明细；S4-C 内容的行内化，「立刻重试」与死信文案在此；2026-08-05 补 |
 | S13 模糊查询（原编号 S11） | 1240×820 | 否 | `ui/fuzzy_search/` |
 | S14 保存 / 搜索记录（原编号 S12） | 1280×560 | 否 | `fuzzy_search/save_ui.rs`、`import_ui.rs` |
+| S15 三维数据提资 · 提资前检查 · 需要更新 | 1040×720 | 是（`三维数据提资.pen`） | 新入口「创建 → 三维数据提资」：`data_handover.rs`（窗口）+ `data_publish_check.rs`（判据）；左栏表单与提资元素、右栏检查、底部硬拦；见 ADR-0036，验收基准 `DATA-PUBLISH-FIELD-MAP.md`。旧入口「三维数据接口」无画板、保持不变；2026-11-26 补 |
+| S15-A 三维数据提资 · 更新中 | 1040×720 | 是（同上） | 同 S15：点「更新到最新」之后库行上的排队、运行与进度条。画板上的「优先增量更新」「提资单元 / 其余单元」两条等 gen-model（字段表标「待新增 G1」），今天画「增量更新」与一条「交付单元」 |
+| S15-B 三维数据提资 · 已是最新 | 1040×720 | 是（同上） | 同 S15：放行那一刻。画板画的是按交付单元放行（「提资范围已追平」），等 gen-model（G3）；今天按库放行，直接到「已是最新」 |
+| S15-C 三维数据提资 · 形态表 | 1040×1014 | 是（同上） | 整体判决 7 种、库行 13 种；是形态表不是窗。实现里库行多出「不在本期执行范围」「已是最新却缺行」「此刻排不了」「模型没追平」四种，都归「更新不了」，出处见字段表 §4 |
 
 ### 向导两步：预览 → 确认执行（第三步随 ADR-0011 迁任务队列）
 

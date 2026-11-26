@@ -51,6 +51,49 @@ pub struct RuntimeConfig {
     /// 托管页面、网格在模型服务的 `/assets` 下；`None` 时 wasm 的 `start()` 用相对页面的 `assets`。
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     pub assets_url: Option<String>,
+    /// `/forward` 注入的一次性 Bearer 访问令牌（rs-server 入口页经 `/auth/exchange` 换得）。
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub auth_token: Option<String>,
+    /// `/forward` 注入的当前登录用户信息（rs-server `/get_user` 响应）。
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub auth_user: Option<AuthUser>,
+}
+
+/// rs-server `/get_user` 返回的当前登录用户。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
+pub struct AuthUser {
+    #[serde(default)]
+    pub user_name: String,
+    #[serde(default)]
+    pub chinese_name: String,
+    #[serde(default)]
+    pub user_major: String,
+    #[serde(default)]
+    pub b_designer: bool,
+}
+
+impl AuthUser {
+    /// 界面显示名称：同时有中文名与账号且不同时展示 `中文名 (账号)`，否则取非空项。
+    pub fn display_name(&self) -> String {
+        let user = self.user_name.trim();
+        let chinese = self.chinese_name.trim();
+        match (chinese.is_empty(), user.is_empty()) {
+            (false, false) if chinese != user => format!("{chinese} ({user})"),
+            (false, _) => chinese.to_owned(),
+            (true, false) => user.to_owned(),
+            (true, true) => String::new(),
+        }
+    }
+}
+
+fn normalize_auth_token(token: Option<String>) -> Option<String> {
+    token
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+}
+
+fn normalize_auth_user(user: Option<AuthUser>) -> Option<AuthUser> {
+    user.filter(|u| !u.user_name.trim().is_empty() || !u.chinese_name.trim().is_empty())
 }
 
 /// 这一组连同 [`browser_runtime_config`] 只有 wasm 的 `start()` 入口用得到——配置由
@@ -74,6 +117,10 @@ struct BrowserConfig {
     look: plant_ui::ViewportLookOverrides,
     #[serde(default)]
     assets_url: Option<String>,
+    #[serde(default)]
+    auth_token: Option<String>,
+    #[serde(default)]
+    auth_user: Option<AuthUser>,
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -103,6 +150,10 @@ struct LegacyBrowserConfig {
     password: String,
     #[serde(default)]
     look: plant_ui::ViewportLookOverrides,
+    #[serde(default)]
+    auth_token: Option<String>,
+    #[serde(default)]
+    auth_user: Option<AuthUser>,
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -119,6 +170,8 @@ pub fn browser_runtime_config(json: &str) -> Result<RuntimeConfig> {
         )
         .map(|mut runtime| {
             runtime.look = config.look;
+            runtime.auth_token = normalize_auth_token(config.auth_token);
+            runtime.auth_user = normalize_auth_user(config.auth_user);
             runtime
         }),
         BrowserStartupConfig::Current(config) => {
@@ -169,6 +222,8 @@ pub fn browser_runtime_config(json: &str) -> Result<RuntimeConfig> {
                 auto_gen_mesh: false,
                 look: config.look,
                 assets_url,
+                auth_token: normalize_auth_token(config.auth_token),
+                auth_user: normalize_auth_user(config.auth_user),
             })
         }
     }
@@ -233,6 +288,8 @@ pub fn legacy_runtime_config(
         auto_gen_mesh: legacy.auto_gen_mesh,
         look: plant_ui::ViewportLookOverrides::default(),
         assets_url: None,
+        auth_token: None,
+        auth_user: None,
     })
 }
 
@@ -602,5 +659,55 @@ mod tests {
             index.contains("model_api_url: apiHost") && index.contains("data_api_url: apiHost"),
             "legacy browser entry must take backend URLs from e3d.project.ron api_host"
         );
+    }
+
+    #[test]
+    fn browser_startup_carries_optional_forwarded_auth_token_and_user() {
+        let with_auth = serde_json::json!({
+            "db": {
+                "host": "127.0.0.1",
+                "port": 8009,
+                "namespace": "1516",
+                "database": "AvevaMarineSample",
+                "mdb": "/ALL",
+                "username": "",
+                "password": ""
+            },
+            "model_api_url": "http://127.0.0.1:8022",
+            "data_api_url": "http://127.0.0.1:9098",
+            "auth_token": "  tok-123  ",
+            "auth_user": {
+                "user_name": "KANGWP",
+                "chinese_name": "",
+                "user_major": "test",
+                "b_designer": true
+            }
+        });
+        let parsed = browser_runtime_config(&with_auth.to_string()).unwrap();
+        assert_eq!(parsed.auth_token.as_deref(), Some("tok-123"));
+        let user = parsed.auth_user.expect("auth_user parsed");
+        assert_eq!(user.user_name, "KANGWP");
+        assert_eq!(user.user_major, "test");
+        assert!(user.b_designer);
+        assert_eq!(user.display_name(), "KANGWP");
+
+        let without_auth = serde_json::json!({
+            "db": {
+                "host": "127.0.0.1",
+                "port": 8009,
+                "namespace": "1516",
+                "database": "AvevaMarineSample",
+                "mdb": "/ALL",
+                "username": "",
+                "password": ""
+            },
+            "model_api_url": "http://127.0.0.1:8022",
+            "data_api_url": "http://127.0.0.1:9098",
+            "auth_token": "   ",
+            "auth_user": null
+        });
+        let parsed = browser_runtime_config(&without_auth.to_string()).unwrap();
+        assert_eq!(parsed.auth_token, None);
+        assert_eq!(parsed.auth_user, None);
     }
 }
